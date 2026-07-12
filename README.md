@@ -1,5 +1,6 @@
 # Cythonpp
-MyPy complient Python compiler
+
+MyPy complient Python -> C++ compiler
 
 Cythonpp is a mypy-complient-python compiler that produces straight c++ code.
 
