@@ -1,9 +1,6 @@
-#include <iostream>
-#include "lexer/lexicon.h"
+#include "adapters/cli/cli_adapter.h"
 
-int main() {
-    
-    std::string filepath = "C:/Users/calal/Documents/PersonalProjects/Cythonpp/test_files/hello_world.py";
-    ReadFile(filepath);
-    return 0;
+int main(int argc, char** argv) {
+    cythonpp::adapters::cli::CliAdapter cli;
+    return cli.run(argc, argv);
 }
