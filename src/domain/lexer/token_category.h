@@ -16,6 +16,19 @@ enum class token_category : uint16_t {
     PUNCTUATION = 1 << 5,
     IDENTIFIER  = 1 << 6,
     SPECIAL     = 1 << 7,
+    // Marks a token that denotes a Python *value* -- something that is an
+    // instance of a class and therefore carries a runtime type and its
+    // methods. Literals, True/False/None/Ellipsis, names (which bind to
+    // objects) and builtin type names (a class is itself an object) all
+    // carry it. Pure syntax does not: statement keywords, operators,
+    // delimiters, punctuation, comments and the stream markers.
+    //
+    // The rule is "this token, standing alone, denotes a value", not "the
+    // construct it introduces evaluates to a value". So KEYWORD_LAMBDA and
+    // OPEN_BRACKET are not OBJECT even though `lambda: 1` and `[1, 2]`
+    // produce objects -- without that restriction OBJECT would leak into
+    // half the delimiters and stop meaning anything.
+    OBJECT      = 1 << 8,
 };
 
 } // namespace cythonpp::domain::lexer
