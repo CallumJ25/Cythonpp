@@ -49,14 +49,19 @@ inline constexpr uint32_t TYPE_NAME_FLAGS   = cat(token_category::KEYWORD) | cat
 } // namespace detail
 
 enum class token_type : uint32_t {
-    // Special: stream markers, never a Python value. INDENT/DEDENT are
-    // deliberately absent -- indentation is not modelled yet, and the
-    // scanner emits SPACE/TAB per leading character instead.
+    // Special: stream markers, never a Python value.
+    //
+    // SPACE/TAB are what the scanner emits, one per leading character.
+    // INDENT/DEDENT are what IndentationPass replaces them with, so the two
+    // pairs never coexist in the same stream: a stream that has been through
+    // the pass has no SPACE or TAB in it at all.
     TOKEN_EOF   = detail::make_token(detail::SPECIAL_FLAGS, 0),
     TOKEN_ERROR = detail::make_token(detail::SPECIAL_FLAGS, 1),
     NEWLINE     = detail::make_token(detail::SPECIAL_FLAGS, 2),
     SPACE       = detail::make_token(detail::SPECIAL_FLAGS, 3),
     TAB         = detail::make_token(detail::SPECIAL_FLAGS, 4),
+    INDENT      = detail::make_token(detail::SPECIAL_FLAGS, 5),
+    DEDENT      = detail::make_token(detail::SPECIAL_FLAGS, 6),
 
     // Identifiers: a name denotes whatever object it is bound to.
     IDENTIFIER = detail::make_token(detail::NAME_FLAGS, 0),

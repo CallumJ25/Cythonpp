@@ -19,6 +19,8 @@ constexpr token_type ALL_TOKEN_TYPES[] = {
     token_type::NEWLINE,
     token_type::SPACE,
     token_type::TAB,
+    token_type::INDENT,
+    token_type::DEDENT,
 
     token_type::IDENTIFIER,
 
@@ -284,7 +286,7 @@ TEST(TokenType, SubtypeIndicesRestartPerFlagCombination) {
 
 TEST(TokenType, EveryEnumeratorHasAUniqueValue) {
     const std::size_t count = std::size(ALL_TOKEN_TYPES);
-    EXPECT_EQ(count, 115u);
+    EXPECT_EQ(count, 117u);
 
     for (std::size_t left = 0; left < count; ++left) {
         for (std::size_t right = left + 1; right < count; ++right) {
@@ -317,6 +319,16 @@ TEST(TokenType, EveryEnumeratorHasAName) {
         EXPECT_NE(token_type_name(type), "UNKNOWN")
             << "missing name for raw value " << static_cast<uint32_t>(type);
     }
+}
+
+TEST(TokenCategory, IndentAndDedentAreSpecialOnly) {
+    // Structure markers, not values: nothing in the stream binds to them, so
+    // an "is this an object?" check must not pick them up.
+    EXPECT_TRUE(has_category(token_type::INDENT, token_category::SPECIAL));
+    EXPECT_TRUE(has_category(token_type::DEDENT, token_category::SPECIAL));
+    EXPECT_FALSE(has_category(token_type::INDENT, token_category::OBJECT));
+    EXPECT_FALSE(has_category(token_type::DEDENT, token_category::OBJECT));
+    EXPECT_NE(token_type::INDENT, token_type::DEDENT);
 }
 
 } // namespace
