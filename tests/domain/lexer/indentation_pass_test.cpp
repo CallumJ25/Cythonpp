@@ -154,5 +154,67 @@ TEST(IndentationPass, RunningTheSamePassObjectTwiceProducesTheSameResult) {
     EXPECT_TRUE(second_sink.empty());
 }
 
+TEST(IndentationPass, ConsistentTabIndentationProducesNoDiagnostic) {
+    const TypeList types = types_of("if a:\n\tx\n\t\ty\n");
+    EXPECT_EQ(count_of(types, token_type::INDENT), 2);
+    EXPECT_EQ(count_of(types, token_type::DEDENT), 2);
+}
+
+TEST(IndentationPass, TabAdvancesToTheNextTabStopRatherThanAddingEight) {
+    // "  \t" is column 8. If a tab added eight instead it would be column 10,
+    // and the eight-space line below would compare as a dedent rather than as
+    // the same column -- so the TabError here is what proves the arithmetic.
+    diagnostics::DiagnosticSink sink;
+    const TypeList types = types_of("if a:\n  \tx\n        y\n", sink);
+
+    EXPECT_EQ(count_of(types, token_type::INDENT), 1);
+    ASSERT_EQ(sink.diagnostics().size(), 1u);
+    EXPECT_EQ(sink.diagnostics().front().code, "TabError");
+}
+
+TEST(IndentationPass, EqualColumnsWithADifferentTabAndSpaceMixReportTabError) {
+    // "\t" and eight spaces are both column 8, but alt column 1 and 8. Which
+    // block the second line belongs to depends on the tab width, so Python
+    // refuses to guess.
+    diagnostics::DiagnosticSink sink;
+    types_of("if a:\n\tx\n        y\n", sink);
+
+    ASSERT_EQ(sink.diagnostics().size(), 1u);
+    EXPECT_EQ(sink.diagnostics().front().code, "TabError");
+    EXPECT_EQ(sink.diagnostics().front().severity, diagnostics::Severity::Error);
+    EXPECT_EQ(sink.diagnostics().front().line, 3);
+}
+
+TEST(IndentationPass, DeeperColumnWithNonIncreasingAltColumnReportsTabError) {
+    // Eight spaces is col 8 / alt 8; two tabs is col 16 / alt 2. Deeper by one
+    // measure, shallower by the other.
+    diagnostics::DiagnosticSink sink;
+    types_of("if a:\n        x\n\t\ty\n", sink);
+
+    ASSERT_GE(sink.diagnostics().size(), 1u);
+    EXPECT_EQ(sink.diagnostics().front().code, "TabError");
+}
+
+TEST(IndentationPass, TabErrorRecoveryStillEmitsABalancedStream) {
+    // expect_balanced runs inside types_of, so this asserts the recovery path
+    // does not leak a level. Named explicitly because it is the property, not
+    // the token counts, that matters here.
+    diagnostics::DiagnosticSink sink;
+    const TypeList types = types_of("if a:\n\tx\n        y\n\t\tz\nw\n", sink);
+    EXPECT_FALSE(sink.empty());
+    EXPECT_EQ(count_of(types, token_type::INDENT), count_of(types, token_type::DEDENT));
+}
+
+TEST(IndentationPass, TabErrorDiagnosticsCarryTheOffendingPosition) {
+    diagnostics::DiagnosticSink sink;
+    types_of("if a:\n\tx\n        y\n", sink);
+
+    ASSERT_EQ(sink.diagnostics().size(), 1u);
+    // The position of the token the diagnostic is about, so an editor jumps to
+    // the statement rather than to the invisible whitespace before it.
+    EXPECT_EQ(sink.diagnostics().front().line, 3);
+    EXPECT_EQ(sink.diagnostics().front().column, 9);
+}
+
 } // namespace
 } // namespace cythonpp::domain::lexer
