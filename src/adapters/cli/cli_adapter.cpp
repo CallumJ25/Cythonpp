@@ -6,6 +6,7 @@
 #include <iostream>
 #include <string>
 
+#include "adapters/cli/console_diagnostics_reporter.h"
 #include "adapters/filesystem/filesystem_source_lister.h"
 #include "adapters/filesystem/filesystem_source_reader.h"
 #include "application/compile_pipeline.h"
@@ -64,7 +65,8 @@ int CliAdapter::run(int argc, char** argv) {
     std::string path = argv[1];
     filesystem::FilesystemSourceReader source_reader;
     filesystem::FilesystemSourceLister source_lister;
-    application::CompilePipeline pipeline(source_reader, source_lister);
+    ConsoleDiagnosticsReporter diagnostics_reporter;
+    application::CompilePipeline pipeline(source_reader, source_lister, diagnostics_reporter);
 
     try {
         // Interpreting argv is this adapter's job. Asking the OS whether a
@@ -75,6 +77,11 @@ int CliAdapter::run(int argc, char** argv) {
                                                       ? pipeline.compile_directory(path)
                                                       : pipeline.compile_file(path);
         print_result(result);
+
+        // The dump is still printed for a file with errors -- seeing the
+        // tokens is exactly what helps when diagnosing one -- but the exit
+        // code has to say the compile failed.
+        return result.has_errors ? 1 : 0;
     } catch (const std::exception& error) {
         // Wider than runtime_error: <filesystem> throws filesystem_error and
         // TokenStream::at throws out_of_range, both worth reporting rather
@@ -82,8 +89,6 @@ int CliAdapter::run(int argc, char** argv) {
         std::cerr << error.what() << std::endl;
         return 1;
     }
-
-    return 0;
 }
 
 } // namespace cythonpp::adapters::cli
