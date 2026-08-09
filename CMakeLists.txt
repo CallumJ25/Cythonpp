@@ -12,6 +12,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/lexer/operator_table.cpp
     src/domain/lexer/scan_context.cpp
     src/domain/lexer/lexer.cpp
+    src/domain/lexer/indentation_pass.cpp
     src/domain/diagnostics/diagnostic_sink.cpp
     src/application/compile_pipeline.cpp
     src/adapters/filesystem/filesystem_source_reader.cpp
@@ -50,6 +51,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/lexer/scan_context_test.cpp
         tests/domain/lexer/lexer_test.cpp
         tests/domain/lexer/lexer_annotation_test.cpp
+        tests/domain/lexer/indentation_pass_test.cpp
         tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/application/compile_pipeline_test.cpp
         tests/adapters/filesystem/filesystem_source_lister_test.cpp
