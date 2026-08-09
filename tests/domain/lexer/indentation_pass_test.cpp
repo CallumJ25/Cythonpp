@@ -290,5 +290,118 @@ TEST(IndentationPass, DeeplyNestedThenFullyDedentedFileStaysBalanced) {
     EXPECT_EQ(count_of(types, token_type::DEDENT), 4);
 }
 
+TEST(IndentationPass, BlankLinesBetweenStatementsDoNotChangeTheLevel) {
+    const TypeList types = types_of("if a:\n    x\n\n\n    y\n");
+    EXPECT_EQ(count_of(types, token_type::INDENT), 1);
+    EXPECT_EQ(count_of(types, token_type::DEDENT), 1);
+}
+
+TEST(IndentationPass, CommentOnlyLineAtColumnZeroInsideABlockDoesNotDedent) {
+    // The comment line emits a bare COMMENT_SINGLE with no whitespace and no
+    // NEWLINE. Treating it as a logical line would read it as a dedent to
+    // column 0 and close the block early.
+    const TypeList types = types_of("if a:\n    x\n# note\n    y\n");
+    EXPECT_EQ(count_of(types, token_type::INDENT), 1);
+    EXPECT_EQ(count_of(types, token_type::DEDENT), 1);
+    EXPECT_EQ(count_of(types, token_type::COMMENT_SINGLE), 1);
+}
+
+TEST(IndentationPass, DedentIsInsertedAfterACommentThatPrecedesTheDedentingLine) {
+    // INDENT/DEDENT go immediately before the first *significant* token, so
+    // trivia stays where the scanner put it.
+    EXPECT_EQ(types_of("if a:\n    x\n# note\ny\n"),
+              (TypeList{token_type::KEYWORD_IF, token_type::IDENTIFIER, token_type::COLON,
+                        token_type::NEWLINE, token_type::INDENT, token_type::IDENTIFIER,
+                        token_type::NEWLINE, token_type::COMMENT_SINGLE, token_type::DEDENT,
+                        token_type::IDENTIFIER, token_type::NEWLINE, token_type::TOKEN_EOF}));
+}
+
+TEST(IndentationPass, DedentsReachEndOfFileEvenAfterATrailingCommentLine) {
+    // The flush anchor is the TOKEN_EOF token, not "after the last NEWLINE".
+    const TypeList types = types_of("if a:\n    x\n# note\n");
+    ASSERT_GE(types.size(), 3u);
+    EXPECT_EQ(types[types.size() - 1], token_type::TOKEN_EOF);
+    EXPECT_EQ(types[types.size() - 2], token_type::DEDENT);
+    EXPECT_EQ(types[types.size() - 3], token_type::COMMENT_SINGLE);
+}
+
+TEST(IndentationPass, ContinuationLineInsideBracketsIsNotMeasured) {
+    // No NEWLINE and no whitespace tokens are emitted inside brackets, so the
+    // whole call is one logical line at column 0.
+    const TypeList types = types_of("f(a,\n        b)\n");
+    EXPECT_EQ(count_of(types, token_type::INDENT), 0);
+    EXPECT_EQ(count_of(types, token_type::DEDENT), 0);
+}
+
+TEST(IndentationPass, BackslashContinuationMeasuresTheFirstPhysicalLine) {
+    // The whitespace run is on line 2 and the token it describes is on line 3,
+    // so grouping a line by Token::line_number() instead of by adjacency would
+    // lose the measurement entirely.
+    diagnostics::DiagnosticSink sink;
+    const TokenStream result = pass("if a:\n    \\\n    x\n", sink);
+
+    ASSERT_GE(result.size(), 5u);
+    const Token& indent = result.at(4);
+    EXPECT_EQ(indent.type(), token_type::INDENT);
+    EXPECT_EQ(indent.line_number(), 3);
+    EXPECT_TRUE(sink.empty());
+}
+
+TEST(IndentationPass, SemicolonSeparatedStatementsAreOneLogicalLine) {
+    const TypeList types = types_of("if a:\n    x = 1; y = 2\n");
+    EXPECT_EQ(count_of(types, token_type::INDENT), 1);
+    EXPECT_EQ(count_of(types, token_type::NEWLINE), 2);
+}
+
+TEST(IndentationPass, InlineBlockBodyProducesNoIndent) {
+    const TypeList types = types_of("if a: x = 1\n");
+    EXPECT_EQ(count_of(types, token_type::INDENT), 0);
+}
+
+TEST(IndentationPass, IndentationAfterAMultiLineStringIsMeasuredCorrectly) {
+    // The scanner's line counter advances through the newlines inside the
+    // string, so the run on the line after it carries the right position.
+    const TypeList types = types_of("def f():\n    \"\"\"doc\n    more\n    \"\"\"\n    return 1\n");
+    EXPECT_EQ(count_of(types, token_type::INDENT), 1);
+    EXPECT_EQ(count_of(types, token_type::DEDENT), 1);
+}
+
+TEST(IndentationPass, UnterminatedBracketSuppressesIndentationWithoutUnbalancing) {
+    const TypeList types = types_of("x = (\n    y\n");
+    EXPECT_EQ(count_of(types, token_type::INDENT), 0);
+    EXPECT_EQ(count_of(types, token_type::DEDENT), 0);
+}
+
+TEST(IndentationPass, UnterminatedTripleQuotedStringLeavesABalancedStream) {
+    const TypeList types = types_of("if a:\n    \"\"\"oops\n    x\n");
+    EXPECT_EQ(count_of(types, token_type::INDENT), count_of(types, token_type::DEDENT));
+}
+
+TEST(IndentationPass, CarriageReturnOnlyLineEndingsCollapseToOneLogicalLine) {
+    // Known lexer limitation, pinned rather than worked around: a bare '\r' is
+    // swallowed as inter-token whitespace and never re-arms the line start, so
+    // no NEWLINE and no indentation tokens exist for such a file.
+    const TypeList types = types_of("if x:\r    y\r");
+    EXPECT_EQ(count_of(types, token_type::INDENT), 0);
+    EXPECT_EQ(count_of(types, token_type::NEWLINE), 1);
+}
+
+TEST(IndentationPass, FormFeedBeforeIndentationDivergesFromCPython) {
+    // Known deviation, pinned so it is visible rather than forgotten. The
+    // scanner's emit loop accepts only ' ' and '\t' while the surrounding skip
+    // loops also consume '\f', so the indentation after a leading form feed is
+    // absent from the stream and no implementation of this pass can recover it.
+    // CPython resets the column on a form feed and would measure column 4 here.
+    const TypeList types = types_of("if a:\n\f    x\n");
+    EXPECT_EQ(count_of(types, token_type::INDENT), 0);
+}
+
+TEST(IndentationPass, FormFeedAfterIndentationDivergesFromCPython) {
+    // Same cause, opposite direction: the four spaces before the form feed are
+    // counted, where CPython would count only the two after it.
+    const TypeList types = types_of("if a:\n    \f  x\n");
+    EXPECT_EQ(count_of(types, token_type::INDENT), 1);
+}
+
 } // namespace
 } // namespace cythonpp::domain::lexer
