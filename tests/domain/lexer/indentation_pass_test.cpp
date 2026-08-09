@@ -216,5 +216,79 @@ TEST(IndentationPass, TabErrorDiagnosticsCarryTheOffendingPosition) {
     EXPECT_EQ(sink.diagnostics().front().column, 9);
 }
 
+TEST(IndentationPass, UnmatchedDedentReportsIndentationErrorAndContinues) {
+    diagnostics::DiagnosticSink sink;
+    const TypeList types = types_of("if a:\n    x\n  y\n", sink);
+
+    ASSERT_EQ(sink.diagnostics().size(), 1u);
+    EXPECT_EQ(sink.diagnostics().front().code, "IndentationError");
+    EXPECT_EQ(sink.diagnostics().front().message, "unindent does not match any outer indentation level");
+    EXPECT_EQ(sink.diagnostics().front().line, 3);
+    // Scanning did not stop: the statement on the bad line is still in the
+    // stream, so a later pass can keep reporting problems in this file.
+    // Three identifiers -- the `a` in the header, then `x` and `y`.
+    EXPECT_EQ(count_of(types, token_type::IDENTIFIER), 3);
+}
+
+TEST(IndentationPass, DedentingPastTheBaseLevelDoesNotUnbalanceTheStream) {
+    // The regression case for sentinel overwriting. Line 3 dedents to column 2,
+    // which matches no open level; if the base level were overwritten with 2,
+    // line 4 at column 0 would pop it and emit a second DEDENT against a single
+    // INDENT -- or pop an empty stack.
+    diagnostics::DiagnosticSink sink;
+    const TypeList types = types_of("if a:\n    x\n  y\nz\n", sink);
+
+    EXPECT_EQ(count_of(types, token_type::INDENT), 1);
+    EXPECT_EQ(count_of(types, token_type::DEDENT), 1);
+    EXPECT_EQ(sink.diagnostics().size(), 1u);
+}
+
+TEST(IndentationPass, RepeatedDedentsPastTheBaseLevelStayBalanced) {
+    diagnostics::DiagnosticSink sink;
+    const TypeList types = types_of("if a:\n        x\n    y\n        z\n  w\n", sink);
+
+    EXPECT_EQ(count_of(types, token_type::INDENT), 2);
+    EXPECT_EQ(count_of(types, token_type::DEDENT), 2);
+    EXPECT_EQ(sink.diagnostics().size(), 2u);
+}
+
+TEST(IndentationPass, DedentToAColumnBetweenTwoOpenLevelsAdoptsThatColumn) {
+    // Column 6 sits between the open levels 4 and 8. One DEDENT is emitted for
+    // level 8, then level 4 is overwritten with 6 -- a width change, not a
+    // depth change, so the flush at end of file still balances.
+    diagnostics::DiagnosticSink sink;
+    const TypeList types = types_of("if a:\n    x\n        y\n      z\n", sink);
+
+    EXPECT_EQ(count_of(types, token_type::INDENT), 2);
+    EXPECT_EQ(count_of(types, token_type::DEDENT), 2);
+    ASSERT_EQ(sink.diagnostics().size(), 1u);
+    EXPECT_EQ(sink.diagnostics().front().code, "IndentationError");
+}
+
+TEST(IndentationPass, StreamWithoutAnEndOfFileTokenIsStillFlushed) {
+    // Not something Lexer produces, but the balance guarantee is unconditional
+    // and a hand-built stream must not be able to break it.
+    std::vector<Token> tokens;
+    tokens.emplace_back(token_type::SPACE, " ", 1, 1);
+    tokens.emplace_back(token_type::SPACE, " ", 1, 2);
+    tokens.emplace_back(token_type::IDENTIFIER, "x", 1, 3);
+
+    diagnostics::DiagnosticSink sink;
+    const TokenStream result = IndentationPass().run(TokenStream(std::move(tokens)), sink);
+
+    TypeList types;
+    for (const Token& token : result) {
+        types.push_back(token.type());
+    }
+    EXPECT_EQ(types, (TypeList{token_type::INDENT, token_type::IDENTIFIER, token_type::DEDENT}));
+}
+
+TEST(IndentationPass, DeeplyNestedThenFullyDedentedFileStaysBalanced) {
+    const TypeList types =
+        types_of("if a:\n    if b:\n        if c:\n            if d:\n                x\ny\n");
+    EXPECT_EQ(count_of(types, token_type::INDENT), 4);
+    EXPECT_EQ(count_of(types, token_type::DEDENT), 4);
+}
+
 } // namespace
 } // namespace cythonpp::domain::lexer
