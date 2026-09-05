@@ -6,10 +6,14 @@ namespace cythonpp::domain::ast {
 class Attribute;
 class BinOp;
 class BoolOp;
+class Call;
 class Compare;
 class Constant;
+class DictExpr;
+class ListExpr;
 class Name;
 class Subscript;
+class TupleExpr;
 class UnaryOp;
 
 // Traversal over the node hierarchy.
@@ -33,10 +37,14 @@ public:
     virtual void visit(const Attribute& node) = 0;
     virtual void visit(const BinOp& node) = 0;
     virtual void visit(const BoolOp& node) = 0;
+    virtual void visit(const Call& node) = 0;
     virtual void visit(const Compare& node) = 0;
     virtual void visit(const Constant& node) = 0;
+    virtual void visit(const DictExpr& node) = 0;
+    virtual void visit(const ListExpr& node) = 0;
     virtual void visit(const Name& node) = 0;
     virtual void visit(const Subscript& node) = 0;
+    virtual void visit(const TupleExpr& node) = 0;
     virtual void visit(const UnaryOp& node) = 0;
 };
 

@@ -3,13 +3,17 @@
 #include "attribute.h"
 #include "bin_op.h"
 #include "bool_op.h"
+#include "call.h"
 #include "compare.h"
 #include "constant.h"
+#include "dict_expr.h"
 #include "domain/lexer/keyword_table.h"
 #include "domain/lexer/operator_table.h"
 #include "domain/lexer/token_type_name.h"
+#include "list_expr.h"
 #include "name.h"
 #include "subscript.h"
+#include "tuple_expr.h"
 #include "unary_op.h"
 
 namespace cythonpp::domain::ast {
@@ -64,6 +68,16 @@ void AstPrinter::visit(const BoolOp& node) {
     out_ += ")";
 }
 
+void AstPrinter::visit(const Call& node) {
+    out_ += "(Call ";
+    node.callee().accept(*this);
+    for (const ExprPtr& arg : node.args()) {
+        out_ += " ";
+        arg->accept(*this);
+    }
+    out_ += ")";
+}
+
 void AstPrinter::visit(const Compare& node) {
     out_ += "(Compare ";
     node.left().accept(*this);
@@ -78,6 +92,27 @@ void AstPrinter::visit(const Constant& node) {
     out_ += "(Constant " + node.lexeme() + ")";
 }
 
+void AstPrinter::visit(const DictExpr& node) {
+    out_ += "(DictExpr";
+    for (const DictExpr::Entry& entry : node.entries()) {
+        out_ += " (";
+        entry.key->accept(*this);
+        out_ += " ";
+        entry.value->accept(*this);
+        out_ += ")";
+    }
+    out_ += ")";
+}
+
+void AstPrinter::visit(const ListExpr& node) {
+    out_ += "(ListExpr";
+    for (const ExprPtr& element : node.elements()) {
+        out_ += " ";
+        element->accept(*this);
+    }
+    out_ += ")";
+}
+
 void AstPrinter::visit(const Name& node) {
     out_ += "(Name " + node.identifier() + ")";
 }
@@ -87,6 +122,15 @@ void AstPrinter::visit(const Subscript& node) {
     node.value().accept(*this);
     out_ += " ";
     node.index().accept(*this);
+    out_ += ")";
+}
+
+void AstPrinter::visit(const TupleExpr& node) {
+    out_ += "(TupleExpr";
+    for (const ExprPtr& element : node.elements()) {
+        out_ += " ";
+        element->accept(*this);
+    }
     out_ += ")";
 }
 

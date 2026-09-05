@@ -8,10 +8,14 @@
 #include "domain/ast/attribute.h"
 #include "domain/ast/bin_op.h"
 #include "domain/ast/bool_op.h"
+#include "domain/ast/call.h"
 #include "domain/ast/compare.h"
 #include "domain/ast/constant.h"
+#include "domain/ast/dict_expr.h"
+#include "domain/ast/list_expr.h"
 #include "domain/ast/name.h"
 #include "domain/ast/subscript.h"
+#include "domain/ast/tuple_expr.h"
 #include "domain/ast/unary_op.h"
 
 namespace cythonpp::domain::ast {
@@ -81,6 +85,47 @@ TEST(AstPrinter, CompareRendersEachOperatorWithItsOperand) {
     rest.push_back({lexer::token_type::OP_LESS, std::make_unique<Name>(kSpan, "c")});
     const Compare node(kSpan, std::make_unique<Name>(kSpan, "a"), std::move(rest));
     EXPECT_EQ(print(node), "(Compare (Name a) < (Name b) < (Name c))");
+}
+
+TEST(AstPrinter, CallWithNoArgumentsRendersJustTheCallee) {
+    const Call node(kSpan, std::make_unique<Name>(kSpan, "f"), {});
+    EXPECT_EQ(print(node), "(Call (Name f))");
+}
+
+TEST(AstPrinter, CallRendersItsArgumentsInOrder) {
+    std::vector<ExprPtr> args;
+    args.push_back(std::make_unique<Name>(kSpan, "x"));
+    args.push_back(std::make_unique<Constant>(kSpan, lexer::token_type::LITERAL_INT, "2"));
+    const Call node(kSpan, std::make_unique<Name>(kSpan, "f"), std::move(args));
+    EXPECT_EQ(print(node), "(Call (Name f) (Name x) (Constant 2))");
+}
+
+TEST(AstPrinter, EmptyListRendersWithNoElements) {
+    const ListExpr node(kSpan, {});
+    EXPECT_EQ(print(node), "(ListExpr)");
+}
+
+TEST(AstPrinter, ListRendersItsElements) {
+    std::vector<ExprPtr> elements;
+    elements.push_back(std::make_unique<Constant>(kSpan, lexer::token_type::LITERAL_INT, "1"));
+    elements.push_back(std::make_unique<Constant>(kSpan, lexer::token_type::LITERAL_INT, "2"));
+    const ListExpr node(kSpan, std::move(elements));
+    EXPECT_EQ(print(node), "(ListExpr (Constant 1) (Constant 2))");
+}
+
+TEST(AstPrinter, TupleRendersItsElements) {
+    std::vector<ExprPtr> elements;
+    elements.push_back(std::make_unique<Name>(kSpan, "a"));
+    const TupleExpr node(kSpan, std::move(elements));
+    EXPECT_EQ(print(node), "(TupleExpr (Name a))");
+}
+
+TEST(AstPrinter, DictRendersEachKeyValuePair) {
+    std::vector<DictExpr::Entry> entries;
+    entries.push_back({std::make_unique<Constant>(kSpan, lexer::token_type::LITERAL_STRING, "'k'"),
+                       std::make_unique<Constant>(kSpan, lexer::token_type::LITERAL_INT, "1")});
+    const DictExpr node(kSpan, std::move(entries));
+    EXPECT_EQ(print(node), "(DictExpr ((Constant 'k') (Constant 1)))");
 }
 
 TEST(Node, CarriesTheSpanItWasBuiltWith) {
