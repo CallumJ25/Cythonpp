@@ -97,9 +97,9 @@ TEST(AstPrinter, BoolOpRendersAWordShapedOperator) {
 TEST(AstPrinter, CompareRendersEachOperatorWithItsOperand) {
     std::vector<Compare::Rest> rest;
     rest.push_back({lexer::token_type::OP_LESS, std::make_unique<Name>(kSpan, "b")});
-    rest.push_back({lexer::token_type::OP_LESS, std::make_unique<Name>(kSpan, "c")});
+    rest.push_back({lexer::token_type::OP_LESS_EQUAL, std::make_unique<Name>(kSpan, "c")});
     const Compare node(kSpan, std::make_unique<Name>(kSpan, "a"), std::move(rest));
-    EXPECT_EQ(print(node), "(Compare (Name a) < (Name b) < (Name c))");
+    EXPECT_EQ(print(node), "(Compare (Name a) < (Name b) <= (Name c))");
 }
 
 TEST(AstPrinter, CallWithNoArgumentsRendersJustTheCallee) {
@@ -273,7 +273,7 @@ TEST(AstPrinter, FunctionDefWithNoParametersRendersNameThenBody) {
 
 TEST(AstPrinter, FunctionDefRendersParametersAndReturnAnnotation) {
     std::vector<Parameter> params;
-    params.push_back(Parameter{"x", std::make_unique<Name>(kSpan, "int"), nullptr, kSpan});
+    params.push_back(Parameter(kSpan, "x", std::make_unique<Name>(kSpan, "int"), nullptr));
 
     std::vector<StmtPtr> body;
     body.push_back(std::make_unique<Pass>(kSpan));
@@ -285,12 +285,16 @@ TEST(AstPrinter, FunctionDefRendersParametersAndReturnAnnotation) {
               "  (Pass))");
 }
 
+TEST(Parameter, CarriesTheSpanItWasBuiltWith) {
+    const Parameter param(SourceSpan{4, 9, 4, 14}, "x", nullptr, nullptr);
+    EXPECT_EQ(param.span, (SourceSpan{4, 9, 4, 14}));
+}
+
 TEST(AstPrinter, ParameterWithADefaultRendersIt) {
     std::vector<Parameter> params;
-    params.push_back(Parameter{"n", nullptr,
+    params.push_back(Parameter(kSpan, "n", nullptr,
                                std::make_unique<Constant>(kSpan, lexer::token_type::LITERAL_INT,
-                                                          "0"),
-                               kSpan});
+                                                          "0")));
 
     std::vector<StmtPtr> body;
     body.push_back(std::make_unique<Pass>(kSpan));

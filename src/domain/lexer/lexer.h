@@ -26,7 +26,8 @@ namespace cythonpp::domain::lexer {
 // tokenized, because it is not indentation.
 //
 // Positions are 1-based lines and 1-based columns, and a token records the
-// position of its first character. Columns count UTF-8 characters rather
+// position of its first character plus a half-open end position -- one past
+// its last character. Columns count UTF-8 characters rather
 // than bytes, matching what CPython's tokenize reports and where an editor
 // caret lands, so a non-ASCII identifier earlier on the line does not skew
 // every column after it. Note this counts code points, not grapheme
@@ -55,6 +56,12 @@ private:
 
     // Every token is created here so the "significant token" bookkeeping and
     // the ScanContext feed live in exactly one place.
+    //
+    // Precondition: the cursor (line_/column_) must sit exactly one past the
+    // token's last character when this is called, since the end position is
+    // read from line_/column_ at call time rather than recomputed from the
+    // lexeme. Every call site advances past the token's text before calling
+    // emit()/emit_from().
     void emit(token_type type, std::string lexeme, int line, int column);
     void emit_from(token_type type, std::size_t start, int line, int column);
 

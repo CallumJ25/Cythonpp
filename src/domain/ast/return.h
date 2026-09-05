@@ -11,9 +11,11 @@ namespace cythonpp::domain::ast {
 
 // `return` or `return expr`.
 //
-// A null value_ means a bare return. This is the one place a null child is
-// legal, and has_value() is the only supported way to ask -- calling value()
-// on a bare return dereferences null.
+// A null value_ means a bare return, following the same convention as
+// AnnAssign::value_, FunctionDef::return_annotation_, and Parameter's
+// annotation/default_value: has_value() is the only supported way to ask,
+// and value() dereferences unconditionally, so calling it on a bare return
+// dereferences null.
 class Return : public Stmt {
 public:
     Return(SourceSpan span, ExprPtr value) : Stmt(span), value_(std::move(value)) {}
