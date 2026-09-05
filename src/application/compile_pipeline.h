@@ -5,6 +5,7 @@
 #include <string>
 
 #include "domain/lexer/token_stream.h"
+#include "ports/diagnostics_reporter.h"
 #include "ports/source_lister.h"
 #include "ports/source_reader.h"
 
@@ -16,6 +17,12 @@ struct CompileResult {
     // console output and test expectations -- is deterministic; at these
     // sizes hashing would buy nothing.
     std::map<std::string, domain::lexer::TokenStream> modules;
+
+    // True if any module produced an error diagnostic. The diagnostics
+    // themselves went to the reporter as each file was processed; this is only
+    // what the CLI needs to pick an exit code, and a compiler that prints
+    // errors and exits zero is a broken compiler.
+    bool has_errors = false;
 };
 
 // Orchestrates the compiler pipeline stages. Depends only on port
@@ -24,7 +31,9 @@ struct CompileResult {
 // parser, semantic analysis, and codegen stages are TODO.
 class CompilePipeline {
 public:
-    CompilePipeline(ports::SourceReader& source_reader, ports::SourceLister& source_lister);
+    CompilePipeline(ports::SourceReader& source_reader,
+                    ports::SourceLister& source_lister,
+                    ports::DiagnosticsReporter& diagnostics_reporter);
 
     // Lexes a single file. The result holds exactly one entry, keyed by
     // `path`, so callers need only one result-handling path.
@@ -36,10 +45,15 @@ public:
     CompileResult compile_directory(const std::string& directory);
 
 private:
-    domain::lexer::TokenStream compile_one(const std::string& path);
+    // Writes into `result` rather than returning a stream, because a module
+    // contributes two things -- its tokens and whether it failed -- and
+    // threading the second one back through a return value means an out
+    // parameter either way.
+    void compile_one(const std::string& path, CompileResult& result);
 
     ports::SourceReader& source_reader_;
     ports::SourceLister& source_lister_;
+    ports::DiagnosticsReporter& diagnostics_reporter_;
 };
 
 } // namespace cythonpp::application

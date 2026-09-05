@@ -12,11 +12,14 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/lexer/operator_table.cpp
     src/domain/lexer/scan_context.cpp
     src/domain/lexer/lexer.cpp
+    src/domain/lexer/indentation_pass.cpp
+    src/domain/diagnostics/diagnostic_sink.cpp
     src/application/compile_pipeline.cpp
     src/adapters/filesystem/filesystem_source_reader.cpp
     src/adapters/filesystem/filesystem_source_lister.cpp
     src/adapters/filesystem/filesystem_output_writer.cpp
     src/adapters/cli/cli_adapter.cpp
+    src/adapters/cli/console_diagnostics_reporter.cpp
 )
 
 add_library(cythonpp_lib STATIC ${CYTHONPP_LIB_SOURCES})
@@ -49,8 +52,11 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/lexer/scan_context_test.cpp
         tests/domain/lexer/lexer_test.cpp
         tests/domain/lexer/lexer_annotation_test.cpp
+        tests/domain/lexer/indentation_pass_test.cpp
+        tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/application/compile_pipeline_test.cpp
         tests/adapters/filesystem/filesystem_source_lister_test.cpp
+        tests/adapters/cli/console_diagnostics_reporter_test.cpp
     )
     target_link_libraries(cythonpp_tests PRIVATE cythonpp_lib gtest_main)
     target_include_directories(cythonpp_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

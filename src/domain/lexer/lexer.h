@@ -35,9 +35,10 @@ namespace cythonpp::domain::lexer {
 // Lexemes are raw source bytes, so non-ASCII content in identifiers and
 // strings round-trips exactly.
 //
-// TODO: INDENT/DEDENT tokens and TabError detection not yet implemented.
-// When they land, blank and comment-only lines must be excluded from
-// indentation processing, as CPython does.
+// INDENT/DEDENT tokens and TabError detection are not produced here. They are
+// IndentationPass's job, which consumes the SPACE/TAB tokens above; see
+// indentation_pass.h. Blank and comment-only lines are already excluded from
+// the whitespace this emits, as CPython does, so the pass never sees them.
 class Lexer {
 public:
     explicit Lexer(std::string source);

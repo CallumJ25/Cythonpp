@@ -12,6 +12,8 @@ std::string_view token_type_name(token_type type) {
         case token_type::NEWLINE: return "NEWLINE";
         case token_type::SPACE: return "SPACE";
         case token_type::TAB: return "TAB";
+        case token_type::INDENT: return "INDENT";
+        case token_type::DEDENT: return "DEDENT";
 
         case token_type::IDENTIFIER: return "IDENTIFIER";
 
