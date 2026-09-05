@@ -11,13 +11,16 @@
 #include "domain/ast/bin_op.h"
 #include "domain/ast/bool_op.h"
 #include "domain/ast/call.h"
+#include "domain/ast/class_def.h"
 #include "domain/ast/compare.h"
 #include "domain/ast/comprehension_clause.h"
 #include "domain/ast/constant.h"
 #include "domain/ast/dict_expr.h"
+#include "domain/ast/function_def.h"
 #include "domain/ast/list_comp.h"
 #include "domain/ast/list_expr.h"
 #include "domain/ast/name.h"
+#include "domain/ast/parameter.h"
 #include "domain/ast/subscript.h"
 #include "domain/ast/tuple_expr.h"
 #include "domain/ast/unary_op.h"
@@ -255,6 +258,67 @@ TEST(AstPrinter, ForRendersTargetAndIterableBeforeItsBody) {
                    std::make_unique<Name>(kSpan, "items"), std::move(body), {});
     EXPECT_EQ(print(node),
               "(For (Name x) (Name items)\n"
+              "  (Pass))");
+}
+
+TEST(AstPrinter, FunctionDefWithNoParametersRendersNameThenBody) {
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<Pass>(kSpan));
+    const FunctionDef node(kSpan, "f", {}, nullptr, std::move(body));
+    EXPECT_EQ(print(node),
+              "(FunctionDef f\n"
+              "  (Pass))");
+}
+
+TEST(AstPrinter, FunctionDefRendersParametersAndReturnAnnotation) {
+    std::vector<Parameter> params;
+    params.push_back(Parameter{"x", std::make_unique<Name>(kSpan, "int"), nullptr, kSpan});
+
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<Pass>(kSpan));
+
+    const FunctionDef node(kSpan, "f", std::move(params), std::make_unique<Name>(kSpan, "int"),
+                           std::move(body));
+    EXPECT_EQ(print(node),
+              "(FunctionDef f (Params (Parameter x (Name int))) (Returns (Name int))\n"
+              "  (Pass))");
+}
+
+TEST(AstPrinter, ParameterWithADefaultRendersIt) {
+    std::vector<Parameter> params;
+    params.push_back(Parameter{"n", nullptr,
+                               std::make_unique<Constant>(kSpan, lexer::token_type::LITERAL_INT,
+                                                          "0"),
+                               kSpan});
+
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<Pass>(kSpan));
+
+    const FunctionDef node(kSpan, "f", std::move(params), nullptr, std::move(body));
+    EXPECT_EQ(print(node),
+              "(FunctionDef f (Params (Parameter n (Default (Constant 0))))\n"
+              "  (Pass))");
+}
+
+TEST(AstPrinter, ClassDefWithNoBasesRendersNameThenBody) {
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<Pass>(kSpan));
+    const ClassDef node(kSpan, "C", {}, std::move(body));
+    EXPECT_EQ(print(node),
+              "(ClassDef C\n"
+              "  (Pass))");
+}
+
+TEST(AstPrinter, ClassDefRendersItsBases) {
+    std::vector<ExprPtr> bases;
+    bases.push_back(std::make_unique<Name>(kSpan, "Base"));
+
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<Pass>(kSpan));
+
+    const ClassDef node(kSpan, "C", std::move(bases), std::move(body));
+    EXPECT_EQ(print(node),
+              "(ClassDef C (Bases (Name Base))\n"
               "  (Pass))");
 }
 

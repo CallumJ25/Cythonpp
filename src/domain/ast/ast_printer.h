@@ -28,11 +28,13 @@ public:
     void visit(const BoolOp& node) override;
     void visit(const Break& node) override;
     void visit(const Call& node) override;
+    void visit(const ClassDef& node) override;
     void visit(const Compare& node) override;
     void visit(const Constant& node) override;
     void visit(const Continue& node) override;
     void visit(const DictExpr& node) override;
     void visit(const For& node) override;
+    void visit(const FunctionDef& node) override;
     void visit(const If& node) override;
     void visit(const ListComp& node) override;
     void visit(const ListExpr& node) override;

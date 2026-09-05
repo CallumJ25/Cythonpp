@@ -9,6 +9,7 @@
 #include "bool_op.h"
 #include "break.h"
 #include "call.h"
+#include "class_def.h"
 #include "compare.h"
 #include "constant.h"
 #include "continue.h"
@@ -17,10 +18,12 @@
 #include "domain/lexer/operator_table.h"
 #include "domain/lexer/token_type_name.h"
 #include "for.h"
+#include "function_def.h"
 #include "if.h"
 #include "list_comp.h"
 #include "list_expr.h"
 #include "name.h"
+#include "parameter.h"
 #include "pass.h"
 #include "return.h"
 #include "subscript.h"
@@ -112,6 +115,20 @@ void AstPrinter::visit(const Call& node) {
     out_ += ")";
 }
 
+void AstPrinter::visit(const ClassDef& node) {
+    out_ += "(ClassDef " + node.name();
+    if (!node.bases().empty()) {
+        out_ += " (Bases";
+        for (const ExprPtr& base : node.bases()) {
+            out_ += " ";
+            base->accept(*this);
+        }
+        out_ += ")";
+    }
+    print_body(node.body());
+    out_ += ")";
+}
+
 void AstPrinter::visit(const Compare& node) {
     out_ += "(Compare ";
     node.left().accept(*this);
@@ -173,6 +190,34 @@ void AstPrinter::visit(const For& node) {
     node.iterable().accept(*this);
     print_body(node.body());
     print_else(node.orelse());
+    out_ += ")";
+}
+
+void AstPrinter::visit(const FunctionDef& node) {
+    out_ += "(FunctionDef " + node.name();
+    if (!node.params().empty()) {
+        out_ += " (Params";
+        for (const Parameter& param : node.params()) {
+            out_ += " (Parameter " + param.name;
+            if (param.annotation != nullptr) {
+                out_ += " ";
+                param.annotation->accept(*this);
+            }
+            if (param.default_value != nullptr) {
+                out_ += " (Default ";
+                param.default_value->accept(*this);
+                out_ += ")";
+            }
+            out_ += ")";
+        }
+        out_ += ")";
+    }
+    if (node.has_return_annotation()) {
+        out_ += " (Returns ";
+        node.return_annotation().accept(*this);
+        out_ += ")";
+    }
+    print_body(node.body());
     out_ += ")";
 }
 
