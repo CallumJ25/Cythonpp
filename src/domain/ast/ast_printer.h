@@ -20,9 +20,13 @@ public:
     std::string print(const Node& node);
 
     void visit(const Attribute& node) override;
+    void visit(const BinOp& node) override;
+    void visit(const BoolOp& node) override;
+    void visit(const Compare& node) override;
     void visit(const Constant& node) override;
     void visit(const Name& node) override;
     void visit(const Subscript& node) override;
+    void visit(const UnaryOp& node) override;
 
 private:
     std::string out_;

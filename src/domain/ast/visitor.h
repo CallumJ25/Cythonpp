@@ -4,9 +4,13 @@
 namespace cythonpp::domain::ast {
 
 class Attribute;
+class BinOp;
+class BoolOp;
+class Compare;
 class Constant;
 class Name;
 class Subscript;
+class UnaryOp;
 
 // Traversal over the node hierarchy.
 //
@@ -27,9 +31,13 @@ public:
     virtual ~Visitor() = default;
 
     virtual void visit(const Attribute& node) = 0;
+    virtual void visit(const BinOp& node) = 0;
+    virtual void visit(const BoolOp& node) = 0;
+    virtual void visit(const Compare& node) = 0;
     virtual void visit(const Constant& node) = 0;
     virtual void visit(const Name& node) = 0;
     virtual void visit(const Subscript& node) = 0;
+    virtual void visit(const UnaryOp& node) = 0;
 };
 
 } // namespace cythonpp::domain::ast
