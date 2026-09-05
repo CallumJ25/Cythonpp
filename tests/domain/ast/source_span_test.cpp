@@ -35,5 +35,12 @@ TEST(SourceSpan, EqualityComparesAllFourFields) {
     EXPECT_FALSE((SourceSpan{1, 2, 3, 4}) == (SourceSpan{1, 2, 3, 5}));
 }
 
+TEST(SourceSpan, InequalityComparesAllFourFields) {
+    // Equal spans should NOT be unequal
+    EXPECT_FALSE((SourceSpan{1, 2, 3, 4}) != (SourceSpan{1, 2, 3, 4}));
+    // Different in start_line and end_column should be unequal
+    EXPECT_TRUE((SourceSpan{1, 2, 3, 4}) != (SourceSpan{2, 2, 3, 5}));
+}
+
 } // namespace
 } // namespace cythonpp::domain::ast
