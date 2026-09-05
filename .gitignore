@@ -44,3 +44,6 @@
 build/
 
 CLAUDE.md
+
+# Claude Code local state (worktrees, settings, session data)
+.claude/
