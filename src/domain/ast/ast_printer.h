@@ -19,7 +19,10 @@ class AstPrinter : public Visitor {
 public:
     std::string print(const Node& node);
 
+    void visit(const Attribute& node) override;
+    void visit(const Constant& node) override;
     void visit(const Name& node) override;
+    void visit(const Subscript& node) override;
 
 private:
     std::string out_;

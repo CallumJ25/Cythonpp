@@ -3,7 +3,10 @@
 
 namespace cythonpp::domain::ast {
 
+class Attribute;
+class Constant;
 class Name;
+class Subscript;
 
 // Traversal over the node hierarchy.
 //
@@ -23,7 +26,10 @@ class Visitor {
 public:
     virtual ~Visitor() = default;
 
+    virtual void visit(const Attribute& node) = 0;
+    virtual void visit(const Constant& node) = 0;
     virtual void visit(const Name& node) = 0;
+    virtual void visit(const Subscript& node) = 0;
 };
 
 } // namespace cythonpp::domain::ast
