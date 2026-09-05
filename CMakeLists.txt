@@ -53,6 +53,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/lexer/lexer_test.cpp
         tests/domain/lexer/lexer_annotation_test.cpp
         tests/domain/lexer/indentation_pass_test.cpp
+        tests/domain/ast/source_span_test.cpp
         tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/application/compile_pipeline_test.cpp
         tests/adapters/filesystem/filesystem_source_lister_test.cpp
