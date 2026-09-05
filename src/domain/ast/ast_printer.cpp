@@ -22,6 +22,7 @@
 #include "if.h"
 #include "list_comp.h"
 #include "list_expr.h"
+#include "module.h"
 #include "name.h"
 #include "parameter.h"
 #include "pass.h"
@@ -252,6 +253,12 @@ void AstPrinter::visit(const ListExpr& node) {
         out_ += " ";
         element->accept(*this);
     }
+    out_ += ")";
+}
+
+void AstPrinter::visit(const Module& node) {
+    out_ += "(Module";
+    print_body(node.body());
     out_ += ")";
 }
 

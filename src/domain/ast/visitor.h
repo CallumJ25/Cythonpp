@@ -20,6 +20,7 @@ class FunctionDef;
 class If;
 class ListComp;
 class ListExpr;
+class Module;
 class Name;
 class Pass;
 class Return;
@@ -63,6 +64,7 @@ public:
     virtual void visit(const If& node) = 0;
     virtual void visit(const ListComp& node) = 0;
     virtual void visit(const ListExpr& node) = 0;
+    virtual void visit(const Module& node) = 0;
     virtual void visit(const Name& node) = 0;
     virtual void visit(const Pass& node) = 0;
     virtual void visit(const Return& node) = 0;

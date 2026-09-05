@@ -38,6 +38,7 @@ public:
     void visit(const If& node) override;
     void visit(const ListComp& node) override;
     void visit(const ListExpr& node) override;
+    void visit(const Module& node) override;
     void visit(const Name& node) override;
     void visit(const Pass& node) override;
     void visit(const Return& node) override;

@@ -19,6 +19,7 @@
 #include "domain/ast/function_def.h"
 #include "domain/ast/list_comp.h"
 #include "domain/ast/list_expr.h"
+#include "domain/ast/module.h"
 #include "domain/ast/name.h"
 #include "domain/ast/parameter.h"
 #include "domain/ast/subscript.h"
@@ -320,6 +321,52 @@ TEST(AstPrinter, ClassDefRendersItsBases) {
     EXPECT_EQ(print(node),
               "(ClassDef C (Bases (Name Base))\n"
               "  (Pass))");
+}
+
+TEST(AstPrinter, EmptyModuleRendersWithNoBody) {
+    const Module node(kSpan, {});
+    EXPECT_EQ(print(node), "(Module)");
+}
+
+TEST(AstPrinter, ModuleIndentsEachTopLevelStatement) {
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<Pass>(kSpan));
+    body.push_back(std::make_unique<Break>(kSpan));
+    const Module node(kSpan, std::move(body));
+    EXPECT_EQ(print(node),
+              "(Module\n"
+              "  (Pass)\n"
+              "  (Break))");
+}
+
+// The exact shape the design spec promises. If this changes, the spec's
+// example must change with it.
+TEST(AstPrinter, RendersTheCanonicalExampleFromTheSpec) {
+    std::vector<StmtPtr> function_body;
+    function_body.push_back(std::make_unique<Return>(
+        kSpan,
+        std::make_unique<BinOp>(kSpan, lexer::token_type::OP_PLUS,
+                                std::make_unique<Name>(kSpan, "x"),
+                                std::make_unique<Constant>(
+                                    kSpan, lexer::token_type::LITERAL_INT, "1"))));
+
+    std::vector<StmtPtr> module_body;
+    module_body.push_back(
+        std::make_unique<FunctionDef>(kSpan, "f", std::vector<Parameter>{}, nullptr,
+                                      std::move(function_body)));
+
+    const Module node(kSpan, std::move(module_body));
+    EXPECT_EQ(print(node),
+              "(Module\n"
+              "  (FunctionDef f\n"
+              "    (Return (BinOp + (Name x) (Constant 1)))))");
+}
+
+TEST(AstPrinter, PrintingTwiceWithTheSamePrinterGivesTheSameResult) {
+    AstPrinter printer;
+    const Name node(kSpan, "x");
+    EXPECT_EQ(printer.print(node), "(Name x)");
+    EXPECT_EQ(printer.print(node), "(Name x)");
 }
 
 } // namespace
