@@ -3,9 +3,11 @@
 #include "attribute.h"
 #include "bin_op.h"
 #include "bool_op.h"
+#include "break.h"
 #include "call.h"
 #include "compare.h"
 #include "constant.h"
+#include "continue.h"
 #include "dict_expr.h"
 #include "domain/lexer/keyword_table.h"
 #include "domain/lexer/operator_table.h"
@@ -13,6 +15,8 @@
 #include "list_comp.h"
 #include "list_expr.h"
 #include "name.h"
+#include "pass.h"
+#include "return.h"
 #include "subscript.h"
 #include "tuple_expr.h"
 #include "unary_op.h"
@@ -69,6 +73,8 @@ void AstPrinter::visit(const BoolOp& node) {
     out_ += ")";
 }
 
+void AstPrinter::visit(const Break&) { out_ += "(Break)"; }
+
 void AstPrinter::visit(const Call& node) {
     out_ += "(Call ";
     node.callee().accept(*this);
@@ -92,6 +98,8 @@ void AstPrinter::visit(const Compare& node) {
 void AstPrinter::visit(const Constant& node) {
     out_ += "(Constant " + node.lexeme() + ")";
 }
+
+void AstPrinter::visit(const Continue&) { out_ += "(Continue)"; }
 
 void AstPrinter::visit(const DictExpr& node) {
     out_ += "(DictExpr";
@@ -133,6 +141,17 @@ void AstPrinter::visit(const ListExpr& node) {
 
 void AstPrinter::visit(const Name& node) {
     out_ += "(Name " + node.identifier() + ")";
+}
+
+void AstPrinter::visit(const Pass&) { out_ += "(Pass)"; }
+
+void AstPrinter::visit(const Return& node) {
+    out_ += "(Return";
+    if (node.has_value()) {
+        out_ += " ";
+        node.value().accept(*this);
+    }
+    out_ += ")";
 }
 
 void AstPrinter::visit(const Subscript& node) {

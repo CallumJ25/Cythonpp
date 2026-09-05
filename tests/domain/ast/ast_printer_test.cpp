@@ -19,6 +19,10 @@
 #include "domain/ast/subscript.h"
 #include "domain/ast/tuple_expr.h"
 #include "domain/ast/unary_op.h"
+#include "domain/ast/break.h"
+#include "domain/ast/continue.h"
+#include "domain/ast/pass.h"
+#include "domain/ast/return.h"
 
 namespace cythonpp::domain::ast {
 namespace {
@@ -154,6 +158,24 @@ TEST(AstPrinter, ListCompRendersClauseConditions) {
 TEST(Node, CarriesTheSpanItWasBuiltWith) {
     const Name node(SourceSpan{4, 9, 4, 14}, "total");
     EXPECT_EQ(node.span(), (SourceSpan{4, 9, 4, 14}));
+}
+
+TEST(AstPrinter, KeywordOnlyStatementsRenderAsBareNodes) {
+    EXPECT_EQ(print(Pass(kSpan)), "(Pass)");
+    EXPECT_EQ(print(Break(kSpan)), "(Break)");
+    EXPECT_EQ(print(Continue(kSpan)), "(Continue)");
+}
+
+TEST(AstPrinter, BareReturnRendersWithNoValue) {
+    const Return node(kSpan, nullptr);
+    EXPECT_FALSE(node.has_value());
+    EXPECT_EQ(print(node), "(Return)");
+}
+
+TEST(AstPrinter, ReturnRendersItsValue) {
+    const Return node(kSpan, std::make_unique<Name>(kSpan, "total"));
+    EXPECT_TRUE(node.has_value());
+    EXPECT_EQ(print(node), "(Return (Name total))");
 }
 
 } // namespace
