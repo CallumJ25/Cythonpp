@@ -10,6 +10,7 @@ class Call;
 class Compare;
 class Constant;
 class DictExpr;
+class ListComp;
 class ListExpr;
 class Name;
 class Subscript;
@@ -41,6 +42,7 @@ public:
     virtual void visit(const Compare& node) = 0;
     virtual void visit(const Constant& node) = 0;
     virtual void visit(const DictExpr& node) = 0;
+    virtual void visit(const ListComp& node) = 0;
     virtual void visit(const ListExpr& node) = 0;
     virtual void visit(const Name& node) = 0;
     virtual void visit(const Subscript& node) = 0;

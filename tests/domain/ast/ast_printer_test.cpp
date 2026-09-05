@@ -10,8 +10,10 @@
 #include "domain/ast/bool_op.h"
 #include "domain/ast/call.h"
 #include "domain/ast/compare.h"
+#include "domain/ast/comprehension_clause.h"
 #include "domain/ast/constant.h"
 #include "domain/ast/dict_expr.h"
+#include "domain/ast/list_comp.h"
 #include "domain/ast/list_expr.h"
 #include "domain/ast/name.h"
 #include "domain/ast/subscript.h"
@@ -126,6 +128,27 @@ TEST(AstPrinter, DictRendersEachKeyValuePair) {
                        std::make_unique<Constant>(kSpan, lexer::token_type::LITERAL_INT, "1")});
     const DictExpr node(kSpan, std::move(entries));
     EXPECT_EQ(print(node), "(DictExpr ((Constant 'k') (Constant 1)))");
+}
+
+TEST(AstPrinter, ListCompRendersElementThenClause) {
+    std::vector<ComprehensionClause> clauses;
+    clauses.push_back(ComprehensionClause{std::make_unique<Name>(kSpan, "x"),
+                                          std::make_unique<Name>(kSpan, "items"),
+                                          {}});
+    const ListComp node(kSpan, std::make_unique<Name>(kSpan, "x"), std::move(clauses));
+    EXPECT_EQ(print(node), "(ListComp (Name x) (Clause (Name x) (Name items)))");
+}
+
+TEST(AstPrinter, ListCompRendersClauseConditions) {
+    std::vector<ExprPtr> conditions;
+    conditions.push_back(std::make_unique<Name>(kSpan, "keep"));
+
+    std::vector<ComprehensionClause> clauses;
+    clauses.push_back(ComprehensionClause{std::make_unique<Name>(kSpan, "x"),
+                                          std::make_unique<Name>(kSpan, "items"),
+                                          std::move(conditions)});
+    const ListComp node(kSpan, std::make_unique<Name>(kSpan, "x"), std::move(clauses));
+    EXPECT_EQ(print(node), "(ListComp (Name x) (Clause (Name x) (Name items) (Name keep)))");
 }
 
 TEST(Node, CarriesTheSpanItWasBuiltWith) {

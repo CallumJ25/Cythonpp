@@ -10,6 +10,7 @@
 #include "domain/lexer/keyword_table.h"
 #include "domain/lexer/operator_table.h"
 #include "domain/lexer/token_type_name.h"
+#include "list_comp.h"
 #include "list_expr.h"
 #include "name.h"
 #include "subscript.h"
@@ -99,6 +100,23 @@ void AstPrinter::visit(const DictExpr& node) {
         entry.key->accept(*this);
         out_ += " ";
         entry.value->accept(*this);
+        out_ += ")";
+    }
+    out_ += ")";
+}
+
+void AstPrinter::visit(const ListComp& node) {
+    out_ += "(ListComp ";
+    node.element().accept(*this);
+    for (const ComprehensionClause& clause : node.clauses()) {
+        out_ += " (Clause ";
+        clause.target->accept(*this);
+        out_ += " ";
+        clause.iterable->accept(*this);
+        for (const ExprPtr& condition : clause.conditions) {
+            out_ += " ";
+            condition->accept(*this);
+        }
         out_ += ")";
     }
     out_ += ")";

@@ -26,6 +26,7 @@ public:
     void visit(const Compare& node) override;
     void visit(const Constant& node) override;
     void visit(const DictExpr& node) override;
+    void visit(const ListComp& node) override;
     void visit(const ListExpr& node) override;
     void visit(const Name& node) override;
     void visit(const Subscript& node) override;
