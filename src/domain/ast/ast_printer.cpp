@@ -1,5 +1,7 @@
 #include "ast_printer.h"
 
+#include <cstddef>
+
 #include "ann_assign.h"
 #include "assign.h"
 #include "attribute.h"
@@ -14,6 +16,8 @@
 #include "domain/lexer/keyword_table.h"
 #include "domain/lexer/operator_table.h"
 #include "domain/lexer/token_type_name.h"
+#include "for.h"
+#include "if.h"
 #include "list_comp.h"
 #include "list_expr.h"
 #include "name.h"
@@ -22,6 +26,7 @@
 #include "subscript.h"
 #include "tuple_expr.h"
 #include "unary_op.h"
+#include "while.h"
 
 namespace cythonpp::domain::ast {
 
@@ -135,6 +140,50 @@ void AstPrinter::visit(const DictExpr& node) {
     out_ += ")";
 }
 
+void AstPrinter::newline_indent() {
+    out_ += "\n";
+    out_.append(static_cast<std::size_t>(2 * depth_), ' ');
+}
+
+void AstPrinter::print_body(const std::vector<StmtPtr>& body) {
+    ++depth_;
+    for (const StmtPtr& statement : body) {
+        newline_indent();
+        statement->accept(*this);
+    }
+    --depth_;
+}
+
+void AstPrinter::print_else(const std::vector<StmtPtr>& orelse) {
+    if (orelse.empty()) {
+        return;
+    }
+    ++depth_;
+    newline_indent();
+    out_ += "(Else";
+    print_body(orelse);
+    out_ += ")";
+    --depth_;
+}
+
+void AstPrinter::visit(const For& node) {
+    out_ += "(For ";
+    node.target().accept(*this);
+    out_ += " ";
+    node.iterable().accept(*this);
+    print_body(node.body());
+    print_else(node.orelse());
+    out_ += ")";
+}
+
+void AstPrinter::visit(const If& node) {
+    out_ += "(If ";
+    node.condition().accept(*this);
+    print_body(node.body());
+    print_else(node.orelse());
+    out_ += ")";
+}
+
 void AstPrinter::visit(const ListComp& node) {
     out_ += "(ListComp ";
     node.element().accept(*this);
@@ -196,6 +245,14 @@ void AstPrinter::visit(const TupleExpr& node) {
 void AstPrinter::visit(const UnaryOp& node) {
     out_ += "(UnaryOp " + op_spelling(node.op()) + " ";
     node.operand().accept(*this);
+    out_ += ")";
+}
+
+void AstPrinter::visit(const While& node) {
+    out_ += "(While ";
+    node.condition().accept(*this);
+    print_body(node.body());
+    print_else(node.orelse());
     out_ += ")";
 }
 

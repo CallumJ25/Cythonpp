@@ -2,8 +2,10 @@
 #define CYTHONPP_DOMAIN_AST_AST_PRINTER_H
 
 #include <string>
+#include <vector>
 
 #include "node.h"
+#include "stmt.h"
 #include "visitor.h"
 
 namespace cythonpp::domain::ast {
@@ -30,6 +32,8 @@ public:
     void visit(const Constant& node) override;
     void visit(const Continue& node) override;
     void visit(const DictExpr& node) override;
+    void visit(const For& node) override;
+    void visit(const If& node) override;
     void visit(const ListComp& node) override;
     void visit(const ListExpr& node) override;
     void visit(const Name& node) override;
@@ -38,10 +42,22 @@ public:
     void visit(const Subscript& node) override;
     void visit(const TupleExpr& node) override;
     void visit(const UnaryOp& node) override;
+    void visit(const While& node) override;
 
 private:
     std::string out_;
     int depth_ = 0;
+
+    void newline_indent();
+
+    // Renders each statement on its own line, one level deeper. Shared by
+    // every node with a suite, so the indentation rule lives in one place.
+    void print_body(const std::vector<StmtPtr>& body);
+
+    // The optional `else` suite that If, While and For all carry. Emits
+    // nothing when `orelse` is empty, so each caller is one unconditional
+    // line rather than three copies of the same guard.
+    void print_else(const std::vector<StmtPtr>& orelse);
 };
 
 } // namespace cythonpp::domain::ast

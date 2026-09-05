@@ -23,8 +23,11 @@
 #include "domain/ast/unary_op.h"
 #include "domain/ast/break.h"
 #include "domain/ast/continue.h"
+#include "domain/ast/for.h"
+#include "domain/ast/if.h"
 #include "domain/ast/pass.h"
 #include "domain/ast/return.h"
+#include "domain/ast/while.h"
 
 namespace cythonpp::domain::ast {
 namespace {
@@ -198,6 +201,61 @@ TEST(AstPrinter, AnnAssignWithAValueRendersAllThree) {
                          std::make_unique<Name>(kSpan, "int"),
                          std::make_unique<Constant>(kSpan, lexer::token_type::LITERAL_INT, "5"));
     EXPECT_EQ(print(node), "(AnnAssign (Name x) (Name int) (Constant 5))");
+}
+
+TEST(AstPrinter, IfIndentsItsBodyOnNewLines) {
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<Pass>(kSpan));
+    const If node(kSpan, std::make_unique<Name>(kSpan, "cond"), std::move(body), {});
+    EXPECT_EQ(print(node),
+              "(If (Name cond)\n"
+              "  (Pass))");
+}
+
+TEST(AstPrinter, IfRendersAnElseBranchWhenPresent) {
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<Pass>(kSpan));
+    std::vector<StmtPtr> orelse;
+    orelse.push_back(std::make_unique<Break>(kSpan));
+    const If node(kSpan, std::make_unique<Name>(kSpan, "cond"), std::move(body),
+                  std::move(orelse));
+    EXPECT_EQ(print(node),
+              "(If (Name cond)\n"
+              "  (Pass)\n"
+              "  (Else\n"
+              "    (Break)))");
+}
+
+TEST(AstPrinter, NestedIfsIndentCumulatively) {
+    std::vector<StmtPtr> inner_body;
+    inner_body.push_back(std::make_unique<Pass>(kSpan));
+    std::vector<StmtPtr> outer_body;
+    outer_body.push_back(std::make_unique<If>(kSpan, std::make_unique<Name>(kSpan, "b"),
+                                              std::move(inner_body), std::vector<StmtPtr>{}));
+    const If node(kSpan, std::make_unique<Name>(kSpan, "a"), std::move(outer_body), {});
+    EXPECT_EQ(print(node),
+              "(If (Name a)\n"
+              "  (If (Name b)\n"
+              "    (Pass)))");
+}
+
+TEST(AstPrinter, WhileIndentsItsBody) {
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<Continue>(kSpan));
+    const While node(kSpan, std::make_unique<Name>(kSpan, "cond"), std::move(body), {});
+    EXPECT_EQ(print(node),
+              "(While (Name cond)\n"
+              "  (Continue))");
+}
+
+TEST(AstPrinter, ForRendersTargetAndIterableBeforeItsBody) {
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<Pass>(kSpan));
+    const For node(kSpan, std::make_unique<Name>(kSpan, "x"),
+                   std::make_unique<Name>(kSpan, "items"), std::move(body), {});
+    EXPECT_EQ(print(node),
+              "(For (Name x) (Name items)\n"
+              "  (Pass))");
 }
 
 } // namespace

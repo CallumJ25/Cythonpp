@@ -14,6 +14,8 @@ class Compare;
 class Constant;
 class Continue;
 class DictExpr;
+class For;
+class If;
 class ListComp;
 class ListExpr;
 class Name;
@@ -22,6 +24,7 @@ class Return;
 class Subscript;
 class TupleExpr;
 class UnaryOp;
+class While;
 
 // Traversal over the node hierarchy.
 //
@@ -52,6 +55,8 @@ public:
     virtual void visit(const Constant& node) = 0;
     virtual void visit(const Continue& node) = 0;
     virtual void visit(const DictExpr& node) = 0;
+    virtual void visit(const For& node) = 0;
+    virtual void visit(const If& node) = 0;
     virtual void visit(const ListComp& node) = 0;
     virtual void visit(const ListExpr& node) = 0;
     virtual void visit(const Name& node) = 0;
@@ -60,6 +65,7 @@ public:
     virtual void visit(const Subscript& node) = 0;
     virtual void visit(const TupleExpr& node) = 0;
     virtual void visit(const UnaryOp& node) = 0;
+    virtual void visit(const While& node) = 0;
 };
 
 } // namespace cythonpp::domain::ast
