@@ -19,6 +19,8 @@ class AstPrinter : public Visitor {
 public:
     std::string print(const Node& node);
 
+    void visit(const AnnAssign& node) override;
+    void visit(const Assign& node) override;
     void visit(const Attribute& node) override;
     void visit(const BinOp& node) override;
     void visit(const BoolOp& node) override;

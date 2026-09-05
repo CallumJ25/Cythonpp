@@ -3,6 +3,8 @@
 
 namespace cythonpp::domain::ast {
 
+class AnnAssign;
+class Assign;
 class Attribute;
 class BinOp;
 class BoolOp;
@@ -39,6 +41,8 @@ class Visitor {
 public:
     virtual ~Visitor() = default;
 
+    virtual void visit(const AnnAssign& node) = 0;
+    virtual void visit(const Assign& node) = 0;
     virtual void visit(const Attribute& node) = 0;
     virtual void visit(const BinOp& node) = 0;
     virtual void visit(const BoolOp& node) = 0;

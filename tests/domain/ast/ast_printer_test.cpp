@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "domain/ast/ann_assign.h"
+#include "domain/ast/assign.h"
 #include "domain/ast/ast_printer.h"
 #include "domain/ast/attribute.h"
 #include "domain/ast/bin_op.h"
@@ -176,6 +178,26 @@ TEST(AstPrinter, ReturnRendersItsValue) {
     const Return node(kSpan, std::make_unique<Name>(kSpan, "total"));
     EXPECT_TRUE(node.has_value());
     EXPECT_EQ(print(node), "(Return (Name total))");
+}
+
+TEST(AstPrinter, AssignRendersTargetThenValue) {
+    const Assign node(kSpan, std::make_unique<Name>(kSpan, "x"),
+                      std::make_unique<Constant>(kSpan, lexer::token_type::LITERAL_INT, "5"));
+    EXPECT_EQ(print(node), "(Assign (Name x) (Constant 5))");
+}
+
+TEST(AstPrinter, AnnAssignWithoutAValueRendersTargetAndAnnotation) {
+    const AnnAssign node(kSpan, std::make_unique<Name>(kSpan, "x"),
+                         std::make_unique<Name>(kSpan, "int"), nullptr);
+    EXPECT_FALSE(node.has_value());
+    EXPECT_EQ(print(node), "(AnnAssign (Name x) (Name int))");
+}
+
+TEST(AstPrinter, AnnAssignWithAValueRendersAllThree) {
+    const AnnAssign node(kSpan, std::make_unique<Name>(kSpan, "x"),
+                         std::make_unique<Name>(kSpan, "int"),
+                         std::make_unique<Constant>(kSpan, lexer::token_type::LITERAL_INT, "5"));
+    EXPECT_EQ(print(node), "(AnnAssign (Name x) (Name int) (Constant 5))");
 }
 
 } // namespace

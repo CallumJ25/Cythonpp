@@ -1,5 +1,7 @@
 #include "ast_printer.h"
 
+#include "ann_assign.h"
+#include "assign.h"
 #include "attribute.h"
 #include "bin_op.h"
 #include "bool_op.h"
@@ -48,6 +50,26 @@ std::string AstPrinter::print(const Node& node) {
     depth_ = 0;
     node.accept(*this);
     return out_;
+}
+
+void AstPrinter::visit(const AnnAssign& node) {
+    out_ += "(AnnAssign ";
+    node.target().accept(*this);
+    out_ += " ";
+    node.annotation().accept(*this);
+    if (node.has_value()) {
+        out_ += " ";
+        node.value().accept(*this);
+    }
+    out_ += ")";
+}
+
+void AstPrinter::visit(const Assign& node) {
+    out_ += "(Assign ";
+    node.target().accept(*this);
+    out_ += " ";
+    node.value().accept(*this);
+    out_ += ")";
 }
 
 void AstPrinter::visit(const Attribute& node) {
