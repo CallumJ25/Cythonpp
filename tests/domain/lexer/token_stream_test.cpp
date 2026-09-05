@@ -10,9 +10,9 @@ namespace {
 
 std::vector<Token> sample_tokens() {
     return {
-        Token(token_type::IDENTIFIER, "x", 1, 1),
-        Token(token_type::OP_ASSIGN, "=", 1, 3),
-        Token(token_type::LITERAL_INT, "5", 1, 5),
+        Token(token_type::IDENTIFIER, "x", 1, 1, 1, 2),
+        Token(token_type::OP_ASSIGN, "=", 1, 3, 1, 4),
+        Token(token_type::LITERAL_INT, "5", 1, 5, 1, 6),
     };
 }
 

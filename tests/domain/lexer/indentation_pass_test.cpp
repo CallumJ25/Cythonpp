@@ -269,9 +269,9 @@ TEST(IndentationPass, StreamWithoutAnEndOfFileTokenIsStillFlushed) {
     // Not something Lexer produces, but the balance guarantee is unconditional
     // and a hand-built stream must not be able to break it.
     std::vector<Token> tokens;
-    tokens.emplace_back(token_type::SPACE, " ", 1, 1);
-    tokens.emplace_back(token_type::SPACE, " ", 1, 2);
-    tokens.emplace_back(token_type::IDENTIFIER, "x", 1, 3);
+    tokens.emplace_back(token_type::SPACE, " ", 1, 1, 1, 2);
+    tokens.emplace_back(token_type::SPACE, " ", 1, 2, 1, 3);
+    tokens.emplace_back(token_type::IDENTIFIER, "x", 1, 3, 1, 4);
 
     diagnostics::DiagnosticSink sink;
     const TokenStream result = IndentationPass().run(TokenStream(std::move(tokens)), sink);
@@ -401,6 +401,26 @@ TEST(IndentationPass, FormFeedAfterIndentationDivergesFromCPython) {
     // counted, where CPython would count only the two after it.
     const TypeList types = types_of("if a:\n    \f  x\n");
     EXPECT_EQ(count_of(types, token_type::INDENT), 1);
+}
+
+TEST(IndentationPassSpans, SynthesizedIndentAndDedentAreZeroWidth) {
+    diagnostics::DiagnosticSink sink;
+    const TokenStream result = pass("if x:\n    pass\n", sink);
+
+    bool saw_indent = false;
+    bool saw_dedent = false;
+    for (const Token& token : result) {
+        if (token.type() != token_type::INDENT && token.type() != token_type::DEDENT) {
+            continue;
+        }
+        saw_indent = saw_indent || token.type() == token_type::INDENT;
+        saw_dedent = saw_dedent || token.type() == token_type::DEDENT;
+        EXPECT_EQ(token.line_number(), token.end_line());
+        EXPECT_EQ(token.column_number(), token.end_column());
+    }
+
+    EXPECT_TRUE(saw_indent);
+    EXPECT_TRUE(saw_dedent);
 }
 
 } // namespace

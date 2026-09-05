@@ -157,8 +157,10 @@ void Builder::report_tab_error(const Token& at) {
 
 void Builder::emit(token_type type, const Token& at) {
     // Empty lexeme marks a synthesized token, the same convention the scanner
-    // uses for the NEWLINE it invents at end of file.
-    out_.emplace_back(type, "", at.line_number(), at.column_number());
+    // uses for the NEWLINE it invents at end of file. Zero width: these sit
+    // between real tokens and cover no source characters.
+    out_.emplace_back(type, "", at.line_number(), at.column_number(), at.line_number(),
+                      at.column_number());
 }
 
 void Builder::flush(const Token& at) {

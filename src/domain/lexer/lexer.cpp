@@ -105,7 +105,7 @@ void Lexer::emit(token_type type, std::string lexeme, int line, int column) {
         line_has_content_ = true;
         context_.observe(type);
     }
-    tokens_.emplace_back(type, std::move(lexeme), line, column);
+    tokens_.emplace_back(type, std::move(lexeme), line, column, line_, column_);
 }
 
 void Lexer::emit_from(token_type type, std::size_t start, int line, int column) {

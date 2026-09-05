@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <iterator>
 
+#include "domain/lexer/lexer.h"
 #include "domain/lexer/token_category.h"
 #include "domain/lexer/token_type.h"
 #include "domain/lexer/token_type_name.h"
@@ -329,6 +330,45 @@ TEST(TokenCategory, IndentAndDedentAreSpecialOnly) {
     EXPECT_FALSE(has_category(token_type::INDENT, token_category::OBJECT));
     EXPECT_FALSE(has_category(token_type::DEDENT, token_category::OBJECT));
     EXPECT_NE(token_type::INDENT, token_type::DEDENT);
+}
+
+TEST(TokenEndPosition, SingleCharacterTokenEndsOneColumnLater) {
+    const std::vector<Token> tokens = Lexer("x").tokenize();
+    ASSERT_FALSE(tokens.empty());
+    EXPECT_EQ(tokens[0].type(), token_type::IDENTIFIER);
+    EXPECT_EQ(tokens[0].line_number(), 1);
+    EXPECT_EQ(tokens[0].column_number(), 1);
+    EXPECT_EQ(tokens[0].end_line(), 1);
+    EXPECT_EQ(tokens[0].end_column(), 2);
+}
+
+TEST(TokenEndPosition, MultiCharacterTokenEndsPastItsLastCharacter) {
+    const std::vector<Token> tokens = Lexer("total").tokenize();
+    EXPECT_EQ(tokens[0].end_column(), 6);
+}
+
+TEST(TokenEndPosition, EndColumnCountsCharactersNotBytes) {
+    // "é" is two UTF-8 bytes but one column, matching Lexer::advance().
+    const std::vector<Token> tokens = Lexer("é").tokenize();
+    EXPECT_EQ(tokens[0].type(), token_type::IDENTIFIER);
+    EXPECT_EQ(tokens[0].end_column(), 2);
+}
+
+TEST(TokenEndPosition, TripleQuotedStringEndsOnALaterLine) {
+    const std::vector<Token> tokens = Lexer("\"\"\"a\nb\"\"\"").tokenize();
+    ASSERT_FALSE(tokens.empty());
+    EXPECT_EQ(tokens[0].type(), token_type::LITERAL_STRING);
+    EXPECT_EQ(tokens[0].line_number(), 1);
+    EXPECT_EQ(tokens[0].end_line(), 2);
+    EXPECT_EQ(tokens[0].end_column(), 5);
+}
+
+TEST(TokenEndPosition, SynthesizedEndOfFileTokenIsZeroWidth) {
+    const std::vector<Token> tokens = Lexer("").tokenize();
+    ASSERT_EQ(tokens.size(), 1u);
+    EXPECT_EQ(tokens[0].type(), token_type::TOKEN_EOF);
+    EXPECT_EQ(tokens[0].line_number(), tokens[0].end_line());
+    EXPECT_EQ(tokens[0].column_number(), tokens[0].end_column());
 }
 
 } // namespace
