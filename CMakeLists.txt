@@ -14,6 +14,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/lexer/lexer.cpp
     src/domain/lexer/indentation_pass.cpp
     src/domain/diagnostics/diagnostic_sink.cpp
+    src/domain/ast/ast_printer.cpp
     src/application/compile_pipeline.cpp
     src/adapters/filesystem/filesystem_source_reader.cpp
     src/adapters/filesystem/filesystem_source_lister.cpp
@@ -54,6 +55,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/lexer/lexer_annotation_test.cpp
         tests/domain/lexer/indentation_pass_test.cpp
         tests/domain/ast/source_span_test.cpp
+        tests/domain/ast/ast_printer_test.cpp
         tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/application/compile_pipeline_test.cpp
         tests/adapters/filesystem/filesystem_source_lister_test.cpp

@@ -1,0 +1,31 @@
+#ifndef CYTHONPP_DOMAIN_AST_VISITOR_H
+#define CYTHONPP_DOMAIN_AST_VISITOR_H
+
+namespace cythonpp::domain::ast {
+
+class Name;
+
+// Traversal over the node hierarchy.
+//
+// Every method is pure virtual on purpose. The node set is still growing, and
+// adding a node should break every visitor until it is handled -- a compile
+// error at exactly the places that need attention. A defaulted no-op would
+// turn "added a node, forgot to emit code for it" into missing output at
+// runtime instead.
+//
+// WARNING for whoever adds a RecursiveVisitor with non-pure defaults: a
+// derived class that declares one `visit` override hides *every* other
+// `visit` overload from the base. That is harmless here, because all methods
+// are pure and so every visitor overrides all of them. It stops being
+// harmless the moment defaults exist -- subclasses will need
+// `using RecursiveVisitor::visit;` or traversal will silently stop.
+class Visitor {
+public:
+    virtual ~Visitor() = default;
+
+    virtual void visit(const Name& node) = 0;
+};
+
+} // namespace cythonpp::domain::ast
+
+#endif // CYTHONPP_DOMAIN_AST_VISITOR_H
