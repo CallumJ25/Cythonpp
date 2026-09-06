@@ -59,5 +59,13 @@ TEST(ExpressionParserError, AMissingRightOperandIsReported) {
     expect_error("1 +", "expected an expression", 1, 4);
 }
 
+TEST(ExpressionParserError, NotWithoutInAfterAnOperandIsReported) {
+    expect_error("a not b", "expected 'in' after 'not'", 1, 7);
+}
+
+TEST(ExpressionParserError, AMissingComparisonOperandIsReported) {
+    expect_error("a <", "expected an expression", 1, 4);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

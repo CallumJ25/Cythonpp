@@ -129,5 +129,48 @@ TEST(ExpressionParser, AssignmentOperatorsEndAnExpressionRatherThanJoiningIt) {
     EXPECT_EQ(printed("a -> b"), "(Name a)");
 }
 
+TEST(ExpressionParser, ASingleComparisonBuildsACompare) {
+    EXPECT_EQ(printed("a < b"), "(Compare (Name a) < (Name b))");
+    EXPECT_EQ(printed("a != b"), "(Compare (Name a) != (Name b))");
+}
+
+TEST(ExpressionParser, ChainedComparisonsStayInOneNode) {
+    // Kept intact rather than desugared to `a < b and b <= c`, so a later
+    // stage can evaluate the middle operand once.
+    EXPECT_EQ(printed("a < b <= c"), "(Compare (Name a) < (Name b) <= (Name c))");
+    EXPECT_EQ(printed("a < b < c < d"),
+              "(Compare (Name a) < (Name b) < (Name c) < (Name d))");
+}
+
+TEST(ExpressionParser, WordShapedComparisonOperators) {
+    EXPECT_EQ(printed("a is b"), "(Compare (Name a) is (Name b))");
+    EXPECT_EQ(printed("a in b"), "(Compare (Name a) in (Name b))");
+}
+
+TEST(ExpressionParser, TwoWordComparisonOperatorsFoldIntoOneOperator) {
+    EXPECT_EQ(printed("a is not b"), "(Compare (Name a) is not (Name b))");
+    EXPECT_EQ(printed("a not in b"), "(Compare (Name a) not in (Name b))");
+}
+
+TEST(ExpressionParser, TwoWordOperatorsChainToo) {
+    EXPECT_EQ(printed("a not in b not in c"),
+              "(Compare (Name a) not in (Name b) not in (Name c))");
+}
+
+TEST(ExpressionParser, ComparisonBindsLooserThanArithmetic) {
+    EXPECT_EQ(printed("a + 1 < b * 2"),
+              "(Compare (BinOp + (Name a) (Constant 1)) < (BinOp * (Name b) (Constant 2)))");
+}
+
+TEST(ExpressionParser, NotBindsLooserThanComparison) {
+    // `not a == b` is `not (a == b)`, which is why `not` is its own level and
+    // not grouped with the `-` and `~` prefix operators.
+    EXPECT_EQ(printed("not a == b"), "(UnaryOp not (Compare (Name a) == (Name b)))");
+}
+
+TEST(ExpressionParser, NotNests) {
+    EXPECT_EQ(printed("not not a"), "(UnaryOp not (UnaryOp not (Name a)))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

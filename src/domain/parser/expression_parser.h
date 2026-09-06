@@ -51,6 +51,14 @@ public:
     ast::ExprPtr parse_target();
 
 private:
+    // Prefix `not`. A level of its own, between and_test and comparison,
+    // because `not a == b` means `not (a == b)`.
+    ast::ExprPtr parse_not_test();
+
+    // A comparison chain. `a < b <= c` is one Compare with two entries, not
+    // two nested nodes.
+    ast::ExprPtr parse_comparison();
+
     // Precedence climbing over the table levels. `min_level` is the loosest
     // binding power this call will consume.
     ast::ExprPtr parse_binary(int min_level);
