@@ -308,6 +308,67 @@ TEST(StatementParserError, AnOrphanedElseOrElifIsReported) {
     }
 }
 
+TEST(StatementParserError, AFailedIfBodyTakesItsElseWithItRatherThanCascading) {
+    // When the suite fails, parse_if returns null before parse_else_clause
+    // ever runs. Without the fix, the orphaned `else` then gets dispatched
+    // through parse_simple_statement as a misplaced keyword, and its own body
+    // becomes a second, unrelated "unexpected indent" -- three diagnostics
+    // instead of one, and two of them pointing at the wrong place.
+    const statement_test_support::ModuleResult result =
+        parse_module("if a:\n    pass pass\nelse:\n    pass\nz = 1\n");
+
+    EXPECT_TRUE(result.indentation_diagnostics.empty());
+    ASSERT_EQ(result.diagnostics.size(), 1u);
+    EXPECT_EQ(result.diagnostics.front().message,
+              "expected a newline after the statement");
+    EXPECT_EQ(result.diagnostics.front().line, 2);
+    EXPECT_EQ(result.diagnostics.front().column, 10);
+    ASSERT_NE(result.module, nullptr);
+    EXPECT_EQ(result.printed(), "(Module\n  (Assign (Name z) (Constant 1)))");
+}
+
+TEST(StatementParserError, AFailedIfBodyTakesItsElifWithItRatherThanCascading) {
+    const statement_test_support::ModuleResult result =
+        parse_module("if a:\n    pass pass\nelif b:\n    pass\nz = 1\n");
+
+    EXPECT_TRUE(result.indentation_diagnostics.empty());
+    ASSERT_EQ(result.diagnostics.size(), 1u);
+    EXPECT_EQ(result.diagnostics.front().message,
+              "expected a newline after the statement");
+    EXPECT_EQ(result.diagnostics.front().line, 2);
+    EXPECT_EQ(result.diagnostics.front().column, 10);
+    ASSERT_NE(result.module, nullptr);
+    EXPECT_EQ(result.printed(), "(Module\n  (Assign (Name z) (Constant 1)))");
+}
+
+TEST(StatementParserError, AFailedWhileBodyTakesItsElseWithItRatherThanCascading) {
+    const statement_test_support::ModuleResult result =
+        parse_module("while a:\n    pass pass\nelse:\n    pass\nz = 1\n");
+
+    EXPECT_TRUE(result.indentation_diagnostics.empty());
+    ASSERT_EQ(result.diagnostics.size(), 1u);
+    EXPECT_EQ(result.diagnostics.front().message,
+              "expected a newline after the statement");
+    EXPECT_EQ(result.diagnostics.front().line, 2);
+    EXPECT_EQ(result.diagnostics.front().column, 10);
+    ASSERT_NE(result.module, nullptr);
+    EXPECT_EQ(result.printed(), "(Module\n  (Assign (Name z) (Constant 1)))");
+}
+
+TEST(StatementParserError, AFailedForBodyTakesItsElseWithItRatherThanCascading) {
+    const statement_test_support::ModuleResult result =
+        parse_module("for a in b:\n    pass pass\nelse:\n    pass\nz = 1\n");
+
+    EXPECT_TRUE(result.indentation_diagnostics.empty());
+    ASSERT_EQ(result.diagnostics.size(), 1u);
+    EXPECT_EQ(result.diagnostics.front().message,
+              "expected a newline after the statement");
+    EXPECT_EQ(result.diagnostics.front().line, 2);
+    EXPECT_EQ(result.diagnostics.front().column, 10);
+    ASSERT_NE(result.module, nullptr);
+    EXPECT_EQ(result.printed(), "(Module\n  (Assign (Name z) (Constant 1)))");
+}
+
 TEST(StatementParserError, AnUnsupportedStatementDoesNotCascade) {
     // reject() itself only reports; parse_statement_list's synchronize() call
     // on the false return is what consumes the rest of the logical line, so
@@ -343,7 +404,10 @@ TEST(StatementParserError, SoftKeywordsStayOrdinaryNames) {
     // for a top-level colon, whose only consumer would be an error message.
     const statement_test_support::ModuleResult statement =
         parse_module("match x:\n    case 1:\n        pass\n");
-    EXPECT_FALSE(statement.diagnostics.empty());
+    ASSERT_EQ(statement.diagnostics.size(), 2u);
+    EXPECT_EQ(statement.diagnostics.at(0).message,
+              "expected a newline after the statement");
+    EXPECT_EQ(statement.diagnostics.at(1).message, "unexpected indent");
 
     // The other half: as ordinary names they must still parse as names.
     EXPECT_EQ(statement_test_support::parse_module("match = 1\n").diagnostics.size(), 0u);

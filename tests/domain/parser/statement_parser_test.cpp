@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <memory>
+
 #include "domain/ast/ann_assign.h"
 #include "domain/ast/constant.h"
 #include "domain/ast/expr_stmt.h"
@@ -18,6 +20,24 @@ using statement_test_support::printed;
 
 TEST(StatementParser, AnEmptyFileIsAnEmptyModule) {
     EXPECT_EQ(printed(""), "(Module)");
+}
+
+TEST(StatementParser, AnEmptyTokenStreamNeverThrows) {
+    // parse_module's empty-stream guard is the only thing standing between it
+    // and a thrown std::out_of_range from TokenStream::peek(). Real Lexer +
+    // IndentationPass output always ends in TOKEN_EOF, so this path is only
+    // reachable through a hand-built, genuinely empty stream -- which is
+    // exactly what this test builds, bypassing parse_module()/printed()'s
+    // usual Lexer + IndentationPass chain.
+    lexer::TokenStream tokens;
+    diagnostics::DiagnosticSink sink;
+    StatementParser parser(tokens, sink);
+
+    const std::unique_ptr<ast::Module> module = parser.parse_module();
+
+    ASSERT_NE(module, nullptr);
+    EXPECT_TRUE(module->body().empty());
+    EXPECT_TRUE(sink.diagnostics().empty());
 }
 
 TEST(StatementParser, ACommentOnlyFileIsAnEmptyModule) {

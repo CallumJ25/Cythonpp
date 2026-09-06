@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "assignability.h"
 #include "domain/ast/attribute.h"
 #include "domain/ast/bin_op.h"
 #include "domain/ast/bool_op.h"
@@ -22,7 +23,6 @@
 #include "domain/lexer/operator_table.h"
 #include "domain/lexer/token_category.h"
 #include "domain/lexer/token_type.h"
-#include "assignability.h"
 #include "precedence_table.h"
 
 namespace cythonpp::domain::parser {

@@ -1,9 +1,9 @@
 #include "statement_parser.h"
 
 #include <cstddef>
-#include <utility>
-
+#include <iterator>
 #include <string>
+#include <utility>
 
 #include "assignability.h"
 #include "domain/ast/ann_assign.h"
@@ -156,6 +156,18 @@ std::vector<ast::StmtPtr> StatementParser::parse_statement_list() {
                     // one diagnostic per failed statement" covers the whole
                     // statement -- header and body together.
                     skip_unexpected_block();
+                }
+                // A compound statement dropped whole takes its trailing
+                // else/elif with it. Consumed silently: the else is not
+                // misplaced, it is orphaned as a consequence of the error
+                // already reported, and "one diagnostic per failed statement"
+                // covers the whole statement, clauses included.
+                while (tokens_.check(token_type::KEYWORD_ELSE) ||
+                       tokens_.check(token_type::KEYWORD_ELIF)) {
+                    synchronize();
+                    if (tokens_.check(token_type::INDENT)) {
+                        skip_unexpected_block();
+                    }
                 }
             }
         } else {
@@ -539,7 +551,8 @@ bool StatementParser::parse_else_clause(std::vector<ast::StmtPtr>& into) {
     if (body.empty()) {
         return false; // already reported
     }
-    into = std::move(body);
+    into.insert(into.end(), std::make_move_iterator(body.begin()),
+                std::make_move_iterator(body.end()));
     return true;
 }
 

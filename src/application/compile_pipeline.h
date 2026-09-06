@@ -53,19 +53,19 @@ public:
                     ports::SourceLister& source_lister,
                     ports::DiagnosticsReporter& diagnostics_reporter);
 
-    // Lexes a single file. The result holds exactly one entry, keyed by
-    // `path`, so callers need only one result-handling path.
+    // Lexes and parses a single file. The result holds exactly one entry,
+    // keyed by `path`, so callers need only one result-handling path.
     CompileResult compile_file(const std::string& path);
 
-    // Lexes every source file the lister reports under `directory`. Files
-    // are lexed independently of one another -- cross-file dependency
-    // resolution is not yet done.
+    // Lexes and parses every source file the lister reports under
+    // `directory`. Files are processed independently of one another --
+    // cross-file dependency resolution is not yet done.
     CompileResult compile_directory(const std::string& directory);
 
 private:
     // Writes into `result` rather than returning a stream, because a module
-    // contributes two things -- its tokens and whether it failed -- and
-    // threading the second one back through a return value means an out
+    // contributes three things -- its tokens, its AST, and whether it failed
+    // -- and threading the rest back through a return value means an out
     // parameter either way.
     void compile_one(const std::string& path, CompileResult& result);
 
