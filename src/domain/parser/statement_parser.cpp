@@ -114,6 +114,17 @@ std::vector<ast::StmtPtr> StatementParser::parse_statement_list() {
             continue;
         }
 
+        if (tokens_.check(token_type::INDENT)) {
+            // IndentationPass emits this without reporting, so the diagnostic
+            // is ours. Report once, discard the block, and carry on -- the
+            // statements around it are still worth parsing.
+            const ast::SourceSpan span = ast::span_of(tokens_.peek());
+            sink_.report_error("IndentationError", "unexpected indent", span.start_line,
+                               span.start_column);
+            skip_unexpected_block();
+            continue;
+        }
+
         // Dispatch happens here rather than inside parse_statement, because a
         // simple-statement *line* can yield several statements -- `pass;
         // break` is two -- and a function returning one StmtPtr cannot say
@@ -299,6 +310,25 @@ ast::StmtPtr StatementParser::parse_annotated_assignment(ast::ExprPtr target) {
     const ast::SourceSpan span = ast::merge(target->span(), end);
     return std::make_unique<ast::AnnAssign>(span, std::move(target), std::move(annotation),
                                             std::move(value));
+}
+
+void StatementParser::skip_unexpected_block() {
+    if (!tokens_.match(token_type::INDENT)) {
+        return;
+    }
+    // Nesting is tracked so a block containing its own deeper block is
+    // skipped whole. IndentationPass guarantees balance, so the matching
+    // DEDENT exists and this loop cannot run to EOF on real lexer output --
+    // the at_end() check is for a hand-built stream.
+    int depth = 1;
+    while (depth > 0 && !tokens_.at_end()) {
+        if (tokens_.check(token_type::INDENT)) {
+            ++depth;
+        } else if (tokens_.check(token_type::DEDENT)) {
+            --depth;
+        }
+        tokens_.advance();
+    }
 }
 
 void StatementParser::synchronize() {

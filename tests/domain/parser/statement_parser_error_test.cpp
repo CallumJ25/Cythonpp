@@ -75,5 +75,38 @@ TEST(StatementParserError, AFailedExpressionStatementReportsOnlyItsOwnDiagnostic
     expect_error("f(*a)\n", "starred expressions are not supported", 1, 3);
 }
 
+TEST(StatementParserError, AnIndentWithNoBlockHeaderIsReported) {
+    // IndentationPass emits a balanced INDENT/DEDENT pair here and reports
+    // nothing, so this diagnostic is the parser's to produce.
+    const diagnostics::Diagnostic diagnostic =
+        only_error(statement_test_support::parse_module("a = 1\n    b = 2\nc = 3\n"));
+    EXPECT_EQ(diagnostic.code, "IndentationError");
+    EXPECT_EQ(diagnostic.message, "unexpected indent");
+    EXPECT_EQ(diagnostic.line, 2);
+    EXPECT_EQ(diagnostic.column, 5);
+}
+
+TEST(StatementParserError, AnUnexpectedIndentDoesNotEatTheRestOfTheFile) {
+    const statement_test_support::ModuleResult result =
+        parse_module("a = 1\n    b = 2\nc = 3\n");
+
+    ASSERT_NE(result.module, nullptr);
+    // The indented block is discarded; the statements around it survive.
+    EXPECT_EQ(result.printed(),
+              "(Module\n  (Assign (Name a) (Constant 1))\n  (Assign (Name c) (Constant 3)))");
+}
+
+TEST(StatementParserError, ANestedUnexpectedIndentIsStillOneDiagnostic) {
+    // skip_unexpected_block tracks nesting depth, so a block containing its
+    // own deeper block is skipped whole rather than re-reported per level.
+    const statement_test_support::ModuleResult result =
+        parse_module("a = 1\n    b = 2\n        c = 3\nd = 4\n");
+
+    EXPECT_EQ(result.diagnostics.size(), 1u);
+    ASSERT_NE(result.module, nullptr);
+    EXPECT_EQ(result.printed(),
+              "(Module\n  (Assign (Name a) (Constant 1))\n  (Assign (Name d) (Constant 4)))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser
