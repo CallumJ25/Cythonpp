@@ -161,9 +161,15 @@ std::vector<ast::StmtPtr> StatementParser::parse_statement_list() {
                 // else/elif with it. Consumed silently: the else is not
                 // misplaced, it is orphaned as a consequence of the error
                 // already reported, and "one diagnostic per failed statement"
-                // covers the whole statement, clauses included.
-                while (tokens_.check(token_type::KEYWORD_ELSE) ||
-                       tokens_.check(token_type::KEYWORD_ELIF)) {
+                // covers the whole statement, clauses included. The leading
+                // !at_end() guards a hand-built stream missing a trailing
+                // TOKEN_EOF: peek() clamps to the last token once the cursor
+                // runs past it, so check(KEYWORD_ELSE) would keep reporting
+                // true forever on such a stream even after synchronize() and
+                // skip_unexpected_block() both became no-ops, spinning
+                // without consuming anything.
+                while (!tokens_.at_end() && (tokens_.check(token_type::KEYWORD_ELSE) ||
+                                             tokens_.check(token_type::KEYWORD_ELIF))) {
                     synchronize();
                     if (tokens_.check(token_type::INDENT)) {
                         skip_unexpected_block();
