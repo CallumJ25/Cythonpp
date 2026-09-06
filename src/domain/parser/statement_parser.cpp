@@ -243,6 +243,37 @@ ast::StmtPtr StatementParser::parse_simple_statement() {
             return std::make_unique<ast::Continue>(ast::span_of(first));
         case token_type::KEYWORD_RETURN:
             return parse_return();
+        case token_type::KEYWORD_IMPORT:
+        case token_type::KEYWORD_FROM:
+            return reject(first, "import statements are not supported");
+        case token_type::KEYWORD_TRY:
+        case token_type::KEYWORD_EXCEPT:
+        case token_type::KEYWORD_FINALLY:
+            return reject(first, "try statements are not supported");
+        case token_type::KEYWORD_WITH:
+            return reject(first, "with statements are not supported");
+        case token_type::KEYWORD_RAISE:
+            return reject(first, "raise statements are not supported");
+        case token_type::KEYWORD_ASSERT:
+            return reject(first, "assert statements are not supported");
+        case token_type::KEYWORD_DEL:
+            return reject(first, "del statements are not supported");
+        case token_type::KEYWORD_GLOBAL:
+            return reject(first, "global statements are not supported");
+        case token_type::KEYWORD_NONLOCAL:
+            return reject(first, "nonlocal statements are not supported");
+        case token_type::KEYWORD_ASYNC:
+            return reject(first, "async statements are not supported");
+        case token_type::OP_AT:
+            // Settles OP_AT's two readings. No Python expression can begin
+            // with a binary operator, so a statement-initial '@' is
+            // unambiguously the decorator marker; everywhere else the
+            // expression parser reads it as matrix-multiply.
+            return reject(first, "decorators are not supported");
+        case token_type::KEYWORD_ELSE:
+            return reject(first, "unexpected 'else'");
+        case token_type::KEYWORD_ELIF:
+            return reject(first, "unexpected 'elif'");
         default:
             return parse_expression_statement();
     }
@@ -335,6 +366,22 @@ ast::StmtPtr StatementParser::parse_annotated_assignment(ast::ExprPtr target) {
     const ast::SourceSpan span = ast::merge(target->span(), end);
     return std::make_unique<ast::AnnAssign>(span, std::move(target), std::move(annotation),
                                             std::move(value));
+}
+
+ast::StmtPtr StatementParser::reject(const lexer::Token& keyword, std::string message) {
+    error(keyword, std::move(message));
+    // The resync is left entirely to the caller. parse_simple_statement_line
+    // returns false without consuming anything further, and every caller of
+    // parse_simple_statement_line already calls synchronize() itself when it
+    // sees false -- calling it here too double-resyncs. For a rejected
+    // construct with no indented body (`import os\nx = 1\n`), the first
+    // synchronize() would already run past this logical line's NEWLINE onto
+    // the next line, and a second call would then consume *that* line too,
+    // silently dropping a statement this construct never owned. For a
+    // rejected block construct (`try:`), the caller's single synchronize()
+    // still stops before the orphaned INDENT, which the stray-INDENT path
+    // reports as its own, separate diagnostic -- unaffected by this change.
+    return nullptr;
 }
 
 void StatementParser::skip_unexpected_block() {

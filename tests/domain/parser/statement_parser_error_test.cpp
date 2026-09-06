@@ -205,5 +205,155 @@ TEST(StatementParserError, AKeywordArgumentInABaseListIsReported) {
                  "keyword arguments are not supported", 1, 9);
 }
 
+TEST(StatementParserError, UnsupportedStatementsNameThemselves) {
+    // `with` is deliberately absent here: it has an indented body, so it
+    // produces two diagnostics like try: and async def, and only_error would
+    // fail. It gets its own test below, alongside except/finally/else/elif,
+    // which have the same shape.
+    expect_error("import os\n", "import statements are not supported", 1, 1);
+    expect_error("from os import path\n", "import statements are not supported", 1, 1);
+    expect_error("raise ValueError()\n", "raise statements are not supported", 1, 1);
+    expect_error("assert x\n", "assert statements are not supported", 1, 1);
+    expect_error("del x\n", "del statements are not supported", 1, 1);
+    expect_error("global x\n", "global statements are not supported", 1, 1);
+    expect_error("nonlocal x\n", "nonlocal statements are not supported", 1, 1);
+}
+
+TEST(StatementParserError, WithStatementDoesNotCascadeIntoItsBody) {
+    // Deviation from the brief: `with` has an indented body, so -- like try:
+    // and async def -- it produces two diagnostics (the rejection, then the
+    // orphaned block) and cannot use expect_error's only_error. Moved out of
+    // UnsupportedStatementsNameThemselves rather than loosening only_error.
+    const statement_test_support::ModuleResult result =
+        parse_module("with open(p) as f:\n    pass\n");
+
+    ASSERT_EQ(result.diagnostics.size(), 2u);
+    EXPECT_EQ(result.diagnostics.at(0).message, "with statements are not supported");
+    EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
+    ASSERT_NE(result.module, nullptr);
+    EXPECT_EQ(result.printed(), "(Module)");
+}
+
+TEST(StatementParserError, OrphanedExceptAndFinallyNameTryRatherThanThemselves) {
+    // try is unsupported, so a bare except: can only ever be orphaned. The
+    // message naming the construct is more useful than "unexpected 'except'".
+    //
+    // Deviation from the brief: both except: and finally: have an indented
+    // body, so -- like try: itself -- each produces two diagnostics and
+    // cannot use expect_error's only_error.
+    {
+        const statement_test_support::ModuleResult result = parse_module("except:\n    pass\n");
+        ASSERT_EQ(result.diagnostics.size(), 2u);
+        EXPECT_EQ(result.diagnostics.at(0).message, "try statements are not supported");
+        EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
+        ASSERT_NE(result.module, nullptr);
+        EXPECT_EQ(result.printed(), "(Module)");
+    }
+    {
+        const statement_test_support::ModuleResult result = parse_module("finally:\n    pass\n");
+        ASSERT_EQ(result.diagnostics.size(), 2u);
+        EXPECT_EQ(result.diagnostics.at(0).message, "try statements are not supported");
+        EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
+        ASSERT_NE(result.module, nullptr);
+        EXPECT_EQ(result.printed(), "(Module)");
+    }
+}
+
+TEST(StatementParserError, DecoratorsAreRejectedAtStatementPosition) {
+    // Settles OP_AT's second reading: decorator at statement position,
+    // matrix-multiply everywhere else.
+    expect_error("@deco\ndef f():\n    pass\n", "decorators are not supported", 1, 1);
+}
+
+TEST(StatementParserError, MatrixMultiplyStillParsesInsideAnExpression) {
+    // The other half of the OP_AT split. This must NOT be read as a decorator.
+    const statement_test_support::ModuleResult result = parse_module("c = a @ b\n");
+    EXPECT_TRUE(result.diagnostics.empty());
+    ASSERT_NE(result.module, nullptr);
+    EXPECT_EQ(result.printed(),
+              "(Module\n  (Assign (Name c) (BinOp @ (Name a) (Name b))))");
+}
+
+TEST(StatementParserError, AugmentedAssignmentIsRejected) {
+    expect_error("x += 1\n", "augmented assignment is not supported", 1, 3);
+    expect_error("x //= 2\n", "augmented assignment is not supported", 1, 3);
+    expect_error("x >>= 2\n", "augmented assignment is not supported", 1, 3);
+}
+
+TEST(StatementParserError, AnOrphanedElseOrElifIsReported) {
+    // Deviation from the brief: both else: and elif x: have an indented
+    // body, so -- like try: and with -- each produces two diagnostics (the
+    // misplaced-keyword rejection, then the orphaned block) and cannot use
+    // expect_error's only_error.
+    {
+        const statement_test_support::ModuleResult result = parse_module("else:\n    pass\n");
+        ASSERT_EQ(result.diagnostics.size(), 2u);
+        EXPECT_EQ(result.diagnostics.at(0).message, "unexpected 'else'");
+        EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
+        ASSERT_NE(result.module, nullptr);
+        EXPECT_EQ(result.printed(), "(Module)");
+    }
+    {
+        const statement_test_support::ModuleResult result = parse_module("elif x:\n    pass\n");
+        ASSERT_EQ(result.diagnostics.size(), 2u);
+        EXPECT_EQ(result.diagnostics.at(0).message, "unexpected 'elif'");
+        EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
+        ASSERT_NE(result.module, nullptr);
+        EXPECT_EQ(result.printed(), "(Module)");
+    }
+}
+
+TEST(StatementParserError, AnUnsupportedStatementDoesNotCascade) {
+    // reject() consumes the rest of the logical line, so the tokens the
+    // construct would have owned cannot each produce their own diagnostic.
+    const statement_test_support::ModuleResult result = parse_module("import os\nx = 1\n");
+
+    EXPECT_EQ(result.diagnostics.size(), 1u);
+    ASSERT_NE(result.module, nullptr);
+    EXPECT_EQ(result.printed(), "(Module\n  (Assign (Name x) (Constant 1)))");
+}
+
+TEST(StatementParserError, AnUnsupportedBlockStatementDoesNotCascadeIntoItsBody) {
+    // `try:` is rejected, and its indented body then hits the stray-INDENT
+    // path -- a second, different diagnostic. Two is correct here; what must
+    // not happen is one per statement in the body.
+    const statement_test_support::ModuleResult result =
+        parse_module("try:\n    a = 1\n    b = 2\nc = 3\n");
+
+    ASSERT_EQ(result.diagnostics.size(), 2u);
+    EXPECT_EQ(result.diagnostics.at(0).message, "try statements are not supported");
+    EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
+    ASSERT_NE(result.module, nullptr);
+    EXPECT_EQ(result.printed(), "(Module\n  (Assign (Name c) (Constant 3)))");
+}
+
+TEST(StatementParserError, SoftKeywordsStayOrdinaryNames) {
+    // Spec 3 declined to build the soft_keyword_of seam because there is no
+    // node to re-classify into, and Spec 4 does not change that. `match` and
+    // `case` arrive as IDENTIFIER, so `match x:` is two adjacent atoms and
+    // fails generically. Recognising it properly needs a bracket-depth scan
+    // for a top-level colon, whose only consumer would be an error message.
+    const statement_test_support::ModuleResult statement =
+        parse_module("match x:\n    case 1:\n        pass\n");
+    EXPECT_FALSE(statement.diagnostics.empty());
+
+    // The other half: as ordinary names they must still parse as names.
+    EXPECT_EQ(statement_test_support::parse_module("match = 1\n").diagnostics.size(), 0u);
+    EXPECT_EQ(statement_test_support::parse_module("case = 1\n").diagnostics.size(), 0u);
+    EXPECT_EQ(statement_test_support::parse_module("_ = 1\n").diagnostics.size(), 0u);
+}
+
+TEST(StatementParserError, AsyncIsRejected) {
+    // Its body is an indented block, so this produces the same two
+    // diagnostics as try: the rejection, then the orphaned block.
+    const statement_test_support::ModuleResult result =
+        parse_module("async def f():\n    pass\n");
+
+    ASSERT_FALSE(result.diagnostics.empty());
+    EXPECT_EQ(result.diagnostics.at(0).message, "async statements are not supported");
+    EXPECT_EQ(result.diagnostics.at(0).line, 1);
+    EXPECT_EQ(result.diagnostics.at(0).column, 1);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser
