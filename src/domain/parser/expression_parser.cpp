@@ -10,7 +10,9 @@
 #include "domain/ast/compare.h"
 #include "domain/ast/constant.h"
 #include "domain/ast/name.h"
+#include "domain/ast/tuple_expr.h"
 #include "domain/ast/unary_op.h"
+#include "domain/lexer/operator_table.h"
 #include "domain/lexer/token_category.h"
 #include "domain/lexer/token_type.h"
 #include "precedence_table.h"
@@ -42,6 +44,19 @@ bool is_simple_comparison(token_type type) {
     }
 }
 
+bool is_closing_delimiter(token_type type) {
+    return type == token_type::CLOSE_PAREN || type == token_type::CLOSE_BRACKET ||
+           type == token_type::CLOSE_BRACE;
+}
+
+// True where a trailing comma is legal -- that is, where no further element
+// can begin.
+bool ends_a_sequence(token_type type) {
+    return is_closing_delimiter(type) || type == token_type::NEWLINE ||
+           type == token_type::TOKEN_EOF || type == token_type::INDENT ||
+           type == token_type::DEDENT;
+}
+
 } // namespace
 
 ExpressionParser::ExpressionParser(lexer::TokenStream& tokens, diagnostics::DiagnosticSink& sink)
@@ -68,8 +83,29 @@ ast::ExprPtr ExpressionParser::parse_expression() {
     return value;
 }
 
-// Filled in at Task 9.
-ast::ExprPtr ExpressionParser::parse_expression_list() { return parse_expression(); }
+ast::ExprPtr ExpressionParser::parse_expression_list() {
+    ast::ExprPtr first = parse_expression();
+    if (first == nullptr) {
+        return nullptr;
+    }
+    if (!tokens_.check(token_type::COMMA)) {
+        return first;
+    }
+    std::vector<ast::ExprPtr> elements;
+    elements.push_back(std::move(first));
+    while (tokens_.match(token_type::COMMA)) {
+        if (ends_a_sequence(tokens_.peek().type())) {
+            break; // trailing comma
+        }
+        ast::ExprPtr next = parse_expression();
+        if (next == nullptr) {
+            return nullptr;
+        }
+        elements.push_back(std::move(next));
+    }
+    const ast::SourceSpan span = ast::merge(elements.front()->span(), elements.back()->span());
+    return std::make_unique<ast::TupleExpr>(span, std::move(elements));
+}
 
 // Filled in at Task 11.
 ast::ExprPtr ExpressionParser::parse_target() { return parse_atom(); }
@@ -260,6 +296,10 @@ ast::ExprPtr ExpressionParser::parse_atom() {
             break;
     }
 
+    if (tokens_.check(token_type::OPEN_PAREN)) {
+        return parse_paren_atom();
+    }
+
     // One rule for IDENTIFIER and all thirteen TYPE_* spellings. ScanContext
     // makes `int` a TYPE_INT in `list[int]` and an IDENTIFIER in
     // `print(int)`; Name stores the lexeme either way, and erasing the
@@ -279,6 +319,73 @@ ast::ExprPtr ExpressionParser::parse_atom() {
     }
 
     return error(token, "expected an expression");
+}
+
+ast::ExprPtr ExpressionParser::parse_paren_atom() {
+    const lexer::Token& opener = tokens_.advance();
+
+    if (tokens_.check(token_type::CLOSE_PAREN)) {
+        const lexer::Token& closer = tokens_.advance();
+        const ast::SourceSpan span = ast::merge(ast::span_of(opener), ast::span_of(closer));
+        return std::make_unique<ast::TupleExpr>(span, std::vector<ast::ExprPtr>{});
+    }
+
+    std::vector<ast::ExprPtr> elements;
+    bool saw_comma = false;
+    while (true) {
+        // Nothing that can start an expression remains: this is the unclosed
+        // bracket itself, not a missing operand, so report it against the
+        // opener rather than letting parse_expression's own "expected an
+        // expression" mask it. The indentation pass synthesizes a NEWLINE at
+        // end-of-file even inside an unclosed bracket (confirmed by
+        // inspecting the token stream for "("), so TOKEN_EOF alone is not a
+        // sufficient check -- ends_a_sequence catches that NEWLINE too. See
+        // the task report for why the brief's literal code needed this
+        // addition.
+        if (ends_a_sequence(tokens_.peek().type())) {
+            return unclosed(opener);
+        }
+        ast::ExprPtr element = parse_expression();
+        if (element == nullptr) {
+            return nullptr;
+        }
+        elements.push_back(std::move(element));
+        if (!tokens_.match(token_type::COMMA)) {
+            break;
+        }
+        saw_comma = true;
+        if (tokens_.check(token_type::CLOSE_PAREN)) {
+            break; // trailing comma
+        }
+    }
+
+    if (!tokens_.check(token_type::CLOSE_PAREN)) {
+        return unclosed(opener);
+    }
+    const lexer::Token& closer = tokens_.advance();
+
+    if (!saw_comma) {
+        // Grouping. The inner node is returned unchanged, so `(a)` keeps a's
+        // span: nodes are immutable, and widening it would mean rebuilding
+        // the subtree for a distinction nothing downstream uses.
+        return std::move(elements.front());
+    }
+    const ast::SourceSpan span = ast::merge(ast::span_of(opener), ast::span_of(closer));
+    return std::make_unique<ast::TupleExpr>(span, std::move(elements));
+}
+
+ast::ExprPtr ExpressionParser::unclosed(const lexer::Token& opener) {
+    const lexer::Token& found = tokens_.peek();
+    const std::string opener_lexeme(lexer::operator_lexeme_of(opener.type()));
+
+    // A closer of the wrong kind is a different mistake from running out of
+    // input, and naming both brackets is what makes it fixable.
+    if (is_closing_delimiter(found.type())) {
+        return error(found, "closing '" + std::string(lexer::operator_lexeme_of(found.type())) +
+                                "' does not match '" + opener_lexeme + "' opened on line " +
+                                std::to_string(opener.line_number()));
+    }
+    return error(opener, "'" + opener_lexeme + "' was never closed");
 }
 
 ast::ExprPtr ExpressionParser::error(const lexer::Token& token, std::string message) {

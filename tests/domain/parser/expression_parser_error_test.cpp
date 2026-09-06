@@ -98,5 +98,33 @@ TEST(ExpressionParserError, AWalrusInOperandPositionIsAlsoRejected) {
     expect_error(":= 1", "assignment expressions are not supported", 1, 1);
 }
 
+TEST(ExpressionParserError, AnUnclosedParenthesisIsReportedAgainstItsOpener) {
+    // Reported at the '(' on line 1, not at end of input, so the message
+    // points at the line that needs fixing.
+    expect_error("(a + b", "'(' was never closed", 1, 1);
+}
+
+TEST(ExpressionParserError, AnUnclosedParenthesisSpanningLinesNamesTheOpeningLine) {
+    // The lexer suppresses the newline inside brackets, so this is one
+    // logical line and the report must still name line 1.
+    expect_error("(a,\n b", "'(' was never closed", 1, 1);
+}
+
+TEST(ExpressionParserError, AMismatchedCloserNamesBothBrackets) {
+    expect_error("(a]", "closing ']' does not match '(' opened on line 1", 1, 3);
+}
+
+TEST(ExpressionParserError, AnEmptyGroupWithNoCloserIsReported) {
+    expect_error("(", "'(' was never closed", 1, 1);
+}
+
+TEST(ExpressionParserError, AParenthesisedAssignmentExpressionIsRejected) {
+    // Deferred here from Task 8: '(' only became an atom in this task. This
+    // is the spelling that motivated the check in parse_expression at all --
+    // without it the paren rule below would report "'(' was never closed"
+    // and point at column 1 instead of at the ':='.
+    expect_error("(n := 1)", "assignment expressions are not supported", 1, 4);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

@@ -3,6 +3,7 @@
 #include <string>
 
 #include "domain/ast/constant.h"
+#include "domain/ast/source_span.h"
 #include "domain/lexer/token_type.h"
 #include "parse_test_helpers.h"
 
@@ -11,6 +12,7 @@ namespace {
 
 using test_support::parse;
 using test_support::printed;
+using test_support::printed_list;
 
 // The token_type of a root Constant. AstPrinter erases it, so a literal-kind
 // misclassification is invisible in the printed form alone.
@@ -191,6 +193,49 @@ TEST(ExpressionParser, NotBindsTighterThanAnd) {
 TEST(ExpressionParser, BooleanOperatorsBindLooserThanComparison) {
     EXPECT_EQ(printed("a < b and c"),
               "(BoolOp and (Compare (Name a) < (Name b)) (Name c))");
+}
+
+TEST(ExpressionParser, ParenthesesGroupWithoutBuildingANode) {
+    EXPECT_EQ(printed("(a)"), "(Name a)");
+    EXPECT_EQ(printed("(a + b) * c"),
+              "(BinOp * (BinOp + (Name a) (Name b)) (Name c))");
+}
+
+TEST(ExpressionParser, GroupingLeavesTheInnerSpanAlone) {
+    // Nodes are immutable, so widening the span to cover the parentheses
+    // would mean rebuilding the subtree for a distinction nothing downstream
+    // can use. `a` in `(a)` is at column 2, ending at column 3.
+    const test_support::ParseResult result = parse("(a)");
+    ASSERT_TRUE(result.succeeded());
+    EXPECT_EQ(result.span(), (ast::SourceSpan{1, 2, 1, 3}));
+}
+
+TEST(ExpressionParser, ATrailingCommaMakesAOneElementTuple) {
+    EXPECT_EQ(printed("(a,)"), "(TupleExpr (Name a))");
+    // Unlike grouping, the parentheses genuinely create this node, so it
+    // spans them: columns 1 through 5.
+    const test_support::ParseResult result = parse("(a,)");
+    ASSERT_TRUE(result.succeeded());
+    EXPECT_EQ(result.span(), (ast::SourceSpan{1, 1, 1, 5}));
+}
+
+TEST(ExpressionParser, EmptyParenthesesAreTheEmptyTuple) {
+    EXPECT_EQ(printed("()"), "(TupleExpr)");
+}
+
+TEST(ExpressionParser, ParenthesisedTuples) {
+    EXPECT_EQ(printed("(a, b)"), "(TupleExpr (Name a) (Name b))");
+    EXPECT_EQ(printed("(a, b, c)"), "(TupleExpr (Name a) (Name b) (Name c))");
+    EXPECT_EQ(printed("(a, b,)"), "(TupleExpr (Name a) (Name b))");
+}
+
+TEST(ExpressionParser, ABareCommaListIsATuple) {
+    EXPECT_EQ(printed_list("a, b"), "(TupleExpr (Name a) (Name b))");
+    EXPECT_EQ(printed_list("a,"), "(TupleExpr (Name a))");
+}
+
+TEST(ExpressionParser, AListOfOneWithNoCommaIsNotATuple) {
+    EXPECT_EQ(printed_list("a"), "(Name a)");
 }
 
 } // namespace

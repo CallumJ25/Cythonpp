@@ -92,6 +92,14 @@ inline std::string printed(const std::string& source) {
     return result.printed();
 }
 
+// The printed tree of a parse_expression_list() that must succeed cleanly.
+inline std::string printed_list(const std::string& source) {
+    const ParseResult result = parse_from(source, 0, Entry::ExpressionList);
+    EXPECT_TRUE(result.succeeded()) << "parse failed: " << source;
+    EXPECT_TRUE(result.diagnostics.empty()) << "unexpected diagnostics: " << source;
+    return result.printed();
+}
+
 // The single diagnostic a failing parse must produce. Asserts the count, so
 // a rule that reports twice cannot hide behind a message match.
 inline diagnostics::Diagnostic only_error(const ParseResult& result) {

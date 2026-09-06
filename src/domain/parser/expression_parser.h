@@ -80,6 +80,15 @@ private:
 
     ast::ExprPtr parse_atom();
 
+    // '(' ... ')': grouping when there is no comma, a TupleExpr when there is.
+    ast::ExprPtr parse_paren_atom();
+
+    // Reports an unclosed or mismatched bracket against `opener`, which the
+    // production that consumed it holds in a local. There is no delimiter
+    // stack: the C++ call stack already is one, and an explicit copy would
+    // need a push/pop matched across every early return.
+    ast::ExprPtr unclosed(const lexer::Token& opener);
+
     // Reports one SyntaxError and returns nullptr, so a failing rule reads as
     // a single `return error(...)`.
     ast::ExprPtr error(const lexer::Token& token, std::string message);
