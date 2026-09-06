@@ -139,6 +139,15 @@ private:
     // the enclosing suite swallow the rest of the file into the wrong block.
     void synchronize();
 
+    // True when the cursor sits at the start of a logical line, because the
+    // token before it terminated one. A statement that failed here has
+    // already reached a clean boundary, so panic-mode skipping would discard
+    // the *next* statement rather than the rest of the bad one.
+    //
+    // Only compound statements can be in this position: a simple statement
+    // always fails somewhere inside its own line.
+    bool at_statement_boundary() const;
+
     // Consumes the NEWLINE (or SEMICOLON, or TOKEN_EOF) that must end a
     // simple statement. Reports and returns false if something else is there.
     bool expect_end_of_statement();

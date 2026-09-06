@@ -108,5 +108,32 @@ TEST(StatementParserError, ANestedUnexpectedIndentIsStillOneDiagnostic) {
               "(Module\n  (Assign (Name a) (Constant 1))\n  (Assign (Name d) (Constant 4)))");
 }
 
+TEST(StatementParserError, AMissingColonAfterAnIfConditionIsReported) {
+    expect_error("if x\n    pass\n", "expected ':'", 1, 5);
+}
+
+TEST(StatementParserError, AnIfHeaderWithNoIndentedBodyIsReported) {
+    expect_error("if x:\npass\n", "expected an indented block", 2, 1);
+}
+
+TEST(StatementParserError, ABadStatementInsideASuiteDoesNotDiscardTheSuite) {
+    // The reason recovery stops at -- and never consumes -- INDENT/DEDENT.
+    const statement_test_support::ModuleResult result =
+        parse_module("if a:\n    pass pass\n    break\n");
+
+    EXPECT_EQ(result.diagnostics.size(), 1u);
+    ASSERT_NE(result.module, nullptr);
+    EXPECT_EQ(result.printed(), "(Module\n  (If (Name a)\n    (Break)))");
+}
+
+TEST(StatementParserError, ABadSuiteDoesNotSwallowTheStatementsAfterIt) {
+    const statement_test_support::ModuleResult result =
+        parse_module("if a:\n    pass pass\nb = 1\n");
+
+    EXPECT_EQ(result.diagnostics.size(), 1u);
+    ASSERT_NE(result.module, nullptr);
+    EXPECT_EQ(result.printed(), "(Module\n  (Assign (Name b) (Constant 1)))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

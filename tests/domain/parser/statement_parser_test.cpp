@@ -181,5 +181,53 @@ TEST(StatementParser, AnExprStmtLiteralKeepsItsLexerTokenType) {
     EXPECT_EQ(constant->type(), lexer::token_type::LITERAL_FLOAT);
 }
 
+TEST(StatementParser, ParsesAnIfWithABlockBody) {
+    EXPECT_EQ(printed("if x:\n    pass\n"),
+              "(Module\n  (If (Name x)\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesAnIfWithAOneLineBody) {
+    // The guard-clause form. Same production as a semicolon line.
+    EXPECT_EQ(printed("if x: return 1\n"),
+              "(Module\n  (If (Name x)\n    (Return (Constant 1))))");
+}
+
+TEST(StatementParser, ParsesAOneLineBodyWithSeveralStatements) {
+    EXPECT_EQ(printed("if x: pass; break\n"),
+              "(Module\n  (If (Name x)\n    (Pass)\n    (Break)))");
+}
+
+TEST(StatementParser, ParsesAnIfElse) {
+    EXPECT_EQ(printed("if x:\n    pass\nelse:\n    break\n"),
+              "(Module\n  (If (Name x)\n    (Pass)\n    (Else\n      (Break))))");
+}
+
+TEST(StatementParser, ElifNestsAsAnIfInsideTheOuterOrelse) {
+    EXPECT_EQ(printed("if a:\n    pass\nelif b:\n    break\n"),
+              "(Module\n  (If (Name a)\n    (Pass)\n    (Else\n      (If (Name b)\n"
+              "        (Break)))))");
+}
+
+TEST(StatementParser, ParsesAFullElifChain) {
+    EXPECT_EQ(printed("if a:\n    pass\nelif b:\n    break\nelse:\n    continue\n"),
+              "(Module\n  (If (Name a)\n    (Pass)\n    (Else\n      (If (Name b)\n"
+              "        (Break)\n        (Else\n          (Continue))))))");
+}
+
+TEST(StatementParser, ParsesNestedIfs) {
+    EXPECT_EQ(printed("if a:\n    if b:\n        pass\n"),
+              "(Module\n  (If (Name a)\n    (If (Name b)\n      (Pass))))");
+}
+
+TEST(StatementParser, AnIfConditionCanBeAComparison) {
+    EXPECT_EQ(printed("if a != b:\n    pass\n"),
+              "(Module\n  (If (Compare (Name a) != (Name b))\n    (Pass)))");
+}
+
+TEST(StatementParser, StatementsAfterABlockReturnToTheOuterLevel) {
+    EXPECT_EQ(printed("if a:\n    pass\nbreak\n"),
+              "(Module\n  (If (Name a)\n    (Pass))\n  (Break))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

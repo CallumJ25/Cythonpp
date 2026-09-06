@@ -9,6 +9,7 @@
 #include "domain/ast/break.h"
 #include "domain/ast/continue.h"
 #include "domain/ast/expr_stmt.h"
+#include "domain/ast/if.h"
 #include "domain/ast/pass.h"
 #include "domain/ast/return.h"
 #include "domain/ast/source_span.h"
@@ -30,10 +31,9 @@ bool ends_a_statement(token_type type) {
 
 // The statements that own a suite. Everything else is a simple statement and
 // can share a logical line with a semicolon.
-//
-// Empty until Task 7 adds def/class/if/while/for, which is why every
-// statement currently takes the simple path.
-bool is_compound_keyword(token_type) { return false; }
+bool is_compound_keyword(token_type type) {
+    return type == token_type::KEYWORD_IF;
+}
 
 // The thirteen augmented-assignment operators. Each is a diagnostic rather
 // than a parse: there is no AugAssign node, and desugaring `x += 1` to
@@ -129,14 +129,25 @@ std::vector<ast::StmtPtr> StatementParser::parse_statement_list() {
         // simple-statement *line* can yield several statements -- `pass;
         // break` is two -- and a function returning one StmtPtr cannot say
         // so. Compound statements own a suite and are always exactly one, so
-        // they go through parse_statement. Task 7 fills in the compound set;
-        // until then is_compound_keyword is never true.
+        // they go through parse_statement. is_compound_keyword names that
+        // set; while/for/def/class join it in later tasks.
         if (is_compound_keyword(tokens_.peek().type())) {
             ast::StmtPtr statement = parse_statement();
             if (statement != nullptr) {
                 body.push_back(std::move(statement));
             } else {
-                synchronize();
+                // A compound statement can fail after already reaching a
+                // boundary; synchronizing again would eat the next statement.
+                if (!at_statement_boundary()) {
+                    synchronize();
+                }
+                if (tokens_.check(token_type::INDENT)) {
+                    // Silently. This block is orphaned as a consequence of the
+                    // error already reported, not independently, and "exactly
+                    // one diagnostic per failed statement" covers the whole
+                    // statement -- header and body together.
+                    skip_unexpected_block();
+                }
             }
         } else {
             // A scratch vector, not `body` directly: parse_simple_statement_line
@@ -169,11 +180,12 @@ std::vector<ast::StmtPtr> StatementParser::parse_statement_list() {
     return body;
 }
 
-// Compound statements (def, class, if, while, for) are added in Task 7, which
-// is what gives this function anything to dispatch. Until then the compound
-// set is empty and every statement goes down the simple path in
-// parse_statement_list, so this is never called.
 ast::StmtPtr StatementParser::parse_statement() {
+    switch (tokens_.peek().type()) {
+        case token_type::KEYWORD_IF: return parse_if();
+        default:                     break;
+    }
+    // Only reachable if is_compound_keyword and this switch disagree.
     return error(tokens_.peek(), "expected a statement");
 }
 
@@ -344,12 +356,111 @@ void StatementParser::synchronize() {
     }
 }
 
+bool StatementParser::at_statement_boundary() const {
+    std::size_t index = tokens_.position();
+    if (index == 0) {
+        return true;
+    }
+    // Step back past comments, which survive IndentationPass and which the
+    // cursor itself skips -- so the token physically before the cursor is not
+    // necessarily the one that logically precedes it.
+    do {
+        --index;
+    } while (index > 0 && tokens_.at(index).type() == token_type::COMMENT_SINGLE);
+
+    const token_type previous = tokens_.at(index).type();
+    return previous == token_type::NEWLINE || previous == token_type::INDENT ||
+           previous == token_type::DEDENT;
+}
+
 bool StatementParser::expect_end_of_statement() {
     if (ends_a_statement(tokens_.peek().type())) {
         return true;
     }
     error(tokens_.peek(), "expected a newline after the statement");
     return false;
+}
+
+std::vector<ast::StmtPtr> StatementParser::parse_suite() {
+    if (!tokens_.match(token_type::COLON)) {
+        error(tokens_.peek(), "expected ':'");
+        return {};
+    }
+
+    // The one-line form: `if x: return 1`. Python's grammar makes this and a
+    // semicolon-separated line the same production, so it is the same call.
+    if (!tokens_.match(token_type::NEWLINE)) {
+        // A scratch vector spliced only on success, matching what Task 3's
+        // parse_statement_list does at module level. parse_simple_statement_line
+        // appends every statement it parsed before hitting trouble, but a
+        // malformed line is dropped whole rather than half-kept: the leading
+        // `pass` in `if x: pass pass` is part of the same bad line, not a
+        // separate salvageable statement. Returning empty here makes the
+        // caller drop the whole compound statement, which is how a failed
+        // block suite already behaves.
+        std::vector<ast::StmtPtr> line;
+        if (!parse_simple_statement_line(line)) {
+            return {};
+        }
+        return line;
+    }
+
+    if (!tokens_.check(token_type::INDENT)) {
+        error(tokens_.peek(), "expected an indented block");
+        return {};
+    }
+    tokens_.advance();
+
+    std::vector<ast::StmtPtr> body = parse_statement_list();
+    // IndentationPass guarantees a matching DEDENT, so match() rather than a
+    // check-and-report: there is no reachable branch where it is absent.
+    tokens_.match(token_type::DEDENT);
+    return body;
+}
+
+ast::StmtPtr StatementParser::parse_if() {
+    const ast::SourceSpan keyword_span = ast::span_of(tokens_.peek());
+    tokens_.advance(); // 'if' or 'elif' -- both reach here, which is the point
+
+    // parse_expression, not parse_expression_list: `if a, b:` is not valid
+    // Python, and letting a comma through would build a TupleExpr condition
+    // that is always truthy.
+    ast::ExprPtr condition = expressions_.parse_expression();
+    if (condition == nullptr) {
+        return nullptr; // already reported
+    }
+
+    std::vector<ast::StmtPtr> body = parse_suite();
+    if (body.empty()) {
+        return nullptr; // already reported
+    }
+
+    std::vector<ast::StmtPtr> orelse;
+    if (tokens_.check(token_type::KEYWORD_ELIF)) {
+        // elif is not a node: it nests as an If inside this one's orelse,
+        // which is how Python's own grammar defines it. See if.h.
+        ast::StmtPtr nested = parse_if();
+        if (nested == nullptr) {
+            return nullptr;
+        }
+        orelse.push_back(std::move(nested));
+    } else {
+        orelse = parse_else_clause();
+    }
+
+    // Bound before the moves below: argument evaluation order is unspecified.
+    const ast::SourceSpan end = orelse.empty() ? body.back()->span() : orelse.back()->span();
+    const ast::SourceSpan span = ast::merge(keyword_span, end);
+    return std::make_unique<ast::If>(span, std::move(condition), std::move(body),
+                                     std::move(orelse));
+}
+
+std::vector<ast::StmtPtr> StatementParser::parse_else_clause() {
+    if (!tokens_.check(token_type::KEYWORD_ELSE)) {
+        return {};
+    }
+    tokens_.advance();
+    return parse_suite();
 }
 
 ast::StmtPtr StatementParser::error(const lexer::Token& token, std::string message) {
