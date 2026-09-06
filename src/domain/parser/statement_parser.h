@@ -128,9 +128,12 @@ private:
     bool parse_parameters(std::vector<ast::Parameter>& into);
 
     // A construct outside the supported subset: reports `message` against
-    // `keyword` and consumes the rest of its logical line, so the caller gets
-    // one diagnostic and a clean boundary rather than a cascade from the
-    // tokens the construct would have owned.
+    // `keyword` and returns nullptr. Only reports -- it does not resynchronise.
+    // That is deliberately the caller's job: parse_statement_list already
+    // calls synchronize() when a statement comes back null, and a second
+    // synchronize() here, on a cursor that has already reached the next line,
+    // would consume that line's statement instead of the failed one's
+    // remainder.
     ast::StmtPtr reject(const lexer::Token& keyword, std::string message);
 
     // An INDENT at statement position, which IndentationPass emits without

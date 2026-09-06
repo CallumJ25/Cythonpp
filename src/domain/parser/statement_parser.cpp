@@ -370,17 +370,33 @@ ast::StmtPtr StatementParser::parse_annotated_assignment(ast::ExprPtr target) {
 
 ast::StmtPtr StatementParser::reject(const lexer::Token& keyword, std::string message) {
     error(keyword, std::move(message));
-    // The resync is left entirely to the caller. parse_simple_statement_line
-    // returns false without consuming anything further, and every caller of
-    // parse_simple_statement_line already calls synchronize() itself when it
-    // sees false -- calling it here too double-resyncs. For a rejected
-    // construct with no indented body (`import os\nx = 1\n`), the first
-    // synchronize() would already run past this logical line's NEWLINE onto
-    // the next line, and a second call would then consume *that* line too,
-    // silently dropping a statement this construct never owned. For a
-    // rejected block construct (`try:`), the caller's single synchronize()
-    // still stops before the orphaned INDENT, which the stray-INDENT path
-    // reports as its own, separate diagnostic -- unaffected by this change.
+    // The resync is left entirely to the caller -- there are two paths back
+    // here, and each already owns exactly one synchronize() call of its own.
+    //
+    // parse_simple_statement_line returns false without consuming anything
+    // further, and parse_statement_list (the module-level loop and each
+    // suite's block-body loop are the same function) calls synchronize()
+    // itself whenever it sees false. Calling it here too would double-resync:
+    // for a rejected construct with no indented body (`import os\nx = 1\n`),
+    // the first synchronize() already runs past this logical line's NEWLINE
+    // onto the next line, and a second call would then consume *that* line
+    // too, silently dropping a statement this construct never owned.
+    //
+    // The other path is parse_suite's one-line-suite form, which returns `{}`
+    // without synchronizing at all. That empty suite makes the enclosing
+    // compound rule (parse_if and siblings) return null in turn, and the null
+    // resurfaces one level further out, in parse_statement_list's *compound*
+    // branch -- whose synchronize() is gated on `!at_statement_boundary()`.
+    // A reject() reached this way never advances the cursor, so it is still
+    // sitting where parse_suite left it right after the ':', and the token
+    // before a ':' is never a NEWLINE/INDENT/DEDENT -- at_statement_boundary()
+    // is therefore always false here, the gate always opens, and exactly one
+    // synchronize() still runs, just from that other call site.
+    //
+    // For a rejected block construct (`try:`), the caller's single
+    // synchronize() still stops before the orphaned INDENT, which the
+    // stray-INDENT path reports as its own, separate diagnostic -- unaffected
+    // by any of the above.
     return nullptr;
 }
 

@@ -227,6 +227,7 @@ TEST(StatementParserError, WithStatementDoesNotCascadeIntoItsBody) {
     const statement_test_support::ModuleResult result =
         parse_module("with open(p) as f:\n    pass\n");
 
+    EXPECT_TRUE(result.indentation_diagnostics.empty());
     ASSERT_EQ(result.diagnostics.size(), 2u);
     EXPECT_EQ(result.diagnostics.at(0).message, "with statements are not supported");
     EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
@@ -243,6 +244,7 @@ TEST(StatementParserError, OrphanedExceptAndFinallyNameTryRatherThanThemselves) 
     // cannot use expect_error's only_error.
     {
         const statement_test_support::ModuleResult result = parse_module("except:\n    pass\n");
+        EXPECT_TRUE(result.indentation_diagnostics.empty());
         ASSERT_EQ(result.diagnostics.size(), 2u);
         EXPECT_EQ(result.diagnostics.at(0).message, "try statements are not supported");
         EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
@@ -251,6 +253,7 @@ TEST(StatementParserError, OrphanedExceptAndFinallyNameTryRatherThanThemselves) 
     }
     {
         const statement_test_support::ModuleResult result = parse_module("finally:\n    pass\n");
+        EXPECT_TRUE(result.indentation_diagnostics.empty());
         ASSERT_EQ(result.diagnostics.size(), 2u);
         EXPECT_EQ(result.diagnostics.at(0).message, "try statements are not supported");
         EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
@@ -287,6 +290,7 @@ TEST(StatementParserError, AnOrphanedElseOrElifIsReported) {
     // expect_error's only_error.
     {
         const statement_test_support::ModuleResult result = parse_module("else:\n    pass\n");
+        EXPECT_TRUE(result.indentation_diagnostics.empty());
         ASSERT_EQ(result.diagnostics.size(), 2u);
         EXPECT_EQ(result.diagnostics.at(0).message, "unexpected 'else'");
         EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
@@ -295,6 +299,7 @@ TEST(StatementParserError, AnOrphanedElseOrElifIsReported) {
     }
     {
         const statement_test_support::ModuleResult result = parse_module("elif x:\n    pass\n");
+        EXPECT_TRUE(result.indentation_diagnostics.empty());
         ASSERT_EQ(result.diagnostics.size(), 2u);
         EXPECT_EQ(result.diagnostics.at(0).message, "unexpected 'elif'");
         EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
@@ -304,8 +309,10 @@ TEST(StatementParserError, AnOrphanedElseOrElifIsReported) {
 }
 
 TEST(StatementParserError, AnUnsupportedStatementDoesNotCascade) {
-    // reject() consumes the rest of the logical line, so the tokens the
-    // construct would have owned cannot each produce their own diagnostic.
+    // reject() itself only reports; parse_statement_list's synchronize() call
+    // on the false return is what consumes the rest of the logical line, so
+    // the tokens the construct would have owned cannot each produce their own
+    // diagnostic -- and, just as importantly, cannot bleed into the next one.
     const statement_test_support::ModuleResult result = parse_module("import os\nx = 1\n");
 
     EXPECT_EQ(result.diagnostics.size(), 1u);
@@ -320,6 +327,7 @@ TEST(StatementParserError, AnUnsupportedBlockStatementDoesNotCascadeIntoItsBody)
     const statement_test_support::ModuleResult result =
         parse_module("try:\n    a = 1\n    b = 2\nc = 3\n");
 
+    EXPECT_TRUE(result.indentation_diagnostics.empty());
     ASSERT_EQ(result.diagnostics.size(), 2u);
     EXPECT_EQ(result.diagnostics.at(0).message, "try statements are not supported");
     EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
@@ -349,10 +357,12 @@ TEST(StatementParserError, AsyncIsRejected) {
     const statement_test_support::ModuleResult result =
         parse_module("async def f():\n    pass\n");
 
-    ASSERT_FALSE(result.diagnostics.empty());
+    EXPECT_TRUE(result.indentation_diagnostics.empty());
+    ASSERT_EQ(result.diagnostics.size(), 2u);
     EXPECT_EQ(result.diagnostics.at(0).message, "async statements are not supported");
     EXPECT_EQ(result.diagnostics.at(0).line, 1);
     EXPECT_EQ(result.diagnostics.at(0).column, 1);
+    EXPECT_EQ(result.diagnostics.at(1).message, "unexpected indent");
 }
 
 } // namespace
