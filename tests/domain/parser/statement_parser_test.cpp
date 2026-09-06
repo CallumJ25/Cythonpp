@@ -355,5 +355,41 @@ TEST(StatementParser, ParsesNestedDefs) {
               "(Module\n  (FunctionDef outer\n    (FunctionDef inner\n      (Pass))))");
 }
 
+TEST(StatementParser, ParsesAClassWithNoBases) {
+    EXPECT_EQ(printed("class C:\n    pass\n"), "(Module\n  (ClassDef C\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesAClassWithOneBase) {
+    // ScanContext keeps `int` an IDENTIFIER here rather than TYPE_INT, which
+    // is exactly the case class-base handling exists for.
+    EXPECT_EQ(printed("class C(int):\n    pass\n"),
+              "(Module\n  (ClassDef C (Bases (Name int))\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesAClassWithSeveralBases) {
+    EXPECT_EQ(printed("class C(A, B):\n    pass\n"),
+              "(Module\n  (ClassDef C (Bases (Name A) (Name B))\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesASubscriptedBase) {
+    EXPECT_EQ(printed("class C(Generic[T]):\n    pass\n"),
+              "(Module\n  (ClassDef C (Bases (Subscript (Name Generic) (Name T)))\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesAnEmptyBaseList) {
+    EXPECT_EQ(printed("class C():\n    pass\n"), "(Module\n  (ClassDef C\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesAClassWithMethods) {
+    EXPECT_EQ(printed("class C:\n    def m(self):\n        return 1\n"),
+              "(Module\n  (ClassDef C\n    (FunctionDef m (Params (Parameter self))\n"
+              "      (Return (Constant 1)))))");
+}
+
+TEST(StatementParser, ParsesAnAnnotatedClassAttribute) {
+    EXPECT_EQ(printed("class C:\n    x: int = 0\n"),
+              "(Module\n  (ClassDef C\n    (AnnAssign (Name x) (Name int) (Constant 0))))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

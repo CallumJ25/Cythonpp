@@ -9,6 +9,7 @@
 #include "domain/ast/ann_assign.h"
 #include "domain/ast/assign.h"
 #include "domain/ast/break.h"
+#include "domain/ast/class_def.h"
 #include "domain/ast/continue.h"
 #include "domain/ast/expr_stmt.h"
 #include "domain/ast/for.h"
@@ -39,7 +40,8 @@ bool ends_a_statement(token_type type) {
 // can share a logical line with a semicolon.
 bool is_compound_keyword(token_type type) {
     return type == token_type::KEYWORD_IF || type == token_type::KEYWORD_WHILE ||
-           type == token_type::KEYWORD_FOR || type == token_type::KEYWORD_DEF;
+           type == token_type::KEYWORD_FOR || type == token_type::KEYWORD_DEF ||
+           type == token_type::KEYWORD_CLASS;
 }
 
 // The thirteen augmented-assignment operators. Each is a diagnostic rather
@@ -193,6 +195,7 @@ ast::StmtPtr StatementParser::parse_statement() {
         case token_type::KEYWORD_WHILE: return parse_while();
         case token_type::KEYWORD_FOR:   return parse_for();
         case token_type::KEYWORD_DEF:   return parse_function_def();
+        case token_type::KEYWORD_CLASS: return parse_class_def();
         default:                        break;
     }
     // Only reachable if is_compound_keyword and this switch disagree.
@@ -578,6 +581,58 @@ ast::StmtPtr StatementParser::parse_function_def() {
     const ast::SourceSpan span = ast::merge(keyword_span, body.back()->span());
     return std::make_unique<ast::FunctionDef>(span, std::move(name), std::move(params),
                                               std::move(return_annotation), std::move(body));
+}
+
+ast::StmtPtr StatementParser::parse_class_def() {
+    const ast::SourceSpan keyword_span = ast::span_of(tokens_.peek());
+    tokens_.advance(); // 'class'
+
+    const lexer::Token& name_token = tokens_.peek();
+    if (!lexer::has_category(name_token.type(), lexer::token_category::IDENTIFIER)) {
+        return error(name_token, "expected a class name");
+    }
+    std::string name = name_token.lexeme();
+    tokens_.advance();
+
+    std::vector<ast::ExprPtr> bases;
+    if (tokens_.check(token_type::OPEN_PAREN)) {
+        const ast::SourceSpan opener_span = ast::span_of(tokens_.peek());
+        tokens_.advance();
+
+        if (!tokens_.check(token_type::CLOSE_PAREN)) {
+            while (true) {
+                ast::ExprPtr base = expressions_.parse_expression();
+                if (base == nullptr) {
+                    return nullptr; // already reported
+                }
+                bases.push_back(std::move(base));
+                if (tokens_.match(token_type::COMMA)) {
+                    if (tokens_.check(token_type::CLOSE_PAREN)) {
+                        break; // trailing comma
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        if (!tokens_.match(token_type::CLOSE_PAREN)) {
+            // Reported against the opener, not the current token: the lexer
+            // emits a NEWLINE at EOF even inside an unclosed bracket, so
+            // wherever the cursor has reached says nothing useful about
+            // where the mistake is. Same convention as parse_parameters.
+            return error_at(opener_span, "expected ')' to close the base list");
+        }
+    }
+
+    std::vector<ast::StmtPtr> body = parse_suite();
+    if (body.empty()) {
+        return nullptr; // already reported
+    }
+
+    // Bound before the moves below: argument evaluation order is unspecified.
+    const ast::SourceSpan span = ast::merge(keyword_span, body.back()->span());
+    return std::make_unique<ast::ClassDef>(span, std::move(name), std::move(bases),
+                                           std::move(body));
 }
 
 bool StatementParser::parse_parameters(std::vector<ast::Parameter>& into) {

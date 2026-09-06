@@ -188,5 +188,26 @@ TEST(StatementParserError, AStarredParameterIsReported) {
     expect_error("def f(*args):\n    pass\n", "expected a parameter name", 1, 7);
 }
 
+TEST(StatementParserError, AClassWithNoNameIsReported) {
+    expect_error("class :\n    pass\n", "expected a class name", 1, 7);
+}
+
+TEST(StatementParserError, AnUnclosedBaseListIsReportedAgainstItsOpener) {
+    expect_error("class C(A\n", "expected ')' to close the base list", 1, 8);
+}
+
+TEST(StatementParserError, AKeywordArgumentInABaseListIsReported) {
+    // Verified against the real parser: a base list is not a call, so it is
+    // parsed by looping parse_expression(), which has no special-case for
+    // '='. `metaclass` parses fine as a bare Name, leaving '=M' unconsumed;
+    // the loop then sees neither ',' nor ')' and the base list is reported
+    // unclosed against its opener -- the same diagnostic
+    // AnUnclosedBaseListIsReportedAgainstItsOpener exercises, not
+    // ExpressionParser's call-argument message, since a base list is parsed
+    // by parse_expression() directly and never reaches that check.
+    expect_error("class C(metaclass=M):\n    pass\n",
+                 "expected ')' to close the base list", 1, 8);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser
