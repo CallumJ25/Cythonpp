@@ -12,6 +12,7 @@
 #include "domain/ast/compare.h"
 #include "domain/ast/comprehension_clause.h"
 #include "domain/ast/constant.h"
+#include "domain/ast/dict_expr.h"
 #include "domain/ast/list_comp.h"
 #include "domain/ast/list_expr.h"
 #include "domain/ast/name.h"
@@ -463,6 +464,10 @@ ast::ExprPtr ExpressionParser::parse_atom() {
         return parse_bracket_atom();
     }
 
+    if (tokens_.check(token_type::OPEN_BRACE)) {
+        return parse_brace_atom();
+    }
+
     // One rule for IDENTIFIER and all thirteen TYPE_* spellings. ScanContext
     // makes `int` a TYPE_INT in `list[int]` and an IDENTIFIER in
     // `print(int)`; Name stores the lexeme either way, and erasing the
@@ -622,6 +627,75 @@ ast::ExprPtr ExpressionParser::parse_list_comp(const lexer::Token& opener, ast::
     const lexer::Token& closer = tokens_.advance();
     const ast::SourceSpan span = ast::merge(ast::span_of(opener), ast::span_of(closer));
     return std::make_unique<ast::ListComp>(span, std::move(element), std::move(clauses));
+}
+
+ast::ExprPtr ExpressionParser::parse_brace_atom() {
+    const lexer::Token& opener = tokens_.advance(); // '{'
+
+    // `{}` is the empty dict in Python, not the empty set.
+    if (tokens_.check(token_type::CLOSE_BRACE)) {
+        const lexer::Token& closer = tokens_.advance();
+        const ast::SourceSpan span = ast::merge(ast::span_of(opener), ast::span_of(closer));
+        return std::make_unique<ast::DictExpr>(span, std::vector<ast::DictExpr::Entry>{});
+    }
+
+    // As in parse_bracket_atom: nothing can start an expression here, so the
+    // brace is unclosed rather than an operand missing. The lexer emits a
+    // NEWLINE at end of file even inside an open bracket, so TOKEN_EOF alone
+    // is not a sufficient test.
+    if (ends_a_sequence(tokens_.peek().type())) {
+        return unclosed(opener);
+    }
+    ast::ExprPtr first_key = parse_expression();
+    if (first_key == nullptr) {
+        return nullptr;
+    }
+
+    // What follows the first expression is what tells the three brace
+    // constructs apart, which is why the check happens here and not earlier.
+    if (!tokens_.check(token_type::COLON)) {
+        if (tokens_.check(token_type::KEYWORD_FOR)) {
+            return error(tokens_.peek(), "set comprehensions are not supported");
+        }
+        return error(tokens_.peek(), "set displays are not supported");
+    }
+    tokens_.advance(); // ':'
+
+    ast::ExprPtr first_value = parse_expression();
+    if (first_value == nullptr) {
+        return nullptr;
+    }
+    if (tokens_.check(token_type::KEYWORD_FOR)) {
+        return error(tokens_.peek(), "dict comprehensions are not supported");
+    }
+
+    std::vector<ast::DictExpr::Entry> entries;
+    entries.push_back(ast::DictExpr::Entry{std::move(first_key), std::move(first_value)});
+
+    while (tokens_.match(token_type::COMMA)) {
+        if (tokens_.check(token_type::CLOSE_BRACE)) {
+            break; // trailing comma
+        }
+        ast::ExprPtr key = parse_expression();
+        if (key == nullptr) {
+            return nullptr;
+        }
+        if (!tokens_.match(token_type::COLON)) {
+            return error(tokens_.peek(), "expected ':' in a dict display");
+        }
+        ast::ExprPtr value = parse_expression();
+        if (value == nullptr) {
+            return nullptr;
+        }
+        entries.push_back(ast::DictExpr::Entry{std::move(key), std::move(value)});
+    }
+
+    if (!tokens_.check(token_type::CLOSE_BRACE)) {
+        return unclosed(opener);
+    }
+    const lexer::Token& closer = tokens_.advance();
+    const ast::SourceSpan span = ast::merge(ast::span_of(opener), ast::span_of(closer));
+    return std::make_unique<ast::DictExpr>(span, std::move(entries));
 }
 
 ast::ExprPtr ExpressionParser::unclosed(const lexer::Token& opener) {

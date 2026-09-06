@@ -345,5 +345,23 @@ TEST(ExpressionParser, TargetParsingStopsBeforeIn) {
     EXPECT_EQ(result.printed(), "(Name x)");
 }
 
+TEST(ExpressionParser, DictDisplays) {
+    EXPECT_EQ(printed("{}"), "(DictExpr)");
+    EXPECT_EQ(printed("{'k': 1}"), "(DictExpr ((Constant 'k') (Constant 1)))");
+}
+
+TEST(ExpressionParser, DictDisplaysWithSeveralEntries) {
+    // The first n>1 rendering of DictExpr's (key value) pairs.
+    EXPECT_EQ(printed("{'a': 1, 'b': 2}"),
+              "(DictExpr ((Constant 'a') (Constant 1)) ((Constant 'b') (Constant 2)))");
+    EXPECT_EQ(printed("{'a': 1, 'b': 2,}"),
+              "(DictExpr ((Constant 'a') (Constant 1)) ((Constant 'b') (Constant 2)))");
+}
+
+TEST(ExpressionParser, DictKeysAndValuesAreFullExpressions) {
+    EXPECT_EQ(printed("{a + 1: f(b)}"),
+              "(DictExpr ((BinOp + (Name a) (Constant 1)) (Call (Name f) (Name b))))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

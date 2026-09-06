@@ -95,6 +95,10 @@ private:
     ast::ExprPtr parse_bracket_atom();
     ast::ExprPtr parse_list_comp(const lexer::Token& opener, ast::ExprPtr element);
 
+    // '{' ... '}': a DictExpr. Set displays and both brace comprehensions
+    // need nodes the AST does not have, so each is a named diagnostic.
+    ast::ExprPtr parse_brace_atom();
+
     // Reports an unclosed or mismatched bracket against `opener`, which the
     // production that consumed it holds in a local. There is no delimiter
     // stack: the C++ call stack already is one, and an explicit copy would

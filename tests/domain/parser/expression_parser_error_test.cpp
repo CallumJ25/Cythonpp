@@ -189,5 +189,26 @@ TEST(ExpressionParserError, AnUnclosedListIsReportedAgainstItsOpener) {
     expect_error("[1,", "'[' was never closed", 1, 1);
 }
 
+TEST(ExpressionParserError, SetDisplaysAreRejected) {
+    expect_error("{1, 2}", "set displays are not supported", 1, 3);
+}
+
+TEST(ExpressionParserError, SetComprehensionsAreRejected) {
+    expect_error("{x for x in y}", "set comprehensions are not supported", 1, 4);
+}
+
+TEST(ExpressionParserError, DictComprehensionsAreRejected) {
+    expect_error("{k: v for k, v in pairs}", "dict comprehensions are not supported", 1, 7);
+}
+
+TEST(ExpressionParserError, AMissingColonInADictIsReported) {
+    expect_error("{'a': 1, 'b'}", "expected ':' in a dict display", 1, 13);
+}
+
+TEST(ExpressionParserError, AnUnclosedBraceIsReportedAgainstItsOpener) {
+    expect_error("{'a': 1", "'{' was never closed", 1, 1);
+    expect_error("{", "'{' was never closed", 1, 1);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser
