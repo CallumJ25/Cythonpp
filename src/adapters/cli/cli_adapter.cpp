@@ -48,8 +48,8 @@ void print_module(const std::string& path, const domain::lexer::TokenStream& tok
 void print_result(const application::CompileResult& result) {
     std::size_t total = 0;
     for (const auto& module : result.modules) {
-        print_module(module.first, module.second);
-        total += module.second.size();
+        print_module(module.first, module.second.tokens);
+        total += module.second.tokens.size();
     }
     std::cout << result.modules.size() << " files, " << total << " tokens" << std::endl;
 }

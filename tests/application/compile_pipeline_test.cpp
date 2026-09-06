@@ -6,6 +6,8 @@
 #include <vector>
 
 #include "application/compile_pipeline.h"
+#include "domain/ast/ast_printer.h"
+#include "domain/ast/module.h"
 #include "domain/diagnostics/diagnostic.h"
 #include "domain/lexer/token_type.h"
 #include "ports/diagnostics_reporter.h"
@@ -64,7 +66,7 @@ TEST(CompilePipeline, CompileFileProducesASingleModuleKeyedByItsPath) {
 
     ASSERT_EQ(result.modules.size(), 1u);
     ASSERT_EQ(result.modules.count("a.py"), 1u);
-    EXPECT_FALSE(result.modules.at("a.py").empty());
+    EXPECT_FALSE(result.modules.at("a.py").tokens.empty());
 }
 
 TEST(CompilePipeline, CompileFilePropagatesRuntimeErrorForAnUnreadableFile) {
@@ -98,9 +100,9 @@ TEST(CompilePipeline, EachModuleHoldsItsOwnTokens) {
 
     const CompileResult result = pipeline.compile_directory("");
 
-    EXPECT_EQ(result.modules.at("a.py").at(0).lexeme(), "x");
-    EXPECT_EQ(result.modules.at("b.py").at(0).lexeme(), "y");
-    EXPECT_NE(result.modules.at("a.py").size(), result.modules.at("b.py").size());
+    EXPECT_EQ(result.modules.at("a.py").tokens.at(0).lexeme(), "x");
+    EXPECT_EQ(result.modules.at("b.py").tokens.at(0).lexeme(), "y");
+    EXPECT_NE(result.modules.at("a.py").tokens.size(), result.modules.at("b.py").tokens.size());
 }
 
 TEST(CompilePipeline, ModuleKeysAreSortedRegardlessOfListerOrder) {
@@ -145,8 +147,9 @@ TEST(CompilePipeline, EveryModuleEndsWithAnEndOfFileToken) {
     const CompileResult result = pipeline.compile_directory("");
 
     for (const auto& module : result.modules) {
-        ASSERT_FALSE(module.second.empty()) << module.first;
-        EXPECT_EQ(module.second.at(module.second.size() - 1).type(), domain::lexer::token_type::TOKEN_EOF)
+        ASSERT_FALSE(module.second.tokens.empty()) << module.first;
+        EXPECT_EQ(module.second.tokens.at(module.second.tokens.size() - 1).type(),
+                  domain::lexer::token_type::TOKEN_EOF)
             << module.first;
     }
 }
@@ -160,7 +163,7 @@ TEST(CompilePipeline, ModuleTokensHaveBeenThroughTheIndentationPass) {
     const CompileResult result = pipeline.compile_file("a.py");
 
     bool saw_indent = false;
-    for (const domain::lexer::Token& token : result.modules.at("a.py")) {
+    for (const domain::lexer::Token& token : result.modules.at("a.py").tokens) {
         EXPECT_NE(token.type(), domain::lexer::token_type::SPACE);
         if (token.type() == domain::lexer::token_type::INDENT) {
             saw_indent = true;
@@ -206,6 +209,79 @@ TEST(CompilePipeline, HasErrorsIsSetWhenAnyModuleInADirectoryFails) {
     EXPECT_EQ(result.modules.size(), 2u);
     EXPECT_TRUE(result.has_errors);
     EXPECT_EQ(reporter.entries.size(), 1u);
+}
+
+TEST(CompilePipeline, EachModuleCarriesAParsedAst) {
+    FakeSourceReader reader({{"a.py", "x = 1\n"}});
+    FakeSourceLister lister({});
+    RecordingDiagnosticsReporter reporter;
+    CompilePipeline pipeline(reader, lister, reporter);
+
+    const CompileResult result = pipeline.compile_file("a.py");
+
+    ASSERT_EQ(result.modules.count("a.py"), 1u);
+    const CompiledModule& compiled = result.modules.at("a.py");
+    ASSERT_NE(compiled.ast, nullptr);
+    EXPECT_EQ(domain::ast::AstPrinter().print(*compiled.ast),
+              "(Module\n  (Assign (Name x) (Constant 1)))");
+    EXPECT_FALSE(compiled.tokens.empty());
+}
+
+TEST(CompilePipeline, ParserDiagnosticsAreReportedAgainstTheirSourcePath) {
+    FakeSourceReader reader({{"pkg/bad.py", "import os\n"}});
+    FakeSourceLister lister({});
+    RecordingDiagnosticsReporter reporter;
+    CompilePipeline pipeline(reader, lister, reporter);
+
+    const CompileResult result = pipeline.compile_file("pkg/bad.py");
+
+    ASSERT_EQ(reporter.entries.size(), 1u);
+    EXPECT_EQ(reporter.entries.front().path, "pkg/bad.py");
+    EXPECT_EQ(reporter.entries.front().diagnostic.code, "SyntaxError");
+    EXPECT_EQ(reporter.entries.front().diagnostic.message,
+              "import statements are not supported");
+    EXPECT_TRUE(result.has_errors);
+}
+
+TEST(CompilePipeline, AFileWithIndentationErrorsIsStillParsed) {
+    // IndentationPass is total and balanced, so the stream is always
+    // parseable. Running the parser anyway yields more diagnostics per
+    // invocation than stopping at the first failing stage.
+    FakeSourceReader reader({{"a.py", "if a:\n\tx = 1\n        y = 2\n"}});
+    FakeSourceLister lister({});
+    RecordingDiagnosticsReporter reporter;
+    CompilePipeline pipeline(reader, lister, reporter);
+
+    const CompileResult result = pipeline.compile_file("a.py");
+
+    ASSERT_NE(result.modules.at("a.py").ast, nullptr);
+    EXPECT_TRUE(result.has_errors);
+}
+
+TEST(CompilePipeline, TheAstIsNeverNullEvenForAFileThatFailedEntirely) {
+    FakeSourceReader reader({{"a.py", "import os\n"}});
+    FakeSourceLister lister({});
+    RecordingDiagnosticsReporter reporter;
+    CompilePipeline pipeline(reader, lister, reporter);
+
+    const CompileResult result = pipeline.compile_file("a.py");
+
+    ASSERT_NE(result.modules.at("a.py").ast, nullptr);
+    EXPECT_TRUE(result.modules.at("a.py").ast->body().empty());
+    EXPECT_TRUE(result.has_errors);
+}
+
+TEST(CompilePipeline, TheTokenStreamCursorIsRewoundForTheCaller) {
+    // The parser reads through the cursor, so whoever holds the result must
+    // get a stream positioned at the start rather than wherever it stopped.
+    FakeSourceReader reader({{"a.py", "x = 1\n"}});
+    FakeSourceLister lister({});
+    RecordingDiagnosticsReporter reporter;
+    CompilePipeline pipeline(reader, lister, reporter);
+
+    const CompileResult result = pipeline.compile_file("a.py");
+
+    EXPECT_EQ(result.modules.at("a.py").tokens.position(), 0u);
 }
 
 } // namespace
