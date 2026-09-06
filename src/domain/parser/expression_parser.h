@@ -78,6 +78,13 @@ private:
     // cannot express that asymmetry, which is why '**' is not in the table.
     ast::ExprPtr parse_power();
 
+    // atom followed by any number of '.name', '[index]' and '(args)'
+    // trailers, applied left to right.
+    ast::ExprPtr parse_postfix();
+    ast::ExprPtr parse_attribute(ast::ExprPtr value);
+    ast::ExprPtr parse_subscript(ast::ExprPtr value);
+    ast::ExprPtr parse_call(ast::ExprPtr callee);
+
     ast::ExprPtr parse_atom();
 
     // '(' ... ')': grouping when there is no comma, a TupleExpr when there is.

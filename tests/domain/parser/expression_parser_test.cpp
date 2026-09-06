@@ -238,5 +238,58 @@ TEST(ExpressionParser, AListOfOneWithNoCommaIsNotATuple) {
     EXPECT_EQ(printed_list("a"), "(Name a)");
 }
 
+TEST(ExpressionParser, AttributeAccess) {
+    EXPECT_EQ(printed("self.count"), "(Attribute (Name self) count)");
+    EXPECT_EQ(printed("a.b.c"), "(Attribute (Attribute (Name a) b) c)");
+}
+
+TEST(ExpressionParser, Subscripting) {
+    EXPECT_EQ(printed("items[0]"), "(Subscript (Name items) (Constant 0))");
+    EXPECT_EQ(printed("grid[a, b]"),
+              "(Subscript (Name grid) (TupleExpr (Name a) (Name b)))");
+}
+
+TEST(ExpressionParser, Calls) {
+    EXPECT_EQ(printed("f()"), "(Call (Name f))");
+    EXPECT_EQ(printed("f(x)"), "(Call (Name f) (Name x))");
+    EXPECT_EQ(printed("f(x, 2)"), "(Call (Name f) (Name x) (Constant 2))");
+    EXPECT_EQ(printed("f(x,)"), "(Call (Name f) (Name x))");
+}
+
+TEST(ExpressionParser, TrailersChainInSourceOrder) {
+    EXPECT_EQ(printed("a.b[0](c).d"),
+              "(Attribute (Call (Subscript (Attribute (Name a) b) (Constant 0)) (Name c)) d)");
+}
+
+TEST(ExpressionParser, TrailersBindTighterThanEveryOperator) {
+    EXPECT_EQ(printed("-f(x)"), "(UnaryOp - (Call (Name f) (Name x)))");
+    EXPECT_EQ(printed("a.b + c"), "(BinOp + (Attribute (Name a) b) (Name c))");
+    EXPECT_EQ(printed("f(x) ** 2"),
+              "(BinOp ** (Call (Name f) (Name x)) (Constant 2))");
+}
+
+TEST(ExpressionParser, SoftKeywordsWorkAsNamesUnderTrailersToo) {
+    // The shapes that would break if `match` or `case` were ever reserved at
+    // the token level rather than at statement level.
+    EXPECT_EQ(printed("match(x)"), "(Call (Name match) (Name x))");
+    EXPECT_EQ(printed("case.value"), "(Attribute (Name case) value)");
+    EXPECT_EQ(printed("_[0]"), "(Subscript (Name _) (Constant 0))");
+}
+
+TEST(ExpressionParser, ArgumentsAreFullExpressions) {
+    EXPECT_EQ(printed("f(a + b, c or d)"),
+              "(Call (Name f) (BinOp + (Name a) (Name b)) (BoolOp or (Name c) (Name d)))");
+}
+
+TEST(ExpressionParser, BuiltinTypeNamesInAnnotationPositionAlsoBecomeNames) {
+    // The scanner spells `int` as TYPE_INT only in annotation position, which
+    // needs a statement the expression parser cannot consume. Parsing from
+    // the token after the ':' proves both spellings reach the same node.
+    // Tokens: x(0) :(1) list(2) [(3) int(4) ](5) =(6) [(7) ](8)
+    const test_support::ParseResult result = test_support::parse_from("x: list[int] = []", 2);
+    ASSERT_TRUE(result.succeeded());
+    EXPECT_EQ(result.printed(), "(Subscript (Name list) (Name int))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

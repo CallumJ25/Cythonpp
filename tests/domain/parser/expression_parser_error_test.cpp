@@ -126,5 +126,58 @@ TEST(ExpressionParserError, AParenthesisedAssignmentExpressionIsRejected) {
     expect_error("(n := 1)", "assignment expressions are not supported", 1, 4);
 }
 
+TEST(ExpressionParserError, SlicesAreRejected) {
+    expect_error("items[1:2]", "slices are not supported", 1, 8);
+    expect_error("items[:2]", "slices are not supported", 1, 7);
+    expect_error("items[1:]", "slices are not supported", 1, 8);
+}
+
+TEST(ExpressionParserError, KeywordArgumentsAreRejected) {
+    expect_error("f(k=1)", "keyword arguments are not supported", 1, 4);
+}
+
+TEST(ExpressionParserError, GeneratorExpressionsAreRejected) {
+    expect_error("f(x for x in y)", "generator expressions are not supported", 1, 5);
+}
+
+TEST(ExpressionParserError, StarredArgumentsAreRejected) {
+    expect_error("f(*a)", "starred expressions are not supported", 1, 3);
+    expect_error("f(**a)", "starred expressions are not supported", 1, 3);
+}
+
+TEST(ExpressionParserError, AMissingAttributeNameIsReported) {
+    // The brief's literal fixture is "a.1", but the lexer's scan_number rule
+    // (lexer.cpp:158, `c == '.' && is_digit(peek(1))`) folds a dot directly
+    // followed by a digit into a float literal -- confirmed by dumping the
+    // token stream for "a.1": IDENTIFIER "a", LITERAL_FLOAT ".1", with no DOT
+    // token at all. parse_postfix's loop then never sees a DOT, so the whole
+    // expression parses as bare `a` with a dangling ".1" left unconsumed,
+    // and this test never reaches parse_attribute's error branch. "a.+"
+    // reproduces the same shape (DOT immediately followed by a non-identifier
+    // token) without tripping the number scanner, landing on the same column.
+    expect_error("a.+", "expected an attribute name after '.'", 1, 3);
+}
+
+TEST(ExpressionParserError, AnUnclosedBracketIsReportedAgainstItsOpener) {
+    expect_error("items[0", "'[' was never closed", 1, 6);
+    expect_error("f(a", "'(' was never closed", 1, 2);
+}
+
+TEST(ExpressionParserError, NestedUnclosedBracketsNameTheInnermostOpener) {
+    // CPython reports the innermost too, and it is the one the local in the
+    // innermost production naturally holds.
+    //
+    // The brief's literal fixture is "f(a, [b, c", with '[' opening a list
+    // literal as the second call argument. But list-literal atoms are not
+    // parsed until Task 11's parse_bracket_atom (see progress.md); at this
+    // task's state parse_atom has no case for OPEN_BRACKET, so that '[' is
+    // rejected with "expected an expression" before ever reaching a bracket
+    // rule at all -- confirmed by running the literal fixture. "f(a, b[c, d"
+    // nests the same way through a subscript trailer on `b` instead, which
+    // *is* implemented this task, and still exercises an inner '[' left
+    // unclosed while the outer '(' is also still open, at column 7.
+    expect_error("f(a, b[c, d", "'[' was never closed", 1, 7);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

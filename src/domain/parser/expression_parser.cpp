@@ -5,11 +5,14 @@
 #include <utility>
 #include <vector>
 
+#include "domain/ast/attribute.h"
 #include "domain/ast/bin_op.h"
 #include "domain/ast/bool_op.h"
+#include "domain/ast/call.h"
 #include "domain/ast/compare.h"
 #include "domain/ast/constant.h"
 #include "domain/ast/name.h"
+#include "domain/ast/subscript.h"
 #include "domain/ast/tuple_expr.h"
 #include "domain/ast/unary_op.h"
 #include "domain/lexer/operator_table.h"
@@ -252,9 +255,7 @@ ast::ExprPtr ExpressionParser::parse_unary() {
 }
 
 ast::ExprPtr ExpressionParser::parse_power() {
-    // Becomes parse_postfix() at Task 10, which inserts trailers between the
-    // atom and the exponent.
-    ast::ExprPtr base = parse_atom();
+    ast::ExprPtr base = parse_postfix();
     if (base == nullptr) {
         return nullptr;
     }
@@ -268,6 +269,97 @@ ast::ExprPtr ExpressionParser::parse_power() {
     const ast::SourceSpan span = ast::merge(base->span(), exponent->span());
     return std::make_unique<ast::BinOp>(span, token_type::OP_DOUBLE_STAR, std::move(base),
                                         std::move(exponent));
+}
+
+ast::ExprPtr ExpressionParser::parse_postfix() {
+    ast::ExprPtr value = parse_atom();
+    if (value == nullptr) {
+        return nullptr;
+    }
+    while (true) {
+        if (tokens_.check(token_type::DOT)) {
+            value = parse_attribute(std::move(value));
+        } else if (tokens_.check(token_type::OPEN_BRACKET)) {
+            value = parse_subscript(std::move(value));
+        } else if (tokens_.check(token_type::OPEN_PAREN)) {
+            value = parse_call(std::move(value));
+        } else {
+            return value;
+        }
+        if (value == nullptr) {
+            return nullptr;
+        }
+    }
+}
+
+ast::ExprPtr ExpressionParser::parse_attribute(ast::ExprPtr value) {
+    tokens_.advance(); // '.'
+    if (!lexer::has_category(tokens_.peek().type(), lexer::token_category::IDENTIFIER)) {
+        return error(tokens_.peek(), "expected an attribute name after '.'");
+    }
+    const lexer::Token& name = tokens_.advance();
+    const ast::SourceSpan span = ast::merge(value->span(), ast::span_of(name));
+    return std::make_unique<ast::Attribute>(span, std::move(value), name.lexeme());
+}
+
+ast::ExprPtr ExpressionParser::parse_subscript(ast::ExprPtr value) {
+    const lexer::Token& opener = tokens_.advance(); // '['
+
+    // Subscript holds one index Expr and there is no Slice node, so a colon
+    // here or after the index is the construct, not a typo.
+    if (tokens_.check(token_type::COLON)) {
+        return error(tokens_.peek(), "slices are not supported");
+    }
+    ast::ExprPtr index = parse_expression_list();
+    if (index == nullptr) {
+        return nullptr;
+    }
+    if (tokens_.check(token_type::COLON)) {
+        return error(tokens_.peek(), "slices are not supported");
+    }
+    if (!tokens_.check(token_type::CLOSE_BRACKET)) {
+        return unclosed(opener);
+    }
+    const lexer::Token& closer = tokens_.advance();
+    const ast::SourceSpan span = ast::merge(value->span(), ast::span_of(closer));
+    return std::make_unique<ast::Subscript>(span, std::move(value), std::move(index));
+}
+
+ast::ExprPtr ExpressionParser::parse_call(ast::ExprPtr callee) {
+    const lexer::Token& opener = tokens_.advance(); // '('
+
+    std::vector<ast::ExprPtr> args;
+    if (!tokens_.check(token_type::CLOSE_PAREN)) {
+        while (true) {
+            ast::ExprPtr arg = parse_expression();
+            if (arg == nullptr) {
+                return nullptr;
+            }
+            // Call holds positional arguments only. Both of these are caught
+            // after the argument parses, because `k` and `x` are ordinary
+            // expressions until the token that follows them says otherwise.
+            if (tokens_.check(token_type::OP_ASSIGN)) {
+                return error(tokens_.peek(), "keyword arguments are not supported");
+            }
+            if (tokens_.check(token_type::KEYWORD_FOR)) {
+                return error(tokens_.peek(), "generator expressions are not supported");
+            }
+            args.push_back(std::move(arg));
+            if (!tokens_.match(token_type::COMMA)) {
+                break;
+            }
+            if (tokens_.check(token_type::CLOSE_PAREN)) {
+                break; // trailing comma
+            }
+        }
+    }
+
+    if (!tokens_.check(token_type::CLOSE_PAREN)) {
+        return unclosed(opener);
+    }
+    const lexer::Token& closer = tokens_.advance();
+    const ast::SourceSpan span = ast::merge(callee->span(), ast::span_of(closer));
+    return std::make_unique<ast::Call>(span, std::move(callee), std::move(args));
 }
 
 ast::ExprPtr ExpressionParser::parse_atom() {
