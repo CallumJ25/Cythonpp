@@ -211,5 +211,21 @@ TEST(ExpressionParserError, AnUnclosedBraceIsReportedAgainstItsOpener) {
     expect_error("{'a': 1,", "'{' was never closed", 1, 1);
 }
 
+TEST(ExpressionParserError, NestedUnclosedSubscriptNamesTheInnermostOpener) {
+    // The subscript-trailer spelling of nesting. Task 10 used this fixture as
+    // a stand-in while '[' was not yet an atom; Task 11's list-literal version
+    // then took over the original test name, so this path lost its coverage to
+    // a rename. Restored under a distinct name -- it exercises
+    // parse_subscript's unclosed path, not parse_bracket_atom's.
+    expect_error("f(a, b[c, d", "'[' was never closed", 1, 7);
+}
+
+TEST(ExpressionParserError, AnEmptyTupleIsNotAnAssignableTarget) {
+    // is_assignable rejects an empty TupleExpr explicitly; without that check
+    // `for () in y` would be accepted as a valid target. The branch existed
+    // from Task 11 but nothing exercised it.
+    expect_error("[x for () in y]", "cannot assign to this expression", 1, 8);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

@@ -363,5 +363,75 @@ TEST(ExpressionParser, DictKeysAndValuesAreFullExpressions) {
               "(DictExpr ((BinOp + (Name a) (Constant 1)) (Call (Name f) (Name b))))");
 }
 
+// Columns are 1-based and ends are half-open -- one past the last character.
+// `a + b` is columns 1..6, `a` alone is 1..2.
+TEST(ExpressionParser, BinOpSpansFromOperandToOperand) {
+    const test_support::ParseResult result = parse("a + b");
+    ASSERT_TRUE(result.succeeded());
+    EXPECT_EQ(result.span(), (ast::SourceSpan{1, 1, 1, 6}));
+}
+
+TEST(ExpressionParser, UnaryOpSpansFromOperatorToOperand) {
+    const test_support::ParseResult result = parse("-x");
+    ASSERT_TRUE(result.succeeded());
+    EXPECT_EQ(result.span(), (ast::SourceSpan{1, 1, 1, 3}));
+}
+
+TEST(ExpressionParser, CallSpansFromCalleeToClosingParen) {
+    const test_support::ParseResult result = parse("f(x)");
+    ASSERT_TRUE(result.succeeded());
+    EXPECT_EQ(result.span(), (ast::SourceSpan{1, 1, 1, 5}));
+}
+
+TEST(ExpressionParser, SubscriptSpansFromValueToClosingBracket) {
+    const test_support::ParseResult result = parse("items[0]");
+    ASSERT_TRUE(result.succeeded());
+    EXPECT_EQ(result.span(), (ast::SourceSpan{1, 1, 1, 9}));
+}
+
+TEST(ExpressionParser, DisplaysSpanTheirBrackets) {
+    const test_support::ParseResult list = parse("[1, 2]");
+    ASSERT_TRUE(list.succeeded());
+    EXPECT_EQ(list.span(), (ast::SourceSpan{1, 1, 1, 7}));
+
+    const test_support::ParseResult dict = parse("{'a': 1}");
+    ASSERT_TRUE(dict.succeeded());
+    EXPECT_EQ(dict.span(), (ast::SourceSpan{1, 1, 1, 9}));
+}
+
+TEST(ExpressionParser, CompareSpansTheWholeChain) {
+    const test_support::ParseResult result = parse("a < b <= c");
+    ASSERT_TRUE(result.succeeded());
+    EXPECT_EQ(result.span(), (ast::SourceSpan{1, 1, 1, 11}));
+}
+
+TEST(ExpressionParser, ACommentInsideBracketsIsInvisibleToTheParser) {
+    // The lexer suppresses the newline inside brackets but keeps the comment
+    // token, so this is the case TokenStream's cursor normalisation exists
+    // for. Payoff asserted here rather than only at the cursor level.
+    EXPECT_EQ(printed("f(a,  # note\n    b)"), "(Call (Name f) (Name a) (Name b))");
+}
+
+TEST(ExpressionParser, ALineContinuationIsInvisibleToTheParser) {
+    EXPECT_EQ(printed("a + \\\n    b"), "(BinOp + (Name a) (Name b))");
+}
+
+TEST(ExpressionParser, NonAsciiStringContentRoundTrips) {
+    // Lexemes are raw source bytes while columns count UTF-8 characters, so
+    // this checks Constant carried the bytes through untouched.
+    EXPECT_EQ(printed("'caf\xc3\xa9'"), "(Constant 'caf\xc3\xa9')");
+}
+
+TEST(ExpressionParser, ADeeplyMixedExpression) {
+    EXPECT_EQ(printed("not a.b[0] + 1 < f(c) and d or e"),
+              "(BoolOp or"
+              " (BoolOp and"
+              " (UnaryOp not"
+              " (Compare (BinOp + (Subscript (Attribute (Name a) b) (Constant 0)) (Constant 1))"
+              " < (Call (Name f) (Name c))))"
+              " (Name d))"
+              " (Name e))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser
