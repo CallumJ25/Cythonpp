@@ -67,8 +67,17 @@ private:
     // trailing `;`, ending at NEWLINE. Python's grammar makes semicolons and
     // one-line suites the same production, so this serves both.
     //
-    // Returns false if any statement on the line failed. The ones that
-    // parsed before the failure are still appended to `into`.
+    // Appends to `into` as it parses, so `into` is not left untouched on
+    // failure -- callers cannot treat it as write-only-on-success. Returns
+    // false if any statement on the line failed.
+    //
+    // A failed logical line is dropped as a whole, not just its offending
+    // tail: in `pass pass`, the leading `pass` is part of the same bad line
+    // and is not a separate, salvageable statement. Every caller must
+    // therefore pass a scratch vector as `into` and splice it into the real
+    // accumulator only when this function returns true; passing the real
+    // accumulator directly would leak the partial line's statements back in
+    // on failure.
     bool parse_simple_statement_line(std::vector<ast::StmtPtr>& into);
 
     // One simple statement -- no suite of its own. Null on failure.
