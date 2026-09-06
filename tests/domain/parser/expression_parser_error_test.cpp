@@ -47,5 +47,13 @@ TEST(ExpressionParserError, AFailedParseReportsExactlyOneDiagnostic) {
     EXPECT_EQ(result.diagnostics.size(), 1u);
 }
 
+TEST(ExpressionParserError, AMissingOperandAfterAPrefixOperatorIsReported) {
+    expect_error("-", "expected an expression", 1, 2);
+}
+
+TEST(ExpressionParserError, AMissingExponentIsReported) {
+    expect_error("2 **", "expected an expression", 1, 5);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

@@ -3,8 +3,10 @@
 #include <memory>
 #include <utility>
 
+#include "domain/ast/bin_op.h"
 #include "domain/ast/constant.h"
 #include "domain/ast/name.h"
+#include "domain/ast/unary_op.h"
 #include "domain/lexer/token_category.h"
 #include "domain/lexer/token_type.h"
 
@@ -23,13 +25,47 @@ bool is_string_literal(token_type type) {
 ExpressionParser::ExpressionParser(lexer::TokenStream& tokens, diagnostics::DiagnosticSink& sink)
     : tokens_(tokens), sink_(sink) {}
 
-ast::ExprPtr ExpressionParser::parse_expression() { return parse_atom(); }
+ast::ExprPtr ExpressionParser::parse_expression() { return parse_unary(); }
 
 // Filled in at Task 9.
 ast::ExprPtr ExpressionParser::parse_expression_list() { return parse_expression(); }
 
 // Filled in at Task 11.
 ast::ExprPtr ExpressionParser::parse_target() { return parse_atom(); }
+
+ast::ExprPtr ExpressionParser::parse_unary() {
+    const token_type type = tokens_.peek().type();
+    if (type == token_type::OP_PLUS || type == token_type::OP_MINUS ||
+        type == token_type::OP_TILDE) {
+        const lexer::Token& op = tokens_.advance();
+        ast::ExprPtr operand = parse_unary();
+        if (operand == nullptr) {
+            return nullptr;
+        }
+        const ast::SourceSpan span = ast::merge(ast::span_of(op), operand->span());
+        return std::make_unique<ast::UnaryOp>(span, type, std::move(operand));
+    }
+    return parse_power();
+}
+
+ast::ExprPtr ExpressionParser::parse_power() {
+    // Becomes parse_postfix() at Task 10, which inserts trailers between the
+    // atom and the exponent.
+    ast::ExprPtr base = parse_atom();
+    if (base == nullptr) {
+        return nullptr;
+    }
+    if (!tokens_.match(token_type::OP_DOUBLE_STAR)) {
+        return base;
+    }
+    ast::ExprPtr exponent = parse_unary();
+    if (exponent == nullptr) {
+        return nullptr;
+    }
+    const ast::SourceSpan span = ast::merge(base->span(), exponent->span());
+    return std::make_unique<ast::BinOp>(span, token_type::OP_DOUBLE_STAR, std::move(base),
+                                        std::move(exponent));
+}
 
 ast::ExprPtr ExpressionParser::parse_atom() {
     const lexer::Token& token = tokens_.peek();

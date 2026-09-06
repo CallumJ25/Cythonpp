@@ -51,6 +51,16 @@ public:
     ast::ExprPtr parse_target();
 
 private:
+    // Prefix '+', '-' and '~'. Recurses into itself so `- -x` nests.
+    ast::ExprPtr parse_unary();
+
+    // '**', right-associative. Its right operand goes through parse_unary(),
+    // which is what makes `2 ** -1` legal, while its left operand is reached
+    // only from parse_unary()'s fall-through, which is what makes `-2 ** 2`
+    // group as `-(2 ** 2)`. An associativity flag in the precedence table
+    // cannot express that asymmetry, which is why '**' is not in the table.
+    ast::ExprPtr parse_power();
+
     ast::ExprPtr parse_atom();
 
     // Reports one SyntaxError and returns nullptr, so a failing rule reads as

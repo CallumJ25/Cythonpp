@@ -66,5 +66,29 @@ TEST(ExpressionParser, BuiltinTypeNamesOutsideAnnotationsAreNames) {
     EXPECT_EQ(printed("str"), "(Name str)");
 }
 
+TEST(ExpressionParser, PrefixOperatorsBuildUnaryOps) {
+    EXPECT_EQ(printed("-x"), "(UnaryOp - (Name x))");
+    EXPECT_EQ(printed("+x"), "(UnaryOp + (Name x))");
+    EXPECT_EQ(printed("~mask"), "(UnaryOp ~ (Name mask))");
+}
+
+TEST(ExpressionParser, PrefixOperatorsNest) {
+    EXPECT_EQ(printed("- -x"), "(UnaryOp - (UnaryOp - (Name x)))");
+}
+
+TEST(ExpressionParser, PowerIsRightAssociative) {
+    EXPECT_EQ(printed("2 ** 3 ** 2"),
+              "(BinOp ** (Constant 2) (BinOp ** (Constant 3) (Constant 2)))");
+}
+
+TEST(ExpressionParser, PowerBindsTighterThanUnaryOnItsLeft) {
+    // -2**2 is -4 in Python, not 4.
+    EXPECT_EQ(printed("-2 ** 2"), "(UnaryOp - (BinOp ** (Constant 2) (Constant 2)))");
+}
+
+TEST(ExpressionParser, PowerAllowsAUnaryOperatorOnItsRight) {
+    EXPECT_EQ(printed("2 ** -1"), "(BinOp ** (Constant 2) (UnaryOp - (Constant 1)))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser
