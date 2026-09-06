@@ -51,6 +51,11 @@ public:
     ast::ExprPtr parse_target();
 
 private:
+    // `or` and `and` runs. Each builds one flattened BoolOp rather than
+    // nested pairs.
+    ast::ExprPtr parse_or_test();
+    ast::ExprPtr parse_and_test();
+
     // Prefix `not`. A level of its own, between and_test and comparison,
     // because `not a == b` means `not (a == b)`.
     ast::ExprPtr parse_not_test();

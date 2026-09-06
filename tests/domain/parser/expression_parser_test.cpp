@@ -172,5 +172,26 @@ TEST(ExpressionParser, NotNests) {
     EXPECT_EQ(printed("not not a"), "(UnaryOp not (UnaryOp not (Name a)))");
 }
 
+TEST(ExpressionParser, ARunOfAndIsOneFlattenedNode) {
+    // One node rather than nested pairs, because `a and b and c` short-
+    // circuits as a single left-to-right sequence and codegen wants that.
+    EXPECT_EQ(printed("a and b and c"), "(BoolOp and (Name a) (Name b) (Name c))");
+    EXPECT_EQ(printed("a or b or c"), "(BoolOp or (Name a) (Name b) (Name c))");
+}
+
+TEST(ExpressionParser, AndBindsTighterThanOr) {
+    EXPECT_EQ(printed("a or b and c"), "(BoolOp or (Name a) (BoolOp and (Name b) (Name c)))");
+    EXPECT_EQ(printed("a and b or c"), "(BoolOp or (BoolOp and (Name a) (Name b)) (Name c))");
+}
+
+TEST(ExpressionParser, NotBindsTighterThanAnd) {
+    EXPECT_EQ(printed("not a and b"), "(BoolOp and (UnaryOp not (Name a)) (Name b))");
+}
+
+TEST(ExpressionParser, BooleanOperatorsBindLooserThanComparison) {
+    EXPECT_EQ(printed("a < b and c"),
+              "(BoolOp and (Compare (Name a) < (Name b)) (Name c))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

@@ -67,5 +67,36 @@ TEST(ExpressionParserError, AMissingComparisonOperandIsReported) {
     expect_error("a <", "expected an expression", 1, 4);
 }
 
+TEST(ExpressionParserError, ConditionalExpressionsAreRejected) {
+    // There is no IfExp node. Rejected in parse_expression rather than in an
+    // atom rule, because a comprehension's own `if` is parsed by
+    // parse_or_test and never reaches this check.
+    expect_error("a if c else b", "conditional expressions are not supported", 1, 3);
+}
+
+TEST(ExpressionParserError, AMissingOperandAfterAndIsReported) {
+    expect_error("a and", "expected an expression", 1, 6);
+}
+
+TEST(ExpressionParserError, AssignmentExpressionsAreRejectedAfterTheirTarget) {
+    // `n` fills the operand slot, so ':=' is never seen at atom position.
+    // Without this check the enclosing paren rule reports "'(' was never
+    // closed", which points at the wrong thing entirely.
+    //
+    // The brief's parenthesized case, `(n := 1)`, is deferred: parens are
+    // not parsed until Task 9's parse_paren_atom exists. Until then `(`
+    // itself fails in parse_atom with "expected an expression" at column 1,
+    // before this check ever runs -- confirmed by running this test with
+    // that line included, which fails exactly that way. Re-add
+    // `expect_error("(n := 1)", "assignment expressions are not supported",
+    // 1, 4);` once Task 9 lands.
+    expect_error("n := 1", "assignment expressions are not supported", 1, 3);
+}
+
+TEST(ExpressionParserError, AWalrusInOperandPositionIsAlsoRejected) {
+    // The atom-rule branch, reached only when ':=' starts an operand.
+    expect_error(":= 1", "assignment expressions are not supported", 1, 1);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

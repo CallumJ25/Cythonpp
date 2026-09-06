@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "domain/ast/bin_op.h"
+#include "domain/ast/bool_op.h"
 #include "domain/ast/compare.h"
 #include "domain/ast/constant.h"
 #include "domain/ast/name.h"
@@ -46,13 +47,74 @@ bool is_simple_comparison(token_type type) {
 ExpressionParser::ExpressionParser(lexer::TokenStream& tokens, diagnostics::DiagnosticSink& sink)
     : tokens_(tokens), sink_(sink) {}
 
-ast::ExprPtr ExpressionParser::parse_expression() { return parse_not_test(); }
+ast::ExprPtr ExpressionParser::parse_expression() {
+    ast::ExprPtr value = parse_or_test();
+    if (value == nullptr) {
+        return nullptr;
+    }
+    // `x if c else y` needs an IfExp node the AST deliberately does not have.
+    // Checked here rather than deeper down so a comprehension's own `if`,
+    // which is parsed by parse_or_test, is unaffected.
+    if (tokens_.check(token_type::KEYWORD_IF)) {
+        return error(tokens_.peek(), "conditional expressions are not supported");
+    }
+    // Same shape, same reason. parse_atom rejects a ':=' that *starts* an
+    // operand, but in `n := 1` the target fills the operand slot first, so
+    // that branch never sees it -- and the enclosing bracket rule would
+    // otherwise report "never closed" and point at the wrong thing.
+    if (tokens_.check(token_type::OP_WALRUS)) {
+        return error(tokens_.peek(), "assignment expressions are not supported");
+    }
+    return value;
+}
 
 // Filled in at Task 9.
 ast::ExprPtr ExpressionParser::parse_expression_list() { return parse_expression(); }
 
 // Filled in at Task 11.
 ast::ExprPtr ExpressionParser::parse_target() { return parse_atom(); }
+
+ast::ExprPtr ExpressionParser::parse_or_test() {
+    ast::ExprPtr first = parse_and_test();
+    if (first == nullptr) {
+        return nullptr;
+    }
+    if (!tokens_.check(token_type::OP_OR)) {
+        return first;
+    }
+    std::vector<ast::ExprPtr> values;
+    values.push_back(std::move(first));
+    while (tokens_.match(token_type::OP_OR)) {
+        ast::ExprPtr next = parse_and_test();
+        if (next == nullptr) {
+            return nullptr;
+        }
+        values.push_back(std::move(next));
+    }
+    const ast::SourceSpan span = ast::merge(values.front()->span(), values.back()->span());
+    return std::make_unique<ast::BoolOp>(span, token_type::OP_OR, std::move(values));
+}
+
+ast::ExprPtr ExpressionParser::parse_and_test() {
+    ast::ExprPtr first = parse_not_test();
+    if (first == nullptr) {
+        return nullptr;
+    }
+    if (!tokens_.check(token_type::OP_AND)) {
+        return first;
+    }
+    std::vector<ast::ExprPtr> values;
+    values.push_back(std::move(first));
+    while (tokens_.match(token_type::OP_AND)) {
+        ast::ExprPtr next = parse_not_test();
+        if (next == nullptr) {
+            return nullptr;
+        }
+        values.push_back(std::move(next));
+    }
+    const ast::SourceSpan span = ast::merge(values.front()->span(), values.back()->span());
+    return std::make_unique<ast::BoolOp>(span, token_type::OP_AND, std::move(values));
+}
 
 ast::ExprPtr ExpressionParser::parse_not_test() {
     // Prefix position only. In `a not in b` the `not` arrives after an
