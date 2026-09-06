@@ -169,5 +169,24 @@ TEST(StatementParserError, AForTargetThatCannotBeAssignedIsReported) {
     expect_error("for f() in items:\n    pass\n", "cannot assign to function call", 1, 5);
 }
 
+TEST(StatementParserError, ADefWithNoNameIsReported) {
+    expect_error("def ():\n    pass\n", "expected a function name", 1, 5);
+}
+
+TEST(StatementParserError, ADefWithNoParenthesesIsReported) {
+    expect_error("def f:\n    pass\n", "expected '(' after the function name", 1, 6);
+}
+
+TEST(StatementParserError, AnUnclosedParameterListIsReportedAgainstItsOpener) {
+    // The lexer emits a NEWLINE at EOF even inside an unclosed bracket
+    // (lexer.cpp:544), so there is no NEWLINE-free run to detect -- the close
+    // must be checked explicitly rather than inferred from a missing newline.
+    expect_error("def f(a\n", "expected ')' to close the parameter list", 1, 6);
+}
+
+TEST(StatementParserError, AStarredParameterIsReported) {
+    expect_error("def f(*args):\n    pass\n", "expected a parameter name", 1, 7);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

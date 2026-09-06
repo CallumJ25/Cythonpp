@@ -4,6 +4,7 @@
 #include "domain/ast/constant.h"
 #include "domain/ast/expr_stmt.h"
 #include "domain/ast/for.h"
+#include "domain/ast/function_def.h"
 #include "domain/ast/name.h"
 #include "domain/ast/return.h"
 #include "domain/lexer/token_type.h"
@@ -277,6 +278,81 @@ TEST(StatementParser, AForTargetIsNotSwallowedAsAComparison) {
 TEST(StatementParser, ParsesALoopBodyWithSeveralStatements) {
     EXPECT_EQ(printed("while x:\n    a = 1\n    break\n"),
               "(Module\n  (While (Name x)\n    (Assign (Name a) (Constant 1))\n    (Break)))");
+}
+
+TEST(StatementParser, ParsesADefWithNoParameters) {
+    EXPECT_EQ(printed("def f():\n    pass\n"),
+              "(Module\n  (FunctionDef f\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesADefWithOneParameter) {
+    EXPECT_EQ(printed("def f(a):\n    pass\n"),
+              "(Module\n  (FunctionDef f (Params (Parameter a))\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesADefWithSeveralParameters) {
+    // AstPrinter's (Parameter ...) sequence has only ever been exercised at
+    // n=1; this is the first time anything builds it at n>1.
+    EXPECT_EQ(printed("def f(a, b, c):\n    pass\n"),
+              "(Module\n  (FunctionDef f (Params (Parameter a) (Parameter b) (Parameter c))\n"
+              "    (Pass)))");
+}
+
+TEST(StatementParser, ParsesAnnotatedParameters) {
+    EXPECT_EQ(printed("def f(a: int, b: str):\n    pass\n"),
+              "(Module\n  (FunctionDef f (Params (Parameter a (Name int))"
+              " (Parameter b (Name str)))\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesDefaultedParameters) {
+    EXPECT_EQ(printed("def f(a=1, b=2):\n    pass\n"),
+              "(Module\n  (FunctionDef f (Params (Parameter a (Default (Constant 1)))"
+              " (Parameter b (Default (Constant 2))))\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesAnnotatedAndDefaultedParameters) {
+    EXPECT_EQ(printed("def f(a: int = 1):\n    pass\n"),
+              "(Module\n  (FunctionDef f (Params (Parameter a (Name int) (Default (Constant 1))))"
+              "\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesAReturnAnnotation) {
+    EXPECT_EQ(printed("def f() -> int:\n    pass\n"),
+              "(Module\n  (FunctionDef f (Returns (Name int))\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesADefWithEverything) {
+    EXPECT_EQ(printed("def add(a: int, b: int = 0) -> int:\n    return a + b\n"),
+              "(Module\n  (FunctionDef add (Params (Parameter a (Name int))"
+              " (Parameter b (Name int) (Default (Constant 0)))) (Returns (Name int))\n"
+              "    (Return (BinOp + (Name a) (Name b)))))");
+}
+
+TEST(StatementParser, ParsesADefWithAOneLineBody) {
+    EXPECT_EQ(printed("def f(): pass\n"), "(Module\n  (FunctionDef f\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesATrailingCommaInAParameterList) {
+    EXPECT_EQ(printed("def f(a, b,):\n    pass\n"),
+              "(Module\n  (FunctionDef f (Params (Parameter a) (Parameter b))\n    (Pass)))");
+}
+
+TEST(StatementParser, ADefWithNoReturnAnnotationSaysSo) {
+    const statement_test_support::ModuleResult result = parse_module("def f():\n    pass\n");
+    ASSERT_NE(result.module, nullptr);
+    ASSERT_EQ(result.module->body().size(), 1u);
+    const auto* function =
+        dynamic_cast<const ast::FunctionDef*>(result.module->body().front().get());
+    ASSERT_NE(function, nullptr);
+    // return_annotation() dereferences unconditionally; has_return_annotation
+    // is the only supported way to ask.
+    EXPECT_FALSE(function->has_return_annotation());
+    EXPECT_TRUE(function->params().empty());
+}
+
+TEST(StatementParser, ParsesNestedDefs) {
+    EXPECT_EQ(printed("def outer():\n    def inner():\n        pass\n"),
+              "(Module\n  (FunctionDef outer\n    (FunctionDef inner\n      (Pass))))");
 }
 
 } // namespace

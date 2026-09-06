@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <utility>
 
+#include <string>
+
 #include "assignability.h"
 #include "domain/ast/ann_assign.h"
 #include "domain/ast/assign.h"
@@ -10,12 +12,14 @@
 #include "domain/ast/continue.h"
 #include "domain/ast/expr_stmt.h"
 #include "domain/ast/for.h"
+#include "domain/ast/function_def.h"
 #include "domain/ast/if.h"
 #include "domain/ast/pass.h"
 #include "domain/ast/return.h"
 #include "domain/ast/source_span.h"
 #include "domain/ast/tuple_expr.h"
 #include "domain/ast/while.h"
+#include "domain/lexer/token_category.h"
 #include "domain/lexer/token_type.h"
 
 namespace cythonpp::domain::parser {
@@ -35,7 +39,7 @@ bool ends_a_statement(token_type type) {
 // can share a logical line with a semicolon.
 bool is_compound_keyword(token_type type) {
     return type == token_type::KEYWORD_IF || type == token_type::KEYWORD_WHILE ||
-           type == token_type::KEYWORD_FOR;
+           type == token_type::KEYWORD_FOR || type == token_type::KEYWORD_DEF;
 }
 
 // The thirteen augmented-assignment operators. Each is a diagnostic rather
@@ -188,6 +192,7 @@ ast::StmtPtr StatementParser::parse_statement() {
         case token_type::KEYWORD_IF:    return parse_if();
         case token_type::KEYWORD_WHILE: return parse_while();
         case token_type::KEYWORD_FOR:   return parse_for();
+        case token_type::KEYWORD_DEF:   return parse_function_def();
         default:                        break;
     }
     // Only reachable if is_compound_keyword and this switch disagree.
@@ -538,6 +543,112 @@ ast::StmtPtr StatementParser::parse_for() {
     const ast::SourceSpan span = ast::merge(keyword_span, end);
     return std::make_unique<ast::For>(span, std::move(target), std::move(iterable),
                                       std::move(body), std::move(orelse));
+}
+
+ast::StmtPtr StatementParser::parse_function_def() {
+    const ast::SourceSpan keyword_span = ast::span_of(tokens_.peek());
+    tokens_.advance(); // 'def'
+
+    const lexer::Token& name_token = tokens_.peek();
+    if (!lexer::has_category(name_token.type(), lexer::token_category::IDENTIFIER)) {
+        return error(name_token, "expected a function name");
+    }
+    std::string name = name_token.lexeme();
+    tokens_.advance();
+
+    std::vector<ast::Parameter> params;
+    if (!parse_parameters(params)) {
+        return nullptr; // already reported
+    }
+
+    ast::ExprPtr return_annotation;
+    if (tokens_.match(token_type::OP_ARROW)) {
+        return_annotation = expressions_.parse_expression();
+        if (return_annotation == nullptr) {
+            return nullptr;
+        }
+    }
+
+    std::vector<ast::StmtPtr> body = parse_suite();
+    if (body.empty()) {
+        return nullptr;
+    }
+
+    // Bound before the moves below: argument evaluation order is unspecified.
+    const ast::SourceSpan span = ast::merge(keyword_span, body.back()->span());
+    return std::make_unique<ast::FunctionDef>(span, std::move(name), std::move(params),
+                                              std::move(return_annotation), std::move(body));
+}
+
+bool StatementParser::parse_parameters(std::vector<ast::Parameter>& into) {
+    const lexer::Token& opener = tokens_.peek();
+    // The opener is held in a local rather than on a delimiter stack: the C++
+    // call stack already is one, and an explicit copy would need a push/pop
+    // matched across every early return. Same convention as ExpressionParser.
+    const ast::SourceSpan opener_span = ast::span_of(opener);
+    if (!tokens_.match(token_type::OPEN_PAREN)) {
+        error(opener, "expected '(' after the function name");
+        return false;
+    }
+
+    if (tokens_.match(token_type::CLOSE_PAREN)) {
+        return true;
+    }
+
+    while (true) {
+        const lexer::Token& name_token = tokens_.peek();
+        if (!lexer::has_category(name_token.type(), lexer::token_category::IDENTIFIER)) {
+            error(name_token, "expected a parameter name");
+            return false;
+        }
+        const ast::SourceSpan name_span = ast::span_of(name_token);
+        std::string name = name_token.lexeme();
+        tokens_.advance();
+
+        ast::ExprPtr annotation;
+        if (tokens_.match(token_type::COLON)) {
+            annotation = expressions_.parse_expression();
+            if (annotation == nullptr) {
+                return false;
+            }
+        }
+
+        ast::ExprPtr default_value;
+        if (tokens_.match(token_type::OP_ASSIGN)) {
+            default_value = expressions_.parse_expression();
+            if (default_value == nullptr) {
+                return false;
+            }
+        }
+
+        // Widest end available, read before either pointer moves.
+        ast::SourceSpan end = name_span;
+        if (annotation != nullptr) {
+            end = annotation->span();
+        }
+        if (default_value != nullptr) {
+            end = default_value->span();
+        }
+        const ast::SourceSpan span = ast::merge(name_span, end);
+        into.emplace_back(span, std::move(name), std::move(annotation), std::move(default_value));
+
+        if (tokens_.match(token_type::COMMA)) {
+            if (tokens_.check(token_type::CLOSE_PAREN)) {
+                break; // trailing comma
+            }
+            continue;
+        }
+        break;
+    }
+
+    if (!tokens_.match(token_type::CLOSE_PAREN)) {
+        // Reported against the opener, not the current token: the lexer emits
+        // a NEWLINE at EOF even inside an unclosed bracket, so wherever the
+        // cursor has reached says nothing useful about where the mistake is.
+        error_at(opener_span, "expected ')' to close the parameter list");
+        return false;
+    }
+    return true;
 }
 
 ast::StmtPtr StatementParser::error(const lexer::Token& token, std::string message) {
