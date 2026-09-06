@@ -6,6 +6,7 @@
 #include "domain/ast/break.h"
 #include "domain/ast/continue.h"
 #include "domain/ast/pass.h"
+#include "domain/ast/return.h"
 #include "domain/ast/source_span.h"
 #include "domain/lexer/token_type.h"
 
@@ -174,10 +175,34 @@ ast::StmtPtr StatementParser::parse_simple_statement() {
         case token_type::KEYWORD_CONTINUE:
             tokens_.advance();
             return std::make_unique<ast::Continue>(ast::span_of(first));
+        case token_type::KEYWORD_RETURN:
+            return parse_return();
         default:
             break;
     }
     return error(first, "expected a statement");
+}
+
+ast::StmtPtr StatementParser::parse_return() {
+    const lexer::Token& keyword = tokens_.peek();
+    const ast::SourceSpan keyword_span = ast::span_of(keyword);
+    tokens_.advance();
+
+    if (ends_a_statement(tokens_.peek().type())) {
+        return std::make_unique<ast::Return>(keyword_span, nullptr);
+    }
+
+    // parse_expression_list rather than parse_expression: `return a, b`
+    // returns one tuple, which is what the TupleExpr node is for.
+    ast::ExprPtr value = expressions_.parse_expression_list();
+    if (value == nullptr) {
+        return nullptr; // already reported
+    }
+    // Bound to a local before the move: argument evaluation order is
+    // unspecified, so merging inside the make_unique call can read a
+    // moved-from pointer.
+    const ast::SourceSpan span = ast::merge(keyword_span, value->span());
+    return std::make_unique<ast::Return>(span, std::move(value));
 }
 
 void StatementParser::synchronize() {

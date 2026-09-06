@@ -43,5 +43,12 @@ TEST(StatementParserError, ParseModuleIsNeverNullEvenWhenEverythingFailed) {
     EXPECT_TRUE(result.module->body().empty());
 }
 
+TEST(StatementParserError, ABadReturnValueReportsExactlyOneDiagnostic) {
+    // ExpressionParser already reported "lambda expressions are not
+    // supported". The statement parser must propagate the failure silently
+    // rather than adding a second message.
+    expect_error("return lambda: 1\n", "lambda expressions are not supported", 1, 8);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser
