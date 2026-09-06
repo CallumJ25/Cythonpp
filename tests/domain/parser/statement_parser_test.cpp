@@ -391,5 +391,27 @@ TEST(StatementParser, ParsesAnAnnotatedClassAttribute) {
               "(Module\n  (ClassDef C\n    (AnnAssign (Name x) (Name int) (Constant 0))))");
 }
 
+TEST(StatementParser, ParsesTheRepositorysOwnHelloWorldFile) {
+    // The acceptance criterion for this spec. Two of these four statements
+    // are bare expression statements, which is why ExprStmt had to exist
+    // before any of this could parse. The file has no trailing newline, so
+    // the last statement ends at TOKEN_EOF rather than at a NEWLINE.
+    const std::string source =
+        "print(\"Hello World\")\n"
+        "\n"
+        "string: str = \"Hello\"\n"
+        "\n"
+        "if string != \"hello\":\n"
+        "    print(\"Something has happened to string\")";
+
+    EXPECT_EQ(printed(source),
+              "(Module\n"
+              "  (ExprStmt (Call (Name print) (Constant \"Hello World\")))\n"
+              "  (AnnAssign (Name string) (Name str) (Constant \"Hello\"))\n"
+              "  (If (Compare (Name string) != (Constant \"hello\"))\n"
+              "    (ExprStmt (Call (Name print)"
+              " (Constant \"Something has happened to string\")))))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser
