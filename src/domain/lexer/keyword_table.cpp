@@ -82,6 +82,14 @@ constexpr std::array<KeywordEntry, 3> SOFT_KEYWORDS = {{
     {"match", token_type::KEYWORD_MATCH},
 }};
 
+// Two-word operators the parser synthesises. Reverse lookup only: neither
+// string is a word the scanner can produce, so putting them in
+// RESERVED_KEYWORDS would break what reserved_keyword_of() means.
+constexpr std::array<KeywordEntry, 2> COMPOUND_OPERATORS = {{
+    {"is not", token_type::OP_IS_NOT},
+    {"not in", token_type::OP_NOT_IN},
+}};
+
 // Strict '<' proves ordering and uniqueness in one pass: a duplicate key
 // compares equal and fails. std::string_view's comparison is constexpr in
 // C++17, so this runs entirely at build time.
@@ -98,6 +106,7 @@ constexpr bool is_strictly_sorted(const std::array<KeywordEntry, N>& table) {
 static_assert(is_strictly_sorted(RESERVED_KEYWORDS), "RESERVED_KEYWORDS must be sorted and duplicate-free");
 static_assert(is_strictly_sorted(BUILTIN_TYPE_NAMES), "BUILTIN_TYPE_NAMES must be sorted and duplicate-free");
 static_assert(is_strictly_sorted(SOFT_KEYWORDS), "SOFT_KEYWORDS must be sorted and duplicate-free");
+static_assert(is_strictly_sorted(COMPOUND_OPERATORS), "COMPOUND_OPERATORS must be sorted and duplicate-free");
 
 template <std::size_t N>
 std::optional<token_type> find_word(const std::array<KeywordEntry, N>& table, std::string_view word) {
@@ -156,7 +165,10 @@ std::string_view keyword_lexeme_of(token_type type) {
     if (const std::string_view builtin = find_lexeme(BUILTIN_TYPE_NAMES, type); !builtin.empty()) {
         return builtin;
     }
-    return find_lexeme(SOFT_KEYWORDS, type);
+    if (const std::string_view soft = find_lexeme(SOFT_KEYWORDS, type); !soft.empty()) {
+        return soft;
+    }
+    return find_lexeme(COMPOUND_OPERATORS, type);
 }
 
 } // namespace cythonpp::domain::lexer

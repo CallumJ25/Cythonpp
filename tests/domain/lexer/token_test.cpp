@@ -76,6 +76,8 @@ constexpr token_type ALL_TOKEN_TYPES[] = {
     token_type::OP_NOT,
     token_type::OP_IS,
     token_type::OP_IN,
+    token_type::OP_NOT_IN,
+    token_type::OP_IS_NOT,
 
     token_type::OP_ASSIGN,
     token_type::OP_PLUS,
@@ -287,7 +289,7 @@ TEST(TokenType, SubtypeIndicesRestartPerFlagCombination) {
 
 TEST(TokenType, EveryEnumeratorHasAUniqueValue) {
     const std::size_t count = std::size(ALL_TOKEN_TYPES);
-    EXPECT_EQ(count, 117u);
+    EXPECT_EQ(count, 119u);
 
     for (std::size_t left = 0; left < count; ++left) {
         for (std::size_t right = left + 1; right < count; ++right) {
@@ -330,6 +332,18 @@ TEST(TokenCategory, IndentAndDedentAreSpecialOnly) {
     EXPECT_FALSE(has_category(token_type::INDENT, token_category::OBJECT));
     EXPECT_FALSE(has_category(token_type::DEDENT, token_category::OBJECT));
     EXPECT_NE(token_type::INDENT, token_type::DEDENT);
+}
+
+TEST(TokenCategory, CompoundComparisonOperatorsAreKeywordAndOperator) {
+    // Synthesised by the parser from two tokens; the scanner never emits
+    // them. They live in the KEYWORD|OPERATOR space so the precedence and
+    // comparison rules can dispatch on OPERATOR membership uniformly.
+    EXPECT_TRUE(has_category(token_type::OP_NOT_IN, token_category::KEYWORD));
+    EXPECT_TRUE(has_category(token_type::OP_NOT_IN, token_category::OPERATOR));
+    EXPECT_TRUE(has_category(token_type::OP_IS_NOT, token_category::KEYWORD));
+    EXPECT_TRUE(has_category(token_type::OP_IS_NOT, token_category::OPERATOR));
+    EXPECT_NE(token_type::OP_NOT_IN, token_type::OP_IN);
+    EXPECT_NE(token_type::OP_IS_NOT, token_type::OP_IS);
 }
 
 TEST(TokenEndPosition, SingleCharacterTokenEndsOneColumnLater) {

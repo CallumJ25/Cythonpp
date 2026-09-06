@@ -145,6 +145,14 @@ enum class token_type : uint32_t {
     OP_IS  = detail::make_token(detail::KEYWORD_OP_FLAGS, 3),
     OP_IN  = detail::make_token(detail::KEYWORD_OP_FLAGS, 4),
 
+    // Two-word comparison operators. The scanner never emits these -- `a not
+    // in b` arrives as OP_NOT then OP_IN -- but Compare::Rest names each
+    // comparison with a single token_type, so the parser folds the pair here.
+    // Declared alongside the words they are built from so the numbering stays
+    // in one contiguous block.
+    OP_NOT_IN = detail::make_token(detail::KEYWORD_OP_FLAGS, 5),
+    OP_IS_NOT = detail::make_token(detail::KEYWORD_OP_FLAGS, 6),
+
     // Punctuation-spelled operators. Indices 9-11 previously held
     // OP_AND/OP_OR/OP_NOT, which moved to the KEYWORD|OPERATOR space above;
     // reusing them is safe because token_type values are never persisted

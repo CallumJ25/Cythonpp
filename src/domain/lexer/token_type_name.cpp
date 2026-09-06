@@ -68,6 +68,8 @@ std::string_view token_type_name(token_type type) {
         case token_type::OP_NOT: return "OP_NOT";
         case token_type::OP_IS: return "OP_IS";
         case token_type::OP_IN: return "OP_IN";
+        case token_type::OP_NOT_IN: return "OP_NOT_IN";
+        case token_type::OP_IS_NOT: return "OP_IS_NOT";
 
         case token_type::OP_ASSIGN: return "OP_ASSIGN";
         case token_type::OP_PLUS: return "OP_PLUS";

@@ -141,5 +141,19 @@ TEST(KeywordTable, LexemeLookupRoundTripsThroughTheTable) {
     EXPECT_TRUE(keyword_lexeme_of(token_type::OP_PLUS).empty());
 }
 
+TEST(KeywordTable, CompoundOperatorsSpellThemselvesForDiagnostics) {
+    EXPECT_EQ(keyword_lexeme_of(token_type::OP_IS_NOT), "is not");
+    EXPECT_EQ(keyword_lexeme_of(token_type::OP_NOT_IN), "not in");
+}
+
+TEST(KeywordTable, CompoundOperatorsAreNotWordsTheScannerCanFind) {
+    // Reverse lookup only. Joining RESERVED_KEYWORDS would change what
+    // reserved_keyword_of() means, since neither string is one word.
+    EXPECT_FALSE(reserved_keyword_of("is not").has_value());
+    EXPECT_FALSE(reserved_keyword_of("not in").has_value());
+    EXPECT_FALSE(soft_keyword_of("not in").has_value());
+    EXPECT_EQ(classify_word("not in", false), token_type::IDENTIFIER);
+}
+
 } // namespace
 } // namespace cythonpp::domain::lexer
