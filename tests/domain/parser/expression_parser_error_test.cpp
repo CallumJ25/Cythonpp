@@ -164,19 +164,29 @@ TEST(ExpressionParserError, AnUnclosedBracketIsReportedAgainstItsOpener) {
 }
 
 TEST(ExpressionParserError, NestedUnclosedBracketsNameTheInnermostOpener) {
-    // CPython reports the innermost too, and it is the one the local in the
-    // innermost production naturally holds.
-    //
-    // The brief's literal fixture is "f(a, [b, c", with '[' opening a list
-    // literal as the second call argument. But list-literal atoms are not
-    // parsed until Task 11's parse_bracket_atom (see progress.md); at this
-    // task's state parse_atom has no case for OPEN_BRACKET, so that '[' is
-    // rejected with "expected an expression" before ever reaching a bracket
-    // rule at all -- confirmed by running the literal fixture. "f(a, b[c, d"
-    // nests the same way through a subscript trailer on `b` instead, which
-    // *is* implemented this task, and still exercises an inner '[' left
-    // unclosed while the outer '(' is also still open, at column 7.
-    expect_error("f(a, b[c, d", "'[' was never closed", 1, 7);
+    // Deferred here from Task 10, which could only nest via a subscript
+    // trailer because '[' was not yet an atom. This is the real list-literal
+    // nesting. CPython names the innermost opener too, and it is the one the
+    // innermost production's local naturally holds.
+    expect_error("f(a, [b, c", "'[' was never closed", 1, 6);
+}
+
+TEST(ExpressionParserError, ANonAssignableComprehensionTargetIsReported) {
+    expect_error("[x for 1 in y]", "cannot assign to literal", 1, 8);
+    expect_error("[x for f() in y]", "cannot assign to function call", 1, 8);
+}
+
+TEST(ExpressionParserError, AComprehensionWithoutInIsReported) {
+    expect_error("[x for y z]", "expected 'in' after a comprehension target", 1, 10);
+}
+
+TEST(ExpressionParserError, AnUnclosedListIsReportedAgainstItsOpener) {
+    expect_error("[1, 2", "'[' was never closed", 1, 1);
+    expect_error("[x for x in y", "'[' was never closed", 1, 1);
+    // A bare opener, and one cut off right after a comma. Both hit the
+    // ends_a_sequence guards rather than reporting "expected an expression".
+    expect_error("[", "'[' was never closed", 1, 1);
+    expect_error("[1,", "'[' was never closed", 1, 1);
 }
 
 } // namespace

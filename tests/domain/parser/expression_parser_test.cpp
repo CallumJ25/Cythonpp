@@ -13,6 +13,7 @@ namespace {
 using test_support::parse;
 using test_support::printed;
 using test_support::printed_list;
+using test_support::printed_target;
 
 // The token_type of a root Constant. AstPrinter erases it, so a literal-kind
 // misclassification is invisible in the printed form alone.
@@ -289,6 +290,59 @@ TEST(ExpressionParser, BuiltinTypeNamesInAnnotationPositionAlsoBecomeNames) {
     const test_support::ParseResult result = test_support::parse_from("x: list[int] = []", 2);
     ASSERT_TRUE(result.succeeded());
     EXPECT_EQ(result.printed(), "(Subscript (Name list) (Name int))");
+}
+
+TEST(ExpressionParser, ListDisplays) {
+    EXPECT_EQ(printed("[]"), "(ListExpr)");
+    EXPECT_EQ(printed("[1]"), "(ListExpr (Constant 1))");
+    EXPECT_EQ(printed("[1, 2, 3]"),
+              "(ListExpr (Constant 1) (Constant 2) (Constant 3))");
+    EXPECT_EQ(printed("[1, 2,]"), "(ListExpr (Constant 1) (Constant 2))");
+}
+
+TEST(ExpressionParser, ASimpleListComprehension) {
+    EXPECT_EQ(printed("[x for x in items]"),
+              "(ListComp (Name x) (Clause (Name x) (Name items)))");
+}
+
+TEST(ExpressionParser, AComprehensionWithAConditon) {
+    EXPECT_EQ(printed("[x * 2 for x in items if x > 0]"),
+              "(ListComp (BinOp * (Name x) (Constant 2))"
+              " (Clause (Name x) (Name items) (Compare (Name x) > (Constant 0))))");
+}
+
+TEST(ExpressionParser, AComprehensionWithSeveralConditions) {
+    EXPECT_EQ(printed("[x for x in items if a if b]"),
+              "(ListComp (Name x) (Clause (Name x) (Name items) (Name a) (Name b)))");
+}
+
+TEST(ExpressionParser, AComprehensionWithSeveralForClauses) {
+    // The first n>1 rendering of ListComp's (Clause ...) sequence.
+    EXPECT_EQ(printed("[x for row in grid for x in row]"),
+              "(ListComp (Name x) (Clause (Name row) (Name grid))"
+              " (Clause (Name x) (Name row)))");
+}
+
+TEST(ExpressionParser, AComprehensionTargetMayBeATuple) {
+    EXPECT_EQ(printed("[k for k, v in pairs]"),
+              "(ListComp (Name k) (Clause (TupleExpr (Name k) (Name v)) (Name pairs)))");
+}
+
+TEST(ExpressionParser, TargetsAreRestrictedToPostfixExpressions) {
+    // `in` is a comparison operator, so parsing a target with the full
+    // grammar would swallow `x in y` as a Compare. This grammar has no `in`
+    // in it and halts before the keyword.
+    EXPECT_EQ(printed_target("x"), "(Name x)");
+    EXPECT_EQ(printed_target("a.b"), "(Attribute (Name a) b)");
+    EXPECT_EQ(printed_target("a[0]"), "(Subscript (Name a) (Constant 0))");
+    EXPECT_EQ(printed_target("a, b"), "(TupleExpr (Name a) (Name b))");
+}
+
+TEST(ExpressionParser, TargetParsingStopsBeforeIn) {
+    const test_support::ParseResult result =
+        test_support::parse_from("x in y", 0, test_support::Entry::Target);
+    ASSERT_TRUE(result.succeeded());
+    EXPECT_EQ(result.printed(), "(Name x)");
 }
 
 } // namespace

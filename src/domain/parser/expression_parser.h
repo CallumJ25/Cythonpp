@@ -90,6 +90,11 @@ private:
     // '(' ... ')': grouping when there is no comma, a TupleExpr when there is.
     ast::ExprPtr parse_paren_atom();
 
+    // '[' ... ']': a ListExpr, or a ListComp when a 'for' follows the first
+    // element.
+    ast::ExprPtr parse_bracket_atom();
+    ast::ExprPtr parse_list_comp(const lexer::Token& opener, ast::ExprPtr element);
+
     // Reports an unclosed or mismatched bracket against `opener`, which the
     // production that consumed it holds in a local. There is no delimiter
     // stack: the C++ call stack already is one, and an explicit copy would

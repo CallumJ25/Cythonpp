@@ -10,7 +10,10 @@
 #include "domain/ast/bool_op.h"
 #include "domain/ast/call.h"
 #include "domain/ast/compare.h"
+#include "domain/ast/comprehension_clause.h"
 #include "domain/ast/constant.h"
+#include "domain/ast/list_comp.h"
+#include "domain/ast/list_expr.h"
 #include "domain/ast/name.h"
 #include "domain/ast/subscript.h"
 #include "domain/ast/tuple_expr.h"
@@ -58,6 +61,42 @@ bool ends_a_sequence(token_type type) {
     return is_closing_delimiter(type) || type == token_type::NEWLINE ||
            type == token_type::TOKEN_EOF || type == token_type::INDENT ||
            type == token_type::DEDENT;
+}
+
+bool is_assignable(const ast::Expr& expr) {
+    if (dynamic_cast<const ast::Name*>(&expr) != nullptr) {
+        return true;
+    }
+    if (dynamic_cast<const ast::Attribute*>(&expr) != nullptr) {
+        return true;
+    }
+    if (dynamic_cast<const ast::Subscript*>(&expr) != nullptr) {
+        return true;
+    }
+    if (const auto* tuple = dynamic_cast<const ast::TupleExpr*>(&expr)) {
+        if (tuple->elements().empty()) {
+            return false;
+        }
+        for (const ast::ExprPtr& element : tuple->elements()) {
+            if (!is_assignable(*element)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// CPython's phrasing family, so the message reads like the one a user has
+// seen before.
+std::string not_assignable_message(const ast::Expr& expr) {
+    if (dynamic_cast<const ast::Constant*>(&expr) != nullptr) {
+        return "cannot assign to literal";
+    }
+    if (dynamic_cast<const ast::Call*>(&expr) != nullptr) {
+        return "cannot assign to function call";
+    }
+    return "cannot assign to this expression";
 }
 
 } // namespace
@@ -110,8 +149,36 @@ ast::ExprPtr ExpressionParser::parse_expression_list() {
     return std::make_unique<ast::TupleExpr>(span, std::move(elements));
 }
 
-// Filled in at Task 11.
-ast::ExprPtr ExpressionParser::parse_target() { return parse_atom(); }
+ast::ExprPtr ExpressionParser::parse_target() {
+    ast::ExprPtr first = parse_postfix();
+    if (first == nullptr) {
+        return nullptr;
+    }
+    if (!is_assignable(*first)) {
+        return error_at(first->span(), not_assignable_message(*first));
+    }
+    if (!tokens_.check(token_type::COMMA)) {
+        return first;
+    }
+
+    std::vector<ast::ExprPtr> elements;
+    elements.push_back(std::move(first));
+    while (tokens_.match(token_type::COMMA)) {
+        if (tokens_.check(token_type::OP_IN) || ends_a_sequence(tokens_.peek().type())) {
+            break; // trailing comma
+        }
+        ast::ExprPtr next = parse_postfix();
+        if (next == nullptr) {
+            return nullptr;
+        }
+        if (!is_assignable(*next)) {
+            return error_at(next->span(), not_assignable_message(*next));
+        }
+        elements.push_back(std::move(next));
+    }
+    const ast::SourceSpan span = ast::merge(elements.front()->span(), elements.back()->span());
+    return std::make_unique<ast::TupleExpr>(span, std::move(elements));
+}
 
 ast::ExprPtr ExpressionParser::parse_or_test() {
     ast::ExprPtr first = parse_and_test();
@@ -392,6 +459,10 @@ ast::ExprPtr ExpressionParser::parse_atom() {
         return parse_paren_atom();
     }
 
+    if (tokens_.check(token_type::OPEN_BRACKET)) {
+        return parse_bracket_atom();
+    }
+
     // One rule for IDENTIFIER and all thirteen TYPE_* spellings. ScanContext
     // makes `int` a TYPE_INT in `list[int]` and an IDENTIFIER in
     // `print(int)`; Name stores the lexeme either way, and erasing the
@@ -464,6 +535,93 @@ ast::ExprPtr ExpressionParser::parse_paren_atom() {
     }
     const ast::SourceSpan span = ast::merge(ast::span_of(opener), ast::span_of(closer));
     return std::make_unique<ast::TupleExpr>(span, std::move(elements));
+}
+
+ast::ExprPtr ExpressionParser::parse_bracket_atom() {
+    const lexer::Token& opener = tokens_.advance(); // '['
+
+    if (tokens_.check(token_type::CLOSE_BRACKET)) {
+        const lexer::Token& closer = tokens_.advance();
+        const ast::SourceSpan span = ast::merge(ast::span_of(opener), ast::span_of(closer));
+        return std::make_unique<ast::ListExpr>(span, std::vector<ast::ExprPtr>{});
+    }
+
+    // Nothing that can start an expression remains, so this is the unclosed
+    // bracket itself rather than a missing operand. The lexer closes an
+    // unterminated final line with a NEWLINE even inside an open bracket
+    // (lexer.cpp), so checking for TOKEN_EOF alone would miss it and
+    // parse_expression's "expected an expression" would mask the real error.
+    if (ends_a_sequence(tokens_.peek().type())) {
+        return unclosed(opener);
+    }
+    ast::ExprPtr first = parse_expression();
+    if (first == nullptr) {
+        return nullptr;
+    }
+    if (tokens_.check(token_type::KEYWORD_FOR)) {
+        return parse_list_comp(opener, std::move(first));
+    }
+
+    std::vector<ast::ExprPtr> elements;
+    elements.push_back(std::move(first));
+    while (tokens_.match(token_type::COMMA)) {
+        // ends_a_sequence rather than check(CLOSE_BRACKET), for the same
+        // reason: it covers both a legal trailing comma and `[1,` running out
+        // of input. Either way the closer check below decides which it was.
+        if (ends_a_sequence(tokens_.peek().type())) {
+            break;
+        }
+        ast::ExprPtr next = parse_expression();
+        if (next == nullptr) {
+            return nullptr;
+        }
+        elements.push_back(std::move(next));
+    }
+
+    if (!tokens_.check(token_type::CLOSE_BRACKET)) {
+        return unclosed(opener);
+    }
+    const lexer::Token& closer = tokens_.advance();
+    const ast::SourceSpan span = ast::merge(ast::span_of(opener), ast::span_of(closer));
+    return std::make_unique<ast::ListExpr>(span, std::move(elements));
+}
+
+ast::ExprPtr ExpressionParser::parse_list_comp(const lexer::Token& opener, ast::ExprPtr element) {
+    std::vector<ast::ComprehensionClause> clauses;
+    while (tokens_.match(token_type::KEYWORD_FOR)) {
+        ast::ComprehensionClause clause;
+
+        clause.target = parse_target();
+        if (clause.target == nullptr) {
+            return nullptr;
+        }
+        if (!tokens_.match(token_type::OP_IN)) {
+            return error(tokens_.peek(), "expected 'in' after a comprehension target");
+        }
+
+        // or_test rather than parse_expression, in both positions: Python's
+        // grammar uses or_test here, and going through parse_expression would
+        // misread this clause's own `if` as the start of a rejected ternary.
+        clause.iterable = parse_or_test();
+        if (clause.iterable == nullptr) {
+            return nullptr;
+        }
+        while (tokens_.match(token_type::KEYWORD_IF)) {
+            ast::ExprPtr condition = parse_or_test();
+            if (condition == nullptr) {
+                return nullptr;
+            }
+            clause.conditions.push_back(std::move(condition));
+        }
+        clauses.push_back(std::move(clause));
+    }
+
+    if (!tokens_.check(token_type::CLOSE_BRACKET)) {
+        return unclosed(opener);
+    }
+    const lexer::Token& closer = tokens_.advance();
+    const ast::SourceSpan span = ast::merge(ast::span_of(opener), ast::span_of(closer));
+    return std::make_unique<ast::ListComp>(span, std::move(element), std::move(clauses));
 }
 
 ast::ExprPtr ExpressionParser::unclosed(const lexer::Token& opener) {
