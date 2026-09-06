@@ -1,0 +1,90 @@
+#include "expression_parser.h"
+
+#include <memory>
+#include <utility>
+
+#include "domain/ast/constant.h"
+#include "domain/ast/name.h"
+#include "domain/lexer/token_category.h"
+#include "domain/lexer/token_type.h"
+
+namespace cythonpp::domain::parser {
+
+namespace {
+
+using lexer::token_type;
+
+bool is_string_literal(token_type type) {
+    return type == token_type::LITERAL_STRING || type == token_type::LITERAL_BYTES;
+}
+
+} // namespace
+
+ExpressionParser::ExpressionParser(lexer::TokenStream& tokens, diagnostics::DiagnosticSink& sink)
+    : tokens_(tokens), sink_(sink) {}
+
+ast::ExprPtr ExpressionParser::parse_expression() { return parse_atom(); }
+
+// Filled in at Task 9.
+ast::ExprPtr ExpressionParser::parse_expression_list() { return parse_expression(); }
+
+// Filled in at Task 11.
+ast::ExprPtr ExpressionParser::parse_target() { return parse_atom(); }
+
+ast::ExprPtr ExpressionParser::parse_atom() {
+    const lexer::Token& token = tokens_.peek();
+
+    // Rejections first. The f-string cases in particular MUST precede the
+    // category tests below: FSTRING_* carry OBJECT, so they would otherwise
+    // fall into the Constant rule and build a node out of a fragment.
+    switch (token.type()) {
+        case token_type::FSTRING_START:
+        case token_type::FSTRING_MIDDLE:
+        case token_type::FSTRING_END:
+            return error(token, "f-strings are not supported");
+        case token_type::KEYWORD_LAMBDA:
+            return error(token, "lambda expressions are not supported");
+        case token_type::KEYWORD_AWAIT:
+            return error(token, "await expressions are not supported");
+        case token_type::KEYWORD_YIELD:
+            return error(token, "yield expressions are not supported");
+        case token_type::OP_STAR:
+        case token_type::OP_DOUBLE_STAR:
+            return error(token, "starred expressions are not supported");
+        case token_type::OP_WALRUS:
+            return error(token, "assignment expressions are not supported");
+        default:
+            break;
+    }
+
+    // One rule for IDENTIFIER and all thirteen TYPE_* spellings. ScanContext
+    // makes `int` a TYPE_INT in `list[int]` and an IDENTIFIER in
+    // `print(int)`; Name stores the lexeme either way, and erasing the
+    // distinction is correct because it is the same name.
+    if (lexer::has_category(token.type(), lexer::token_category::IDENTIFIER)) {
+        const lexer::Token& name = tokens_.advance();
+        return std::make_unique<ast::Name>(ast::span_of(name), name.lexeme());
+    }
+
+    if (lexer::has_category(token.type(), lexer::token_category::OBJECT)) {
+        const lexer::Token& literal = tokens_.advance();
+        if (is_string_literal(literal.type()) && is_string_literal(tokens_.peek().type())) {
+            return error(tokens_.peek(), "implicit string concatenation is not supported");
+        }
+        return std::make_unique<ast::Constant>(ast::span_of(literal), literal.type(),
+                                               literal.lexeme());
+    }
+
+    return error(token, "expected an expression");
+}
+
+ast::ExprPtr ExpressionParser::error(const lexer::Token& token, std::string message) {
+    return error_at(ast::span_of(token), std::move(message));
+}
+
+ast::ExprPtr ExpressionParser::error_at(ast::SourceSpan span, std::string message) {
+    sink_.report_error("SyntaxError", std::move(message), span.start_line, span.start_column);
+    return nullptr;
+}
+
+} // namespace cythonpp::domain::parser

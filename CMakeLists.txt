@@ -16,6 +16,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/diagnostics/diagnostic_sink.cpp
     src/domain/ast/ast_printer.cpp
     src/domain/parser/precedence_table.cpp
+    src/domain/parser/expression_parser.cpp
     src/application/compile_pipeline.cpp
     src/adapters/filesystem/filesystem_source_reader.cpp
     src/adapters/filesystem/filesystem_source_lister.cpp
@@ -58,6 +59,8 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/ast/source_span_test.cpp
         tests/domain/ast/ast_printer_test.cpp
         tests/domain/parser/precedence_table_test.cpp
+        tests/domain/parser/expression_parser_test.cpp
+        tests/domain/parser/expression_parser_error_test.cpp
         tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/application/compile_pipeline_test.cpp
         tests/adapters/filesystem/filesystem_source_lister_test.cpp
