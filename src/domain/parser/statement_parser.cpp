@@ -455,14 +455,6 @@ bool StatementParser::at_statement_boundary() const {
            previous == token_type::DEDENT;
 }
 
-bool StatementParser::expect_end_of_statement() {
-    if (ends_a_statement(tokens_.peek().type())) {
-        return true;
-    }
-    error(tokens_.peek(), "expected a newline after the statement");
-    return false;
-}
-
 std::vector<ast::StmtPtr> StatementParser::parse_suite() {
     if (!tokens_.match(token_type::COLON)) {
         error(tokens_.peek(), "expected ':'");

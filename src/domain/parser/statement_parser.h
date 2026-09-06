@@ -159,10 +159,6 @@ private:
     // always fails somewhere inside its own line.
     bool at_statement_boundary() const;
 
-    // Consumes the NEWLINE (or SEMICOLON, or TOKEN_EOF) that must end a
-    // simple statement. Reports and returns false if something else is there.
-    bool expect_end_of_statement();
-
     // Reports one SyntaxError and returns nullptr, so a failing rule reads as
     // a single `return error(...)`. The pair mirrors ExpressionParser's:
     // error() takes the token, error_at() takes a span, for the cases where
