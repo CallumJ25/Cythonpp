@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
 
+#include "domain/ast/ann_assign.h"
+#include "domain/ast/constant.h"
+#include "domain/ast/expr_stmt.h"
 #include "domain/ast/return.h"
+#include "domain/lexer/token_type.h"
 #include "statement_parse_test_helpers.h"
 
 namespace cythonpp::domain::parser {
@@ -89,6 +93,92 @@ TEST(StatementParser, ABareReturnHasNoValue) {
     // value() dereferences unconditionally, so has_value() is the only
     // supported way to ask -- calling value() here would dereference null.
     EXPECT_FALSE(returned->has_value());
+}
+
+TEST(StatementParser, ACallOnItsOwnIsAnExprStmt) {
+    EXPECT_EQ(printed("print(x)\n"),
+              "(Module\n  (ExprStmt (Call (Name print) (Name x))))");
+}
+
+TEST(StatementParser, AMethodCallOnItsOwnIsAnExprStmt) {
+    EXPECT_EQ(printed("items.append(x)\n"),
+              "(Module\n  (ExprStmt (Call (Attribute (Name items) append) (Name x))))");
+}
+
+TEST(StatementParser, ADocstringIsAnExprStmtOfAStringConstant) {
+    EXPECT_EQ(printed("'a docstring'\n"),
+              "(Module\n  (ExprStmt (Constant 'a docstring')))");
+}
+
+TEST(StatementParser, ParsesASimpleAssignment) {
+    EXPECT_EQ(printed("x = 1\n"), "(Module\n  (Assign (Name x) (Constant 1)))");
+}
+
+TEST(StatementParser, ParsesAssignmentToAnAttributeAndASubscript) {
+    EXPECT_EQ(printed("obj.field = 1\n"),
+              "(Module\n  (Assign (Attribute (Name obj) field) (Constant 1)))");
+    EXPECT_EQ(printed("items[0] = 1\n"),
+              "(Module\n  (Assign (Subscript (Name items) (Constant 0)) (Constant 1)))");
+}
+
+TEST(StatementParser, ParsesTupleUnpacking) {
+    EXPECT_EQ(printed("x, y = 1, 2\n"),
+              "(Module\n  (Assign (TupleExpr (Name x) (Name y))"
+              " (TupleExpr (Constant 1) (Constant 2))))");
+}
+
+TEST(StatementParser, AssigningATupleValueToOneNameKeepsTheTuple) {
+    EXPECT_EQ(printed("x = 1, 2\n"),
+              "(Module\n  (Assign (Name x) (TupleExpr (Constant 1) (Constant 2))))");
+}
+
+TEST(StatementParser, ParsesABareAnnotation) {
+    EXPECT_EQ(printed("x: int\n"), "(Module\n  (AnnAssign (Name x) (Name int)))");
+}
+
+TEST(StatementParser, ParsesAnAnnotatedAssignment) {
+    // `int` here lexes as TYPE_INT, not IDENTIFIER -- annotation position is
+    // exactly what ScanContext switches on. The expression parser's atom rule
+    // accepts both spellings via has_category(IDENTIFIER), so it becomes a
+    // Name either way.
+    EXPECT_EQ(printed("x: int = 5\n"),
+              "(Module\n  (AnnAssign (Name x) (Name int) (Constant 5)))");
+}
+
+TEST(StatementParser, ParsesASubscriptedAnnotation) {
+    EXPECT_EQ(printed("values: list[int] = []\n"),
+              "(Module\n  (AnnAssign (Name values) (Subscript (Name list) (Name int))"
+              " (ListExpr)))");
+}
+
+TEST(StatementParser, AnAnnotatedAssignmentValueCanBeATuple) {
+    EXPECT_EQ(printed("x: tuple = 1, 2\n"),
+              "(Module\n  (AnnAssign (Name x) (Name tuple)"
+              " (TupleExpr (Constant 1) (Constant 2))))");
+}
+
+TEST(StatementParser, ABareAnnotationHasNoValue) {
+    const statement_test_support::ModuleResult result = parse_module("x: int\n");
+    ASSERT_NE(result.module, nullptr);
+    ASSERT_EQ(result.module->body().size(), 1u);
+    const auto* annotated =
+        dynamic_cast<const ast::AnnAssign*>(result.module->body().front().get());
+    ASSERT_NE(annotated, nullptr);
+    EXPECT_FALSE(annotated->has_value());
+}
+
+TEST(StatementParser, AnExprStmtLiteralKeepsItsLexerTokenType) {
+    // AstPrinter erases Constant::type(): LITERAL_INT "1" and LITERAL_FLOAT
+    // "1" both render (Constant 1), so the printed form cannot catch a
+    // literal-kind misclassification on its own.
+    const statement_test_support::ModuleResult result = parse_module("3.5\n");
+    ASSERT_NE(result.module, nullptr);
+    ASSERT_EQ(result.module->body().size(), 1u);
+    const auto* statement = dynamic_cast<const ast::ExprStmt*>(result.module->body().front().get());
+    ASSERT_NE(statement, nullptr);
+    const auto* constant = dynamic_cast<const ast::Constant*>(&statement->value());
+    ASSERT_NE(constant, nullptr);
+    EXPECT_EQ(constant->type(), lexer::token_type::LITERAL_FLOAT);
 }
 
 } // namespace

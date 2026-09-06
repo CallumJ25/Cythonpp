@@ -3,11 +3,16 @@
 #include <cstddef>
 #include <utility>
 
+#include "assignability.h"
+#include "domain/ast/ann_assign.h"
+#include "domain/ast/assign.h"
 #include "domain/ast/break.h"
 #include "domain/ast/continue.h"
+#include "domain/ast/expr_stmt.h"
 #include "domain/ast/pass.h"
 #include "domain/ast/return.h"
 #include "domain/ast/source_span.h"
+#include "domain/ast/tuple_expr.h"
 #include "domain/lexer/token_type.h"
 
 namespace cythonpp::domain::parser {
@@ -29,6 +34,31 @@ bool ends_a_statement(token_type type) {
 // Empty until Task 7 adds def/class/if/while/for, which is why every
 // statement currently takes the simple path.
 bool is_compound_keyword(token_type) { return false; }
+
+// The thirteen augmented-assignment operators. Each is a diagnostic rather
+// than a parse: there is no AugAssign node, and desugaring `x += 1` to
+// `x = x + 1` would record a lie, since Python's += evaluates the target once
+// and is in-place for mutable types.
+bool is_augmented_assign(token_type type) {
+    switch (type) {
+        case token_type::OP_PLUS_ASSIGN:
+        case token_type::OP_MINUS_ASSIGN:
+        case token_type::OP_STAR_ASSIGN:
+        case token_type::OP_SLASH_ASSIGN:
+        case token_type::OP_DOUBLE_SLASH_ASSIGN:
+        case token_type::OP_PERCENT_ASSIGN:
+        case token_type::OP_DOUBLE_STAR_ASSIGN:
+        case token_type::OP_AT_ASSIGN:
+        case token_type::OP_AMPERSAND_ASSIGN:
+        case token_type::OP_PIPE_ASSIGN:
+        case token_type::OP_CARET_ASSIGN:
+        case token_type::OP_RIGHT_SHIFT_ASSIGN:
+        case token_type::OP_LEFT_SHIFT_ASSIGN:
+            return true;
+        default:
+            return false;
+    }
+}
 
 } // namespace
 
@@ -178,9 +208,8 @@ ast::StmtPtr StatementParser::parse_simple_statement() {
         case token_type::KEYWORD_RETURN:
             return parse_return();
         default:
-            break;
+            return parse_expression_statement();
     }
-    return error(first, "expected a statement");
 }
 
 ast::StmtPtr StatementParser::parse_return() {
@@ -205,6 +234,73 @@ ast::StmtPtr StatementParser::parse_return() {
     return std::make_unique<ast::Return>(span, std::move(value));
 }
 
+ast::StmtPtr StatementParser::parse_expression_statement() {
+    ast::ExprPtr first = expressions_.parse_expression_list();
+    if (first == nullptr) {
+        return nullptr; // already reported
+    }
+
+    if (tokens_.check(token_type::COLON)) {
+        return parse_annotated_assignment(std::move(first));
+    }
+    if (tokens_.check(token_type::OP_ASSIGN)) {
+        return parse_assignment(std::move(first));
+    }
+    if (is_augmented_assign(tokens_.peek().type())) {
+        return error(tokens_.peek(), "augmented assignment is not supported");
+    }
+
+    const ast::SourceSpan span = first->span();
+    return std::make_unique<ast::ExprStmt>(span, std::move(first));
+}
+
+ast::StmtPtr StatementParser::parse_assignment(ast::ExprPtr target) {
+    if (!is_assignable(*target)) {
+        return error_at(target->span(), not_assignable_message(*target));
+    }
+    tokens_.advance(); // '='
+
+    ast::ExprPtr value = expressions_.parse_expression_list();
+    if (value == nullptr) {
+        return nullptr;
+    }
+    const ast::SourceSpan span = ast::merge(target->span(), value->span());
+    return std::make_unique<ast::Assign>(span, std::move(target), std::move(value));
+}
+
+ast::StmtPtr StatementParser::parse_annotated_assignment(ast::ExprPtr target) {
+    if (!is_assignable(*target)) {
+        return error_at(target->span(), not_assignable_message(*target));
+    }
+    // AnnAssign holds one target, and Python does not allow annotating a
+    // tuple, so this is rejected here rather than deferred to the checker.
+    if (dynamic_cast<const ast::TupleExpr*>(target.get()) != nullptr) {
+        return error_at(target->span(), "only single targets can be annotated");
+    }
+    tokens_.advance(); // ':'
+
+    // parse_expression, not parse_expression_list: `x: int, str` is not a
+    // thing. A composite annotation is spelled `x: tuple[int, str]`, whose
+    // comma is inside the subscript.
+    ast::ExprPtr annotation = expressions_.parse_expression();
+    if (annotation == nullptr) {
+        return nullptr;
+    }
+
+    ast::ExprPtr value;
+    if (tokens_.match(token_type::OP_ASSIGN)) {
+        value = expressions_.parse_expression_list();
+        if (value == nullptr) {
+            return nullptr;
+        }
+    }
+
+    const ast::SourceSpan end = value != nullptr ? value->span() : annotation->span();
+    const ast::SourceSpan span = ast::merge(target->span(), end);
+    return std::make_unique<ast::AnnAssign>(span, std::move(target), std::move(annotation),
+                                            std::move(value));
+}
+
 void StatementParser::synchronize() {
     while (!tokens_.at_end()) {
         if (tokens_.check(token_type::NEWLINE)) {
@@ -227,7 +323,10 @@ bool StatementParser::expect_end_of_statement() {
 }
 
 ast::StmtPtr StatementParser::error(const lexer::Token& token, std::string message) {
-    const ast::SourceSpan span = ast::span_of(token);
+    return error_at(ast::span_of(token), std::move(message));
+}
+
+ast::StmtPtr StatementParser::error_at(ast::SourceSpan span, std::string message) {
     sink_.report_error("SyntaxError", std::move(message), span.start_line, span.start_column);
     return nullptr;
 }

@@ -50,5 +50,30 @@ TEST(StatementParserError, ABadReturnValueReportsExactlyOneDiagnostic) {
     expect_error("return lambda: 1\n", "lambda expressions are not supported", 1, 8);
 }
 
+TEST(StatementParserError, AssigningToALiteralIsRejected) {
+    expect_error("1 = x\n", "cannot assign to literal", 1, 1);
+}
+
+TEST(StatementParserError, AssigningToACallIsRejected) {
+    expect_error("f() = x\n", "cannot assign to function call", 1, 1);
+}
+
+TEST(StatementParserError, AnnotatingATupleIsRejected) {
+    // Python does not allow annotating a tuple, and AnnAssign holds one
+    // target, so this is rejected in the parser rather than deferred.
+    expect_error("x, y: int = 1\n", "only single targets can be annotated", 1, 1);
+}
+
+TEST(StatementParserError, ChainedAssignmentGetsTheGenericMessage) {
+    // Deliberately not a named diagnostic: import and augmented assignment
+    // appear in essentially every real file and earn specific messages, while
+    // chained assignment is rare enough that the generic one is adequate.
+    expect_error("a = b = 1\n", "expected a newline after the statement", 1, 7);
+}
+
+TEST(StatementParserError, AFailedExpressionStatementReportsOnlyItsOwnDiagnostic) {
+    expect_error("f(*a)\n", "starred expressions are not supported", 1, 3);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser
