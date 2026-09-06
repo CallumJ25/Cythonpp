@@ -10,6 +10,8 @@
 #include "adapters/filesystem/filesystem_source_lister.h"
 #include "adapters/filesystem/filesystem_source_reader.h"
 #include "application/compile_pipeline.h"
+#include "domain/ast/ast_printer.h"
+#include "domain/ast/module.h"
 #include "domain/lexer/token_type_name.h"
 
 namespace cythonpp::adapters::cli {
@@ -45,24 +47,49 @@ void print_module(const std::string& path, const domain::lexer::TokenStream& tok
     }
 }
 
-void print_result(const application::CompileResult& result) {
+void print_tree(const std::string& path, const domain::ast::Module& module) {
+    std::cout << "=== " << path << " ===" << std::endl;
+    std::cout << domain::ast::AstPrinter().print(module) << std::endl;
+}
+
+void print_result(const application::CompileResult& result, bool dump_tokens) {
     std::size_t total = 0;
     for (const auto& module : result.modules) {
-        print_module(module.first, module.second.tokens);
-        total += module.second.tokens.size();
+        if (dump_tokens) {
+            print_module(module.first, module.second.tokens);
+            total += module.second.tokens.size();
+        } else {
+            print_tree(module.first, *module.second.ast);
+        }
     }
-    std::cout << result.modules.size() << " files, " << total << " tokens" << std::endl;
+    if (dump_tokens) {
+        std::cout << result.modules.size() << " files, " << total << " tokens" << std::endl;
+    } else {
+        std::cout << result.modules.size() << " files" << std::endl;
+    }
 }
 
 } // namespace
 
 int CliAdapter::run(int argc, char** argv) {
-    if (argc < 2) {
-        std::cerr << "usage: cythonpp <path-to-python-file-or-directory>" << std::endl;
+    bool dump_tokens = false;
+    std::string path;
+    for (int index = 1; index < argc; ++index) {
+        const std::string argument = argv[index];
+        if (argument == "--tokens") {
+            dump_tokens = true;
+        } else if (path.empty()) {
+            path = argument;
+        } else {
+            std::cerr << "unexpected argument: " << argument << std::endl;
+            return 1;
+        }
+    }
+    if (path.empty()) {
+        std::cerr << "usage: cythonpp [--tokens] <path-to-python-file-or-directory>" << std::endl;
         return 1;
     }
 
-    std::string path = argv[1];
     filesystem::FilesystemSourceReader source_reader;
     filesystem::FilesystemSourceLister source_lister;
     ConsoleDiagnosticsReporter diagnostics_reporter;
@@ -76,10 +103,10 @@ int CliAdapter::run(int argc, char** argv) {
         const application::CompileResult result = std::filesystem::is_directory(path)
                                                       ? pipeline.compile_directory(path)
                                                       : pipeline.compile_file(path);
-        print_result(result);
+        print_result(result, dump_tokens);
 
-        // The dump is still printed for a file with errors -- seeing the
-        // tokens is exactly what helps when diagnosing one -- but the exit
+        // The tree is still printed for a file with errors -- seeing the
+        // output is exactly what helps when diagnosing one -- but the exit
         // code has to say the compile failed.
         return result.has_errors ? 1 : 0;
     } catch (const std::exception& error) {
