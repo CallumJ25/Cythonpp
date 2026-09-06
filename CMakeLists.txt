@@ -16,6 +16,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/diagnostics/diagnostic_sink.cpp
     src/domain/ast/ast_printer.cpp
     src/domain/parser/precedence_table.cpp
+    src/domain/parser/assignability.cpp
     src/domain/parser/expression_parser.cpp
     src/application/compile_pipeline.cpp
     src/adapters/filesystem/filesystem_source_reader.cpp
