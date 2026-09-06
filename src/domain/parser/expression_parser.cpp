@@ -56,6 +56,17 @@ bool is_closing_delimiter(token_type type) {
            type == token_type::CLOSE_BRACE;
 }
 
+// The closer a given opening delimiter requires. TOKEN_ERROR for anything
+// that is not an opener, which no caller passes.
+token_type matching_closer_of(token_type opener) {
+    switch (opener) {
+        case token_type::OPEN_PAREN:   return token_type::CLOSE_PAREN;
+        case token_type::OPEN_BRACKET: return token_type::CLOSE_BRACKET;
+        case token_type::OPEN_BRACE:   return token_type::CLOSE_BRACE;
+        default:                       return token_type::TOKEN_ERROR;
+    }
+}
+
 // True where a trailing comma is legal -- that is, where no further element
 // can begin.
 bool ends_a_sequence(token_type type) {
@@ -387,10 +398,11 @@ ast::ExprPtr ExpressionParser::parse_subscript(ast::ExprPtr value) {
     if (tokens_.check(token_type::COLON)) {
         return error(tokens_.peek(), "slices are not supported");
     }
-    // Same guard as the atom productions: nothing that can start an
-    // expression remains, so this is the unclosed '[' itself, not a missing
-    // index.
-    if (ends_a_sequence(tokens_.peek().type())) {
+    // A matching ']' here means an empty subscript, not an unclosed bracket --
+    // let it fall through to the index parse, which reports the missing
+    // expression. Any other sequence-ending token is a genuine unclosed '['.
+    if (ends_a_sequence(tokens_.peek().type()) &&
+        tokens_.peek().type() != matching_closer_of(opener.type())) {
         return unclosed(opener);
     }
     ast::ExprPtr index = parse_expression_list();
@@ -750,8 +762,13 @@ ast::ExprPtr ExpressionParser::unclosed(const lexer::Token& opener) {
     const std::string opener_lexeme(lexer::operator_lexeme_of(opener.type()));
 
     // A closer of the wrong kind is a different mistake from running out of
-    // input, and naming both brackets is what makes it fixable.
-    if (is_closing_delimiter(found.type())) {
+    // input, and naming both brackets is what makes it fixable. A closer that
+    // actually matches the opener is not a mismatch at all -- no current
+    // caller reaches here with one (each pre-filters its own matching closer
+    // before calling unclosed()), but the check is kept here too so a future
+    // caller that forgets to pre-filter still falls through to the correct
+    // "was never closed" branch instead of reporting a false mismatch.
+    if (is_closing_delimiter(found.type()) && found.type() != matching_closer_of(opener.type())) {
         return error(found, "closing '" + std::string(lexer::operator_lexeme_of(found.type())) +
                                 "' does not match '" + opener_lexeme + "' opened on line " +
                                 std::to_string(opener.line_number()));

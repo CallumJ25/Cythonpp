@@ -132,6 +132,13 @@ TEST(ExpressionParserError, SlicesAreRejected) {
     expect_error("items[1:]", "slices are not supported", 1, 8);
 }
 
+TEST(ExpressionParserError, AnEmptySubscriptReportsAMissingExpression) {
+    // The '[' is closed -- it is the index that is missing. Guarding this
+    // case is what keeps parse_subscript's unclosed-bracket check from
+    // claiming a matching ']' does not match its '['.
+    expect_error("x[]", "expected an expression", 1, 3);
+}
+
 TEST(ExpressionParserError, KeywordArgumentsAreRejected) {
     expect_error("f(k=1)", "keyword arguments are not supported", 1, 4);
 }
