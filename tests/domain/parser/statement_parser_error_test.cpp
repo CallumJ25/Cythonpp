@@ -197,16 +197,12 @@ TEST(StatementParserError, AnUnclosedBaseListIsReportedAgainstItsOpener) {
 }
 
 TEST(StatementParserError, AKeywordArgumentInABaseListIsReported) {
-    // Verified against the real parser: a base list is not a call, so it is
-    // parsed by looping parse_expression(), which has no special-case for
-    // '='. `metaclass` parses fine as a bare Name, leaving '=M' unconsumed;
-    // the loop then sees neither ',' nor ')' and the base list is reported
-    // unclosed against its opener -- the same diagnostic
-    // AnUnclosedBaseListIsReportedAgainstItsOpener exercises, not
-    // ExpressionParser's call-argument message, since a base list is parsed
-    // by parse_expression() directly and never reaches that check.
+    // `metaclass` parses fine as a bare Name; parse_class_def then sees the
+    // '=' immediately after and reports the same message ExpressionParser
+    // uses for keyword arguments in a call, positioned at `metaclass` (the
+    // base just parsed) rather than the unclosed-list fallback.
     expect_error("class C(metaclass=M):\n    pass\n",
-                 "expected ')' to close the base list", 1, 8);
+                 "keyword arguments are not supported", 1, 9);
 }
 
 } // namespace

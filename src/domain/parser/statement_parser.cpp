@@ -605,6 +605,14 @@ ast::StmtPtr StatementParser::parse_class_def() {
                 if (base == nullptr) {
                     return nullptr; // already reported
                 }
+                if (tokens_.check(token_type::OP_ASSIGN)) {
+                    // Same wording ExpressionParser uses for keyword arguments
+                    // in a call, but positioned at the keyword name (the base
+                    // just parsed), not the current token (the '='), so the
+                    // reader is pointed at `metaclass`, not `=`.
+                    const ast::SourceSpan base_span = base->span();
+                    return error_at(base_span, "keyword arguments are not supported");
+                }
                 bases.push_back(std::move(base));
                 if (tokens_.match(token_type::COMMA)) {
                     if (tokens_.check(token_type::CLOSE_PAREN)) {
