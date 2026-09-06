@@ -208,6 +208,7 @@ TEST(ExpressionParserError, AMissingColonInADictIsReported) {
 TEST(ExpressionParserError, AnUnclosedBraceIsReportedAgainstItsOpener) {
     expect_error("{'a': 1", "'{' was never closed", 1, 1);
     expect_error("{", "'{' was never closed", 1, 1);
+    expect_error("{'a': 1,", "'{' was never closed", 1, 1);
 }
 
 } // namespace

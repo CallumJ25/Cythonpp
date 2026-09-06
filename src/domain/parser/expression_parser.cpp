@@ -673,8 +673,13 @@ ast::ExprPtr ExpressionParser::parse_brace_atom() {
     entries.push_back(ast::DictExpr::Entry{std::move(first_key), std::move(first_value)});
 
     while (tokens_.match(token_type::COMMA)) {
-        if (tokens_.check(token_type::CLOSE_BRACE)) {
-            break; // trailing comma
+        // ends_a_sequence rather than check(CLOSE_BRACE), matching
+        // parse_bracket_atom: it covers both a legal trailing comma and
+        // `{'a': 1,` running out of input. The closer check below decides
+        // which it was, so the unclosed case reports against the opener
+        // instead of falling through to "expected an expression".
+        if (ends_a_sequence(tokens_.peek().type())) {
+            break;
         }
         ast::ExprPtr key = parse_expression();
         if (key == nullptr) {
