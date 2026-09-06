@@ -369,6 +369,12 @@ bool StatementParser::at_statement_boundary() const {
     } while (index > 0 && tokens_.at(index).type() == token_type::COMMENT_SINGLE);
 
     const token_type previous = tokens_.at(index).type();
+    if (previous == token_type::COMMENT_SINGLE) {
+        // Every token before the cursor was trivia -- a boundary exactly like
+        // index == 0 above, since there is no real statement back there to
+        // have left the cursor mid-line.
+        return true;
+    }
     return previous == token_type::NEWLINE || previous == token_type::INDENT ||
            previous == token_type::DEDENT;
 }
@@ -444,8 +450,8 @@ ast::StmtPtr StatementParser::parse_if() {
             return nullptr;
         }
         orelse.push_back(std::move(nested));
-    } else {
-        orelse = parse_else_clause();
+    } else if (!parse_else_clause(orelse)) {
+        return nullptr; // already reported
     }
 
     // Bound before the moves below: argument evaluation order is unspecified.
@@ -455,12 +461,18 @@ ast::StmtPtr StatementParser::parse_if() {
                                      std::move(orelse));
 }
 
-std::vector<ast::StmtPtr> StatementParser::parse_else_clause() {
+bool StatementParser::parse_else_clause(std::vector<ast::StmtPtr>& into) {
     if (!tokens_.check(token_type::KEYWORD_ELSE)) {
-        return {};
+        return true; // no else is not a failure
     }
     tokens_.advance();
-    return parse_suite();
+
+    std::vector<ast::StmtPtr> body = parse_suite();
+    if (body.empty()) {
+        return false; // already reported
+    }
+    into = std::move(body);
+    return true;
 }
 
 ast::StmtPtr StatementParser::error(const lexer::Token& token, std::string message) {

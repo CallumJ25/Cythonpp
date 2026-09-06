@@ -104,10 +104,18 @@ private:
     // empty is unambiguous.
     std::vector<ast::StmtPtr> parse_suite();
 
-    // The optional `else:` suite If, While and For all carry. Empty when
-    // there is no `else`, which is indistinguishable from a failed one --
-    // the failure was already reported, and both cases yield no statements.
-    std::vector<ast::StmtPtr> parse_else_clause();
+    // The optional `else:` suite If, While and For all carry.
+    //
+    // Returns false only when an `else` was present and failed -- which has
+    // already been reported. No `else` at all is success with nothing
+    // appended, because an else-less if is not an error.
+    //
+    // A bool rather than an empty-vector sentinel because empty cannot tell
+    // "no else" from "broken else". A caller that cannot distinguish them
+    // builds a valid node out of a failed parse, its null-recovery path never
+    // runs, and the orphaned indented block is then reported a second time by
+    // the statement loop -- breaking "one diagnostic per failed statement".
+    bool parse_else_clause(std::vector<ast::StmtPtr>& into);
 
     ast::StmtPtr parse_if();
     ast::StmtPtr parse_while();

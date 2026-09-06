@@ -135,5 +135,31 @@ TEST(StatementParserError, ABadSuiteDoesNotSwallowTheStatementsAfterIt) {
     EXPECT_EQ(result.printed(), "(Module\n  (Assign (Name b) (Constant 1)))");
 }
 
+TEST(StatementParserError, AFailedElseHeaderIsStillOneDiagnostic) {
+    // parse_else_clause must distinguish "no else" from "broken else". If it
+    // cannot, parse_if builds a valid If out of a failed parse, its recovery
+    // path never runs, and the orphaned block is reported a second time.
+    expect_error("if a:\n    pass\nelse\n    pass\n", "expected ':'", 3, 5);
+}
+
+TEST(StatementParserError, ACommentBeforeARecoveredStatementDoesNotHideTheBoundary) {
+    // A comment-only line emits no NEWLINE and survives IndentationPass, so
+    // the token physically before the cursor is not the one that logically
+    // precedes it. Without the backward comment skip, at_statement_boundary()
+    // answers false here, synchronize() eats the `pass` line, and the tree
+    // silently loses it.
+    const statement_test_support::ModuleResult result =
+        parse_module("if x:\n# note\npass\n");
+
+    EXPECT_EQ(result.diagnostics.size(), 1u);
+    EXPECT_EQ(result.diagnostics.front().message, "expected an indented block");
+    ASSERT_NE(result.module, nullptr);
+    EXPECT_EQ(result.printed(), "(Module\n  (Pass))");
+}
+
+TEST(StatementParserError, AFailedIfConditionSwallowsItsOrphanedBlock) {
+    expect_error("if lambda: 1\n    pass\n", "lambda expressions are not supported", 1, 4);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser
