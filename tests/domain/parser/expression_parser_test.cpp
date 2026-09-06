@@ -90,5 +90,44 @@ TEST(ExpressionParser, PowerAllowsAUnaryOperatorOnItsRight) {
     EXPECT_EQ(printed("2 ** -1"), "(BinOp ** (Constant 2) (UnaryOp - (Constant 1)))");
 }
 
+TEST(ExpressionParser, MultiplicationBindsTighterThanAddition) {
+    EXPECT_EQ(printed("a + b * c"), "(BinOp + (Name a) (BinOp * (Name b) (Name c)))");
+    EXPECT_EQ(printed("a * b + c"), "(BinOp + (BinOp * (Name a) (Name b)) (Name c))");
+}
+
+TEST(ExpressionParser, SameLevelOperatorsAreLeftAssociative) {
+    EXPECT_EQ(printed("a - b - c"), "(BinOp - (BinOp - (Name a) (Name b)) (Name c))");
+    EXPECT_EQ(printed("a / b // c"), "(BinOp // (BinOp / (Name a) (Name b)) (Name c))");
+}
+
+TEST(ExpressionParser, EveryLevelBoundaryGroupsCorrectly) {
+    EXPECT_EQ(printed("a | b ^ c"), "(BinOp | (Name a) (BinOp ^ (Name b) (Name c)))");
+    EXPECT_EQ(printed("a ^ b & c"), "(BinOp ^ (Name a) (BinOp & (Name b) (Name c)))");
+    EXPECT_EQ(printed("a & b << c"), "(BinOp & (Name a) (BinOp << (Name b) (Name c)))");
+    EXPECT_EQ(printed("a << b + c"), "(BinOp << (Name a) (BinOp + (Name b) (Name c)))");
+    EXPECT_EQ(printed("a + b % c"), "(BinOp + (Name a) (BinOp % (Name b) (Name c)))");
+}
+
+TEST(ExpressionParser, AtIsMatrixMultiplyInExpressionPosition) {
+    EXPECT_EQ(printed("a @ b"), "(BinOp @ (Name a) (Name b))");
+}
+
+TEST(ExpressionParser, PowerBindsTighterThanEveryTableLevel) {
+    EXPECT_EQ(printed("a * b ** c"), "(BinOp * (Name a) (BinOp ** (Name b) (Name c)))");
+}
+
+TEST(ExpressionParser, UnaryBindsTighterThanBinary) {
+    EXPECT_EQ(printed("-a + b"), "(BinOp + (UnaryOp - (Name a)) (Name b))");
+}
+
+TEST(ExpressionParser, AssignmentOperatorsEndAnExpressionRatherThanJoiningIt) {
+    // OP_ASSIGN and the aug-assigns carry token_category::OPERATOR, so a
+    // parser that trusted the flag instead of the table would build a BinOp
+    // here. The expression is just `a`, and `=` is left for Spec 4.
+    EXPECT_EQ(printed("a = b"), "(Name a)");
+    EXPECT_EQ(printed("a += b"), "(Name a)");
+    EXPECT_EQ(printed("a -> b"), "(Name a)");
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

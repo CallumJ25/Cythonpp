@@ -55,5 +55,9 @@ TEST(ExpressionParserError, AMissingExponentIsReported) {
     expect_error("2 **", "expected an expression", 1, 5);
 }
 
+TEST(ExpressionParserError, AMissingRightOperandIsReported) {
+    expect_error("1 +", "expected an expression", 1, 4);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

@@ -51,6 +51,10 @@ public:
     ast::ExprPtr parse_target();
 
 private:
+    // Precedence climbing over the table levels. `min_level` is the loosest
+    // binding power this call will consume.
+    ast::ExprPtr parse_binary(int min_level);
+
     // Prefix '+', '-' and '~'. Recurses into itself so `- -x` nests.
     ast::ExprPtr parse_unary();
 

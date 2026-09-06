@@ -1,6 +1,7 @@
 #include "expression_parser.h"
 
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include "domain/ast/bin_op.h"
@@ -9,6 +10,7 @@
 #include "domain/ast/unary_op.h"
 #include "domain/lexer/token_category.h"
 #include "domain/lexer/token_type.h"
+#include "precedence_table.h"
 
 namespace cythonpp::domain::parser {
 
@@ -25,13 +27,38 @@ bool is_string_literal(token_type type) {
 ExpressionParser::ExpressionParser(lexer::TokenStream& tokens, diagnostics::DiagnosticSink& sink)
     : tokens_(tokens), sink_(sink) {}
 
-ast::ExprPtr ExpressionParser::parse_expression() { return parse_unary(); }
+ast::ExprPtr ExpressionParser::parse_expression() { return parse_binary(LOWEST_BINARY_LEVEL); }
 
 // Filled in at Task 9.
 ast::ExprPtr ExpressionParser::parse_expression_list() { return parse_expression(); }
 
 // Filled in at Task 11.
 ast::ExprPtr ExpressionParser::parse_target() { return parse_atom(); }
+
+ast::ExprPtr ExpressionParser::parse_binary(int min_level) {
+    ast::ExprPtr left = parse_unary();
+    if (left == nullptr) {
+        return nullptr;
+    }
+    while (true) {
+        const std::optional<BinaryPrecedence> precedence =
+            binary_precedence_of(tokens_.peek().type());
+        if (!precedence.has_value() || precedence->level < min_level) {
+            return left;
+        }
+        const lexer::Token& op = tokens_.advance();
+
+        // Every table entry is left-associative, so the right operand is
+        // parsed one level tighter. That is what groups `a - b - c` as
+        // `(a - b) - c` rather than `a - (b - c)`.
+        ast::ExprPtr right = parse_binary(precedence->level + 1);
+        if (right == nullptr) {
+            return nullptr;
+        }
+        const ast::SourceSpan span = ast::merge(left->span(), right->span());
+        left = std::make_unique<ast::BinOp>(span, op.type(), std::move(left), std::move(right));
+    }
+}
 
 ast::ExprPtr ExpressionParser::parse_unary() {
     const token_type type = tokens_.peek().type();
