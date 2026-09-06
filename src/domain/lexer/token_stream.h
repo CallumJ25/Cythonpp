@@ -12,11 +12,11 @@ namespace cythonpp::domain::lexer {
 // right, top to bottom.
 //
 // This exists so the stages downstream of the lexer name a domain concept
-// instead of passing a bare std::vector<Token>. The vector's mutating half
-// is not part of the contract a parser should have, and the things a parser
-// will want next -- a read cursor, peek()/expect(), a skip-whitespace helper
-// -- get a home here without changing any signature that already exists.
-// It is deliberately minimal until there is a parser to need them.
+// instead of passing a bare std::vector<Token>. The vector's mutating half is
+// not part of the contract a parser should have, so this exposes a read
+// cursor instead: peek()/check()/match()/advance() to consume tokens one at a
+// time, and position()/seek()/rewind() so a caller can save and restore its
+// place.
 class TokenStream {
 public:
     TokenStream() = default;

@@ -24,7 +24,10 @@ namespace cythonpp::domain::parser {
 // where a statement ends.
 //
 // On failure the cursor is left *on* the offending token, so a caller knows
-// where parsing stopped.
+// where parsing stopped. One exception: parse_comparison's "not" without a
+// following "in" reports against the token after "not" (to name what was
+// expected there) while leaving the cursor on "not" itself, so the reported
+// position and the cursor position can differ in that one case.
 //
 // Scope is exactly what the AST node set can represent. Every construct
 // outside it -- ternaries, lambda, slices, f-strings, set displays, walrus --
@@ -51,6 +54,13 @@ public:
     ast::ExprPtr parse_target();
 
 private:
+    // True (after reporting the one diagnostic that makes it true) if the
+    // stream is empty. TokenStream::peek() throws on an empty stream and
+    // every entry point above calls it unguarded further down, so this keeps
+    // the "never throws" contract true unconditionally rather than only for
+    // Lexer output.
+    bool reject_if_empty();
+
     // `or` and `and` runs. Each builds one flattened BoolOp rather than
     // nested pairs.
     ast::ExprPtr parse_or_test();

@@ -161,6 +161,16 @@ TEST(ExpressionParserError, AMissingAttributeNameIsReported) {
 TEST(ExpressionParserError, AnUnclosedBracketIsReportedAgainstItsOpener) {
     expect_error("items[0", "'[' was never closed", 1, 6);
     expect_error("f(a", "'(' was never closed", 1, 2);
+    // parse_call and parse_subscript, the two trailer productions, need the
+    // same ends_a_sequence guard the atom productions have: a bare opener, a
+    // trailing comma running out of input, and a wrong closer arriving where
+    // an argument or index was expected.
+    expect_error("f(", "'(' was never closed", 1, 2);
+    expect_error("f(a,", "'(' was never closed", 1, 2);
+    expect_error("a[", "'[' was never closed", 1, 2);
+    expect_error("f(a, ]", "closing ']' does not match '(' opened on line 1", 1, 6);
+    expect_error("a[)", "closing ')' does not match '[' opened on line 1", 1, 3);
+    expect_error("[1][", "'[' was never closed", 1, 4);
 }
 
 TEST(ExpressionParserError, NestedUnclosedBracketsNameTheInnermostOpener) {
@@ -225,6 +235,73 @@ TEST(ExpressionParserError, AnEmptyTupleIsNotAnAssignableTarget) {
     // `for () in y` would be accepted as a valid target. The branch existed
     // from Task 11 but nothing exercised it.
     expect_error("[x for () in y]", "cannot assign to this expression", 1, 8);
+}
+
+TEST(ExpressionParserError, AGeneratorExpressionInParensIsRejected) {
+    // parse_bracket_atom and parse_brace_atom both check for a trailing 'for'
+    // after their first element; parse_paren_atom did not, so this used to
+    // fall through to "'(' was never closed" at column 1 instead of naming
+    // the construct.
+    expect_error("(x for x in y)", "generator expressions are not supported", 1, 4);
+}
+
+TEST(ExpressionParserError, AListComprehensionCannotFollowACommaSeparatedList) {
+    // Here 'for' arrives after the comma loop rather than right after the
+    // first element, which parse_bracket_atom's existing check does not see.
+    expect_error("[1, 2, 3 for x in y]",
+                 "list comprehensions cannot follow a comma-separated list", 1, 10);
+}
+
+TEST(ExpressionParserError, AnEmptyTokenStreamNeverThrows) {
+    // TokenStream{} bypasses Lexer, which always ends its output in
+    // TOKEN_EOF and so can never actually produce an empty stream -- but the
+    // header's "never throws" contract must hold unconditionally, not only
+    // for token streams a real Lexer could produce. TokenStream::peek()
+    // throws std::out_of_range on an empty vector, and parse_atom/parse_binary
+    // call it unguarded, so without a guard at each entry point this would
+    // throw instead of reporting.
+    lexer::TokenStream empty_stream;
+
+    diagnostics::DiagnosticSink expression_sink;
+    ExpressionParser expression_parser(empty_stream, expression_sink);
+    ast::ExprPtr expression_result;
+    EXPECT_NO_THROW(expression_result = expression_parser.parse_expression());
+    EXPECT_EQ(expression_result, nullptr);
+    EXPECT_EQ(expression_sink.diagnostics().size(), 1u);
+    if (expression_sink.diagnostics().size() == 1) {
+        EXPECT_EQ(expression_sink.diagnostics().front().code, "SyntaxError");
+    }
+
+    diagnostics::DiagnosticSink list_sink;
+    ExpressionParser list_parser(empty_stream, list_sink);
+    ast::ExprPtr list_result;
+    EXPECT_NO_THROW(list_result = list_parser.parse_expression_list());
+    EXPECT_EQ(list_result, nullptr);
+    EXPECT_EQ(list_sink.diagnostics().size(), 1u);
+    if (list_sink.diagnostics().size() == 1) {
+        EXPECT_EQ(list_sink.diagnostics().front().code, "SyntaxError");
+    }
+
+    diagnostics::DiagnosticSink target_sink;
+    ExpressionParser target_parser(empty_stream, target_sink);
+    ast::ExprPtr target_result;
+    EXPECT_NO_THROW(target_result = target_parser.parse_target());
+    EXPECT_EQ(target_result, nullptr);
+    EXPECT_EQ(target_sink.diagnostics().size(), 1u);
+    if (target_sink.diagnostics().size() == 1) {
+        EXPECT_EQ(target_sink.diagnostics().front().code, "SyntaxError");
+    }
+}
+
+TEST(ExpressionParserError, TheCursorRestsOnTheOffendingTokenAfterFailure) {
+    // "1 +": LITERAL_INT "1" (index 0), OP_PLUS (index 1), the lexer's
+    // synthesized end-of-line NEWLINE (index 2), then TOKEN_EOF (index 3).
+    // '+' consumes its own token looking for a right operand, which fails on
+    // the NEWLINE: parse_atom reports against index 2 without advancing past
+    // it, so the cursor must rest there too, not one past it.
+    const test_support::ParseResult result = parse("1 +");
+    EXPECT_FALSE(result.succeeded());
+    EXPECT_EQ(result.stop_position, 2u);
 }
 
 } // namespace

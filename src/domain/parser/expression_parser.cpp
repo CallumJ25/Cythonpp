@@ -106,6 +106,9 @@ ExpressionParser::ExpressionParser(lexer::TokenStream& tokens, diagnostics::Diag
     : tokens_(tokens), sink_(sink) {}
 
 ast::ExprPtr ExpressionParser::parse_expression() {
+    if (reject_if_empty()) {
+        return nullptr;
+    }
     ast::ExprPtr value = parse_or_test();
     if (value == nullptr) {
         return nullptr;
@@ -127,6 +130,9 @@ ast::ExprPtr ExpressionParser::parse_expression() {
 }
 
 ast::ExprPtr ExpressionParser::parse_expression_list() {
+    if (reject_if_empty()) {
+        return nullptr;
+    }
     ast::ExprPtr first = parse_expression();
     if (first == nullptr) {
         return nullptr;
@@ -151,6 +157,9 @@ ast::ExprPtr ExpressionParser::parse_expression_list() {
 }
 
 ast::ExprPtr ExpressionParser::parse_target() {
+    if (reject_if_empty()) {
+        return nullptr;
+    }
     ast::ExprPtr first = parse_postfix();
     if (first == nullptr) {
         return nullptr;
@@ -378,6 +387,12 @@ ast::ExprPtr ExpressionParser::parse_subscript(ast::ExprPtr value) {
     if (tokens_.check(token_type::COLON)) {
         return error(tokens_.peek(), "slices are not supported");
     }
+    // Same guard as the atom productions: nothing that can start an
+    // expression remains, so this is the unclosed '[' itself, not a missing
+    // index.
+    if (ends_a_sequence(tokens_.peek().type())) {
+        return unclosed(opener);
+    }
     ast::ExprPtr index = parse_expression_list();
     if (index == nullptr) {
         return nullptr;
@@ -399,6 +414,12 @@ ast::ExprPtr ExpressionParser::parse_call(ast::ExprPtr callee) {
     std::vector<ast::ExprPtr> args;
     if (!tokens_.check(token_type::CLOSE_PAREN)) {
         while (true) {
+            // Same guard as the atom productions: nothing that can start an
+            // expression remains, so this is the unclosed '(' itself, not a
+            // missing argument.
+            if (ends_a_sequence(tokens_.peek().type())) {
+                return unclosed(opener);
+            }
             ast::ExprPtr arg = parse_expression();
             if (arg == nullptr) {
                 return nullptr;
@@ -501,15 +522,10 @@ ast::ExprPtr ExpressionParser::parse_paren_atom() {
     std::vector<ast::ExprPtr> elements;
     bool saw_comma = false;
     while (true) {
-        // Nothing that can start an expression remains: this is the unclosed
-        // bracket itself, not a missing operand, so report it against the
-        // opener rather than letting parse_expression's own "expected an
-        // expression" mask it. The indentation pass synthesizes a NEWLINE at
-        // end-of-file even inside an unclosed bracket (confirmed by
-        // inspecting the token stream for "("), so TOKEN_EOF alone is not a
-        // sufficient check -- ends_a_sequence catches that NEWLINE too. See
-        // the task report for why the brief's literal code needed this
-        // addition.
+        // Nothing that can start an expression remains, so this is the
+        // unclosed bracket itself rather than a missing operand. The lexer
+        // emits a NEWLINE at end of file even inside an open bracket, so
+        // TOKEN_EOF alone would miss it and mask the real error.
         if (ends_a_sequence(tokens_.peek().type())) {
             return unclosed(opener);
         }
@@ -518,6 +534,12 @@ ast::ExprPtr ExpressionParser::parse_paren_atom() {
             return nullptr;
         }
         elements.push_back(std::move(element));
+        // Only the first element can be a generator expression's leading
+        // value; every later element is already past the point where a
+        // comma-separated tuple was chosen instead.
+        if (elements.size() == 1 && tokens_.check(token_type::KEYWORD_FOR)) {
+            return error(tokens_.peek(), "generator expressions are not supported");
+        }
         if (!tokens_.match(token_type::COMMA)) {
             break;
         }
@@ -581,6 +603,13 @@ ast::ExprPtr ExpressionParser::parse_bracket_atom() {
             return nullptr;
         }
         elements.push_back(std::move(next));
+    }
+
+    // The comma-loop spelling of a comprehension: `for` arriving after a
+    // comma-separated run rather than right after the first element, which
+    // the check above this loop does not see.
+    if (tokens_.check(token_type::KEYWORD_FOR)) {
+        return error(tokens_.peek(), "list comprehensions cannot follow a comma-separated list");
     }
 
     if (!tokens_.check(token_type::CLOSE_BRACKET)) {
@@ -701,6 +730,19 @@ ast::ExprPtr ExpressionParser::parse_brace_atom() {
     const lexer::Token& closer = tokens_.advance();
     const ast::SourceSpan span = ast::merge(ast::span_of(opener), ast::span_of(closer));
     return std::make_unique<ast::DictExpr>(span, std::move(entries));
+}
+
+bool ExpressionParser::reject_if_empty() {
+    if (!tokens_.empty()) {
+        return false;
+    }
+    // TokenStream::peek() throws std::out_of_range on an empty stream, and
+    // every entry point below calls it unguarded. Lexer output always ends in
+    // TOKEN_EOF, so this never happens through the real pipeline -- but the
+    // header's "never throws" contract must hold for any TokenStream, not
+    // just one Lexer produced.
+    error_at(ast::SourceSpan{1, 1, 1, 1}, "expected an expression");
+    return true;
 }
 
 ast::ExprPtr ExpressionParser::unclosed(const lexer::Token& opener) {

@@ -27,6 +27,9 @@ namespace test_support {
 struct ParseResult {
     ast::ExprPtr expression;
     std::vector<diagnostics::Diagnostic> diagnostics;
+    // The stream's cursor position after the parse returned. On a failing
+    // parse this pins the "cursor left on the offending token" contract.
+    std::size_t stop_position = 0;
 
     bool succeeded() const { return expression != nullptr; }
 
@@ -77,6 +80,7 @@ inline ParseResult parse_from(const std::string& source, std::size_t start,
             break;
     }
     result.diagnostics = sink.diagnostics();
+    result.stop_position = stream.position();
     return result;
 }
 
