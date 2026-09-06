@@ -16,6 +16,7 @@
 #include "domain/ast/comprehension_clause.h"
 #include "domain/ast/constant.h"
 #include "domain/ast/dict_expr.h"
+#include "domain/ast/expr_stmt.h"
 #include "domain/ast/function_def.h"
 #include "domain/ast/list_comp.h"
 #include "domain/ast/list_expr.h"
@@ -371,6 +372,29 @@ TEST(AstPrinter, PrintingTwiceWithTheSamePrinterGivesTheSameResult) {
     const Name node(kSpan, "x");
     EXPECT_EQ(printer.print(node), "(Name x)");
     EXPECT_EQ(printer.print(node), "(Name x)");
+}
+
+TEST(AstPrinter, ExprStmtWrapsItsExpression) {
+    auto call = std::make_unique<Call>(
+        SourceSpan{1, 1, 1, 8}, std::make_unique<Name>(SourceSpan{1, 1, 1, 6}, "print"),
+        [] {
+            std::vector<ExprPtr> args;
+            args.push_back(std::make_unique<Name>(SourceSpan{1, 7, 1, 8}, "x"));
+            return args;
+        }());
+    const SourceSpan span = call->span();
+    const ExprStmt statement(span, std::move(call));
+
+    EXPECT_EQ(AstPrinter().print(statement), "(ExprStmt (Call (Name print) (Name x)))");
+}
+
+TEST(AstPrinter, ExprStmtIsAStatementInsideAModule) {
+    std::vector<StmtPtr> body;
+    body.push_back(std::make_unique<ExprStmt>(SourceSpan{1, 1, 1, 2},
+                                              std::make_unique<Name>(SourceSpan{1, 1, 1, 2}, "x")));
+    const Module module(SourceSpan{1, 1, 1, 2}, std::move(body));
+
+    EXPECT_EQ(AstPrinter().print(module), "(Module\n  (ExprStmt (Name x)))");
 }
 
 } // namespace

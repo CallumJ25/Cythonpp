@@ -15,6 +15,7 @@ class Compare;
 class Constant;
 class Continue;
 class DictExpr;
+class ExprStmt;
 class For;
 class FunctionDef;
 class If;
@@ -59,6 +60,7 @@ public:
     virtual void visit(const Constant& node) = 0;
     virtual void visit(const Continue& node) = 0;
     virtual void visit(const DictExpr& node) = 0;
+    virtual void visit(const ExprStmt& node) = 0;
     virtual void visit(const For& node) = 0;
     virtual void visit(const FunctionDef& node) = 0;
     virtual void visit(const If& node) = 0;

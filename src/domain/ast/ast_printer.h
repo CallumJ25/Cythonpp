@@ -33,6 +33,7 @@ public:
     void visit(const Constant& node) override;
     void visit(const Continue& node) override;
     void visit(const DictExpr& node) override;
+    void visit(const ExprStmt& node) override;
     void visit(const For& node) override;
     void visit(const FunctionDef& node) override;
     void visit(const If& node) override;

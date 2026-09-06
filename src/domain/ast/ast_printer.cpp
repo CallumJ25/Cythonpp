@@ -14,6 +14,7 @@
 #include "constant.h"
 #include "continue.h"
 #include "dict_expr.h"
+#include "expr_stmt.h"
 #include "domain/lexer/keyword_table.h"
 #include "domain/lexer/operator_table.h"
 #include "domain/lexer/token_type_name.h"
@@ -155,6 +156,12 @@ void AstPrinter::visit(const DictExpr& node) {
         entry.value->accept(*this);
         out_ += ")";
     }
+    out_ += ")";
+}
+
+void AstPrinter::visit(const ExprStmt& node) {
+    out_ += "(ExprStmt ";
+    node.value().accept(*this);
     out_ += ")";
 }
 
