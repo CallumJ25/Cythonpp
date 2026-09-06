@@ -3,6 +3,8 @@
 #include "domain/ast/ann_assign.h"
 #include "domain/ast/constant.h"
 #include "domain/ast/expr_stmt.h"
+#include "domain/ast/for.h"
+#include "domain/ast/name.h"
 #include "domain/ast/return.h"
 #include "domain/lexer/token_type.h"
 #include "statement_parse_test_helpers.h"
@@ -227,6 +229,54 @@ TEST(StatementParser, AnIfConditionCanBeAComparison) {
 TEST(StatementParser, StatementsAfterABlockReturnToTheOuterLevel) {
     EXPECT_EQ(printed("if a:\n    pass\nbreak\n"),
               "(Module\n  (If (Name a)\n    (Pass))\n  (Break))");
+}
+
+TEST(StatementParser, ParsesAWhileLoop) {
+    EXPECT_EQ(printed("while x:\n    pass\n"),
+              "(Module\n  (While (Name x)\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesAWhileElse) {
+    // Python runs the else when the loop finishes without hitting a break.
+    EXPECT_EQ(printed("while x:\n    break\nelse:\n    pass\n"),
+              "(Module\n  (While (Name x)\n    (Break)\n    (Else\n      (Pass))))");
+}
+
+TEST(StatementParser, ParsesAForLoop) {
+    EXPECT_EQ(printed("for x in items:\n    pass\n"),
+              "(Module\n  (For (Name x) (Name items)\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesAForWithATupleTarget) {
+    EXPECT_EQ(printed("for i, item in pairs:\n    pass\n"),
+              "(Module\n  (For (TupleExpr (Name i) (Name item)) (Name pairs)\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesAForOverACall) {
+    EXPECT_EQ(printed("for i in range(10):\n    pass\n"),
+              "(Module\n  (For (Name i) (Call (Name range) (Constant 10))\n    (Pass)))");
+}
+
+TEST(StatementParser, ParsesAForElse) {
+    EXPECT_EQ(printed("for x in items:\n    pass\nelse:\n    break\n"),
+              "(Module\n  (For (Name x) (Name items)\n    (Pass)\n    (Else\n      (Break))))");
+}
+
+TEST(StatementParser, AForTargetIsNotSwallowedAsAComparison) {
+    // The reason parse_target exists. With the full expression grammar this
+    // would parse `x in items` as one Compare and then find no `in`.
+    const statement_test_support::ModuleResult result =
+        parse_module("for x in items:\n    pass\n");
+    ASSERT_NE(result.module, nullptr);
+    ASSERT_EQ(result.module->body().size(), 1u);
+    const auto* loop = dynamic_cast<const ast::For*>(result.module->body().front().get());
+    ASSERT_NE(loop, nullptr);
+    EXPECT_NE(dynamic_cast<const ast::Name*>(&loop->target()), nullptr);
+}
+
+TEST(StatementParser, ParsesALoopBodyWithSeveralStatements) {
+    EXPECT_EQ(printed("while x:\n    a = 1\n    break\n"),
+              "(Module\n  (While (Name x)\n    (Assign (Name a) (Constant 1))\n    (Break)))");
 }
 
 } // namespace

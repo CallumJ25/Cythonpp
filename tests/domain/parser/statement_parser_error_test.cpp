@@ -161,5 +161,13 @@ TEST(StatementParserError, AFailedIfConditionSwallowsItsOrphanedBlock) {
     expect_error("if lambda: 1\n    pass\n", "lambda expressions are not supported", 1, 4);
 }
 
+TEST(StatementParserError, AForWithNoInKeywordIsReported) {
+    expect_error("for x:\n    pass\n", "expected 'in' after the for target", 1, 6);
+}
+
+TEST(StatementParserError, AForTargetThatCannotBeAssignedIsReported) {
+    expect_error("for f() in items:\n    pass\n", "cannot assign to function call", 1, 5);
+}
+
 } // namespace
 } // namespace cythonpp::domain::parser

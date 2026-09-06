@@ -9,11 +9,13 @@
 #include "domain/ast/break.h"
 #include "domain/ast/continue.h"
 #include "domain/ast/expr_stmt.h"
+#include "domain/ast/for.h"
 #include "domain/ast/if.h"
 #include "domain/ast/pass.h"
 #include "domain/ast/return.h"
 #include "domain/ast/source_span.h"
 #include "domain/ast/tuple_expr.h"
+#include "domain/ast/while.h"
 #include "domain/lexer/token_type.h"
 
 namespace cythonpp::domain::parser {
@@ -32,7 +34,8 @@ bool ends_a_statement(token_type type) {
 // The statements that own a suite. Everything else is a simple statement and
 // can share a logical line with a semicolon.
 bool is_compound_keyword(token_type type) {
-    return type == token_type::KEYWORD_IF;
+    return type == token_type::KEYWORD_IF || type == token_type::KEYWORD_WHILE ||
+           type == token_type::KEYWORD_FOR;
 }
 
 // The thirteen augmented-assignment operators. Each is a diagnostic rather
@@ -182,8 +185,10 @@ std::vector<ast::StmtPtr> StatementParser::parse_statement_list() {
 
 ast::StmtPtr StatementParser::parse_statement() {
     switch (tokens_.peek().type()) {
-        case token_type::KEYWORD_IF: return parse_if();
-        default:                     break;
+        case token_type::KEYWORD_IF:    return parse_if();
+        case token_type::KEYWORD_WHILE: return parse_while();
+        case token_type::KEYWORD_FOR:   return parse_for();
+        default:                        break;
     }
     // Only reachable if is_compound_keyword and this switch disagree.
     return error(tokens_.peek(), "expected a statement");
@@ -473,6 +478,66 @@ bool StatementParser::parse_else_clause(std::vector<ast::StmtPtr>& into) {
     }
     into = std::move(body);
     return true;
+}
+
+ast::StmtPtr StatementParser::parse_while() {
+    const ast::SourceSpan keyword_span = ast::span_of(tokens_.peek());
+    tokens_.advance();
+
+    ast::ExprPtr condition = expressions_.parse_expression();
+    if (condition == nullptr) {
+        return nullptr;
+    }
+
+    std::vector<ast::StmtPtr> body = parse_suite();
+    if (body.empty()) {
+        return nullptr;
+    }
+    std::vector<ast::StmtPtr> orelse;
+    if (!parse_else_clause(orelse)) {
+        return nullptr; // already reported
+    }
+
+    const ast::SourceSpan end = orelse.empty() ? body.back()->span() : orelse.back()->span();
+    const ast::SourceSpan span = ast::merge(keyword_span, end);
+    return std::make_unique<ast::While>(span, std::move(condition), std::move(body),
+                                        std::move(orelse));
+}
+
+ast::StmtPtr StatementParser::parse_for() {
+    const ast::SourceSpan keyword_span = ast::span_of(tokens_.peek());
+    tokens_.advance();
+
+    // parse_target, not parse_expression: `for x in y` parsed with the full
+    // grammar swallows `x in y` as a Compare, because `in` is a comparison
+    // operator. parse_target's grammar has no `in` in it, so it halts before
+    // the keyword without a lookahead or a flag.
+    ast::ExprPtr target = expressions_.parse_target();
+    if (target == nullptr) {
+        return nullptr;
+    }
+    if (!tokens_.match(token_type::OP_IN)) {
+        return error(tokens_.peek(), "expected 'in' after the for target");
+    }
+
+    ast::ExprPtr iterable = expressions_.parse_expression_list();
+    if (iterable == nullptr) {
+        return nullptr;
+    }
+
+    std::vector<ast::StmtPtr> body = parse_suite();
+    if (body.empty()) {
+        return nullptr;
+    }
+    std::vector<ast::StmtPtr> orelse;
+    if (!parse_else_clause(orelse)) {
+        return nullptr; // already reported
+    }
+
+    const ast::SourceSpan end = orelse.empty() ? body.back()->span() : orelse.back()->span();
+    const ast::SourceSpan span = ast::merge(keyword_span, end);
+    return std::make_unique<ast::For>(span, std::move(target), std::move(iterable),
+                                      std::move(body), std::move(orelse));
 }
 
 ast::StmtPtr StatementParser::error(const lexer::Token& token, std::string message) {
