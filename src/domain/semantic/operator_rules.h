@@ -1,10 +1,9 @@
 #ifndef CYTHONPP_DOMAIN_SEMANTIC_OPERATOR_RULES_H
 #define CYTHONPP_DOMAIN_SEMANTIC_OPERATOR_RULES_H
 
-#include <optional>
-
 #include "class_lookup.h"
 #include "domain/lexer/token_type.h"
+#include "rule_result.h"
 #include "type.h"
 
 namespace cythonpp::domain::semantic {
@@ -13,9 +12,19 @@ namespace cythonpp::domain::semantic {
 // precedence_table.cpp: tabular, and independently testable.
 //
 // Every function here is a PURE FUNCTION of its inputs and takes no
-// DiagnosticSink. std::nullopt means "this operator does not apply", which is
-// the caller's cue to report; the table never reports, so its tests need no
-// sink.
+// DiagnosticSink. It answers three ways, and the caller must handle all
+// three (see RuleResult):
+//
+//   Ok            -- use the type.
+//   NotApplicable -- a genuine type error; the caller reports TypeError.
+//   Unsupported   -- this compiler cannot model the answer; the caller
+//                    reports NotImplementedError with
+//                    unsupported_message(reason), NEVER TypeError, because
+//                    the program may be one mypy --strict accepts.
+//
+// The three-valued answer replaced a std::optional<Type> whose nullopt
+// conflated the last two, which made a false TypeError reachable by
+// omission at every call site.
 //
 // HOW Unknown PROPAGATES, stated per function because one blanket rule would
 // be wrong for two of them:
@@ -36,25 +45,25 @@ namespace cythonpp::domain::semantic {
 // `left op right`, for the arithmetic and bitwise operators ast::BinOp
 // carries. Comparison and boolean operators are not here: they build
 // ast::Compare and ast::BoolOp, not ast::BinOp.
-std::optional<Type> binary_result(lexer::token_type op, const Type& left, const Type& right);
+RuleResult binary_result(lexer::token_type op, const Type& left, const Type& right);
 
 // `op operand`, for `-`, `+`, `~` and `not`.
-std::optional<Type> unary_result(lexer::token_type op, const Type& operand);
+RuleResult unary_result(lexer::token_type op, const Type& operand);
 
 // One comparison from an ast::Compare chain. Always Bool when it applies.
-std::optional<Type> comparison_result(lexer::token_type op, const Type& left, const Type& right);
+RuleResult comparison_result(lexer::token_type op, const Type& left, const Type& right);
 
 // `container[index]`.
 //
 // `classes` is forwarded to is_subtype for the dict key check, so a dict
 // keyed by a base class accepts a subclass index. It may be null, in which
 // case two differently-named classes are simply unrelated.
-std::optional<Type> subscript_result(const Type& container, const Type& index,
-                                     const ClassLookup* classes = nullptr);
+RuleResult subscript_result(const Type& container, const Type& index,
+                            const ClassLookup* classes = nullptr);
 
 // What iterating `iterable` yields, for `for` and for comprehensions.
 // Iterating a dict yields its KEYS, not its items.
-std::optional<Type> element_type(const Type& iterable);
+RuleResult element_type(const Type& iterable);
 
 } // namespace cythonpp::domain::semantic
 

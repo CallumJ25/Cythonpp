@@ -1,9 +1,8 @@
-#include <optional>
-
 #include <gtest/gtest.h>
 
 #include "domain/lexer/token_type.h"
 #include "domain/semantic/operator_rules.h"
+#include "domain/semantic/rule_result.h"
 #include "domain/semantic/type.h"
 #include "domain/semantic/type_name.h"
 #include "fake_class_lookup.h"
@@ -16,45 +15,48 @@ using lexer::token_type;
 // Reads as "left op right yields expected", and names both sides on failure,
 // which is worth the wrapper when a table of rows fails at once.
 void expect_binary(token_type op, const Type& left, const Type& right, const Type& expected) {
-    const std::optional<Type> result = binary_result(op, left, right);
-    ASSERT_TRUE(result.has_value()) << type_name(left) << " op " << type_name(right)
-                                    << " should have a result type";
-    EXPECT_EQ(*result, expected) << "got " << type_name(*result) << ", wanted "
-                                 << type_name(expected);
+    const RuleResult result = binary_result(op, left, right);
+    ASSERT_EQ(result.status, RuleResult::Status::Ok)
+        << type_name(left) << " op " << type_name(right) << " should have a result type";
+    EXPECT_EQ(result.type, expected) << "got " << type_name(result.type) << ", wanted "
+                                     << type_name(expected);
 }
 
+// NotApplicable specifically, not merely "not Ok": Unsupported is also not
+// Ok, and conflating them would let a modelling-limit arm silently satisfy a
+// test that means "this is a genuine type error".
 void expect_no_binary(token_type op, const Type& left, const Type& right) {
-    const std::optional<Type> result = binary_result(op, left, right);
-    EXPECT_FALSE(result.has_value())
-        << type_name(left) << " op " << type_name(right) << " should not apply, got "
-        << (result ? type_name(*result) : "nullopt");
+    const RuleResult result = binary_result(op, left, right);
+    EXPECT_EQ(result.status, RuleResult::Status::NotApplicable)
+        << type_name(left) << " op " << type_name(right) << " should be a type error, got "
+        << (result.status == RuleResult::Status::Ok ? type_name(result.type) : "Unsupported");
 }
 
 void expect_unary(token_type op, const Type& operand, const Type& expected) {
-    const std::optional<Type> result = unary_result(op, operand);
-    ASSERT_TRUE(result.has_value()) << "unary op on " << type_name(operand)
-                                    << " should have a result type";
-    EXPECT_EQ(*result, expected) << "got " << type_name(*result);
+    const RuleResult result = unary_result(op, operand);
+    ASSERT_EQ(result.status, RuleResult::Status::Ok)
+        << "unary op on " << type_name(operand) << " should have a result type";
+    EXPECT_EQ(result.type, expected) << "got " << type_name(result.type);
 }
 
 void expect_no_unary(token_type op, const Type& operand) {
-    const std::optional<Type> result = unary_result(op, operand);
-    EXPECT_FALSE(result.has_value()) << "unary op on " << type_name(operand)
-                                     << " should not apply";
+    const RuleResult result = unary_result(op, operand);
+    EXPECT_EQ(result.status, RuleResult::Status::NotApplicable)
+        << "unary op on " << type_name(operand) << " should be a type error";
 }
 
 void expect_comparison(token_type op, const Type& left, const Type& right) {
-    const std::optional<Type> result = comparison_result(op, left, right);
-    ASSERT_TRUE(result.has_value()) << type_name(left) << " cmp " << type_name(right)
-                                    << " should have a result type";
-    EXPECT_EQ(*result, Type::bool_()) << "a comparison must yield bool, got "
-                                      << type_name(*result);
+    const RuleResult result = comparison_result(op, left, right);
+    ASSERT_EQ(result.status, RuleResult::Status::Ok)
+        << type_name(left) << " cmp " << type_name(right) << " should have a result type";
+    EXPECT_EQ(result.type, Type::bool_())
+        << "a comparison must yield bool, got " << type_name(result.type);
 }
 
 void expect_no_comparison(token_type op, const Type& left, const Type& right) {
-    const std::optional<Type> result = comparison_result(op, left, right);
-    EXPECT_FALSE(result.has_value())
-        << type_name(left) << " cmp " << type_name(right) << " should not apply";
+    const RuleResult result = comparison_result(op, left, right);
+    EXPECT_EQ(result.status, RuleResult::Status::NotApplicable)
+        << type_name(left) << " cmp " << type_name(right) << " should be a type error";
 }
 
 TEST(BinaryResult, UnknownIsAbsorbingAndNeverNullopt) {
@@ -424,27 +426,29 @@ TEST(ComparisonResult, IsNulloptForATokenThatIsNotAComparison) {
 }
 
 void expect_subscript(const Type& container, const Type& index, const Type& expected) {
-    const std::optional<Type> result = subscript_result(container, index);
-    ASSERT_TRUE(result.has_value()) << type_name(container) << "[" << type_name(index)
-                                    << "] should have a result type";
-    EXPECT_EQ(*result, expected) << "got " << type_name(*result);
+    const RuleResult result = subscript_result(container, index);
+    ASSERT_EQ(result.status, RuleResult::Status::Ok)
+        << type_name(container) << "[" << type_name(index) << "] should have a result type";
+    EXPECT_EQ(result.type, expected) << "got " << type_name(result.type);
 }
 
 void expect_no_subscript(const Type& container, const Type& index) {
-    const std::optional<Type> result = subscript_result(container, index);
-    EXPECT_FALSE(result.has_value()) << type_name(container) << "[" << type_name(index)
-                                     << "] should not apply";
+    const RuleResult result = subscript_result(container, index);
+    EXPECT_EQ(result.status, RuleResult::Status::NotApplicable)
+        << type_name(container) << "[" << type_name(index) << "] should be a type error";
 }
 
 void expect_element(const Type& iterable, const Type& expected) {
-    const std::optional<Type> result = element_type(iterable);
-    ASSERT_TRUE(result.has_value()) << type_name(iterable) << " should be iterable";
-    EXPECT_EQ(*result, expected) << "got " << type_name(*result);
+    const RuleResult result = element_type(iterable);
+    ASSERT_EQ(result.status, RuleResult::Status::Ok)
+        << type_name(iterable) << " should be iterable";
+    EXPECT_EQ(result.type, expected) << "got " << type_name(result.type);
 }
 
 void expect_not_iterable(const Type& iterable) {
-    const std::optional<Type> result = element_type(iterable);
-    EXPECT_FALSE(result.has_value()) << type_name(iterable) << " should not be iterable";
+    const RuleResult result = element_type(iterable);
+    EXPECT_EQ(result.status, RuleResult::Status::NotApplicable)
+        << type_name(iterable) << " should be a type error";
 }
 
 TEST(SubscriptResult, IndexingASequenceYieldsItsElement) {
@@ -487,9 +491,11 @@ TEST(SubscriptResult, ADictKeyedByABaseClassAcceptsASubclassIndex) {
     const semantic_test_support::FakeClassLookup classes({{"Base", {}}, {"Sub", {"Base"}}});
     const Type dict = Type::dict_of(Type::class_of("Base"), Type::int_());
 
-    EXPECT_TRUE(subscript_result(dict, Type::class_of("Sub"), &classes).has_value());
+    EXPECT_EQ(subscript_result(dict, Type::class_of("Sub"), &classes).status,
+              RuleResult::Status::Ok);
     // Without the lookup the two classes are unrelated, so it does not apply.
-    EXPECT_FALSE(subscript_result(dict, Type::class_of("Sub")).has_value());
+    EXPECT_EQ(subscript_result(dict, Type::class_of("Sub")).status,
+              RuleResult::Status::NotApplicable);
 }
 
 // Verified: reveal_type(t[i]) on a tuple[int, str] with a variable index is

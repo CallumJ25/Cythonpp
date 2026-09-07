@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 #include "type_compatibility.h"
@@ -194,63 +195,71 @@ std::optional<Type> ordered_result(const Type& left, const Type& right) {
     return std::nullopt;
 }
 
+// One place to lift a helper's two-valued answer into the public protocol.
+// The helpers stay two-valued on purpose: internally there is no third case,
+// and the Unsupported arms are decided in the public functions where the
+// operand kinds are still in scope.
+RuleResult lift(std::optional<Type> result) {
+    return result ? RuleResult::ok(std::move(*result)) : RuleResult::not_applicable();
+}
+
 } // namespace
 
-std::optional<Type> binary_result(lexer::token_type op, const Type& left, const Type& right) {
+RuleResult binary_result(lexer::token_type op, const Type& left, const Type& right) {
     // Absorbing, and before the operator switch so it also covers operators
     // that would otherwise never apply: the root cause already reported.
     if (left.kind == TypeKind::Unknown || right.kind == TypeKind::Unknown) {
-        return Type::unknown();
+        return RuleResult::ok(Type::unknown());
     }
 
     switch (op) {
     case lexer::token_type::OP_PLUS:
-        return plus_result(left, right);
+        return lift(plus_result(left, right));
     case lexer::token_type::OP_MINUS:
-        return numeric_join(left, right);
+        return lift(numeric_join(left, right));
     case lexer::token_type::OP_STAR:
-        return star_result(left, right);
+        return lift(star_result(left, right));
     case lexer::token_type::OP_SLASH:
-        return true_divide_result(left, right);
+        return lift(true_divide_result(left, right));
     case lexer::token_type::OP_DOUBLE_SLASH:
         // Complex // complex is accepted here. mypy rejects it; a missed
         // error rather than a false one, so the hard invariant holds.
-        return numeric_join(left, right);
+        return lift(numeric_join(left, right));
     case lexer::token_type::OP_DOUBLE_STAR:
         // int ** int is int. mypy types 2 ** -1 as float by reading the
         // literal's sign, which needs literal types. A recorded gap.
-        return numeric_join(left, right);
+        return lift(numeric_join(left, right));
     case lexer::token_type::OP_PERCENT:
-        return modulo_result(left, right);
+        return lift(modulo_result(left, right));
     case lexer::token_type::OP_AT:
         // Matrix multiplication: no builtin type supports it, so this never
         // applies. The semantic half of OP_AT's two readings.
-        return std::nullopt;
+        return RuleResult::not_applicable();
     case lexer::token_type::OP_AMPERSAND:
     case lexer::token_type::OP_PIPE:
-        return intersection_or_union_result(left, right);
+        return lift(intersection_or_union_result(left, right));
     case lexer::token_type::OP_CARET:
     case lexer::token_type::OP_LEFT_SHIFT:
     case lexer::token_type::OP_RIGHT_SHIFT:
-        return integer_only_result(left, right);
+        return lift(integer_only_result(left, right));
     default:
         // Not a binary arithmetic or bitwise operator. A default is right in
         // a switch over token_type, which has well over a hundred
         // enumerators; Global Constraint 5 forbids one only over TypeKind.
-        return std::nullopt;
+        return RuleResult::not_applicable();
     }
 }
 
-std::optional<Type> unary_result(lexer::token_type op, const Type& operand) {
+RuleResult unary_result(lexer::token_type op, const Type& operand) {
     // BEFORE the Unknown guard, deliberately. Truthiness is universal in
     // Python, so `not` is total and always yields bool; absorbing Unknown
     // here would turn Bool into Unknown and silence a genuine error
     // downstream.
     if (op == lexer::token_type::OP_NOT) {
-        return Type::bool_();
+        return RuleResult::ok(Type::bool_());
     }
     if (operand.kind == TypeKind::Unknown) {
-        return Type::unknown();
+        return RuleResult::ok(Type::unknown());
     }
 
     switch (op) {
@@ -258,22 +267,22 @@ std::optional<Type> unary_result(lexer::token_type op, const Type& operand) {
     case lexer::token_type::OP_MINUS: {
         const int rank = numeric_rank(operand.kind);
         if (rank == 0) {
-            return std::nullopt;
+            return RuleResult::not_applicable();
         }
         // Floored at Int, so -True is int, consistent with the binary rules.
-        return numeric_of_rank(std::max(2, rank));
+        return RuleResult::ok(numeric_of_rank(std::max(2, rank)));
     }
     case lexer::token_type::OP_TILDE:
         if (is_integral(operand.kind)) {
-            return Type::int_();
+            return RuleResult::ok(Type::int_());
         }
-        return std::nullopt;
+        return RuleResult::not_applicable();
     default:
-        return std::nullopt;
+        return RuleResult::not_applicable();
     }
 }
 
-std::optional<Type> comparison_result(lexer::token_type op, const Type& left, const Type& right) {
+RuleResult comparison_result(lexer::token_type op, const Type& left, const Type& right) {
     switch (op) {
     case lexer::token_type::OP_EQUAL:
     case lexer::token_type::OP_NOT_EQUAL:
@@ -283,60 +292,59 @@ std::optional<Type> comparison_result(lexer::token_type op, const Type& left, co
         // operands could ever be equal is mypy's strict-equality rule, which
         // the spec puts out of scope. Note this deliberately does NOT absorb
         // Unknown -- the result type does not depend on the operands.
-        return Type::bool_();
+        return RuleResult::ok(Type::bool_());
     case lexer::token_type::OP_IN:
     case lexer::token_type::OP_NOT_IN:
         if (right.kind == TypeKind::Unknown || is_container(right.kind)) {
-            return Type::bool_();
+            return RuleResult::ok(Type::bool_());
         }
-        return std::nullopt;
+        return RuleResult::not_applicable();
     case lexer::token_type::OP_LESS:
     case lexer::token_type::OP_LESS_EQUAL:
     case lexer::token_type::OP_GREATER:
     case lexer::token_type::OP_GREATER_EQUAL:
-        return ordered_result(left, right);
+        return lift(ordered_result(left, right));
     default:
-        return std::nullopt;
+        return RuleResult::not_applicable();
     }
 }
 
-std::optional<Type> subscript_result(const Type& container, const Type& index,
-                                     const ClassLookup* classes) {
+RuleResult subscript_result(const Type& container, const Type& index, const ClassLookup* classes) {
     if (container.kind == TypeKind::Unknown || index.kind == TypeKind::Unknown) {
-        return Type::unknown();
+        return RuleResult::ok(Type::unknown());
     }
 
     // Dict first, because it is the one container whose index is not an
     // integer and so must skip the integral check below.
     if (container.kind == TypeKind::Dict) {
         if (container.args.size() != 2) {
-            return std::nullopt;
+            return RuleResult::not_applicable();
         }
         // By assignability, not equality, so a dict keyed by a base class
         // accepts a subclass index and the numeric tower applies to the key.
         // This is the only reason this function takes a ClassLookup.
         if (!is_subtype(index, container.args.front(), classes)) {
-            return std::nullopt;
+            return RuleResult::not_applicable();
         }
-        return container.args.back();
+        return RuleResult::ok(container.args.back());
     }
 
     if (!is_integral(index.kind)) {
-        return std::nullopt;
+        return RuleResult::not_applicable();
     }
     if (container.kind == TypeKind::List) {
         if (container.args.empty()) {
-            return std::nullopt;
+            return RuleResult::not_applicable();
         }
-        return container.args.front();
+        return RuleResult::ok(container.args.front());
     }
     if (container.kind == TypeKind::Str) {
-        return Type::str();
+        return RuleResult::ok(Type::str());
     }
     if (container.kind == TypeKind::Bytes || container.kind == TypeKind::ByteArray ||
         container.kind == TypeKind::Range) {
         // Indexing bytes yields an int, not a bytes. Verified.
-        return Type::int_();
+        return RuleResult::ok(Type::int_());
     }
     if (container.kind == TypeKind::Tuple) {
         // BEFORE consulting union_of: an empty tuple (`tuple[()]`) has no
@@ -346,38 +354,38 @@ std::optional<Type> subscript_result(const Type& container, const Type& index,
         // no error was ever reported, so returning it would silently accept
         // `t[0]` on an empty tuple and then propagate Unknown through every
         // later use, masking real errors downstream instead of surfacing
-        // this one. nullopt is the caller's cue to report instead.
+        // this one. NotApplicable is the caller's cue to report instead.
         if (container.args.empty()) {
-            return std::nullopt;
+            return RuleResult::not_applicable();
         }
         // The union of every member. mypy selects the one member a LITERAL
         // index names, which needs literal types; the union is the sound
         // approximation, and is exactly what mypy produces for a variable
         // index. union_of de-duplicates, so a homogeneous tuple collapses.
-        return Type::union_of(container.args);
+        return RuleResult::ok(Type::union_of(container.args));
     }
-    return std::nullopt;
+    return RuleResult::not_applicable();
 }
 
-std::optional<Type> element_type(const Type& iterable) {
+RuleResult element_type(const Type& iterable) {
     if (iterable.kind == TypeKind::Unknown) {
-        return Type::unknown();
+        return RuleResult::ok(Type::unknown());
     }
     if (iterable.kind == TypeKind::List || iterable.kind == TypeKind::Set ||
         iterable.kind == TypeKind::FrozenSet || iterable.kind == TypeKind::Dict) {
         // Iterating a dict yields its KEYS, not its items -- which is why
         // args.front() is right for all four of these.
         if (iterable.args.empty()) {
-            return std::nullopt;
+            return RuleResult::not_applicable();
         }
-        return iterable.args.front();
+        return RuleResult::ok(iterable.args.front());
     }
     if (iterable.kind == TypeKind::Str) {
-        return Type::str();
+        return RuleResult::ok(Type::str());
     }
     if (iterable.kind == TypeKind::Bytes || iterable.kind == TypeKind::ByteArray ||
         iterable.kind == TypeKind::Range) {
-        return Type::int_();
+        return RuleResult::ok(Type::int_());
     }
     if (iterable.kind == TypeKind::Tuple) {
         // Same reasoning as subscript_result's Tuple arm: an empty tuple has
@@ -386,11 +394,11 @@ std::optional<Type> element_type(const Type& iterable) {
         // otherwise bind v: Unknown and silence every genuine error in the
         // loop body.
         if (iterable.args.empty()) {
-            return std::nullopt;
+            return RuleResult::not_applicable();
         }
-        return Type::union_of(iterable.args);
+        return RuleResult::ok(Type::union_of(iterable.args));
     }
-    return std::nullopt;
+    return RuleResult::not_applicable();
 }
 
 } // namespace cythonpp::domain::semantic
