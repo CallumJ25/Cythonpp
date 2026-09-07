@@ -86,9 +86,14 @@ std::optional<Type> star_result(const Type& left, const Type& right) {
     // types `t * n` for a non-literal count as tuple[int, ...], a VARIADIC
     // tuple this model cannot represent (Type has no variadic-tuple
     // constructor, and the spec rejects tuple[int, ...] annotations
-    // outright). A concrete fixed-arity answer would be a wrong type, which
-    // is worse than a missing one, so this stays nullopt -- a "cannot model"
-    // gap, not a type error.
+    // outright), and for a literal count mypy unrolls it, which is constant
+    // folding and out of scope (Spec 2). Either way, though, this line is not
+    // where that gap is enforced: binary_result's `Tuple x integral` +
+    // `op == OP_STAR` check runs BEFORE star_result is ever called and
+    // answers RuleResult::unsupported(UnsupportedReason::TupleRepeat)
+    // directly, so every `tuple * integral` pairing is intercepted there.
+    // This nullopt is unreachable in practice; it stays only so star_result
+    // remains correct in isolation if that gate is ever moved or removed.
     return std::nullopt;
 }
 
@@ -146,10 +151,14 @@ std::optional<Type> intersection_or_union_result(const Type& left, const Type& r
     return std::nullopt;
 }
 
-// PEP 584, Python 3.9+. Verified: dict[str,int] | dict[str,str] is
-// dict[str, int | str] -- the VALUE types union and the keys must match.
-// Only `|` does this: &, - and ^ on dicts are genuine [operator] errors,
-// which is why this cannot live in the shared &/| helper.
+// PEP 584, Python 3.9+. Verified against real mypy 1.18.1:
+// reveal_type(dict[str,int]() | dict[int,int]()) is
+// "builtins.dict[builtins.str | builtins.int, builtins.int]" -- the KEY
+// types union too, they do NOT need to match. (An earlier draft of this
+// table required is_equivalent on the keys, extrapolated from a probe that
+// only ever tried matching keys; that was a false TypeError on a mypy-clean
+// program.) Only `|` does this: &, - and ^ on dicts are genuine [operator]
+// errors, which is why this cannot live in the shared &/| helper.
 std::optional<Type> dict_union_result(const Type& left, const Type& right) {
     if (left.kind != TypeKind::Dict || right.kind != TypeKind::Dict) {
         return std::nullopt;
@@ -157,10 +166,8 @@ std::optional<Type> dict_union_result(const Type& left, const Type& right) {
     if (left.args.size() != 2 || right.args.size() != 2) {
         return std::nullopt;
     }
-    if (!is_equivalent(left.args[0], right.args[0])) {
-        return std::nullopt;
-    }
-    return Type::dict_of(left.args[0], Type::union_of({left.args[1], right.args[1]}));
+    return Type::dict_of(Type::union_of({left.args[0], right.args[0]}),
+                          Type::union_of({left.args[1], right.args[1]}));
 }
 
 std::optional<Type> integer_only_result(const Type& left, const Type& right) {
@@ -182,11 +189,10 @@ bool is_container(TypeKind kind) {
 }
 
 std::optional<Type> ordered_result(const Type& left, const Type& right) {
-    // Bool rather than a report: the root cause already reported, and a
-    // comparison's result type never depends on its operands.
-    if (left.kind == TypeKind::Unknown || right.kind == TypeKind::Unknown) {
-        return Type::bool_();
-    }
+    // No Unknown check here: comparison_result's ordered-operator case
+    // absorbs Unknown itself, above its Unsupported gates, before this
+    // helper is ever called. Duplicating the check here would be dead code
+    // that could hide the fact the caller is responsible for the ordering.
     if (numeric_rank(left.kind) != 0 && numeric_rank(right.kind) != 0) {
         return Type::bool_();
     }
@@ -353,7 +359,28 @@ RuleResult comparison_result(lexer::token_type op, const Type& left, const Type&
         return RuleResult::ok(Type::bool_());
     case lexer::token_type::OP_IN:
     case lexer::token_type::OP_NOT_IN:
-        if (right.kind == TypeKind::Unknown || is_container(right.kind)) {
+        // Unknown absorbs first, then the modelling limits, then the table.
+        // Gated on the RIGHT operand only: `in` asks the right operand
+        // whether it contains the left one, so only the right operand's
+        // kind can make the answer depend on unmodelled dunder dispatch.
+        // Verified: `w in xs` where xs: list[W] is mypy-clean with a plain
+        // user class on the LEFT, so the left side must not be gated.
+        if (right.kind == TypeKind::Unknown) {
+            return RuleResult::ok(Type::bool_());
+        }
+        // Verified: `1 in w` where W defines
+        // __contains__(self, item: int) -> bool is mypy-clean (bool), but
+        // `1 in p` on a plain class with no __contains__ is a genuine
+        // [operator] error. The answer depends on the class's members, same
+        // shape as UserClassOperator elsewhere, so this must defer rather
+        // than guess NotApplicable.
+        if (right.kind == TypeKind::Class) {
+            return RuleResult::unsupported(UnsupportedReason::UserClassOperator);
+        }
+        if (right.kind == TypeKind::Union) {
+            return RuleResult::unsupported(UnsupportedReason::UnionOperand);
+        }
+        if (is_container(right.kind)) {
             return RuleResult::ok(Type::bool_());
         }
         return RuleResult::not_applicable();
@@ -361,6 +388,13 @@ RuleResult comparison_result(lexer::token_type op, const Type& left, const Type&
     case lexer::token_type::OP_LESS_EQUAL:
     case lexer::token_type::OP_GREATER:
     case lexer::token_type::OP_GREATER_EQUAL:
+        // Unknown absorbs FIRST: the root cause already reported, and must
+        // not be re-reported as a modelling limit by the Unsupported gates
+        // below -- `Unknown < Widget` and `Unknown < (int | None)` must
+        // stay Ok(Bool), not Unsupported.
+        if (left.kind == TypeKind::Unknown || right.kind == TypeKind::Unknown) {
+            return RuleResult::ok(Type::bool_());
+        }
         if (left.kind == TypeKind::Class || right.kind == TypeKind::Class) {
             return RuleResult::unsupported(UnsupportedReason::UserClassOperator);
         }

@@ -300,21 +300,26 @@ TEST(BinaryResult, SetsIntersectAcrossUnionMemberOrder) {
     expect_binary(token_type::OP_PIPE, set_str_int, set_int_str, set_str_int);
 }
 
-// Verified: reveal_type(d1 | d2) on two dict[str, int] is dict[str, int], and
-// reveal_type on dict[str, int] | dict[str, str] is dict[str, int | str] --
-// the VALUE types union, the key types must match. PEP 584, Python 3.9+.
-// intersection_or_union_result had no Dict arm at all, so this was a false
-// TypeError on a mypy-clean program.
-TEST(BinaryResult, DictsUnionTheirValueTypes) {
+// Verified against real mypy 1.18.1: reveal_type(d1 | d2) on two
+// dict[str, int] is dict[str, int]; on dict[str, int] | dict[str, str] it is
+// dict[str, int | str]; and on dict[str, int] | dict[int, int] it is
+// dict[str | int, int] -- BOTH key and value types union, keys do NOT need
+// to match. PEP 584, Python 3.9+. intersection_or_union_result had no Dict
+// arm at all, so the first two rows were a false TypeError on a mypy-clean
+// program; the key-matching requirement an earlier draft added for the third
+// row was itself a false TypeError, extrapolated from a probe that only
+// ever tried matching keys.
+TEST(BinaryResult, DictsUnionTheirKeysAndValues) {
     const Type str_int = Type::dict_of(Type::str(), Type::int_());
     const Type str_str = Type::dict_of(Type::str(), Type::str());
+    const Type int_int = Type::dict_of(Type::int_(), Type::int_());
 
     expect_binary(token_type::OP_PIPE, str_int, str_int, str_int);
     expect_binary(token_type::OP_PIPE, str_int, str_str,
                   Type::dict_of(Type::str(), Type::union_of({Type::int_(), Type::str()})));
-
-    // Keys must match. Verified: dict[str, int] | dict[int, int] is an error.
-    expect_no_binary(token_type::OP_PIPE, str_int, Type::dict_of(Type::int_(), Type::int_()));
+    // Mismatched keys union too, rather than being an error.
+    expect_binary(token_type::OP_PIPE, str_int, int_int,
+                  Type::dict_of(Type::union_of({Type::str(), Type::int_()}), Type::int_()));
 }
 
 // Verified: dict & dict, dict - dict and dict ^ dict are all genuine
@@ -533,9 +538,22 @@ TEST(ComparisonResult, OrderedComparisonOfUserClassesIsUnsupportedButEqualityIsN
     expect_comparison(token_type::OP_IS, Type::class_of("Widget"), Type::none());
 }
 
+// Unknown must absorb BEFORE the Unsupported gates in the ordered-comparison
+// case: it is the absorbing bottom for "a root cause already reported", so
+// treating it as a modelling limit would make the caller emit a SECOND,
+// spurious NotImplementedError for an expression that already produced a
+// diagnostic. Covers a Class and a Union on both sides, not just plain
+// types, since the gates this must outrank are keyed on exactly those kinds.
 TEST(ComparisonResult, AnOrderedComparisonWithUnknownIsBoolNotAnError) {
     expect_comparison(token_type::OP_LESS, Type::unknown(), Type::str());
     expect_comparison(token_type::OP_LESS, Type::int_(), Type::unknown());
+
+    expect_comparison(token_type::OP_LESS, Type::unknown(), Type::class_of("Widget"));
+    expect_comparison(token_type::OP_LESS, Type::class_of("Widget"), Type::unknown());
+
+    const Type optional_int = Type::union_of({Type::int_(), Type::none()});
+    expect_comparison(token_type::OP_LESS, Type::unknown(), optional_int);
+    expect_comparison(token_type::OP_LESS, optional_int, Type::unknown());
 }
 
 TEST(ComparisonResult, MembershipRequiresAContainerOnTheRight) {
@@ -554,9 +572,32 @@ TEST(ComparisonResult, MembershipRequiresAContainerOnTheRight) {
         // `"a" in [1]` is comparison-overlap, which is out of scope.
         expect_comparison(op, Type::str(), Type::list_of(Type::int_()));
 
+        // The LEFT operand being a Class must stay clean: verified
+        // `w in xs` where xs: list[W] is mypy-clean. Only the right operand
+        // is gated -- see OperandOnTheRightBeingAUserClassOrUnionIsUnsupported.
+        expect_comparison(op, Type::class_of("Widget"), Type::list_of(Type::class_of("Widget")));
+
         expect_no_comparison(op, Type::int_(), Type::int_());
         expect_no_comparison(op, Type::int_(), Type::none());
-        expect_no_comparison(op, Type::int_(), Type::class_of("Widget"));
+    }
+}
+
+// A seventh row: `in`/`not in` with a user class on the RIGHT. Verified
+// against real mypy 1.18.1: `1 in w` where W defines
+// __contains__(self, item: int) -> bool is clean (bool); `1 in p` on a class
+// with no __contains__ is a genuine "Unsupported right operand type for in"
+// [operator] error. Since the answer depends on the class's members, exactly
+// like the dunder-dispatch deferral elsewhere, this must be Unsupported, not
+// NotApplicable -- is_container excludes Class, so before this fix the table
+// answered NotApplicable and a caller would emit a false TypeError on a
+// mypy-clean program.
+TEST(ComparisonResult, OperandOnTheRightBeingAUserClassOrUnionIsUnsupported) {
+    for (const token_type op : {token_type::OP_IN, token_type::OP_NOT_IN}) {
+        expect_unsupported_comparison(op, Type::int_(), Type::class_of("Widget"),
+                                      UnsupportedReason::UserClassOperator);
+        expect_unsupported_comparison(op, Type::int_(),
+                                      Type::union_of({Type::list_of(Type::int_()), Type::none()}),
+                                      UnsupportedReason::UnionOperand);
     }
 }
 
