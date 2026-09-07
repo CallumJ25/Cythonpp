@@ -6,7 +6,6 @@
 
 #include "domain/semantic/class_table.h"
 #include "domain/semantic/type.h"
-#include "domain/semantic/type_compatibility.h"
 #include "domain/semantic/type_name.h"
 
 namespace cythonpp::domain::semantic {
@@ -111,6 +110,12 @@ TEST(ClassTable, ACycleInTheBaseChainTerminates) {
 
     EXPECT_EQ(table.member_type("A", "missing"), std::nullopt);
     EXPECT_FALSE(table.inherits_builtin("A"));
+    // constructor_type now walks the base chain looking for __init__ too
+    // (see ConstructorTypeFindsAnInheritedInit below); this call is what
+    // makes a future non-guarded rewrite of that walk hang the test instead
+    // of passing silently.
+    EXPECT_EQ(type_name(table.constructor_type("A")),
+              type_name(Type::callable({}, Type::class_of("A"))));
 }
 
 // Verified: reveal_type(C) for `def __init__(self, a: int) -> None` is
@@ -133,6 +138,81 @@ TEST(ClassTable, AClassWithNoInitTakesNoArguments) {
 
     EXPECT_EQ(type_name(table.constructor_type("Widget")),
               type_name(Type::callable({}, Type::class_of("Widget"))));
+}
+
+// Verified against mypy 1.18.1: `class B: def __init__(self, a: int) -> None:
+// ...` then `class D(B): pass` gives `reveal_type(D)` as
+// `def (a: int) -> D` -- D(1) is clean, D() is "Missing positional argument".
+// An inherited __init__ IS the subclass's constructor; self is discarded
+// either way, so there is no "whose self" question to resolve.
+TEST(ClassTable, ConstructorTypeFindsAnInheritedInit) {
+    ClassTable table;
+    table.declare("B", {});
+    table.declare_method(
+        "B", "__init__",
+        Type::callable({Type::class_of("B"), Type::int_()}, Type::none()));
+    table.declare("D", {"B"});
+
+    // The returned instance type is D, the QUERIED class -- not B, the
+    // declaring one.
+    EXPECT_EQ(type_name(table.constructor_type("D")),
+              type_name(Type::callable({Type::int_()}, Type::class_of("D"))));
+}
+
+// A subclass's own __init__ shadows the base's, same as member_type's
+// "first base wins" -- except here the "first base" is the class itself,
+// found before the walk ever looks at bases.
+TEST(ClassTable, ConstructorTypeOwnInitBeatsInherited) {
+    ClassTable table;
+    table.declare("B", {});
+    table.declare_method(
+        "B", "__init__",
+        Type::callable({Type::class_of("B"), Type::int_()}, Type::none()));
+    table.declare("D", {"B"});
+    table.declare_method(
+        "D", "__init__",
+        Type::callable({Type::class_of("D"), Type::str()}, Type::none()));
+
+    EXPECT_EQ(type_name(table.constructor_type("D")),
+              type_name(Type::callable({Type::str()}, Type::class_of("D"))));
+}
+
+TEST(ClassTable, MethodTypeFoundOnTheDeclaringClass) {
+    ClassTable table;
+    table.declare("Widget", {});
+    table.declare_method("Widget", "resize",
+                         Type::callable({Type::class_of("Widget"), Type::int_()}, Type::none()));
+
+    const std::optional<Type> resize = table.method_type("Widget", "resize");
+    ASSERT_TRUE(resize.has_value());
+    EXPECT_EQ(*resize,
+              Type::callable({Type::class_of("Widget"), Type::int_()}, Type::none()));
+
+    EXPECT_EQ(table.method_type("Widget", "missing"), std::nullopt);
+}
+
+TEST(ClassTable, MethodTypeFoundThroughTheBaseChain) {
+    ClassTable table;
+    table.declare("Base", {});
+    table.declare_method("Base", "greet",
+                         Type::callable({Type::class_of("Base")}, Type::str()));
+    table.declare("Middle", {"Base"});
+    table.declare("Leaf", {"Middle"});
+
+    const std::optional<Type> inherited = table.method_type("Leaf", "greet");
+    ASSERT_TRUE(inherited.has_value());
+    EXPECT_EQ(*inherited, Type::callable({Type::class_of("Base")}, Type::str()));
+}
+
+// Same cycle shape as ACycleInTheBaseChainTerminates -- method_type shares
+// walk_chain, so this pins that sharing rather than re-testing the guard
+// itself in a second, independent implementation.
+TEST(ClassTable, MethodTypeTerminatesOnACycle) {
+    ClassTable table;
+    table.declare("A", {"B"});
+    table.declare("B", {"A"});
+
+    EXPECT_EQ(table.method_type("A", "missing"), std::nullopt);
 }
 
 // The predicate that forces Task 20's attribute carve-out. Verified:
@@ -190,6 +270,74 @@ TEST(ClassTable, AliasesShareBasesWithTheirCanonical) {
     const ClassTable table;
 
     EXPECT_EQ(table.bases_of("IOError"), table.bases_of("OSError"));
+}
+
+// Every transitive/constructing query canonicalises, not just bases_of --
+// pinned individually so a future query that forgets to canonicalise fails
+// its own test instead of hiding behind one that happens to still pass.
+TEST(ClassTable, IsClassResolvesAnAliasName) {
+    const ClassTable table;
+
+    EXPECT_TRUE(table.is_class("IOError"));
+}
+
+TEST(ClassTable, MemberTypeResolvesAnAliasName) {
+    ClassTable table;
+    table.declare_member("OSError", "errno", Type::int_(), 7);
+
+    const std::optional<Type> errno_type = table.member_type("IOError", "errno");
+    ASSERT_TRUE(errno_type.has_value());
+    EXPECT_EQ(*errno_type, Type::int_());
+}
+
+TEST(ClassTable, MethodTypeResolvesAnAliasName) {
+    ClassTable table;
+    table.declare_method("OSError", "with_traceback",
+                         Type::callable({Type::class_of("OSError")}, Type::class_of("OSError")));
+
+    EXPECT_NE(table.method_type("IOError", "with_traceback"), std::nullopt);
+}
+
+TEST(ClassTable, ConstructorTypeResolvesAnAliasName) {
+    ClassTable table;
+    table.declare_method(
+        "OSError", "__init__",
+        Type::callable({Type::class_of("OSError"), Type::str()}, Type::none()));
+
+    // Note the instance type is OSError, the CANONICAL spelling, even though
+    // the query was made under the alias -- constructor_type always returns
+    // Class(canonical_name(qualified_name)).
+    EXPECT_EQ(type_name(table.constructor_type("IOError")),
+              type_name(Type::callable({Type::str()}, Type::class_of("OSError"))));
+}
+
+TEST(ClassTable, InheritsBuiltinResolvesAnAliasName) {
+    const ClassTable table;
+
+    // OSError's own base chain (Exception) reaches no builtin_type_kind, so
+    // this should be false under the alias exactly as it is under OSError
+    // itself -- the point is that the alias is canonicalised at all, not
+    // which answer comes back.
+    EXPECT_EQ(table.inherits_builtin("IOError"), table.inherits_builtin("OSError"));
+}
+
+// declare_member/declare_method must not fabricate a class entry: a
+// mis-spelled or mis-ordered call by the future checking pass should do
+// nothing, not silently turn a NameError into a clean annotation.
+TEST(ClassTable, DeclareMemberOnAnUndeclaredClassDoesNothing) {
+    ClassTable table;
+    table.declare_member("Typo", "x", Type::int_(), 1);
+
+    EXPECT_FALSE(table.is_class("Typo"));
+    EXPECT_EQ(table.member_type("Typo", "x"), std::nullopt);
+}
+
+TEST(ClassTable, DeclareMethodOnAnUndeclaredClassDoesNothing) {
+    ClassTable table;
+    table.declare_method("Typo", "m", Type::callable({}, Type::none()));
+
+    EXPECT_FALSE(table.is_class("Typo"));
+    EXPECT_EQ(table.method_type("Typo", "m"), std::nullopt);
 }
 
 } // namespace

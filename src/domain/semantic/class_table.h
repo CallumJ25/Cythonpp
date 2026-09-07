@@ -62,9 +62,25 @@ public:
     std::optional<int> member_declared_line(const std::string& qualified_name,
                                              const std::string& member) const;
 
-    // `__init__`'s parameters minus `self`, returning Class(canonical_name).
-    // A class with no declared __init__ is a nullary callable returning the
-    // instance.
+    // A method's declared signature, including its `self` parameter, found
+    // transitively through the base chain. Callers that need the BOUND
+    // signature drop args[0] themselves -- mypy numbers arguments from the
+    // first user argument and never mentions self. Kept separate from
+    // member_type: attributes and methods are declared by different call
+    // sites, and a later task needs to tell them apart.
+    std::optional<Type> method_type(const std::string& qualified_name,
+                                     const std::string& method) const;
+
+    // `__init__`'s parameters minus `self`, returning Class(canonical_name)
+    // -- the QUERIED class, even when the `__init__` used is inherited from a
+    // base (mypy prints `def (a: int) -> D` for `D(B)` with no `__init__` of
+    // its own; the constructor always returns the class you asked about).
+    // Found transitively through the base chain, depth-first left to right,
+    // same as member_type: first `__init__` wins. A class with no `__init__`
+    // anywhere in the base chain is a nullary callable returning the
+    // instance. Does not check is_class first: a non-class name manufactures
+    // a Class(name) callable regardless, so callers must guard with is_class
+    // themselves when that distinction matters.
     Type constructor_type(const std::string& qualified_name) const;
 
     // Whether the base chain (excluding `object`, and excluding a seeded

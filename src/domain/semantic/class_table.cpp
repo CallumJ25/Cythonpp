@@ -9,18 +9,31 @@
 namespace cythonpp::domain::semantic {
 
 ClassTable::ClassTable() {
+    // Aliases first: seeding below needs to know which names are aliases so
+    // it can skip them, not give them a dead entry of their own.
+    for (std::size_t index = 0; index < kBuiltinClassAliasCount; ++index) {
+        const BuiltinClassAlias& alias = kBuiltinClassAliases[index];
+        aliases_.emplace(alias.alias, alias.canonical);
+    }
     for (std::size_t index = 0; index < kBuiltinClassCount; ++index) {
         const BuiltinClass& builtin = kBuiltinClasses[index];
+        // An alias name (IOError, EnvironmentError, WindowsError) is the SAME
+        // class object as its canonical (OSError), not a distinct one, so it
+        // gets no entry of its own -- every query canonicalises before
+        // touching classes_, so an entry here would only ever be reached by
+        // a direct, uncanonicalised write (declare/declare_member/
+        // declare_method), and leaving it pre-seeded with a duplicate of the
+        // canonical's bases meant such a write silently clobbered that
+        // duplicate instead of creating a fresh entry.
+        if (aliases_.find(builtin.name) != aliases_.end()) {
+            continue;
+        }
         Entry& entry = classes_[builtin.name];
         for (const char* base : builtin.bases) {
             if (base != nullptr) {
                 entry.bases.emplace_back(base);
             }
         }
-    }
-    for (std::size_t index = 0; index < kBuiltinClassAliasCount; ++index) {
-        const BuiltinClassAlias& alias = kBuiltinClassAliases[index];
-        aliases_.emplace(alias.alias, alias.canonical);
     }
 }
 
@@ -47,19 +60,28 @@ void ClassTable::declare(std::string qualified_name, std::vector<std::string> ba
 }
 
 void ClassTable::declare_member(const std::string& qualified_name, std::string member, Type type,
-                                 int declared_line) {
-    Entry& entry = classes_[qualified_name];
-    entry.members[std::move(member)] = Member{std::move(type), declared_line};
+                                int declared_line) {
+    const auto it = classes_.find(qualified_name);
+    if (it == classes_.end()) {
+        // No declare() call ever named this class: a mis-spelled or
+        // mis-ordered call by the checking pass must not fabricate one --
+        // that would silently turn a NameError into a clean annotation.
+        return;
+    }
+    it->second.members[std::move(member)] = Member{std::move(type), declared_line};
 }
 
 void ClassTable::declare_method(const std::string& qualified_name, std::string method,
-                                 Type signature) {
-    Entry& entry = classes_[qualified_name];
-    entry.methods[std::move(method)] = std::move(signature);
+                                Type signature) {
+    const auto it = classes_.find(qualified_name);
+    if (it == classes_.end()) {
+        return;
+    }
+    it->second.methods[std::move(method)] = std::move(signature);
 }
 
 std::optional<Type> ClassTable::member_type(const std::string& qualified_name,
-                                             const std::string& member) const {
+                                            const std::string& member) const {
     std::vector<std::string> visited;
     return walk_chain<Type>(
         qualified_name, visited,
@@ -73,7 +95,7 @@ std::optional<Type> ClassTable::member_type(const std::string& qualified_name,
 }
 
 std::optional<int> ClassTable::member_declared_line(const std::string& qualified_name,
-                                                      const std::string& member) const {
+                                                    const std::string& member) const {
     std::vector<std::string> visited;
     return walk_chain<int>(
         qualified_name, visited,
@@ -86,21 +108,45 @@ std::optional<int> ClassTable::member_declared_line(const std::string& qualified
         });
 }
 
+std::optional<Type> ClassTable::method_type(const std::string& qualified_name,
+                                            const std::string& method) const {
+    std::vector<std::string> visited;
+    return walk_chain<Type>(
+        qualified_name, visited,
+        [&method](const std::string&, const Entry& entry) -> std::optional<Type> {
+            const auto it = entry.methods.find(method);
+            if (it == entry.methods.end()) {
+                return std::nullopt;
+            }
+            return it->second;
+        });
+}
+
 Type ClassTable::constructor_type(const std::string& qualified_name) const {
     const std::string canonical = canonical_name(qualified_name);
-    const Entry* entry = find_entry(canonical);
+
+    // Transitive, through the shared walk_chain, so the cycle guard is
+    // inherited rather than re-implemented: an inherited __init__ IS the
+    // subclass's constructor signature (class D(B): pass with B declaring
+    // __init__ means D(...) takes B's parameters), and a naive non-guarded
+    // transitive search over a base-chain cycle would hang.
+    std::vector<std::string> visited;
+    const std::optional<Type> init = walk_chain<Type>(
+        canonical, visited,
+        [](const std::string&, const Entry& entry) -> std::optional<Type> {
+            const auto it = entry.methods.find("__init__");
+            return it == entry.methods.end() ? std::nullopt : std::optional<Type>(it->second);
+        });
 
     std::vector<Type> params;
-    if (entry != nullptr) {
-        const auto it = entry->methods.find("__init__");
-        if (it != entry->methods.end()) {
-            const Type& init = it->second;
-            // init.args is [self, param..., return], return last. Strip
-            // both ends: self is not a caller-supplied argument, and the
-            // return is replaced by the instance type below.
-            for (std::size_t i = 1; i + 1 < init.args.size(); ++i) {
-                params.push_back(init.args[i]);
-            }
+    if (init.has_value()) {
+        // init->args is [self, param..., return], return last. Strip both
+        // ends: self is not a caller-supplied argument, and the return is
+        // replaced below by the instance type of the QUERIED class, not the
+        // declaring one -- mypy prints `def (a: int) -> D` for D(B) even
+        // though B declared __init__.
+        for (std::size_t i = 1; i + 1 < init->args.size(); ++i) {
+            params.push_back(init->args[i]);
         }
     }
     return Type::callable(std::move(params), Type::class_of(canonical));
