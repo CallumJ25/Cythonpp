@@ -321,6 +321,57 @@ TEST(ClassTable, InheritsBuiltinResolvesAnAliasName) {
     EXPECT_EQ(table.inherits_builtin("IOError"), table.inherits_builtin("OSError"));
 }
 
+// Shadowing a builtin alias name is legal, ordinary Python:
+//   class IOError:
+//       pass
+//   x: IOError = IOError()
+// is mypy --strict clean. declare() writes under the exact spelling with no
+// canonicalisation, so a live user entry at "IOError" must win over the
+// seeded "OSError" alias target -- otherwise is_class/bases_of/
+// constructor_type would all silently answer as OSError instead of the
+// user's own (nullary) class, which is invariant-(a)-adjacent but not yet a
+// false TypeError on its own (see the next test for that).
+TEST(ClassTable, DeclaredClassUnderAnAliasSpellingWinsOverTheBuiltin) {
+    ClassTable table;
+    table.declare("IOError", {"Widget"});
+
+    EXPECT_TRUE(table.is_class("IOError"));
+    EXPECT_EQ(table.bases_of("IOError"), (std::vector<std::string>{"Widget"}));
+    EXPECT_EQ(type_name(table.constructor_type("IOError")),
+              type_name(Type::callable({}, Type::class_of("IOError"))));
+}
+
+// The false-TypeError case named in the finding: without this fix,
+// constructor_type("IOError") would resolve __init__ on OSError (nullary),
+// so IOError("boom") would draw a false "too many arguments" error, and
+// y.tag would draw a false attribute error -- on a program mypy --strict
+// accepts.
+TEST(ClassTable, DeclaredClassUnderAnAliasSpellingGetsItsOwnConstructor) {
+    ClassTable table;
+    table.declare("IOError", {});
+    table.declare_method(
+        "IOError", "__init__",
+        Type::callable({Type::class_of("IOError"), Type::str()}, Type::none()));
+
+    EXPECT_EQ(type_name(table.constructor_type("IOError")),
+              type_name(Type::callable({Type::str()}, Type::class_of("IOError"))));
+}
+
+// The alias fallback must still hold when the user has NOT shadowed the
+// name -- this is the regression check that the precedence change (exact
+// spelling first) did not disturb the existing alias behaviour for the
+// common case where nobody declares a class named "IOError".
+TEST(ClassTable, UndeclaredAliasSpellingStillBehavesAsTheCanonicalBuiltin) {
+    const ClassTable table;
+
+    EXPECT_EQ(table.canonical_name("IOError"), "OSError");
+    EXPECT_TRUE(table.is_class("IOError"));
+    EXPECT_EQ(table.bases_of("IOError"), table.bases_of("OSError"));
+    EXPECT_EQ(type_name(table.constructor_type("IOError")),
+              type_name(Type::callable({}, Type::class_of("OSError"))));
+    EXPECT_EQ(table.inherits_builtin("IOError"), table.inherits_builtin("OSError"));
+}
+
 // declare_member/declare_method must not fabricate a class entry: a
 // mis-spelled or mis-ordered call by the future checking pass should do
 // nothing, not silently turn a NameError into a clean annotation.

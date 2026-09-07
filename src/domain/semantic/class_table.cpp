@@ -42,8 +42,17 @@ std::string ClassTable::canonical_name(const std::string& name) const {
     return it == aliases_.end() ? name : it->second;
 }
 
+std::string ClassTable::resolve_name(const std::string& name) const {
+    // A live entry under the exact spelling wins -- this is what makes a
+    // user class declared under an alias spelling (`class IOError: ...`,
+    // legal ordinary Python) reachable, since declare() writes under the
+    // exact spelling with no canonicalisation. Only on a miss does the
+    // builtin alias mapping apply.
+    return classes_.find(name) != classes_.end() ? name : canonical_name(name);
+}
+
 const ClassTable::Entry* ClassTable::find_entry(const std::string& name) const {
-    const auto it = classes_.find(canonical_name(name));
+    const auto it = classes_.find(resolve_name(name));
     return it == classes_.end() ? nullptr : &it->second;
 }
 
@@ -123,7 +132,11 @@ std::optional<Type> ClassTable::method_type(const std::string& qualified_name,
 }
 
 Type ClassTable::constructor_type(const std::string& qualified_name) const {
-    const std::string canonical = canonical_name(qualified_name);
+    // resolve_name, not canonical_name: a user class declared under an alias
+    // spelling (e.g. `class IOError: ...`) must resolve to itself, not to
+    // OSError. Only an UNDECLARED alias spelling falls back to the builtin's
+    // canonical name.
+    const std::string resolved = resolve_name(qualified_name);
 
     // Transitive, through the shared walk_chain, so the cycle guard is
     // inherited rather than re-implemented: an inherited __init__ IS the
@@ -132,7 +145,7 @@ Type ClassTable::constructor_type(const std::string& qualified_name) const {
     // transitive search over a base-chain cycle would hang.
     std::vector<std::string> visited;
     const std::optional<Type> init = walk_chain<Type>(
-        canonical, visited,
+        resolved, visited,
         [](const std::string&, const Entry& entry) -> std::optional<Type> {
             const auto it = entry.methods.find("__init__");
             return it == entry.methods.end() ? std::nullopt : std::optional<Type>(it->second);
@@ -149,7 +162,7 @@ Type ClassTable::constructor_type(const std::string& qualified_name) const {
             params.push_back(init->args[i]);
         }
     }
-    return Type::callable(std::move(params), Type::class_of(canonical));
+    return Type::callable(std::move(params), Type::class_of(resolved));
 }
 
 bool ClassTable::inherits_builtin(const std::string& qualified_name) const {

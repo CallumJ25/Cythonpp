@@ -23,10 +23,16 @@ namespace cythonpp::domain::semantic {
 //
 // Three names -- EnvironmentError, IOError, WindowsError -- are not distinct
 // builtin classes but the SAME class object as OSError under another
-// spelling (see builtin_class_table.h's kBuiltinClassAliases). Every public
-// query canonicalises its name argument first, so `Class("IOError")` behaves
-// identically to `Class("OSError")` everywhere: is_class, bases_of,
-// member_type, member_declared_line, constructor_type and inherits_builtin.
+// spelling (see builtin_class_table.h's kBuiltinClassAliases). Every read
+// query resolves its name argument through the shared resolve_name/find_entry/
+// walk_chain path, which tries the EXACT spelling in classes_ first and falls
+// back to canonical_name()'s alias mapping only on a miss. So an
+// undeclared `Class("IOError")` behaves identically to `Class("OSError")`
+// everywhere: is_class, bases_of, member_type, member_declared_line,
+// method_type, constructor_type and inherits_builtin -- but a user class
+// legitimately declared under the alias spelling (`class IOError: ...`, legal
+// ordinary Python) wins over the builtin alias, since declare() writes under
+// the exact spelling and the exact spelling is now tried first.
 class ClassTable : public ClassLookup {
 public:
     // Seeds itself from kBuiltinClasses (builtin_class_table.h).
@@ -38,9 +44,12 @@ public:
     // is not a class.
     std::vector<std::string> bases_of(const std::string& name) const override;
 
-    // The name under which this class is actually known. An alias resolves
-    // to its canonical spelling (canonical_name("IOError") == "OSError");
-    // every other name -- including a canonical one -- resolves to itself.
+    // A pure alias query: does `name` name one of the seeded builtin aliases
+    // (see builtin_class_table.h's kBuiltinClassAliases)? If so, returns the
+    // canonical spelling (canonical_name("IOError") == "OSError"); every
+    // other name -- including a canonical one, and including a user class
+    // declared under an alias spelling -- resolves to itself. This does NOT
+    // decide what a read query actually looks up; see resolve_name for that.
     std::string canonical_name(const std::string& name) const;
 
     // Declares a class (possibly nested, via a qualified name) with its
@@ -71,10 +80,14 @@ public:
     std::optional<Type> method_type(const std::string& qualified_name,
                                      const std::string& method) const;
 
-    // `__init__`'s parameters minus `self`, returning Class(canonical_name)
-    // -- the QUERIED class, even when the `__init__` used is inherited from a
-    // base (mypy prints `def (a: int) -> D` for `D(B)` with no `__init__` of
-    // its own; the constructor always returns the class you asked about).
+    // `__init__`'s parameters minus `self`, returning Class(resolve_name(...))
+    // -- the QUERIED class as the lookup actually resolved it, even when the
+    // `__init__` used is inherited from a base (mypy prints `def (a: int) ->
+    // D` for `D(B)` with no `__init__` of its own; the constructor always
+    // returns the class you asked about). A user class declared under an
+    // alias spelling returns Class("IOError"), not Class("OSError"); an
+    // UNDECLARED alias spelling still returns Class("OSError"), matching
+    // canonical_name's fallback.
     // Found transitively through the base chain, depth-first left to right,
     // same as member_type: first `__init__` wins. A class with no `__init__`
     // anywhere in the base chain is a nullary callable returning the
@@ -102,34 +115,44 @@ private:
         std::map<std::string, Type> methods;
     };
 
-    // Canonicalises, then looks the entry up directly (no transitive walk).
+    // The single lookup-precedence rule every read query shares: a live entry
+    // under the EXACT spelling wins (so a user class declared under an alias
+    // spelling, e.g. `class IOError: ...`, is reachable), and only on a miss
+    // does this fall back to canonical_name()'s alias mapping. declare()
+    // always writes under the exact spelling, so this is what makes that
+    // write observable again.
+    std::string resolve_name(const std::string& name) const;
+
+    // Resolves, then looks the entry up directly (no transitive walk).
     const Entry* find_entry(const std::string& name) const;
 
     // The ONE private helper the transitive queries share, so the cycle
     // guard exists in exactly one place. Walks the base chain depth-first,
-    // left to right, canonicalising each name before visiting it and
-    // refusing to revisit a name already in `visited`. `extract` inspects
-    // one entry (given its canonical name, for inherits_builtin's benefit)
-    // and returns a result if this entry alone answers the query; the walk
-    // stops at the first non-nullopt, matching "first base wins".
+    // left to right, resolving each name (see resolve_name) before visiting
+    // it and refusing to revisit a name already in `visited`. `extract`
+    // inspects one entry (given the name the lookup resolved it to, for
+    // inherits_builtin's and constructor_type's benefit) and returns a
+    // result if this entry alone answers the query; the walk stops at the
+    // first non-nullopt, matching "first base wins".
     template <typename Result, typename Extract>
     std::optional<Result> walk_chain(const std::string& name, std::vector<std::string>& visited,
                                       const Extract& extract) const {
-        const std::string canonical = canonical_name(name);
-        if (std::find(visited.begin(), visited.end(), canonical) != visited.end()) {
+        const std::string resolved = resolve_name(name);
+        if (std::find(visited.begin(), visited.end(), resolved) != visited.end()) {
             return std::nullopt;
         }
-        visited.push_back(canonical);
+        visited.push_back(resolved);
 
-        const Entry* entry = find_entry(canonical);
-        if (entry == nullptr) {
+        const auto it = classes_.find(resolved);
+        if (it == classes_.end()) {
             return std::nullopt;
         }
+        const Entry& entry = it->second;
 
-        if (std::optional<Result> direct = extract(canonical, *entry)) {
+        if (std::optional<Result> direct = extract(resolved, entry)) {
             return direct;
         }
-        for (const std::string& base : entry->bases) {
+        for (const std::string& base : entry.bases) {
             if (std::optional<Result> found = walk_chain<Result>(base, visited, extract)) {
                 return found;
             }
