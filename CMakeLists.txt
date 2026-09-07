@@ -15,6 +15,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/lexer/indentation_pass.cpp
     src/domain/diagnostics/diagnostic_sink.cpp
     src/domain/ast/ast_printer.cpp
+    src/domain/ast/recursive_visitor.cpp
     src/domain/parser/precedence_table.cpp
     src/domain/parser/assignability.cpp
     src/domain/parser/expression_parser.cpp
@@ -66,6 +67,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/lexer/indentation_pass_test.cpp
         tests/domain/ast/source_span_test.cpp
         tests/domain/ast/ast_printer_test.cpp
+        tests/domain/ast/recursive_visitor_test.cpp
         tests/domain/parser/precedence_table_test.cpp
         tests/domain/parser/expression_parser_test.cpp
         tests/domain/parser/expression_parser_error_test.cpp
