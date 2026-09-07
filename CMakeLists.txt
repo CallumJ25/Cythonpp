@@ -20,6 +20,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/parser/expression_parser.cpp
     src/domain/parser/statement_parser.cpp
     src/domain/semantic/type_name.cpp
+    src/domain/semantic/type_compatibility.cpp
     src/application/compile_pipeline.cpp
     src/adapters/filesystem/filesystem_source_reader.cpp
     src/adapters/filesystem/filesystem_source_lister.cpp
@@ -68,6 +69,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/parser/statement_parser_error_test.cpp
         tests/domain/semantic/type_test.cpp
         tests/domain/semantic/type_name_test.cpp
+        tests/domain/semantic/type_compatibility_test.cpp
         tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/application/compile_pipeline_test.cpp
         tests/adapters/filesystem/filesystem_source_lister_test.cpp

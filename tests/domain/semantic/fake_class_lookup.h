@@ -1,0 +1,41 @@
+#ifndef CYTHONPP_TESTS_DOMAIN_SEMANTIC_FAKE_CLASS_LOOKUP_H
+#define CYTHONPP_TESTS_DOMAIN_SEMANTIC_FAKE_CLASS_LOOKUP_H
+
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "domain/semantic/class_lookup.h"
+
+namespace cythonpp::domain::semantic {
+namespace semantic_test_support {
+
+// A ClassLookup built from a literal map of class name to direct bases.
+//
+// Deliberately does not validate the table: a base naming a class that is not
+// itself declared, or a cycle, are both constructible on purpose, because
+// is_subtype must survive a malformed table and only a fake can hand it one.
+class FakeClassLookup : public ClassLookup {
+public:
+    FakeClassLookup() = default;
+    explicit FakeClassLookup(std::map<std::string, std::vector<std::string>> classes)
+        : classes_(std::move(classes)) {}
+
+    bool is_class(const std::string& name) const override {
+        return classes_.find(name) != classes_.end();
+    }
+
+    std::vector<std::string> bases_of(const std::string& name) const override {
+        const auto found = classes_.find(name);
+        return found == classes_.end() ? std::vector<std::string>() : found->second;
+    }
+
+private:
+    std::map<std::string, std::vector<std::string>> classes_;
+};
+
+} // namespace semantic_test_support
+} // namespace cythonpp::domain::semantic
+
+#endif // CYTHONPP_TESTS_DOMAIN_SEMANTIC_FAKE_CLASS_LOOKUP_H
