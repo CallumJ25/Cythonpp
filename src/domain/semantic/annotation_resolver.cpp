@@ -6,7 +6,6 @@
 #include <utility>
 #include <vector>
 
-#include "builtin_class_table.h"
 #include "builtin_type_names.h"
 #include "domain/ast/source_span.h"
 #include "domain/ast/tuple_expr.h"
@@ -21,42 +20,33 @@ Type of_kind(TypeKind kind) {
     return type;
 }
 
-// Whether `name` is one of the classes seeded from Python's `builtins`
-// module (Task 7's kBuiltinClasses), as opposed to a user-defined class the
-// program itself declares. ClassLookup deliberately has only is_class and
-// bases_of -- 5a's header explains the two-method choice -- so this cannot
-// be answered by asking `classes_`. Consulting the table directly here, in
-// the one place that needs the distinction, keeps that seam intact.
+// The seven builtin classes typeshed marks generic -- zip, map, filter,
+// enumerate, reversed, staticmethod, classmethod. Bare use (`x: zip`) is a
+// mypy type-arg error while ours is clean (a recorded direction-(b) miss),
+// but `x: zip[int]` is mypy-CLEAN, so subscripting one of these must draw
+// NotImplementedError rather than the TypeError a genuinely non-generic
+// seeded class (e.g. `x: ValueError[int]`, a real mypy type-arg error) or a
+// genuinely user-defined generic (`class C: pass` then `x: C[int]`) draws.
 //
-// Needed because `x: zip[int]` is mypy-CLEAN (zip is generic in typeshed):
-// once zip is seeded as a class, treating it the same as a user class would
-// report "'zip' is not subscriptable", a false TypeError. A genuinely
-// user-defined generic (`class C: pass` then `x: C[int]`) is still a real
-// error, since user-defined generics are out of scope.
-bool is_seeded_builtin_class(const std::string& name) {
-    for (const BuiltinClass& entry : kBuiltinClasses) {
-        if (name == entry.name) {
+// Deliberately narrower than "is this name in kBuiltinClasses" -- this
+// predicate's predecessor, is_seeded_builtin_class, matched the whole
+// 97-entry table and so reported EVERY subscripted seeded class as
+// unimplemented, even a non-generic one where mypy gives a genuine TypeError.
+// No missed error resulted (a diagnostic still fired either way) but the
+// wrong ONE fired. ClassLookup deliberately has only is_class and bases_of --
+// 5a's header explains the two-method choice -- so this cannot be answered by
+// asking `classes_`; consulting a small local list here, in the one place
+// that needs the distinction, keeps that seam intact.
+bool is_generic_builtin_class(const std::string& name) {
+    static constexpr const char* kGenericBuiltinClasses[] = {
+        "zip", "map", "filter", "enumerate", "reversed", "staticmethod", "classmethod",
+    };
+    for (const char* generic : kGenericBuiltinClasses) {
+        if (name == generic) {
             return true;
         }
     }
     return false;
-}
-
-// `EnvironmentError`, `IOError` and `WindowsError` are not distinct classes:
-// each IS `builtins.OSError`, the same class object, so `x: IOError =
-// OSError()` and `y: OSError = IOError()` are both mypy-clean. ClassTable's
-// canonical_name collapses them, but ClassLookup does not expose that -- it
-// has only is_class and bases_of -- so resolve_name consults the alias table
-// directly here rather than widening the seam. Returns `name` unchanged when
-// it is not an alias, which covers every non-aliased class including
-// "OSError" itself.
-std::string canonical_class_name(const std::string& name) {
-    for (const BuiltinClassAlias& entry : kBuiltinClassAliases) {
-        if (name == entry.alias) {
-            return entry.canonical;
-        }
-    }
-    return name;
 }
 
 } // namespace
@@ -101,12 +91,18 @@ Type AnnotationResolver::resolve_name(const ast::Name& name) {
         return of_kind(*kind);
     }
     if (classes_.is_class(name.identifier())) {
-        // Not Type::class_of(name.identifier()) unconditionally: EnvironmentError,
-        // IOError and WindowsError are the SAME class object as OSError, not
-        // three distinct classes with a shared base, so the Type built here
-        // must be spelled with the canonical name -- otherwise Class("IOError")
-        // and Class("OSError") would compare unequal despite being one class.
-        return Type::class_of(canonical_class_name(name.identifier()));
+        // Not Type::class_of(name.identifier()) unconditionally:
+        // EnvironmentError, IOError and WindowsError are the SAME class
+        // object as OSError, not three distinct classes with a shared base,
+        // so the Type built here must be spelled with the canonical name --
+        // otherwise Class("IOError") and Class("OSError") would compare
+        // unequal despite being one class. Routed through classes_ itself
+        // (ClassLookup::canonical_name), not a second, file-local alias
+        // table: that duplication is exactly what let this resolver disagree
+        // with ClassTable's own precedence (a user class declared under the
+        // alias spelling, e.g. `class IOError: pass`, must resolve to
+        // itself, and only ClassTable's canonical_name knows that).
+        return Type::class_of(classes_.canonical_name(name.identifier()));
     }
     // A builtin that is not a type -- `x: print` -- also lands here. mypy
     // errors on it too, with different wording, so this is a wording
@@ -197,7 +193,7 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
     std::optional<TypeKind> kind = builtin_type_kind(base->identifier());
     if (!kind.has_value()) {
         if (classes_.is_class(base->identifier())) {
-            if (is_seeded_builtin_class(base->identifier())) {
+            if (is_generic_builtin_class(base->identifier())) {
                 // `x: zip[int]` is mypy-CLEAN -- zip is generic in typeshed --
                 // so this must not be the same TypeError a genuinely
                 // non-generic user class draws below. Subscripting a builtin
@@ -206,7 +202,10 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
                 return error(*base, "NotImplementedError",
                              "generic builtin type '" + base->identifier() + "' is not supported");
             }
-            // No user-defined generics in the subset.
+            // Either a genuine user class (no user-defined generics in the
+            // subset) or a seeded builtin that is NOT one of the seven
+            // generic ones -- `x: ValueError[int]` is a real mypy type-arg
+            // error too, so this is the correct diagnostic for it as well.
             return error(*base, "TypeError",
                          "'" + base->identifier() + "' is not subscriptable");
         }

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "domain/semantic/class_table.h"
 #include "domain/semantic/type.h"
 #include "domain/semantic/type_compatibility.h"
 #include "domain/semantic/type_name.h"
@@ -258,15 +259,24 @@ TEST(IsSubtype, ClassesAreUnrelatedWithNoLookup) {
 
 // A malformed table must not hang the compiler. Python rejects this, but
 // nothing guarantees the table is well-formed, and a recursive walk would
-// not return. Also covers the walk's builtin-kind check: a cycle must
-// terminate that lookup too, not just the class-to-class one.
+// not return.
+//
+// Fix round 1 (Finding 2): the previous fixture ({"A": ["B"], "B": ["A"]})
+// never exercised the walk's builtin-kind check at all -- neither "A" nor
+// "B" is a builtin name, so builtin_type_kind returned nullopt on every
+// iteration and the recursive is_subtype branch was never entered, despite
+// the comment claiming otherwise. "A" now inherits "int" directly as well,
+// so the builtin-kind lookup actually fires -- and, composing with the
+// numeric tower through the SAME recursive call the plain
+// AUserClassInheritingABuiltinIsAssignableToThatBuiltin test exercises
+// outside a cycle, must still terminate rather than hang here.
 TEST(IsSubtype, ACycleInTheBaseChainTerminates) {
-    const semantic_test_support::FakeClassLookup classes({{"A", {"B"}}, {"B", {"A"}}});
+    const semantic_test_support::FakeClassLookup classes({{"A", {"B", "int"}}, {"B", {"A"}}});
 
     EXPECT_FALSE(is_subtype(Type::class_of("A"), Type::class_of("Unrelated"), &classes));
     EXPECT_TRUE(is_subtype(Type::class_of("A"), Type::class_of("B"), &classes));
-    EXPECT_FALSE(is_subtype(Type::class_of("A"), Type::int_(), &classes));
-    EXPECT_FALSE(is_subtype(Type::class_of("A"), Type::class_of("C"), &classes));
+    EXPECT_TRUE(is_subtype(Type::class_of("A"), Type::int_(), &classes));
+    EXPECT_TRUE(is_subtype(Type::class_of("A"), Type::float_(), &classes));
 }
 
 // Verified: `class Sub(int): pass` then `x: int = Sub()` is mypy-clean, and
@@ -312,6 +322,37 @@ TEST(IsSubtype, ASeededExceptionSubclassIsAssignableToItsBase) {
     EXPECT_TRUE(is_subtype(Type::class_of("ValueError"), Type::class_of("BaseException"),
                            &classes));
     EXPECT_FALSE(is_subtype(Type::class_of("Exception"), Type::class_of("ValueError"), &classes));
+}
+
+// Fix round 1 (Finding 1): the shadowing program --
+//   class IOError:
+//       pass
+//   x: IOError = IOError()
+// is mypy --strict clean, ordinary Python. Needs the REAL ClassTable:
+// FakeClassLookup's canonical_name is identity, so it cannot reproduce the
+// alias-vs-shadow precedence this test exists to pin. Both sides are spelled
+// "IOError" here, so this passes even via the plain identity check at the
+// top of is_subtype -- it is the base case the un-shadowed test below
+// contrasts with.
+TEST(IsSubtype, AShadowingUserClassIsAssignableToItself) {
+    ClassTable classes;
+    classes.declare("IOError", {});
+
+    EXPECT_TRUE(is_subtype(Type::class_of("IOError"), Type::class_of("IOError"), &classes));
+}
+
+// The un-shadowed path (Finding 1): with no user declaration, "IOError" and
+// "OSError" name the SAME class object, so is_subtype must be true in BOTH
+// directions even though the two Types carry different `name` strings and
+// neither is a base of the other -- this is IDENTITY through
+// canonicalisation, not reachability through class_reaches's base-chain
+// walk (walking OSError's bases, e.g. "Exception", would never visit the
+// string "IOError", and vice versa).
+TEST(IsSubtype, AnAliasedBuiltinExceptionIsAssignableToItsCanonicalNameAndBack) {
+    const ClassTable classes;
+
+    EXPECT_TRUE(is_subtype(Type::class_of("OSError"), Type::class_of("IOError"), &classes));
+    EXPECT_TRUE(is_subtype(Type::class_of("IOError"), Type::class_of("OSError"), &classes));
 }
 
 TEST(IsSubtype, ClassSubtypingWorksInsideAUnionAndATuple) {

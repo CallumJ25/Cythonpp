@@ -38,21 +38,21 @@ ClassTable::ClassTable() {
 }
 
 std::string ClassTable::canonical_name(const std::string& name) const {
-    const auto it = aliases_.find(name);
-    return it == aliases_.end() ? name : it->second;
-}
-
-std::string ClassTable::resolve_name(const std::string& name) const {
     // A live entry under the exact spelling wins -- this is what makes a
     // user class declared under an alias spelling (`class IOError: ...`,
     // legal ordinary Python) reachable, since declare() writes under the
     // exact spelling with no canonicalisation. Only on a miss does the
-    // builtin alias mapping apply.
-    return classes_.find(name) != classes_.end() ? name : canonical_name(name);
+    // builtin alias mapping apply, and only on a miss there does the name
+    // resolve to itself.
+    if (classes_.find(name) != classes_.end()) {
+        return name;
+    }
+    const auto it = aliases_.find(name);
+    return it == aliases_.end() ? name : it->second;
 }
 
 const ClassTable::Entry* ClassTable::find_entry(const std::string& name) const {
-    const auto it = classes_.find(resolve_name(name));
+    const auto it = classes_.find(canonical_name(name));
     return it == classes_.end() ? nullptr : &it->second;
 }
 
@@ -132,11 +132,11 @@ std::optional<Type> ClassTable::method_type(const std::string& qualified_name,
 }
 
 Type ClassTable::constructor_type(const std::string& qualified_name) const {
-    // resolve_name, not canonical_name: a user class declared under an alias
-    // spelling (e.g. `class IOError: ...`) must resolve to itself, not to
-    // OSError. Only an UNDECLARED alias spelling falls back to the builtin's
-    // canonical name.
-    const std::string resolved = resolve_name(qualified_name);
+    // canonical_name resolves through the same exact-spelling-wins precedence
+    // every read query shares: a user class declared under an alias spelling
+    // (e.g. `class IOError: ...`) resolves to itself, not to OSError. Only an
+    // UNDECLARED alias spelling falls back to the builtin's canonical name.
+    const std::string resolved = canonical_name(qualified_name);
 
     // Transitive, through the shared walk_chain, so the cycle guard is
     // inherited rather than re-implemented: an inherited __init__ IS the

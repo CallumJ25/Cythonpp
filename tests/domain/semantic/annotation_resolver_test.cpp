@@ -14,6 +14,7 @@
 #include "domain/lexer/token_stream.h"
 #include "domain/parser/statement_parser.h"
 #include "domain/semantic/annotation_resolver.h"
+#include "domain/semantic/class_table.h"
 #include "domain/semantic/type.h"
 #include "domain/semantic/type_name.h"
 #include "fake_class_lookup.h"
@@ -347,15 +348,53 @@ TEST(AnnotationResolver, SubscriptingAUserClassIsStillAnError) {
     EXPECT_EQ(error.message, "'Widget' is not subscriptable");
 }
 
+// Finding 5 (fix round 1): ValueError is a seeded builtin class (Task 7) but,
+// unlike zip, is NOT one of the seven names typeshed marks generic --
+// `x: ValueError[int]` is a genuine mypy type-arg error, not merely
+// unimplemented. The old is_seeded_builtin_class matched the WHOLE 97-entry
+// table, so this used to draw the same NotImplementedError as `zip[int]`;
+// narrowed to the seven actually-generic names, it now draws the same
+// TypeError a genuine non-generic user class draws.
+TEST(AnnotationResolver, SubscriptingANonGenericSeededBuiltinIsAGenuineError) {
+    const FakeClassLookup classes({{"ValueError", {}}});
+    const Resolved resolved = resolve_annotation("x: ValueError[int] = y\n", classes);
+
+    const diagnostics::Diagnostic error = only_error(resolved);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "'ValueError' is not subscriptable");
+}
+
 // Verified against real mypy: `x: IOError = OSError()` and
 // `y: OSError = IOError()` are both clean -- IOError IS OSError, the same
 // class object, not a distinct class with a shared base. resolve_name must
 // build Type::class_of("OSError"), not Type::class_of("IOError"), so the two
 // spellings compare as the identical Type they denote.
+//
+// Needs the REAL ClassTable, not FakeClassLookup: FakeClassLookup's
+// canonical_name is identity (see its header comment) -- only ClassTable
+// seeds the actual builtin alias table this resolves through, and a Fake
+// pre-loaded with a fake "IOError -> OSError" base edge would not exercise
+// canonical_name at all, only bases_of.
 TEST(AnnotationResolver, ResolvesAnAliasedBuiltinExceptionToItsCanonicalName) {
-    const FakeClassLookup classes({{"IOError", {"OSError"}}, {"OSError", {}}});
+    const ClassTable classes;
 
     EXPECT_EQ(resolved_name("x: IOError = y\n", classes), "OSError");
+}
+
+// Fix-round-1 regression test (Finding 1): `class IOError: pass` then
+// `x: IOError = IOError()` is mypy --strict clean, ordinary Python shadowing.
+// The OLD annotation_resolver.cpp had its own file-local alias table that
+// mapped IOError -> OSError UNCONDITIONALLY, disagreeing with
+// ClassTable::constructor_type (which lets a live entry under the exact
+// spelling win) and producing Class("OSError") here against Class("IOError")
+// from the constructor -- a false TypeError from is_subtype on this exact
+// clean program. Routing through classes_.canonical_name (ClassTable's own
+// exact-spelling-wins precedence) closes it: the shadow must win here too.
+TEST(AnnotationResolver, AShadowingUserClassResolvesToItselfNotTheAlias) {
+    ClassTable classes;
+    classes.declare("IOError", {});
+
+    EXPECT_EQ(resolved_name("x: IOError = y\n", classes), "IOError");
 }
 
 // None of these can be imported, so the base is simply undefined. This is

@@ -31,6 +31,15 @@ public:
         return found == classes_.end() ? std::vector<std::string>() : found->second;
     }
 
+    // Identity. This fake has no alias table of its own -- every test built
+    // on it names its classes directly, and the real builtin alias mapping
+    // (EnvironmentError/IOError/WindowsError -> OSError) only exists on
+    // ClassTable. A test that needs to exercise actual canonicalisation uses
+    // the real ClassTable instead (see class_table_test.cpp and the
+    // ClassTable-based tests in annotation_resolver_test.cpp /
+    // type_compatibility_test.cpp).
+    std::string canonical_name(const std::string& name) const override { return name; }
+
 private:
     std::map<std::string, std::vector<std::string>> classes_;
 };

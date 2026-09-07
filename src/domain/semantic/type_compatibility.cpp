@@ -85,17 +85,31 @@ Type builtin_base_type(TypeKind kind) {
 // found means the numeric tower (int -> float -> complex) and the Object top
 // arm apply without being restated in this walk.
 //
+// `derived` is expected already canonicalised by the caller (is_subtype);
+// every name visited DURING the walk is canonicalised here, once, at the
+// point it is read off `pending` -- the single place that feeds both the
+// target-name comparison and the `seen` guard, so canonicalisation can never
+// let the same class be visited twice under two different spellings (which
+// would also risk the cycle guard missing a cycle spelled inconsistently).
+//
+// Only one ClassLookup parameter: `classes` is also what the recursive
+// is_subtype call below needs, and every caller already has exactly one
+// lookup in hand -- a second parameter for "the same object, as a pointer"
+// answered no question a caller could ever answer differently.
+//
 // Iterative with an explicit worklist and a visited list rather than
 // recursive: a malformed class table can contain a cycle -- `class A(B)` with
 // `class B(A)` is rejected by Python, but nothing here guarantees the table
 // it is handed is well-formed -- and a recursive walk would not return.
-bool class_reaches(const ClassLookup& classes, const std::string& derived, const Type& target,
-                   const ClassLookup* classes_for_recursion) {
+bool class_reaches(const ClassLookup& classes, const std::string& derived, const Type& target) {
+    const std::string canonical_target =
+        target.kind == TypeKind::Class ? classes.canonical_name(target.name) : std::string();
+
     std::vector<std::string> pending = classes.bases_of(derived);
     std::vector<std::string> seen;
 
     while (!pending.empty()) {
-        const std::string current = pending.back();
+        const std::string current = classes.canonical_name(pending.back());
         pending.pop_back();
 
         bool already_seen = false;
@@ -110,11 +124,11 @@ bool class_reaches(const ClassLookup& classes, const std::string& derived, const
         }
         seen.push_back(current);
 
-        if (target.kind == TypeKind::Class && current == target.name) {
+        if (target.kind == TypeKind::Class && current == canonical_target) {
             return true;
         }
         if (const std::optional<TypeKind> kind = builtin_type_kind(current)) {
-            if (is_subtype(builtin_base_type(*kind), target, classes_for_recursion)) {
+            if (is_subtype(builtin_base_type(*kind), target, &classes)) {
                 return true;
             }
         }
@@ -224,7 +238,24 @@ bool is_subtype(const Type& source, const Type& target, const ClassLookup* class
         // uniformly. Without a lookup there is no chain to walk, so two
         // Class types (or a Class and a builtin kind) are simply unrelated,
         // matching the pre-Task-9 behaviour exactly.
-        return classes != nullptr && class_reaches(*classes, source.name, target, classes);
+        if (classes == nullptr) {
+            return false;
+        }
+        // Canonicalise the source before comparing or walking: an
+        // EnvironmentError/IOError/WindowsError spelling and its OSError
+        // canonical are the SAME class, not two related-but-distinct ones,
+        // so a source and target that denote one class under two different
+        // spellings must compare equal by IDENTITY here, not merely via a
+        // base-chain walk that would never find one as a base of the other.
+        // This is the fix for the regression where AnnotationResolver and
+        // ClassTable could each hand back a Type::class_of(...) spelled
+        // differently for the one class.
+        const std::string canonical_source = classes->canonical_name(source.name);
+        if (target.kind == TypeKind::Class &&
+            canonical_source == classes->canonical_name(target.name)) {
+            return true;
+        }
+        return class_reaches(*classes, canonical_source, target);
     }
 
     const int source_rank = numeric_rank(source.kind);
