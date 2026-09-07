@@ -4,6 +4,8 @@
 #include "domain/semantic/type_compatibility.h"
 #include "domain/semantic/type_name.h"
 
+#include "fake_class_lookup.h"
+
 namespace cythonpp::domain::semantic {
 namespace {
 
@@ -129,6 +131,131 @@ TEST(NumericRank, OrdersTheTowerAndExcludesEverythingElse) {
     EXPECT_EQ(numeric_rank(TypeKind::List), 0);
     EXPECT_EQ(numeric_rank(TypeKind::Object), 0);
     EXPECT_EQ(numeric_rank(TypeKind::Class), 0);
+}
+
+TEST(IsSubtype, AMemberIsAssignableToItsUnion) {
+    const Type optional_str = Type::union_of({Type::str(), Type::none()});
+
+    expect_subtype(Type::str(), optional_str);
+    expect_subtype(Type::none(), optional_str);
+    expect_not_subtype(Type::int_(), optional_str);
+}
+
+TEST(IsSubtype, AUnionIsAssignableOnlyWhenEveryMemberIs) {
+    const Type int_or_str = Type::union_of({Type::int_(), Type::str()});
+
+    expect_subtype(int_or_str, Type::object());
+    expect_not_subtype(int_or_str, Type::int_());
+    expect_not_subtype(int_or_str, Type::str());
+}
+
+TEST(IsSubtype, AUnionIsAssignableToAWiderUnion) {
+    const Type narrow = Type::union_of({Type::int_(), Type::str()});
+    const Type wide = Type::union_of({Type::int_(), Type::str(), Type::none()});
+
+    expect_subtype(narrow, wide);
+    expect_not_subtype(wide, narrow);
+}
+
+// The documented counterpart to Type's order-sensitive operator==: two
+// unions spelled in different orders are mutually assignable even though
+// they are not equal.
+TEST(IsSubtype, UnionMemberOrderDoesNotAffectCompatibility) {
+    const Type left = Type::union_of({Type::int_(), Type::str()});
+    const Type right = Type::union_of({Type::str(), Type::int_()});
+
+    EXPECT_NE(left, right);
+    expect_subtype(left, right);
+    expect_subtype(right, left);
+}
+
+TEST(IsSubtype, TheNumericTowerAppliesThroughAUnion) {
+    const Type int_or_none = Type::union_of({Type::int_(), Type::none()});
+
+    expect_subtype(Type::bool_(), int_or_none);
+    expect_subtype(Type::int_(), Type::union_of({Type::float_(), Type::none()}));
+}
+
+TEST(IsSubtype, CallableReturnTypesAreCovariant) {
+    expect_subtype(Type::callable({Type::int_()}, Type::bool_()),
+                   Type::callable({Type::int_()}, Type::int_()));
+    expect_not_subtype(Type::callable({Type::int_()}, Type::int_()),
+                       Type::callable({Type::int_()}, Type::bool_()));
+}
+
+// Fails in the covariant reading, which is the point: a function that only
+// accepts int cannot stand in where one accepting bool-or-int is expected...
+// but one accepting the wider float DOES stand in where int is expected.
+TEST(IsSubtype, CallableParameterTypesAreContravariant) {
+    expect_subtype(Type::callable({Type::float_()}, Type::int_()),
+                   Type::callable({Type::int_()}, Type::int_()));
+    expect_not_subtype(Type::callable({Type::bool_()}, Type::int_()),
+                       Type::callable({Type::int_()}, Type::int_()));
+}
+
+TEST(IsSubtype, CallableArityMustMatch) {
+    expect_not_subtype(Type::callable({Type::int_()}, Type::int_()),
+                       Type::callable({Type::int_(), Type::int_()}, Type::int_()));
+    expect_not_subtype(Type::callable({}, Type::int_()),
+                       Type::callable({Type::int_()}, Type::int_()));
+    expect_subtype(Type::callable({}, Type::int_()), Type::callable({}, Type::int_()));
+}
+
+TEST(IsSubtype, AClassIsAssignableToItsDirectBase) {
+    const semantic_test_support::FakeClassLookup classes({{"Base", {}}, {"Sub", {"Base"}}});
+
+    EXPECT_TRUE(is_subtype(Type::class_of("Sub"), Type::class_of("Base"), &classes));
+    EXPECT_FALSE(is_subtype(Type::class_of("Base"), Type::class_of("Sub"), &classes));
+}
+
+TEST(IsSubtype, AClassIsAssignableUpAChainOfBases) {
+    const semantic_test_support::FakeClassLookup classes(
+        {{"Top", {}}, {"Middle", {"Top"}}, {"Bottom", {"Middle"}}});
+
+    EXPECT_TRUE(is_subtype(Type::class_of("Bottom"), Type::class_of("Top"), &classes));
+    EXPECT_TRUE(is_subtype(Type::class_of("Bottom"), Type::class_of("Middle"), &classes));
+    EXPECT_FALSE(is_subtype(Type::class_of("Top"), Type::class_of("Bottom"), &classes));
+}
+
+TEST(IsSubtype, AClassIsAssignableThroughAnyOfSeveralBases) {
+    const semantic_test_support::FakeClassLookup classes(
+        {{"Left", {}}, {"Right", {}}, {"Both", {"Left", "Right"}}});
+
+    EXPECT_TRUE(is_subtype(Type::class_of("Both"), Type::class_of("Left"), &classes));
+    EXPECT_TRUE(is_subtype(Type::class_of("Both"), Type::class_of("Right"), &classes));
+}
+
+TEST(IsSubtype, ClassesAreUnrelatedWithNoLookup) {
+    expect_not_subtype(Type::class_of("Sub"), Type::class_of("Base"));
+    // Identity still holds without a lookup.
+    expect_subtype(Type::class_of("Base"), Type::class_of("Base"));
+    expect_subtype(Type::class_of("Base"), Type::object());
+}
+
+// A malformed table must not hang the compiler. Python rejects this, but
+// nothing guarantees the table is well-formed, and a recursive walk would
+// not return.
+TEST(IsSubtype, ACycleInTheBaseChainTerminates) {
+    const semantic_test_support::FakeClassLookup classes({{"A", {"B"}}, {"B", {"A"}}});
+
+    EXPECT_FALSE(is_subtype(Type::class_of("A"), Type::class_of("Unrelated"), &classes));
+    EXPECT_TRUE(is_subtype(Type::class_of("A"), Type::class_of("B"), &classes));
+}
+
+TEST(IsSubtype, ClassSubtypingWorksInsideAUnionAndATuple) {
+    const semantic_test_support::FakeClassLookup classes({{"Base", {}}, {"Sub", {"Base"}}});
+
+    EXPECT_TRUE(is_subtype(Type::class_of("Sub"),
+                           Type::union_of({Type::class_of("Base"), Type::none()}), &classes));
+    EXPECT_TRUE(is_subtype(Type::tuple_of({Type::class_of("Sub")}),
+                           Type::tuple_of({Type::class_of("Base")}), &classes));
+}
+
+TEST(IsSubtype, AClassIsNotAssignableToAnUnrelatedKind) {
+    const semantic_test_support::FakeClassLookup classes({{"Widget", {}}});
+
+    EXPECT_FALSE(is_subtype(Type::class_of("Widget"), Type::int_(), &classes));
+    EXPECT_FALSE(is_subtype(Type::int_(), Type::class_of("Widget"), &classes));
 }
 
 } // namespace
