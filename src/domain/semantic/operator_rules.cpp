@@ -508,4 +508,26 @@ RuleResult element_type(const Type& iterable) {
     return RuleResult::not_applicable();
 }
 
+RuleResult boolop_result(lexer::token_type op, const std::vector<Type>& operands) {
+    if (op != lexer::token_type::OP_AND && op != lexer::token_type::OP_OR) {
+        return RuleResult::not_applicable();
+    }
+    if (operands.empty()) {
+        return RuleResult::not_applicable();
+    }
+    for (const Type& operand : operands) {
+        if (operand.kind == TypeKind::Unknown) {
+            return RuleResult::ok(Type::unknown());
+        }
+    }
+    for (const Type& operand : operands) {
+        if (operand.kind == TypeKind::Union) {
+            return RuleResult::unsupported(UnsupportedReason::UnionOperand);
+        }
+    }
+    // A user class operand is deliberately NOT UserClassOperator: truthiness
+    // is universal in Python and needs no dunder, verified clean for `if w:`.
+    return RuleResult::ok(Type::union_of(operands));
+}
+
 } // namespace cythonpp::domain::semantic

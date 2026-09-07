@@ -810,5 +810,71 @@ TEST(SubscriptAndElementType, AParameterlessContainerDoesNotApply) {
     expect_not_iterable(bare_dict);
 }
 
+void expect_boolop(token_type op, const std::vector<Type>& operands, const Type& expected) {
+    const RuleResult result = boolop_result(op, operands);
+    ASSERT_EQ(result.status, RuleResult::Status::Ok);
+    EXPECT_EQ(result.type, expected) << "got " << type_name(result.type);
+}
+
+// Verified: reveal_type for `a and b` with both int is int; with bool and
+// bool is bool. union_of de-duplicates, so same-typed operands collapse.
+TEST(BoolOpResult, SameTypedOperandsCollapseToThatType) {
+    expect_boolop(token_type::OP_AND, {Type::int_(), Type::int_()}, Type::int_());
+    expect_boolop(token_type::OP_OR, {Type::bool_(), Type::bool_()}, Type::bool_());
+    expect_boolop(token_type::OP_AND, {Type::str(), Type::str(), Type::str()}, Type::str());
+}
+
+// mypy gives `int and str` the type Literal[0] | str, applying falsiness
+// narrowing to produce a literal out of a non-literal operand. int | str is a
+// supertype of that, so every assignment mypy rejects we also reject; the gap
+// is a MISSED error, never a false one.
+TEST(BoolOpResult, MixedOperandsWidenToTheirUnion) {
+    expect_boolop(token_type::OP_AND, {Type::int_(), Type::str()},
+                  Type::union_of({Type::int_(), Type::str()}));
+    expect_boolop(token_type::OP_OR, {Type::int_(), Type::str(), Type::none()},
+                  Type::union_of({Type::int_(), Type::str(), Type::none()}));
+}
+
+// Verified: `a or b` with a: int | None and b: int reveals int -- mypy
+// narrows None out of the left operand. We would produce int | None, and
+// `y: int = a or b` would then be a FALSE TypeError. So the narrowing
+// deferral has to cover BoolOp too.
+TEST(BoolOpResult, UnionOperandsAreUnsupportedNotErrors) {
+    const RuleResult result =
+        boolop_result(token_type::OP_OR,
+                      {Type::union_of({Type::int_(), Type::none()}), Type::int_()});
+
+    ASSERT_EQ(result.status, RuleResult::Status::Unsupported);
+    EXPECT_EQ(result.reason, UnsupportedReason::UnionOperand);
+}
+
+// Absorbing, like binary_result: one root cause, one diagnostic.
+TEST(BoolOpResult, UnknownIsAbsorbing) {
+    expect_boolop(token_type::OP_AND, {Type::unknown(), Type::int_()}, Type::unknown());
+    expect_boolop(token_type::OP_OR, {Type::int_(), Type::unknown()}, Type::unknown());
+}
+
+// A user class is fine here: truthiness is universal, verified clean for
+// `if w:` and for `w and 1` on a plain class. This is NOT a dunder question,
+// so it must not be UserClassOperator.
+TEST(BoolOpResult, UserClassOperandsAreFineBecauseTruthinessIsUniversal) {
+    expect_boolop(token_type::OP_AND, {Type::class_of("Widget"), Type::class_of("Widget")},
+                  Type::class_of("Widget"));
+    expect_boolop(token_type::OP_OR, {Type::class_of("Widget"), Type::int_()},
+                  Type::union_of({Type::class_of("Widget"), Type::int_()}));
+}
+
+TEST(BoolOpResult, IsNotApplicableForATokenThatIsNotABooleanOperator) {
+    const RuleResult result = boolop_result(token_type::OP_PLUS, {Type::int_(), Type::int_()});
+    EXPECT_EQ(result.status, RuleResult::Status::NotApplicable);
+}
+
+// ExpressionParser never builds a BoolOp with fewer than two values, but the
+// function is total and must not index into an empty vector.
+TEST(BoolOpResult, DegenerateOperandListsDoNotCrash) {
+    EXPECT_EQ(boolop_result(token_type::OP_AND, {}).status, RuleResult::Status::NotApplicable);
+    expect_boolop(token_type::OP_AND, {Type::int_()}, Type::int_());
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

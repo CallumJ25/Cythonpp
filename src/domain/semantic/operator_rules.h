@@ -1,6 +1,8 @@
 #ifndef CYTHONPP_DOMAIN_SEMANTIC_OPERATOR_RULES_H
 #define CYTHONPP_DOMAIN_SEMANTIC_OPERATOR_RULES_H
 
+#include <vector>
+
 #include "class_lookup.h"
 #include "domain/lexer/token_type.h"
 #include "rule_result.h"
@@ -64,6 +66,19 @@ RuleResult subscript_result(const Type& container, const Type& index,
 // What iterating `iterable` yields, for `for` and for comprehensions.
 // Iterating a dict yields its KEYS, not its items.
 RuleResult element_type(const Type& iterable);
+
+// `a and b`, `a or b` -- one ast::BoolOp, whose `values()` may hold more than
+// two operands because the parser flattens a chain.
+//
+// Unknown is absorbing here, like binary_result. A Union operand is
+// Unsupported(UnionOperand): mypy NARROWS, so `(int | None) or 0` is int, and
+// producing int | None instead would make `y: int = x or 0` a false
+// TypeError.
+//
+// Non-union operands yield union_of(operands). mypy's answer applies
+// falsiness narrowing -- `int and str` is Literal[0] | str -- and int | str is
+// a supertype of that, so the widening only ever misses an error.
+RuleResult boolop_result(lexer::token_type op, const std::vector<Type>& operands);
 
 } // namespace cythonpp::domain::semantic
 
