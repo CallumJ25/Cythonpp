@@ -4,6 +4,7 @@
 #include <string>
 
 #include "class_lookup.h"
+#include "domain/ast/attribute.h"
 #include "domain/ast/bin_op.h"
 #include "domain/ast/constant.h"
 #include "domain/ast/expr.h"
@@ -40,6 +41,7 @@ public:
 private:
     Type resolve_name(const ast::Name& name);
     Type resolve_constant(const ast::Constant& constant);
+    Type resolve_attribute(const ast::Attribute& attribute);
     Type resolve_subscript(const ast::Subscript& subscript);
     Type resolve_union(const ast::BinOp& operation);
 

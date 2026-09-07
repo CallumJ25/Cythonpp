@@ -177,14 +177,64 @@ TEST(AnnotationResolver, ReportsANonNoneLiteralAsNotAValidAnnotation) {
 
 TEST(AnnotationResolver, ReportsAnExpressionShapeThatIsNotAnAnnotation) {
     const FakeClassLookup classes({{"C", {}}});
-    for (const std::string& annotation : {"f(1)", "C.inner", "[int]", "{1: 2}", "-int",
-                                          "int and str"}) {
+    for (const std::string& annotation : {"f(1)", "[int]", "{1: 2}", "-int", "int and str"}) {
         const Resolved resolved = resolve_annotation("x: " + annotation + " = y\n", classes);
         const diagnostics::Diagnostic error = only_error(resolved);
 
         EXPECT_EQ(error.code, "TypeError") << annotation;
         EXPECT_EQ(error.message, "not a valid type annotation") << annotation;
     }
+}
+
+// A nested class is addressed by its qualified name -- `C.inner` -- rather
+// than through a ClassLookup extension. mypy --strict accepts this
+// construct (verified against the real binary), so reporting TypeError here
+// would violate invariant (a): FakeClassLookup registers the nested class
+// under its dotted name, exactly as a real class table would.
+TEST(AnnotationResolver, ResolvesANestedClassByItsQualifiedName) {
+    const FakeClassLookup classes({{"C.inner", {}}});
+
+    EXPECT_EQ(resolved_name("x: C.inner = y\n", classes), "C.inner");
+}
+
+// Attribute chains nest leftward -- (Attribute (Attribute (Name A) B) D) --
+// so a three-deep qualified name exercises the walk-to-root-and-reverse
+// logic beyond the single-level case above. Verified mypy-clean for real.
+TEST(AnnotationResolver, ResolvesAThreeDeepQualifiedName) {
+    const FakeClassLookup classes({{"A.B.D", {}}});
+
+    EXPECT_EQ(resolved_name("x: A.B.D = y\n", classes), "A.B.D");
+}
+
+// mypy's own message for this case is "Name \"C.missing\" is not defined"
+// with code name-defined -- verified against the real binary -- so the
+// dotted qualified name is what NameError names, matching mypy's wording.
+TEST(AnnotationResolver, ReportsAnUnknownQualifiedNameAsUndefined) {
+    const FakeClassLookup classes({{"C", {}}});
+    const Resolved resolved = resolve_annotation("x: C.missing = y\n", classes);
+    const diagnostics::Diagnostic error = only_error(resolved);
+
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'C.missing' is not defined");
+}
+
+// An attribute chain whose root is not a bare Name -- e.g. `f().x` -- is not
+// a qualified class reference at all. mypy rejects this too ("Invalid type
+// comment or annotation"), so TypeError is correct rather than a compliance
+// gap.
+TEST(AnnotationResolver, ReportsAnAttributeChainNotRootedInAName) {
+    const FakeClassLookup no_classes;
+    const Resolved resolved = resolve_annotation("x: f().attr = y\n", no_classes);
+    const diagnostics::Diagnostic error = only_error(resolved);
+
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "not a valid type annotation");
+}
+
+TEST(AnnotationResolver, ResolvesANestedClassAsAGenericArgument) {
+    const FakeClassLookup classes({{"C.inner", {}}});
+
+    EXPECT_EQ(resolved_name("x: list[C.inner] = []\n", classes), "list[C.inner]");
 }
 
 // The spec's headline acceptance test: the exact shape the spec names.

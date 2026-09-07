@@ -82,6 +82,9 @@ Type AnnotationResolver::resolve(const ast::Expr& annotation) {
     if (const auto* constant = dynamic_cast<const ast::Constant*>(&annotation)) {
         return resolve_constant(*constant);
     }
+    if (const auto* attribute = dynamic_cast<const ast::Attribute*>(&annotation)) {
+        return resolve_attribute(*attribute);
+    }
     if (const auto* subscript = dynamic_cast<const ast::Subscript*>(&annotation)) {
         return resolve_subscript(*subscript);
     }
@@ -129,6 +132,39 @@ Type AnnotationResolver::resolve_constant(const ast::Constant& constant) {
                      "string forward references are not supported");
     }
     return error(constant, "TypeError", "not a valid type annotation");
+}
+
+Type AnnotationResolver::resolve_attribute(const ast::Attribute& attribute) {
+    // Attribute chains nest LEFTWARD: `A.B.D` parses as
+    // (Attribute (Attribute (Name A) B) D), so walking `.value()` down to the
+    // root and collecting `.attribute()` on the way yields the segments in
+    // reverse order -- reversed back below to read left to right.
+    std::vector<std::string> segments;
+    const ast::Expr* cursor = &attribute;
+    while (const auto* link = dynamic_cast<const ast::Attribute*>(cursor)) {
+        segments.push_back(link->attribute());
+        cursor = &link->value();
+    }
+
+    const auto* root = dynamic_cast<const ast::Name*>(cursor);
+    if (root == nullptr) {
+        // e.g. `f().x`: mypy rejects this too ("Invalid type comment or
+        // annotation"), so TypeError is correct here, not a compliance gap.
+        return error(attribute, "TypeError", "not a valid type annotation");
+    }
+
+    std::string dotted = root->identifier();
+    for (auto it = segments.rbegin(); it != segments.rend(); ++it) {
+        dotted += "." + *it;
+    }
+
+    if (classes_.is_class(dotted)) {
+        return Type::class_of(dotted);
+    }
+    // A qualified name mypy would resolve to a real class is registered under
+    // that same dotted name; if it is not in the table, mypy would not have
+    // resolved it either, so this cannot make invariant (a) false.
+    return error(attribute, "NameError", "name '" + dotted + "' is not defined");
 }
 
 Type AnnotationResolver::resolve_union(const ast::BinOp& operation) {
