@@ -51,3 +51,9 @@ CLAUDE.md
 # Internal-facing, not published
 docs/
 .vscode/
+.superpowers/
+
+# mypy writes its cache into the working directory, i.e. the repo root. It
+# self-protects with a nested ignore it generates, but relying on that means
+# the protection disappears if the directory is ever recreated by hand.
+.mypy_cache/
