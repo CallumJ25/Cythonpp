@@ -150,6 +150,34 @@ constexpr BuiltinClass kBuiltinClasses[] = {
 constexpr std::size_t kBuiltinClassCount =
     sizeof(kBuiltinClasses) / sizeof(kBuiltinClasses[0]);
 
+// Names that are not distinct classes at all, but the SAME class object under
+// another spelling -- `getattr(builtins, "IOError") is builtins.OSError` is
+// True in CPython. A bases[] entry cannot express this: it means is-a, and an
+// alias needs is. `EnvironmentError`, `IOError` and `WindowsError` are all
+// `OSError` by identity, so both `x: IOError = OSError()` and
+// `y: OSError = IOError()` are mypy-clean, and treating them as three
+// distinct classes with a shared base would make one of those two directions
+// a false TypeError.
+//
+// Detected by grouping extracted names by id(getattr(builtins, name)); a
+// group of more than one name picks its canonical spelling from
+// cls.__name__ (verified to be a member of every such group -- the generator
+// raises otherwise) and emits the rest as aliases. A name that is already its
+// own canonical is never given a row here.
+struct BuiltinClassAlias {
+    const char* alias;
+    const char* canonical;
+};
+
+constexpr BuiltinClassAlias kBuiltinClassAliases[] = {
+    {"EnvironmentError", "OSError"},
+    {"IOError", "OSError"},
+    {"WindowsError", "OSError"},
+};
+
+constexpr std::size_t kBuiltinClassAliasCount =
+    sizeof(kBuiltinClassAliases) / sizeof(kBuiltinClassAliases[0]);
+
 } // namespace cythonpp::domain::semantic
 
 #endif // CYTHONPP_DOMAIN_SEMANTIC_BUILTIN_CLASS_TABLE_H
