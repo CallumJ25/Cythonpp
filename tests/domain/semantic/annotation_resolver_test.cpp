@@ -187,5 +187,159 @@ TEST(AnnotationResolver, ReportsAnExpressionShapeThatIsNotAnAnnotation) {
     }
 }
 
+// The spec's headline acceptance test: the exact shape the spec names.
+TEST(AnnotationResolver, ResolvesASubscriptedDictToItsKeyAndValueTypes) {
+    EXPECT_EQ(resolved_name("x: dict[str, int] = {}\n"), "dict[str, int]");
+}
+
+TEST(AnnotationResolver, ResolvesTheSingleArgumentGenericBuiltins) {
+    EXPECT_EQ(resolved_name("x: list[int] = []\n"), "list[int]");
+    EXPECT_EQ(resolved_name("x: set[str] = s\n"), "set[str]");
+    EXPECT_EQ(resolved_name("x: frozenset[bool] = f\n"), "frozenset[bool]");
+}
+
+TEST(AnnotationResolver, ResolvesTuplesOfAnyArity) {
+    EXPECT_EQ(resolved_name("x: tuple[int] = t\n"), "tuple[int]");
+    EXPECT_EQ(resolved_name("x: tuple[int, str] = t\n"), "tuple[int, str]");
+    EXPECT_EQ(resolved_name("x: tuple[int, str, bool] = t\n"), "tuple[int, str, bool]");
+}
+
+TEST(AnnotationResolver, ResolvesNestedGenerics) {
+    EXPECT_EQ(resolved_name("x: list[list[int]] = []\n"), "list[list[int]]");
+    EXPECT_EQ(resolved_name("x: dict[str, list[int]] = {}\n"), "dict[str, list[int]]");
+    EXPECT_EQ(resolved_name("x: dict[str, dict[str, int]] = {}\n"),
+              "dict[str, dict[str, int]]");
+}
+
+TEST(AnnotationResolver, ResolvesAClassAsAGenericArgument) {
+    const FakeClassLookup classes({{"Widget", {}}});
+
+    EXPECT_EQ(resolved_name("x: list[Widget] = []\n", classes), "list[Widget]");
+    EXPECT_EQ(resolved_name("x: dict[str, Widget] = {}\n", classes), "dict[str, Widget]");
+}
+
+// PEP 604. `None` here comes through the Constant arm, not the Name arm.
+TEST(AnnotationResolver, ResolvesAPipeUnion) {
+    EXPECT_EQ(resolved_name("x: str | None = None\n"), "str | None");
+    EXPECT_EQ(resolved_name("x: int | str = y\n"), "int | str");
+    EXPECT_EQ(resolved_name("x: int | str | None = y\n"), "int | str | None");
+}
+
+TEST(AnnotationResolver, ResolvesAUnionOfGenerics) {
+    EXPECT_EQ(resolved_name("x: list[int] | None = None\n"), "list[int] | None");
+    EXPECT_EQ(resolved_name("x: dict[str, int] | list[int] = y\n"),
+              "dict[str, int] | list[int]");
+}
+
+TEST(AnnotationResolver, CollapsesADuplicatedUnionMember) {
+    EXPECT_EQ(resolved_name("x: int | int = y\n"), "int");
+}
+
+TEST(AnnotationResolver, ReportsWrongArityOnAGenericBuiltin) {
+    const FakeClassLookup no_classes;
+
+    const Resolved one_for_dict = resolve_annotation("x: dict[str] = {}\n", no_classes);
+    const diagnostics::Diagnostic dict_error = only_error(one_for_dict);
+    EXPECT_EQ(dict_error.code, "TypeError");
+    EXPECT_EQ(dict_error.message, "\"dict\" expects 2 type arguments, but 1 given");
+
+    const Resolved two_for_list = resolve_annotation("x: list[int, str] = []\n", no_classes);
+    const diagnostics::Diagnostic list_error = only_error(two_for_list);
+    EXPECT_EQ(list_error.code, "TypeError");
+    EXPECT_EQ(list_error.message, "\"list\" expects 1 type argument, but 2 given");
+}
+
+// mypy accepts tuple[int, ...], so this must be NotImplementedError rather
+// than TypeError or the hard invariant breaks.
+TEST(AnnotationResolver, ReportsAVariadicTupleAsUnsupported) {
+    const FakeClassLookup no_classes;
+    const Resolved resolved = resolve_annotation("x: tuple[int, ...] = t\n", no_classes);
+    const diagnostics::Diagnostic error = only_error(resolved);
+
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "variadic tuple annotations are not supported");
+}
+
+TEST(AnnotationResolver, ReportsSubscriptingANonGenericType) {
+    const FakeClassLookup classes({{"Widget", {}}});
+
+    for (const std::string& annotation : {"int[str]", "str[int]", "Widget[int]"}) {
+        const Resolved resolved = resolve_annotation("x: " + annotation + " = y\n", classes);
+        const diagnostics::Diagnostic error = only_error(resolved);
+
+        EXPECT_EQ(error.code, "TypeError") << annotation;
+        EXPECT_NE(error.message.find("is not subscriptable"), std::string::npos) << annotation;
+    }
+}
+
+// None of these can be imported, so the base is simply undefined. This is
+// where the import gap becomes visible, and it is the correct outcome.
+TEST(AnnotationResolver, ReportsTheUnimportableTypingNamesAsUndefined) {
+    const FakeClassLookup no_classes;
+    const std::map<std::string, std::string> annotations = {
+        {"Optional[int]", "Optional"},
+        {"Union[int, str]", "Union"},
+        {"Callable[[int], str]", "Callable"},
+        {"Generic[T]", "Generic"},
+    };
+
+    for (const auto& entry : annotations) {
+        const Resolved resolved = resolve_annotation("x: " + entry.first + " = y\n", no_classes);
+        const diagnostics::Diagnostic error = only_error(resolved);
+
+        EXPECT_EQ(error.code, "NameError") << entry.first;
+        EXPECT_EQ(error.message, "name '" + entry.second + "' is not defined") << entry.first;
+    }
+}
+
+TEST(AnnotationResolver, ReportsANonNameSubscriptBase) {
+    const FakeClassLookup no_classes;
+    const Resolved resolved = resolve_annotation("x: list[int][str] = y\n", no_classes);
+    const diagnostics::Diagnostic error = only_error(resolved);
+
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "not a valid type annotation");
+}
+
+TEST(AnnotationResolver, ReportsABinaryOperatorThatIsNotAUnion) {
+    const FakeClassLookup no_classes;
+    for (const std::string& annotation : {"int + str", "int & str", "int * 2"}) {
+        const Resolved resolved = resolve_annotation("x: " + annotation + " = y\n", no_classes);
+        const diagnostics::Diagnostic error = only_error(resolved);
+
+        EXPECT_EQ(error.code, "TypeError") << annotation;
+        EXPECT_EQ(error.message, "not a valid type annotation") << annotation;
+    }
+}
+
+// One diagnostic per root cause, and NO cascade: the enclosing dict does not
+// add a third. This is the only thing that pins the absorbing behaviour.
+TEST(AnnotationResolver, ReportsEachUndefinedArgumentOnceAndDoesNotCascade) {
+    const FakeClassLookup no_classes;
+    const Resolved resolved = resolve_annotation("x: dict[Foo, Bar] = {}\n", no_classes);
+
+    ASSERT_EQ(resolved.diagnostics.size(), 2u);
+    EXPECT_EQ(resolved.diagnostics[0].message, "name 'Foo' is not defined");
+    EXPECT_EQ(resolved.diagnostics[1].message, "name 'Bar' is not defined");
+    EXPECT_EQ(resolved.type, Type::unknown());
+}
+
+TEST(AnnotationResolver, AFailedUnionMemberMakesTheWholeUnionUnknownWithoutCascading) {
+    const FakeClassLookup no_classes;
+    const Resolved resolved = resolve_annotation("x: Foo | None = None\n", no_classes);
+    const diagnostics::Diagnostic error = only_error(resolved);
+
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'Foo' is not defined");
+}
+
+TEST(AnnotationResolver, AFailedGenericArgumentMakesTheWholeAnnotationUnknown) {
+    const FakeClassLookup no_classes;
+    const Resolved resolved = resolve_annotation("x: list[Foo] = []\n", no_classes);
+    const diagnostics::Diagnostic error = only_error(resolved);
+
+    EXPECT_EQ(error.message, "name 'Foo' is not defined");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

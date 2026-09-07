@@ -1,10 +1,13 @@
 #include "annotation_resolver.h"
 
 #include <array>
+#include <cstddef>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "domain/ast/source_span.h"
+#include "domain/ast/tuple_expr.h"
 #include "domain/lexer/token_type.h"
 
 namespace cythonpp::domain::semantic {
@@ -79,7 +82,12 @@ Type AnnotationResolver::resolve(const ast::Expr& annotation) {
     if (const auto* constant = dynamic_cast<const ast::Constant*>(&annotation)) {
         return resolve_constant(*constant);
     }
-    // Task 10 adds the Subscript and BinOp arms here.
+    if (const auto* subscript = dynamic_cast<const ast::Subscript*>(&annotation)) {
+        return resolve_subscript(*subscript);
+    }
+    if (const auto* operation = dynamic_cast<const ast::BinOp*>(&annotation)) {
+        return resolve_union(*operation);
+    }
     return error(annotation, "TypeError", "not a valid type annotation");
 }
 
@@ -121,6 +129,110 @@ Type AnnotationResolver::resolve_constant(const ast::Constant& constant) {
                      "string forward references are not supported");
     }
     return error(constant, "TypeError", "not a valid type annotation");
+}
+
+Type AnnotationResolver::resolve_union(const ast::BinOp& operation) {
+    // PEP 604. Only `|` builds a union; every other binary operator in
+    // annotation position is simply not an annotation.
+    if (operation.op() != lexer::token_type::OP_PIPE) {
+        return error(operation, "TypeError", "not a valid type annotation");
+    }
+
+    const Type left = resolve(operation.left());
+    const Type right = resolve(operation.right());
+    // Absorbing rather than a union carrying an Unknown member: the failing
+    // side already reported, and such a union would compare true against
+    // everything while rendering nonsense.
+    if (left.kind == TypeKind::Unknown || right.kind == TypeKind::Unknown) {
+        return Type::unknown();
+    }
+    // union_of flattens, so `int | str | None` -- which parses as
+    // BinOp(|, BinOp(|, int, str), None) -- is one three-member union.
+    return Type::union_of({left, right});
+}
+
+Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
+    const auto* base = dynamic_cast<const ast::Name*>(&subscript.value());
+    if (base == nullptr) {
+        return error(subscript, "TypeError", "not a valid type annotation");
+    }
+
+    const BuiltinTypeName* builtin = builtin_type_named(base->identifier());
+    if (builtin == nullptr) {
+        if (classes_.is_class(base->identifier())) {
+            // No user-defined generics in the subset.
+            return error(*base, "TypeError",
+                         "'" + base->identifier() + "' is not subscriptable");
+        }
+        // Optional, Union, Callable and Generic all land here: none of them
+        // can be imported, so the base is simply undefined. This is where the
+        // import gap becomes visible, and it is the correct outcome.
+        return error(*base, "NameError", "name '" + base->identifier() + "' is not defined");
+    }
+    if (builtin->arity == 0) {
+        return error(*base, "TypeError", "'" + base->identifier() + "' is not subscriptable");
+    }
+
+    // dict[str, int] arrives as Subscript(Name dict, TupleExpr(str, int));
+    // list[int] as Subscript(Name list, Name int). Flattening the one-element
+    // case here means the arity check below is the same for both.
+    std::vector<const ast::Expr*> arguments;
+    if (const auto* tuple = dynamic_cast<const ast::TupleExpr*>(&subscript.index())) {
+        for (const ast::ExprPtr& element : tuple->elements()) {
+            arguments.push_back(element.get());
+        }
+    } else {
+        arguments.push_back(&subscript.index());
+    }
+
+    // Only for tuple, and BEFORE the arity check: tuple is variadic, so arity
+    // would never catch tuple[int, ...]. Restricting it to tuple means
+    // list[int, ...] gets the arity message instead of a misleading one.
+    if (builtin->kind == TypeKind::Tuple) {
+        for (const ast::Expr* argument : arguments) {
+            const auto* constant = dynamic_cast<const ast::Constant*>(argument);
+            if (constant != nullptr && constant->type() == lexer::token_type::ELLIPSIS) {
+                // mypy accepts tuple[int, ...], so this must NOT be a
+                // TypeError or the hard invariant breaks.
+                return error(*argument, "NotImplementedError",
+                             "variadic tuple annotations are not supported");
+            }
+        }
+    }
+
+    if (builtin->arity > 0 && arguments.size() != static_cast<std::size_t>(builtin->arity)) {
+        // Before resolving the arguments, so a wrong-arity annotation draws
+        // one diagnostic about arity rather than that plus one per argument.
+        const std::string plural = builtin->arity == 1 ? " type argument, but "
+                                                       : " type arguments, but ";
+        return error(*base, "TypeError",
+                     "\"" + base->identifier() + "\" expects " +
+                         std::to_string(builtin->arity) + plural +
+                         std::to_string(arguments.size()) + " given");
+    }
+
+    std::vector<Type> resolved;
+    bool failed = false;
+    for (const ast::Expr* argument : arguments) {
+        Type type = resolve(*argument);
+        // Every argument is resolved even after one fails, so two undefined
+        // names draw two diagnostics -- two root causes -- as mypy's do.
+        if (type.kind == TypeKind::Unknown) {
+            failed = true;
+        }
+        resolved.push_back(std::move(type));
+    }
+    if (failed) {
+        // Silently: the failing argument already reported, and a second
+        // report from the enclosing constructor is exactly the cascade the
+        // absorbing bottom exists to prevent.
+        return Type::unknown();
+    }
+
+    Type type;
+    type.kind = builtin->kind;
+    type.args = std::move(resolved);
+    return type;
 }
 
 Type AnnotationResolver::error(const ast::Expr& at, std::string code, std::string message) {
