@@ -25,6 +25,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/semantic/type_compatibility.cpp
     src/domain/semantic/literal_type.cpp
     src/domain/semantic/operator_rules.cpp
+    src/domain/semantic/builtin_type_names.cpp
     src/domain/semantic/annotation_resolver.cpp
     src/application/compile_pipeline.cpp
     src/adapters/filesystem/filesystem_source_reader.cpp
@@ -79,6 +80,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/semantic/type_compatibility_test.cpp
         tests/domain/semantic/literal_type_test.cpp
         tests/domain/semantic/operator_rules_test.cpp
+        tests/domain/semantic/builtin_type_names_test.cpp
         tests/domain/semantic/annotation_resolver_test.cpp
         tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/application/compile_pipeline_test.cpp

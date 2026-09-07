@@ -1,61 +1,18 @@
 #include "annotation_resolver.h"
 
-#include <array>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "builtin_type_names.h"
 #include "domain/ast/source_span.h"
 #include "domain/ast/tuple_expr.h"
 #include "domain/lexer/token_type.h"
 
 namespace cythonpp::domain::semantic {
 namespace {
-
-struct BuiltinTypeName {
-    const char* spelling;
-    TypeKind kind;
-    // Type arguments the constructor takes: 0 for a non-generic builtin, 1
-    // for list/set/frozenset, 2 for dict, and -1 for tuple, which takes any
-    // number.
-    int arity;
-};
-
-// Matched on the SPELLING rather than on token_type, deliberately. `int` in
-// annotation position is TYPE_INT while the same word elsewhere is
-// IDENTIFIER, and both parse to an ast::Name carrying the identifier -- so
-// the string is the only thing always available.
-//
-// Fourteen entries: keyword_table.cpp's thirteen builtin type names, plus
-// `range`. range is not one of the thirteen, so it arrives as an IDENTIFIER,
-// but TypeKind::Range exists for what range() returns and `x: range` is legal
-// Python, so omitting it would make a legal annotation a NameError.
-constexpr std::array<BuiltinTypeName, 14> BUILTIN_TYPE_NAMES = {{
-    {"bool", TypeKind::Bool, 0},
-    {"bytearray", TypeKind::ByteArray, 0},
-    {"bytes", TypeKind::Bytes, 0},
-    {"complex", TypeKind::Complex, 0},
-    {"dict", TypeKind::Dict, 2},
-    {"float", TypeKind::Float, 0},
-    {"frozenset", TypeKind::FrozenSet, 1},
-    {"int", TypeKind::Int, 0},
-    {"list", TypeKind::List, 1},
-    {"object", TypeKind::Object, 0},
-    {"range", TypeKind::Range, 0},
-    {"set", TypeKind::Set, 1},
-    {"str", TypeKind::Str, 0},
-    {"tuple", TypeKind::Tuple, -1},
-}};
-
-const BuiltinTypeName* builtin_type_named(const std::string& spelling) {
-    for (const BuiltinTypeName& entry : BUILTIN_TYPE_NAMES) {
-        if (spelling == entry.spelling) {
-            return &entry;
-        }
-    }
-    return nullptr;
-}
 
 Type of_kind(TypeKind kind) {
     Type type;
@@ -95,14 +52,14 @@ Type AnnotationResolver::resolve(const ast::Expr& annotation) {
 }
 
 Type AnnotationResolver::resolve_name(const ast::Name& name) {
-    if (const BuiltinTypeName* builtin = builtin_type_named(name.identifier())) {
-        if (builtin->arity != 0) {
+    if (std::optional<TypeKind> kind = builtin_type_kind(name.identifier())) {
+        if (builtin_type_arity(name.identifier()) != 0) {
             // mypy's type-arg rule under --strict's disallow-any-generics.
             return error(name, "TypeError",
                          "missing type parameters for generic type \"" + name.identifier() +
                              "\"");
         }
-        return of_kind(builtin->kind);
+        return of_kind(*kind);
     }
     if (classes_.is_class(name.identifier())) {
         return Type::class_of(name.identifier());
@@ -113,7 +70,7 @@ Type AnnotationResolver::resolve_name(const ast::Name& name) {
     //
     // RECORDED OBLIGATION (not fixed here, ruled out of Spec 5a): the
     // reasoning above only covers names mypy itself rejects. It does NOT
-    // cover builtin classes outside BUILTIN_TYPE_NAMES' 14 entries --
+    // cover builtin classes outside builtin_type_names.cpp's 14 entries --
     // `x: type`, `x: Exception`, `x: BaseException`, `x: slice`,
     // `x: memoryview` are all mypy --strict clean, yet draw this same
     // NameError, a genuine false positive against invariant (a). 5a's
@@ -205,8 +162,8 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
         return error(subscript, "TypeError", "not a valid type annotation");
     }
 
-    const BuiltinTypeName* builtin = builtin_type_named(base->identifier());
-    if (builtin == nullptr) {
+    std::optional<TypeKind> kind = builtin_type_kind(base->identifier());
+    if (!kind.has_value()) {
         if (classes_.is_class(base->identifier())) {
             // No user-defined generics in the subset.
             return error(*base, "TypeError",
@@ -217,7 +174,8 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
         // import gap becomes visible, and it is the correct outcome.
         return error(*base, "NameError", "name '" + base->identifier() + "' is not defined");
     }
-    if (builtin->arity == 0) {
+    const int arity = builtin_type_arity(base->identifier());
+    if (arity == 0) {
         return error(*base, "TypeError", "'" + base->identifier() + "' is not subscriptable");
     }
 
@@ -236,7 +194,7 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
     // Only for tuple, and BEFORE the arity check: tuple is variadic, so arity
     // would never catch tuple[int, ...]. Restricting it to tuple means
     // list[int, ...] gets the arity message instead of a misleading one.
-    if (builtin->kind == TypeKind::Tuple) {
+    if (*kind == TypeKind::Tuple) {
         for (const ast::Expr* argument : arguments) {
             const auto* constant = dynamic_cast<const ast::Constant*>(argument);
             if (constant != nullptr && constant->type() == lexer::token_type::ELLIPSIS) {
@@ -248,14 +206,12 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
         }
     }
 
-    if (builtin->arity > 0 && arguments.size() != static_cast<std::size_t>(builtin->arity)) {
+    if (arity > 0 && arguments.size() != static_cast<std::size_t>(arity)) {
         // Before resolving the arguments, so a wrong-arity annotation draws
         // one diagnostic about arity rather than that plus one per argument.
-        const std::string plural = builtin->arity == 1 ? " type argument, but "
-                                                       : " type arguments, but ";
+        const std::string plural = arity == 1 ? " type argument, but " : " type arguments, but ";
         return error(*base, "TypeError",
-                     "\"" + base->identifier() + "\" expects " +
-                         std::to_string(builtin->arity) + plural +
+                     "\"" + base->identifier() + "\" expects " + std::to_string(arity) + plural +
                          std::to_string(arguments.size()) + " given");
     }
 
@@ -278,7 +234,7 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
     }
 
     Type type;
-    type.kind = builtin->kind;
+    type.kind = *kind;
     type.args = std::move(resolved);
     return type;
 }
