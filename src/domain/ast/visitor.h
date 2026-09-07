@@ -38,12 +38,26 @@ class While;
 // turn "added a node, forgot to emit code for it" into missing output at
 // runtime instead.
 //
-// WARNING for whoever adds a RecursiveVisitor with non-pure defaults: a
-// derived class that declares one `visit` override hides *every* other
-// `visit` overload from the base. That is harmless here, because all methods
-// are pure and so every visitor overrides all of them. It stops being
-// harmless the moment defaults exist -- subclasses will need
-// `using RecursiveVisitor::visit;` or traversal will silently stop.
+// NOTE for whoever adds a RecursiveVisitor with non-pure defaults: a derived
+// class that declares one `visit` override does hide *every* other `visit`
+// overload from the base, by ordinary name-hiding rules. That is harmless
+// here, because all methods are pure and so every visitor overrides all of
+// them.
+//
+// It is also less dangerous than it looks once defaults exist, and the
+// earlier version of this comment had it wrong. Traversal does NOT silently
+// stop: accept() dispatches through Visitor&, and virtual dispatch is
+// unaffected by name hiding, so a subclass overriding one method still has
+// the base's defaults fire for the other twenty-five and still receives its
+// own override when one is reached. Verified by experiment.
+//
+// What hiding actually costs is narrower and louder: an UNQUALIFIED
+// `visit(child)` written inside such a subclass fails to compile, because
+// only the overloads that subclass declared are visible to name lookup --
+// `error: no viable conversion from 'const A' to 'const B'`. The fix is
+// `using RecursiveVisitor::visit;` in the subclass, or a qualified
+// `RecursiveVisitor::visit(node)` call. Either way it is a build failure, not
+// a runtime one.
 class Visitor {
 public:
     virtual ~Visitor() = default;
