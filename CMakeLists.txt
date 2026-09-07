@@ -65,6 +65,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/parser/expression_parser_error_test.cpp
         tests/domain/parser/statement_parser_test.cpp
         tests/domain/parser/statement_parser_error_test.cpp
+        tests/domain/semantic/type_test.cpp
         tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/application/compile_pipeline_test.cpp
         tests/adapters/filesystem/filesystem_source_lister_test.cpp
