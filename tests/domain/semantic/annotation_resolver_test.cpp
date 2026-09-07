@@ -322,6 +322,42 @@ TEST(AnnotationResolver, ReportsSubscriptingANonGenericType) {
     }
 }
 
+// Verified: `x: zip[int]` is mypy-CLEAN (zip is generic in typeshed). Once
+// Task 7 seeds zip as a class, the Subscript arm would report
+// "'zip' is not subscriptable" -- a false TypeError on a clean program. It
+// must be a NotImplementedError instead.
+TEST(AnnotationResolver, SubscriptingASeededBuiltinClassIsUnsupportedNotAnError) {
+    const FakeClassLookup classes({{"zip", {}}});
+    const Resolved resolved = resolve_annotation("x: zip[int] = y\n", classes);
+
+    const diagnostics::Diagnostic error = only_error(resolved);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "generic builtin type 'zip' is not supported");
+}
+
+// A USER class subscripted is still a genuine error: user-defined generics
+// are out of scope and mypy reports "is not generic" for
+// `class C: pass` then `x: C[int]`.
+TEST(AnnotationResolver, SubscriptingAUserClassIsStillAnError) {
+    const FakeClassLookup classes({{"Widget", {}}});
+    const Resolved resolved = resolve_annotation("x: Widget[int] = y\n", classes);
+
+    const diagnostics::Diagnostic error = only_error(resolved);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "'Widget' is not subscriptable");
+}
+
+// Verified against real mypy: `x: IOError = OSError()` and
+// `y: OSError = IOError()` are both clean -- IOError IS OSError, the same
+// class object, not a distinct class with a shared base. resolve_name must
+// build Type::class_of("OSError"), not Type::class_of("IOError"), so the two
+// spellings compare as the identical Type they denote.
+TEST(AnnotationResolver, ResolvesAnAliasedBuiltinExceptionToItsCanonicalName) {
+    const FakeClassLookup classes({{"IOError", {"OSError"}}, {"OSError", {}}});
+
+    EXPECT_EQ(resolved_name("x: IOError = y\n", classes), "OSError");
+}
+
 // None of these can be imported, so the base is simply undefined. This is
 // where the import gap becomes visible, and it is the correct outcome.
 TEST(AnnotationResolver, ReportsTheUnimportableTypingNamesAsUndefined) {

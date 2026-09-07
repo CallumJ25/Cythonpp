@@ -1,8 +1,11 @@
 #include "type_compatibility.h"
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
+
+#include "builtin_type_names.h"
 
 namespace cythonpp::domain::semantic {
 namespace {
@@ -12,23 +15,88 @@ bool is_invariant_container(TypeKind kind) {
            kind == TypeKind::FrozenSet;
 }
 
-// Whether `derived` reaches `base` through its base chain.
+// Builds the Type a builtin base-name KIND denotes, for the base-chain walk
+// below. Task 6 made builtin_type_kind visible outside
+// annotation_resolver.cpp precisely so this becomes possible: a base spelled
+// "int" -- `class Sub(int): ...` -- can now be turned back into a real Type
+// and handed to the ordinary is_subtype rules, rather than being unreachable.
+//
+// Exhaustive switch, no default, per project rule: adding a TypeKind forces a
+// decision here rather than silently falling through.
+//
+// The parametric kinds (List, Dict, Set, FrozenSet, Tuple) cannot carry
+// arguments as a bare base name -- `class Sub(list): ...` has no syntax for
+// list's element type -- so they are modelled as an argument-less container
+// (empty `args`). That is a RECORDED imprecision, not a silent one: the
+// invariant-container arm below requires equal-length args, so a class
+// modelled this way is never equal to, say, `list[int]` -- an honest
+// consequence of the bare spelling carrying no element type.
+//
+// Union, Callable and Class can never be a bare base-name spelling --
+// builtin_type_kind() never returns them -- so their cases exist only to keep
+// this switch exhaustive.
+Type builtin_base_type(TypeKind kind) {
+    switch (kind) {
+    case TypeKind::Unknown:
+        return Type::unknown();
+    case TypeKind::NoneType:
+        return Type::none();
+    case TypeKind::Bool:
+        return Type::bool_();
+    case TypeKind::Int:
+        return Type::int_();
+    case TypeKind::Float:
+        return Type::float_();
+    case TypeKind::Complex:
+        return Type::complex_();
+    case TypeKind::Str:
+        return Type::str();
+    case TypeKind::Bytes:
+        return Type::bytes();
+    case TypeKind::ByteArray:
+        return Type::bytearray_();
+    case TypeKind::Ellipsis:
+        return Type::ellipsis();
+    case TypeKind::Range:
+        return Type::range_();
+    case TypeKind::Object:
+        return Type::object();
+    case TypeKind::List:
+    case TypeKind::Dict:
+    case TypeKind::Set:
+    case TypeKind::FrozenSet:
+    case TypeKind::Tuple:
+    case TypeKind::Union:
+    case TypeKind::Callable:
+    case TypeKind::Class: {
+        Type type;
+        type.kind = kind;
+        return type;
+    }
+    }
+    // Unreachable: exhaustive above, with no default, so adding a kind warns
+    // here rather than silently mis-modelling it.
+    return Type::unknown();
+}
+
+// Whether `derived`'s base chain reaches something assignable to `target`.
+// A visited base NAME may denote either another class (walked further) or a
+// builtin KIND -- recursing through the ordinary is_subtype rules once one is
+// found means the numeric tower (int -> float -> complex) and the Object top
+// arm apply without being restated in this walk.
 //
 // Iterative with an explicit worklist and a visited list rather than
 // recursive: a malformed class table can contain a cycle -- `class A(B)` with
 // `class B(A)` is rejected by Python, but nothing here guarantees the table
 // it is handed is well-formed -- and a recursive walk would not return.
-bool inherits_from(const ClassLookup& classes, const std::string& derived,
-                   const std::string& base) {
+bool class_reaches(const ClassLookup& classes, const std::string& derived, const Type& target,
+                   const ClassLookup* classes_for_recursion) {
     std::vector<std::string> pending = classes.bases_of(derived);
     std::vector<std::string> seen;
 
     while (!pending.empty()) {
         const std::string current = pending.back();
         pending.pop_back();
-        if (current == base) {
-            return true;
-        }
 
         bool already_seen = false;
         for (const std::string& visited : seen) {
@@ -41,6 +109,15 @@ bool inherits_from(const ClassLookup& classes, const std::string& derived,
             continue;
         }
         seen.push_back(current);
+
+        if (target.kind == TypeKind::Class && current == target.name) {
+            return true;
+        }
+        if (const std::optional<TypeKind> kind = builtin_type_kind(current)) {
+            if (is_subtype(builtin_base_type(*kind), target, classes_for_recursion)) {
+                return true;
+            }
+        }
 
         const std::vector<std::string> bases = classes.bases_of(current);
         for (const std::string& next : bases) {
@@ -139,18 +216,15 @@ bool is_subtype(const Type& source, const Type& target, const ClassLookup* class
         // Covariant in the return type.
         return is_subtype(source.args.back(), target.args.back(), classes);
     }
-    if (source.kind == TypeKind::Class && target.kind == TypeKind::Class) {
-        // RECORDED OBLIGATION (not fixed here, ruled out of Spec 5a): a
-        // user class inheriting a BUILTIN -- `class Sub(int): ...` -- has no
-        // representation. is_subtype(Class("Sub"), Int) is false even though
-        // `x: int = Sub()` is mypy --strict clean, because resolve_name
-        // consults the builtin table before is_class, so the target can
-        // never be spelled Class("int"). Unreachable today: no real
-        // ClassLookup implementation exists yet, so no Class-kinded Type ever
-        // reaches this arm in practice. Spec 5b's class table is expected to
-        // close this by giving builtin-inheriting classes a representable
-        // base.
-        return classes != nullptr && inherits_from(*classes, source.name, target.name);
+    if (source.kind == TypeKind::Class) {
+        // Broader than "target is also Class": a user class's base chain can
+        // reach a builtin KIND, not just another class -- `class Sub(int)`
+        // makes `x: int = Sub()` mypy --strict clean, so target may be Int,
+        // Float or Complex here too. class_reaches walks both kinds of base
+        // uniformly. Without a lookup there is no chain to walk, so two
+        // Class types (or a Class and a builtin kind) are simply unrelated,
+        // matching the pre-Task-9 behaviour exactly.
+        return classes != nullptr && class_reaches(*classes, source.name, target, classes);
     }
 
     const int source_rank = numeric_rank(source.kind);

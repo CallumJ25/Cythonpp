@@ -258,12 +258,60 @@ TEST(IsSubtype, ClassesAreUnrelatedWithNoLookup) {
 
 // A malformed table must not hang the compiler. Python rejects this, but
 // nothing guarantees the table is well-formed, and a recursive walk would
-// not return.
+// not return. Also covers the walk's builtin-kind check: a cycle must
+// terminate that lookup too, not just the class-to-class one.
 TEST(IsSubtype, ACycleInTheBaseChainTerminates) {
     const semantic_test_support::FakeClassLookup classes({{"A", {"B"}}, {"B", {"A"}}});
 
     EXPECT_FALSE(is_subtype(Type::class_of("A"), Type::class_of("Unrelated"), &classes));
     EXPECT_TRUE(is_subtype(Type::class_of("A"), Type::class_of("B"), &classes));
+    EXPECT_FALSE(is_subtype(Type::class_of("A"), Type::int_(), &classes));
+    EXPECT_FALSE(is_subtype(Type::class_of("A"), Type::class_of("C"), &classes));
+}
+
+// Verified: `class Sub(int): pass` then `x: int = Sub()` is mypy-clean, and
+// reveal_type(Sub()) is Sub. is_subtype was false, because the Class arm
+// needed a target spelled Class("int") and resolve_name can never produce
+// one -- it consults the builtin table first. THE FALSE TypeError THIS
+// CLOSES: `x: int = Sub()`.
+TEST(IsSubtype, AUserClassInheritingABuiltinIsAssignableToThatBuiltin) {
+    const semantic_test_support::FakeClassLookup classes({{"Sub", {"int"}}});
+
+    EXPECT_TRUE(is_subtype(Type::class_of("Sub"), Type::int_(), &classes));
+    // And composes with the numeric tower for free: int -> float -> complex.
+    EXPECT_TRUE(is_subtype(Type::class_of("Sub"), Type::float_(), &classes));
+    EXPECT_TRUE(is_subtype(Type::class_of("Sub"), Type::complex_(), &classes));
+    // Not the other way: int is not a Sub.
+    EXPECT_FALSE(is_subtype(Type::int_(), Type::class_of("Sub"), &classes));
+    // And not to an unrelated builtin.
+    EXPECT_FALSE(is_subtype(Type::class_of("Sub"), Type::str(), &classes));
+}
+
+TEST(IsSubtype, TheBuiltinBaseIsFoundTransitively) {
+    const semantic_test_support::FakeClassLookup classes(
+        {{"Sub", {"int"}}, {"Deeper", {"Sub"}}});
+
+    EXPECT_TRUE(is_subtype(Type::class_of("Deeper"), Type::int_(), &classes));
+}
+
+// Without a lookup there is no base chain to walk, so the old behaviour must
+// be preserved exactly: two differently-named classes are unrelated, and a
+// Class is not assignable to a builtin kind.
+TEST(IsSubtype, AClassIsNotAssignableToABuiltinWithoutALookup) {
+    EXPECT_FALSE(is_subtype(Type::class_of("Sub"), Type::int_()));
+}
+
+// Verified: `e: Exception = ValueError()` is mypy-clean. This is the hole
+// that seeding names WITHOUT bases would have opened -- the reason Task 7
+// extracts the hierarchy rather than just the names.
+TEST(IsSubtype, ASeededExceptionSubclassIsAssignableToItsBase) {
+    const semantic_test_support::FakeClassLookup classes(
+        {{"ValueError", {"Exception"}}, {"Exception", {"BaseException"}}, {"BaseException", {}}});
+
+    EXPECT_TRUE(is_subtype(Type::class_of("ValueError"), Type::class_of("Exception"), &classes));
+    EXPECT_TRUE(is_subtype(Type::class_of("ValueError"), Type::class_of("BaseException"),
+                           &classes));
+    EXPECT_FALSE(is_subtype(Type::class_of("Exception"), Type::class_of("ValueError"), &classes));
 }
 
 TEST(IsSubtype, ClassSubtypingWorksInsideAUnionAndATuple) {
