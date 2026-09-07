@@ -267,4 +267,78 @@ std::optional<Type> comparison_result(lexer::token_type op, const Type& left, co
     }
 }
 
+std::optional<Type> subscript_result(const Type& container, const Type& index,
+                                     const ClassLookup* classes) {
+    if (container.kind == TypeKind::Unknown || index.kind == TypeKind::Unknown) {
+        return Type::unknown();
+    }
+
+    // Dict first, because it is the one container whose index is not an
+    // integer and so must skip the integral check below.
+    if (container.kind == TypeKind::Dict) {
+        if (container.args.size() != 2) {
+            return std::nullopt;
+        }
+        // By assignability, not equality, so a dict keyed by a base class
+        // accepts a subclass index and the numeric tower applies to the key.
+        // This is the only reason this function takes a ClassLookup.
+        if (!is_subtype(index, container.args.front(), classes)) {
+            return std::nullopt;
+        }
+        return container.args.back();
+    }
+
+    if (!is_integral(index.kind)) {
+        return std::nullopt;
+    }
+    if (container.kind == TypeKind::List) {
+        if (container.args.empty()) {
+            return std::nullopt;
+        }
+        return container.args.front();
+    }
+    if (container.kind == TypeKind::Str) {
+        return Type::str();
+    }
+    if (container.kind == TypeKind::Bytes || container.kind == TypeKind::ByteArray ||
+        container.kind == TypeKind::Range) {
+        // Indexing bytes yields an int, not a bytes. Verified.
+        return Type::int_();
+    }
+    if (container.kind == TypeKind::Tuple) {
+        // The union of every member. mypy selects the one member a LITERAL
+        // index names, which needs literal types; the union is the sound
+        // approximation, and is exactly what mypy produces for a variable
+        // index. union_of de-duplicates, so a homogeneous tuple collapses.
+        return Type::union_of(container.args);
+    }
+    return std::nullopt;
+}
+
+std::optional<Type> element_type(const Type& iterable) {
+    if (iterable.kind == TypeKind::Unknown) {
+        return Type::unknown();
+    }
+    if (iterable.kind == TypeKind::List || iterable.kind == TypeKind::Set ||
+        iterable.kind == TypeKind::FrozenSet || iterable.kind == TypeKind::Dict) {
+        // Iterating a dict yields its KEYS, not its items -- which is why
+        // args.front() is right for all four of these.
+        if (iterable.args.empty()) {
+            return std::nullopt;
+        }
+        return iterable.args.front();
+    }
+    if (iterable.kind == TypeKind::Str) {
+        return Type::str();
+    }
+    if (iterable.kind == TypeKind::Bytes || iterable.kind == TypeKind::ByteArray ||
+        iterable.kind == TypeKind::Range) {
+        return Type::int_();
+    }
+    if (iterable.kind == TypeKind::Tuple) {
+        return Type::union_of(iterable.args);
+    }
+    return std::nullopt;
+}
+
 } // namespace cythonpp::domain::semantic

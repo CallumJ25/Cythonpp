@@ -6,6 +6,7 @@
 #include "domain/semantic/operator_rules.h"
 #include "domain/semantic/type.h"
 #include "domain/semantic/type_name.h"
+#include "fake_class_lookup.h"
 
 namespace cythonpp::domain::semantic {
 namespace {
@@ -343,6 +344,163 @@ TEST(ComparisonResult, IsNulloptForATokenThatIsNotAComparison) {
     expect_no_comparison(token_type::OP_PLUS, Type::int_(), Type::int_());
     expect_no_comparison(token_type::OP_AND, Type::bool_(), Type::bool_());
     expect_no_comparison(token_type::COLON, Type::int_(), Type::int_());
+}
+
+void expect_subscript(const Type& container, const Type& index, const Type& expected) {
+    const std::optional<Type> result = subscript_result(container, index);
+    ASSERT_TRUE(result.has_value()) << type_name(container) << "[" << type_name(index)
+                                    << "] should have a result type";
+    EXPECT_EQ(*result, expected) << "got " << type_name(*result);
+}
+
+void expect_no_subscript(const Type& container, const Type& index) {
+    const std::optional<Type> result = subscript_result(container, index);
+    EXPECT_FALSE(result.has_value()) << type_name(container) << "[" << type_name(index)
+                                     << "] should not apply";
+}
+
+void expect_element(const Type& iterable, const Type& expected) {
+    const std::optional<Type> result = element_type(iterable);
+    ASSERT_TRUE(result.has_value()) << type_name(iterable) << " should be iterable";
+    EXPECT_EQ(*result, expected) << "got " << type_name(*result);
+}
+
+void expect_not_iterable(const Type& iterable) {
+    const std::optional<Type> result = element_type(iterable);
+    EXPECT_FALSE(result.has_value()) << type_name(iterable) << " should not be iterable";
+}
+
+TEST(SubscriptResult, IndexingASequenceYieldsItsElement) {
+    expect_subscript(Type::list_of(Type::str()), Type::int_(), Type::str());
+    expect_subscript(Type::list_of(Type::str()), Type::bool_(), Type::str());
+    expect_subscript(Type::str(), Type::int_(), Type::str());
+    expect_subscript(Type::range_(), Type::int_(), Type::int_());
+}
+
+// Verified: reveal_type(bs[0]) on a bytes is int, not bytes.
+TEST(SubscriptResult, IndexingBytesYieldsAnInt) {
+    expect_subscript(Type::bytes(), Type::int_(), Type::int_());
+    expect_subscript(Type::bytearray_(), Type::int_(), Type::int_());
+}
+
+TEST(SubscriptResult, ASequenceIndexMustBeAnInteger) {
+    expect_no_subscript(Type::list_of(Type::str()), Type::str());
+    expect_no_subscript(Type::str(), Type::str());
+    expect_no_subscript(Type::bytes(), Type::float_());
+    expect_no_subscript(Type::range_(), Type::none());
+}
+
+TEST(SubscriptResult, IndexingADictYieldsItsValueAndChecksTheKey) {
+    const Type dict = Type::dict_of(Type::str(), Type::int_());
+
+    expect_subscript(dict, Type::str(), Type::int_());
+    // Verified: d[1] on a dict[str, int] is "Invalid index type".
+    expect_no_subscript(dict, Type::int_());
+    expect_no_subscript(dict, Type::none());
+}
+
+// The tower applies to the key check, because it goes through is_subtype.
+TEST(SubscriptResult, ADictKeyIsCheckedByAssignabilityNotEquality) {
+    expect_subscript(Type::dict_of(Type::float_(), Type::str()), Type::int_(), Type::str());
+    expect_subscript(Type::dict_of(Type::object(), Type::str()), Type::none(), Type::str());
+}
+
+// The reason subscript_result takes a ClassLookup at all.
+TEST(SubscriptResult, ADictKeyedByABaseClassAcceptsASubclassIndex) {
+    const semantic_test_support::FakeClassLookup classes({{"Base", {}}, {"Sub", {"Base"}}});
+    const Type dict = Type::dict_of(Type::class_of("Base"), Type::int_());
+
+    EXPECT_TRUE(subscript_result(dict, Type::class_of("Sub"), &classes).has_value());
+    // Without the lookup the two classes are unrelated, so it does not apply.
+    EXPECT_FALSE(subscript_result(dict, Type::class_of("Sub")).has_value());
+}
+
+// Verified: reveal_type(t[i]) on a tuple[int, str] with a variable index is
+// int | str. mypy selects one member for a literal index, which needs
+// literal types; the union is the sound approximation.
+TEST(SubscriptResult, IndexingATupleYieldsTheUnionOfItsMembers) {
+    expect_subscript(Type::tuple_of({Type::int_(), Type::str()}), Type::int_(),
+                     Type::union_of({Type::int_(), Type::str()}));
+    // A homogeneous tuple collapses, because union_of de-duplicates.
+    expect_subscript(Type::tuple_of({Type::int_(), Type::int_()}), Type::int_(), Type::int_());
+    expect_subscript(Type::tuple_of({Type::str()}), Type::int_(), Type::str());
+}
+
+TEST(SubscriptResult, UnknownIsAbsorbingOnEitherSide) {
+    expect_subscript(Type::unknown(), Type::int_(), Type::unknown());
+    expect_subscript(Type::list_of(Type::str()), Type::unknown(), Type::unknown());
+    expect_subscript(Type::none(), Type::unknown(), Type::unknown());
+}
+
+TEST(SubscriptResult, NonSubscriptableTypesDoNotApply) {
+    expect_no_subscript(Type::int_(), Type::int_());
+    expect_no_subscript(Type::none(), Type::int_());
+    expect_no_subscript(Type::set_of(Type::int_()), Type::int_());
+    expect_no_subscript(Type::class_of("Widget"), Type::int_());
+    expect_no_subscript(Type::union_of({Type::list_of(Type::int_()), Type::none()}),
+                        Type::int_());
+}
+
+TEST(ElementType, IteratingASequenceYieldsItsElement) {
+    expect_element(Type::list_of(Type::str()), Type::str());
+    expect_element(Type::set_of(Type::int_()), Type::int_());
+    expect_element(Type::frozenset_of(Type::bool_()), Type::bool_());
+    expect_element(Type::str(), Type::str());
+    expect_element(Type::range_(), Type::int_());
+}
+
+// Verified: `for e in bs` on a bytes gives int.
+TEST(ElementType, IteratingBytesYieldsAnInt) {
+    expect_element(Type::bytes(), Type::int_());
+    expect_element(Type::bytearray_(), Type::int_());
+}
+
+// Verified: `for k in d` on a dict[str, int] gives str, not a tuple.
+TEST(ElementType, IteratingADictYieldsItsKeys) {
+    expect_element(Type::dict_of(Type::str(), Type::int_()), Type::str());
+}
+
+// Verified: `for g in t` on a tuple[int, str] gives int | str, and on a
+// tuple[int, int] gives int.
+TEST(ElementType, IteratingATupleYieldsTheUnionOfItsMembers) {
+    expect_element(Type::tuple_of({Type::int_(), Type::str()}),
+                   Type::union_of({Type::int_(), Type::str()}));
+    expect_element(Type::tuple_of({Type::int_(), Type::int_()}), Type::int_());
+}
+
+TEST(ElementType, UnknownIsAbsorbing) {
+    expect_element(Type::unknown(), Type::unknown());
+}
+
+TEST(ElementType, NonIterableTypesDoNotApply) {
+    expect_not_iterable(Type::int_());
+    expect_not_iterable(Type::none());
+    expect_not_iterable(Type::bool_());
+    expect_not_iterable(Type::class_of("Widget"));
+    expect_not_iterable(Type::object());
+    expect_not_iterable(Type::union_of({Type::list_of(Type::int_()), Type::none()}));
+}
+
+// An empty tuple has no members, so union_of collapses to Unknown rather
+// than to a Union of nothing. Pinned so the invariant is visible.
+TEST(ElementType, IteratingAnEmptyTupleIsUnknown) {
+    expect_element(Type::tuple_of({}), Type::unknown());
+}
+
+// Unreachable through Type's factories, which always supply arguments, but
+// these functions are total and must not index into an empty vector.
+TEST(SubscriptAndElementType, AParameterlessContainerDoesNotApply) {
+    Type bare;
+    bare.kind = TypeKind::List;
+
+    expect_no_subscript(bare, Type::int_());
+    expect_not_iterable(bare);
+
+    Type bare_dict;
+    bare_dict.kind = TypeKind::Dict;
+
+    expect_no_subscript(bare_dict, Type::str());
+    expect_not_iterable(bare_dict);
 }
 
 } // namespace
