@@ -82,6 +82,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/semantic/operator_rules_test.cpp
         tests/domain/semantic/builtin_type_names_test.cpp
         tests/domain/semantic/annotation_resolver_test.cpp
+        tests/domain/semantic/builtin_class_table_test.cpp
         tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/application/compile_pipeline_test.cpp
         tests/adapters/filesystem/filesystem_source_lister_test.cpp
