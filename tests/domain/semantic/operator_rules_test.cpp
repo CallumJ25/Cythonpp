@@ -120,6 +120,32 @@ TEST(BinaryResult, BytesConcatenateAndRepeat) {
     expect_no_binary(token_type::OP_PLUS, Type::bytes(), Type::str());
 }
 
+// mypy --strict verified: bytearray + bytearray, bytearray * int and
+// bytearray % int are all clean (reveal_type: bytearray, bytearray, bytes
+// respectively). Task 7 added ByteArray to is_container and ordered_result
+// with a written argument for it; these three arms never got the same
+// treatment, so bytearray was drawing a false "unsupported operand types".
+TEST(BinaryResult, ByteArrayConcatenatesRepeatsAndFormats) {
+    expect_binary(token_type::OP_PLUS, Type::bytearray_(), Type::bytearray_(), Type::bytearray_());
+    expect_binary(token_type::OP_STAR, Type::bytearray_(), Type::int_(), Type::bytearray_());
+    expect_binary(token_type::OP_STAR, Type::int_(), Type::bytearray_(), Type::bytearray_());
+
+    // Verified: reveal_type(bytearray(b"x") % 3) is builtins.bytes, NOT
+    // bytearray -- typeshed types bytearray.__mod__ to return bytes, which
+    // disagrees with the real CPython runtime but is what mypy --strict
+    // checks against. Modelling this as bytearray would make
+    // `z: bytes = ba % 3` (mypy-clean) fail our own is_subtype check.
+    expect_binary(token_type::OP_PERCENT, Type::bytearray_(), Type::int_(), Type::bytes());
+
+    // Recorded gap, not fixed in this wave (out of the four instructed
+    // arms): mypy --strict actually ACCEPTS mixed bytearray + bytes, typed as
+    // bytearray (verified: reveal_type(bytearray(b"x") + b"y") is
+    // builtins.bytearray). plus_result requires an exact kind match on both
+    // sides, so this is a missed error rather than a false one -- acceptable
+    // under invariant (a), but worth a follow-up arm in a future spec.
+    expect_no_binary(token_type::OP_PLUS, Type::bytearray_(), Type::bytes());
+}
+
 // Verified: reveal_type([1] + [2]) is list[int], reveal_type([1] * 2) is
 // list[int], and reveal_type([1] * True) is list[int].
 TEST(BinaryResult, ListsConcatenateWhenTheirElementsMatchExactly) {
@@ -135,6 +161,21 @@ TEST(BinaryResult, ListsConcatenateWhenTheirElementsMatchExactly) {
     // is no join that would be sound for a mutable container.
     expect_no_binary(token_type::OP_PLUS, ints, floats);
     expect_no_binary(token_type::OP_MINUS, ints, ints);
+}
+
+// Elementwise EQUIVALENCE, not ==: list[int | str] and list[str | int] are
+// the same type despite the differently-ordered union spelling, and mypy
+// --strict accepts concatenating them. Genuinely different element types
+// (int vs float) must still fail, in both directions.
+TEST(BinaryResult, ListsConcatenateAcrossUnionMemberOrder) {
+    const Type list_int_str = Type::list_of(Type::union_of({Type::int_(), Type::str()}));
+    const Type list_str_int = Type::list_of(Type::union_of({Type::str(), Type::int_()}));
+
+    expect_binary(token_type::OP_PLUS, list_int_str, list_str_int, list_int_str);
+    expect_binary(token_type::OP_PLUS, list_str_int, list_int_str, list_str_int);
+
+    expect_no_binary(token_type::OP_PLUS, Type::list_of(Type::int_()), Type::list_of(Type::float_()));
+    expect_no_binary(token_type::OP_PLUS, Type::list_of(Type::float_()), Type::list_of(Type::int_()));
 }
 
 // Verified: reveal_type((1,) + (2,)) is tuple[int, int].
@@ -184,6 +225,28 @@ TEST(BinaryResult, SetsIntersectAndUnion) {
     expect_binary(token_type::OP_PIPE, ints, ints, ints);
     expect_no_binary(token_type::OP_AMPERSAND, ints, Type::set_of(Type::str()));
     expect_no_binary(token_type::OP_CARET, ints, ints);
+}
+
+// Task 7 added ByteArray to is_container and ordered_result with a written
+// argument for it; FrozenSet never got the same treatment for & and |, even
+// though mypy --strict accepts both (verified: reveal_type(frozenset({1}) &
+// frozenset({2})) and the | counterpart are both frozenset[int]).
+TEST(BinaryResult, FrozenSetsIntersectAndUnion) {
+    const Type ints = Type::frozenset_of(Type::int_());
+
+    expect_binary(token_type::OP_AMPERSAND, ints, ints, ints);
+    expect_binary(token_type::OP_PIPE, ints, ints, ints);
+    expect_no_binary(token_type::OP_AMPERSAND, ints, Type::frozenset_of(Type::str()));
+}
+
+// Elementwise equivalence, not ==, matching the list-concatenation fix:
+// set[int | str] and set[str | int] are the same type.
+TEST(BinaryResult, SetsIntersectAcrossUnionMemberOrder) {
+    const Type set_int_str = Type::set_of(Type::union_of({Type::int_(), Type::str()}));
+    const Type set_str_int = Type::set_of(Type::union_of({Type::str(), Type::int_()}));
+
+    expect_binary(token_type::OP_AMPERSAND, set_int_str, set_str_int, set_int_str);
+    expect_binary(token_type::OP_PIPE, set_str_int, set_int_str, set_str_int);
 }
 
 // The semantic half of OP_AT's two readings. Spec 4 settled the syntactic
@@ -309,6 +372,20 @@ TEST(ComparisonResult, OrderedComparisonsRequireCompatibleOperands) {
     }
 }
 
+// Elementwise equivalence, not ==, matching the list-concatenation and
+// set-operation fixes: list[int | str] and list[str | int] are the same
+// type, so an ordered comparison between them must still apply.
+TEST(ComparisonResult, OrderedComparisonAppliesAcrossUnionMemberOrder) {
+    const Type list_int_str = Type::list_of(Type::union_of({Type::int_(), Type::str()}));
+    const Type list_str_int = Type::list_of(Type::union_of({Type::str(), Type::int_()}));
+
+    for (const token_type op : {token_type::OP_LESS, token_type::OP_LESS_EQUAL,
+                                token_type::OP_GREATER, token_type::OP_GREATER_EQUAL}) {
+        expect_comparison(op, list_int_str, list_str_int);
+        expect_comparison(op, list_str_int, list_int_str);
+    }
+}
+
 TEST(ComparisonResult, AnOrderedComparisonWithUnknownIsBoolNotAnError) {
     expect_comparison(token_type::OP_LESS, Type::unknown(), Type::str());
     expect_comparison(token_type::OP_LESS, Type::int_(), Type::unknown());
@@ -426,6 +503,13 @@ TEST(SubscriptResult, IndexingATupleYieldsTheUnionOfItsMembers) {
     expect_subscript(Type::tuple_of({Type::str()}), Type::int_(), Type::str());
 }
 
+// The subscript_result half of Fix 4: an empty tuple has no member to index,
+// and nothing reported that, so this must not silently hand back Unknown
+// either. No test at all existed for this before the fix.
+TEST(SubscriptResult, IndexingAnEmptyTupleDoesNotApply) {
+    expect_no_subscript(Type::tuple_of({}), Type::int_());
+}
+
 TEST(SubscriptResult, UnknownIsAbsorbingOnEitherSide) {
     expect_subscript(Type::unknown(), Type::int_(), Type::unknown());
     expect_subscript(Type::list_of(Type::str()), Type::unknown(), Type::unknown());
@@ -481,10 +565,15 @@ TEST(ElementType, NonIterableTypesDoNotApply) {
     expect_not_iterable(Type::union_of({Type::list_of(Type::int_()), Type::none()}));
 }
 
-// An empty tuple has no members, so union_of collapses to Unknown rather
-// than to a Union of nothing. Pinned so the invariant is visible.
-TEST(ElementType, IteratingAnEmptyTupleIsUnknown) {
-    expect_element(Type::tuple_of({}), Type::unknown());
+// CORRECTED (Fix 4): this test used to pin element_type(tuple[()]) ==
+// Unknown, on the reasoning that union_of({}) collapses there. But Unknown is
+// the ABSORBING bottom for an error that was already reported, and nothing
+// reports one for `tuple[()]` -- resolve_subscript accepts it silently. The
+// old behaviour meant `for v in ()` bound v: Unknown and silenced every
+// genuine error in the loop body. element_type now returns nullopt before
+// consulting union_of, so the CALLER reports instead of silently absorbing.
+TEST(ElementType, IteratingAnEmptyTupleDoesNotApply) {
+    expect_not_iterable(Type::tuple_of({}));
 }
 
 // Unreachable through Type's factories, which always supply arguments, but

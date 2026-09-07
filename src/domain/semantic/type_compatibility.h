@@ -33,6 +33,14 @@ int numeric_rank(TypeKind kind);
 // requiring one would mean inventing an empty implementation at every site.
 bool is_subtype(const Type& source, const Type& target, const ClassLookup* classes = nullptr);
 
+// Whether two types are the SAME type, as opposed to one being assignable to
+// the other. Mutual assignability rather than operator==, because == is exact
+// and order-sensitive for unions while `int | str` and `str | int` are the
+// same type. Use this -- never == -- wherever a rule needs type identity:
+// invariant containers, list concatenation, set operations, ordered
+// comparisons.
+bool is_equivalent(const Type& left, const Type& right, const ClassLookup* classes = nullptr);
+
 } // namespace cythonpp::domain::semantic
 
 #endif // CYTHONPP_DOMAIN_SEMANTIC_TYPE_COMPATIBILITY_H

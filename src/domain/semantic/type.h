@@ -140,6 +140,22 @@ inline Type Type::union_of(std::vector<Type> members) {
         }
     }
 
+    // Unknown is absorbing here too, and checked BEFORE dedup: a member that
+    // failed to resolve means one diagnostic was already reported for it, and
+    // a union that carried it forward (`int | Unknown`) would keep comparing
+    // as only partially compatible with everything -- is_subtype(int|Unknown,
+    // str) is false even though the real annotation is unrecoverable, not
+    // "str-shaped" -- so the same root cause would draw a SECOND diagnostic
+    // at every later use. Returning Unknown outright is what keeps one root
+    // cause to one diagnostic, matching the caller-side guard
+    // AnnotationResolver::resolve_union already carries for exactly this
+    // reason.
+    for (const Type& member : flat) {
+        if (member.kind == TypeKind::Unknown) {
+            return unknown();
+        }
+    }
+
     std::vector<Type> distinct;
     for (Type& candidate : flat) {
         bool seen = false;

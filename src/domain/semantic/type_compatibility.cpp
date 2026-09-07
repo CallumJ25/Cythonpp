@@ -140,6 +140,16 @@ bool is_subtype(const Type& source, const Type& target, const ClassLookup* class
         return is_subtype(source.args.back(), target.args.back(), classes);
     }
     if (source.kind == TypeKind::Class && target.kind == TypeKind::Class) {
+        // RECORDED OBLIGATION (not fixed here, ruled out of Spec 5a): a
+        // user class inheriting a BUILTIN -- `class Sub(int): ...` -- has no
+        // representation. is_subtype(Class("Sub"), Int) is false even though
+        // `x: int = Sub()` is mypy --strict clean, because resolve_name
+        // consults the builtin table before is_class, so the target can
+        // never be spelled Class("int"). Unreachable today: no real
+        // ClassLookup implementation exists yet, so no Class-kinded Type ever
+        // reaches this arm in practice. Spec 5b's class table is expected to
+        // close this by giving builtin-inheriting classes a representable
+        // base.
         return classes != nullptr && inherits_from(*classes, source.name, target.name);
     }
 
@@ -153,11 +163,25 @@ bool is_subtype(const Type& source, const Type& target, const ClassLookup* class
         return false;
     }
     if (is_invariant_container(source.kind)) {
-        // Invariant, so identity above was the only way these could succeed;
-        // reaching here means the arguments differ. list[float] = list[int]
-        // would let a float be appended through the alias, which is why mypy
-        // says outright that list is invariant.
-        return false;
+        // Invariant, so a MUTATION through the alias must stay sound --
+        // list[float] = list[int] would let a float be appended to what is
+        // really a list[int], which is why mypy says outright that list is
+        // invariant. But invariant means the two ELEMENT types must be the
+        // same type, not that they must be spelled identically: operator==
+        // already failed above (or this arm would be unreached), yet
+        // list[int | str] and list[str | int] are the same type with a
+        // differently-ordered union spelling. Elementwise is_equivalent,
+        // never ==, is what tells those apart from a genuine list[int] vs
+        // list[float] mismatch.
+        if (source.args.size() != target.args.size()) {
+            return false;
+        }
+        for (std::size_t index = 0; index < source.args.size(); ++index) {
+            if (!is_equivalent(source.args[index], target.args[index], classes)) {
+                return false;
+            }
+        }
+        return true;
     }
     if (source.kind == TypeKind::Tuple) {
         // Covariant, elementwise, because a tuple is immutable. Arity must
@@ -173,6 +197,10 @@ bool is_subtype(const Type& source, const Type& target, const ClassLookup* class
         return true;
     }
     return false;
+}
+
+bool is_equivalent(const Type& left, const Type& right, const ClassLookup* classes) {
+    return is_subtype(left, right, classes) && is_subtype(right, left, classes);
 }
 
 } // namespace cythonpp::domain::semantic

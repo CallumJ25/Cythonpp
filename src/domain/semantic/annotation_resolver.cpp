@@ -110,6 +110,18 @@ Type AnnotationResolver::resolve_name(const ast::Name& name) {
     // A builtin that is not a type -- `x: print` -- also lands here. mypy
     // errors on it too, with different wording, so this is a wording
     // divergence rather than a compliance one.
+    //
+    // RECORDED OBLIGATION (not fixed here, ruled out of Spec 5a): the
+    // reasoning above only covers names mypy itself rejects. It does NOT
+    // cover builtin classes outside BUILTIN_TYPE_NAMES' 14 entries --
+    // `x: type`, `x: Exception`, `x: BaseException`, `x: slice`,
+    // `x: memoryview` are all mypy --strict clean, yet draw this same
+    // NameError, a genuine false positive against invariant (a). 5a's
+    // behaviour is arguably already correct given what exists today (no real
+    // ClassLookup implementation is wired in yet), but nothing recorded the
+    // obligation until now: Spec 5b's class table is expected to close this
+    // by seeding itself with builtin class names so is_class(...) picks them
+    // up here before falling through.
     return error(name, "NameError", "name '" + name.identifier() + "' is not defined");
 }
 

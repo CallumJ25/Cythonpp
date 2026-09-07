@@ -152,6 +152,16 @@ TEST(Type, UnionMemberOrderIsPreservedAndSignificantToEquality) {
     EXPECT_EQ(right.args.front(), Type::str());
 }
 
+// Unknown is absorbing in a union too, not just at is_subtype: a member that
+// failed to resolve must not survive into `int | Unknown`, or is_subtype
+// would compare it as only partially compatible with everything and a single
+// root cause would draw a second diagnostic at every later use.
+TEST(Type, UnionOfAbsorbsUnknown) {
+    EXPECT_EQ(Type::union_of({Type::int_(), Type::unknown()}), Type::unknown());
+    EXPECT_EQ(Type::union_of({Type::unknown(), Type::str(), Type::none()}), Type::unknown());
+    EXPECT_EQ(Type::union_of({Type::unknown(), Type::unknown()}), Type::unknown());
+}
+
 TEST(Type, IsCopyableUnlikeAnAstNode) {
     const Type original = Type::dict_of(Type::str(), Type::list_of(Type::int_()));
     const Type copy = original;

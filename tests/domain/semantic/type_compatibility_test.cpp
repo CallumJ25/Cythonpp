@@ -88,6 +88,30 @@ TEST(IsSubtype, MutableContainersAreInvariant) {
 
 // Verified against mypy: tuple[float, float] = tuple[int, int] is clean,
 // because a tuple is immutable and so may be covariant.
+// The Critical finding this wave exists to fix: a union nested INSIDE an
+// invariant container used to have only source == target left as a success
+// path, so list[int | str] and list[str | int] -- the same type, verified
+// against mypy --strict as mutually assignable -- came back false. Elementwise
+// is_equivalent (never ==) is what makes this order-insensitive at any depth,
+// not just at the top level.
+TEST(IsSubtype, InvariantContainersAreOrderInsensitiveForUnionElements) {
+    const Type list_int_str = Type::list_of(Type::union_of({Type::int_(), Type::str()}));
+    const Type list_str_int = Type::list_of(Type::union_of({Type::str(), Type::int_()}));
+    expect_subtype(list_int_str, list_str_int);
+    expect_subtype(list_str_int, list_int_str);
+
+    const Type dict_int_none = Type::dict_of(Type::str(), Type::union_of({Type::int_(), Type::none()}));
+    const Type dict_none_int = Type::dict_of(Type::str(), Type::union_of({Type::none(), Type::int_()}));
+    expect_subtype(dict_int_none, dict_none_int);
+    expect_subtype(dict_none_int, dict_int_none);
+
+    // The fix must not have loosened invariance itself: a union spelling
+    // difference is fine, but a genuinely different element type still is
+    // not, in either direction.
+    expect_not_subtype(Type::list_of(Type::int_()), Type::list_of(Type::float_()));
+    expect_not_subtype(Type::list_of(Type::float_()), Type::list_of(Type::int_()));
+}
+
 TEST(IsSubtype, TuplesAreCovariantElementwise) {
     expect_subtype(Type::tuple_of({Type::int_(), Type::int_()}),
                    Type::tuple_of({Type::float_(), Type::float_()}));

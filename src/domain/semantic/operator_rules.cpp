@@ -44,9 +44,14 @@ std::optional<Type> plus_result(const Type& left, const Type& right) {
     if (left.kind == TypeKind::Bytes && right.kind == TypeKind::Bytes) {
         return Type::bytes();
     }
-    if (left.kind == TypeKind::List && right.kind == TypeKind::List && left == right) {
-        // Exact element match, matching list's invariance: there is no join
-        // that would be sound for a mutable container.
+    if (left.kind == TypeKind::ByteArray && right.kind == TypeKind::ByteArray) {
+        return Type::bytearray_();
+    }
+    if (left.kind == TypeKind::List && right.kind == TypeKind::List && is_equivalent(left, right)) {
+        // Equivalent, not ==, matching list's invariance the way is_subtype
+        // now does: list[int | str] and list[str | int] are the same type
+        // even though they are not ==, and there is still no join that would
+        // be sound for a mutable container beyond that.
         return left;
     }
     if (left.kind == TypeKind::Tuple && right.kind == TypeKind::Tuple) {
@@ -71,9 +76,16 @@ std::optional<Type> star_result(const Type& left, const Type& right) {
         return std::nullopt;
     }
     if (sequence.kind == TypeKind::Str || sequence.kind == TypeKind::Bytes ||
-        sequence.kind == TypeKind::List) {
+        sequence.kind == TypeKind::ByteArray || sequence.kind == TypeKind::List) {
         return sequence;
     }
+    // Tuple is deliberately ABSENT here, and this is not an omission: mypy
+    // types `t * n` for a non-literal count as tuple[int, ...], a VARIADIC
+    // tuple this model cannot represent (Type has no variadic-tuple
+    // constructor, and the spec rejects tuple[int, ...] annotations
+    // outright). A concrete fixed-arity answer would be a wrong type, which
+    // is worse than a missing one, so this stays nullopt -- a "cannot model"
+    // gap, not a type error.
     return std::nullopt;
 }
 
@@ -97,20 +109,36 @@ std::optional<Type> modulo_result(const Type& left, const Type& right) {
     if (left.kind == TypeKind::Str) {
         return Type::str();
     }
-    if (left.kind == TypeKind::Bytes) {
+    // ByteArray joins the Bytes arm here, NOT a bytearray arm of its own.
+    // Verified against mypy 1.18.1: `reveal_type(bytearray(b"x") % 3)` is
+    // "builtins.bytes", not bytearray -- confirmed by also checking
+    // `y: bytearray = bytearray(b"x") % 3`, which mypy --strict rejects as
+    // incompatible ("bytes" vs "bytearray"). This is typeshed's stub for
+    // bytearray.__mod__, and it disagrees with the real CPython runtime
+    // (bytearray % anything IS a bytearray there) -- but this compiler's
+    // contract is mypy-compliance, not runtime fidelity. Modelling this arm
+    // as returning bytearray, as an earlier draft of this fix assumed, would
+    // make `z: bytes = ba % 3` a false TypeError on code mypy accepts
+    // cleanly, which is exactly the invariant this wave exists to protect.
+    if (left.kind == TypeKind::Bytes || left.kind == TypeKind::ByteArray) {
         return Type::bytes();
     }
     return std::nullopt;
 }
 
-// & and | are integer bitwise operators and also set intersection/union.
-// ^ on sets is a recorded gap: only & and | are modelled.
+// & and | are integer bitwise operators and also set/frozenset
+// intersection/union. ^ on sets is a recorded gap: only & and | are modelled.
 std::optional<Type> intersection_or_union_result(const Type& left, const Type& right) {
     if (is_integral(left.kind) && is_integral(right.kind)) {
         return Type::int_();
     }
-    if (left.kind == TypeKind::Set && right.kind == TypeKind::Set && left == right) {
-        return left;
+    if ((left.kind == TypeKind::Set && right.kind == TypeKind::Set) ||
+        (left.kind == TypeKind::FrozenSet && right.kind == TypeKind::FrozenSet)) {
+        // Equivalent, not ==, for the same reason as plus_result's List arm:
+        // set[int | str] and set[str | int] are the same type.
+        if (is_equivalent(left, right)) {
+            return left;
+        }
     }
     return std::nullopt;
 }
@@ -149,7 +177,8 @@ std::optional<Type> ordered_result(const Type& left, const Type& right) {
         left.kind == TypeKind::ByteArray) {
         return Type::bool_();
     }
-    if (left.kind == TypeKind::List && left == right) {
+    if (left.kind == TypeKind::List && is_equivalent(left, right)) {
+        // Equivalent, not ==, for the same reason as plus_result's List arm.
         return Type::bool_();
     }
     if (left.kind == TypeKind::Tuple) {
@@ -157,7 +186,11 @@ std::optional<Type> ordered_result(const Type& left, const Type& right) {
         // the element types are not constrained here.
         return Type::bool_();
     }
-    // Sets support subset comparison in Python; not modelled, a recorded gap.
+    // Sets support subset comparison in Python (`s1 <= s2`); not modelled,
+    // a recorded gap -- verified against mypy 1.18.1, which types it bool
+    // with no error. Left nullopt because this compiler's table has no way
+    // to distinguish "cannot model" from "type error"; see the same
+    // observation at plus_result/star_result's tuple-repetition gap.
     return std::nullopt;
 }
 
@@ -306,6 +339,17 @@ std::optional<Type> subscript_result(const Type& container, const Type& index,
         return Type::int_();
     }
     if (container.kind == TypeKind::Tuple) {
+        // BEFORE consulting union_of: an empty tuple (`tuple[()]`) has no
+        // element to index, and nothing upstream reported that -- resolve_
+        // subscript accepts `tuple[()]` silently. union_of({}) is Unknown,
+        // which is the ABSORBING bottom for an already-reported error; here
+        // no error was ever reported, so returning it would silently accept
+        // `t[0]` on an empty tuple and then propagate Unknown through every
+        // later use, masking real errors downstream instead of surfacing
+        // this one. nullopt is the caller's cue to report instead.
+        if (container.args.empty()) {
+            return std::nullopt;
+        }
         // The union of every member. mypy selects the one member a LITERAL
         // index names, which needs literal types; the union is the sound
         // approximation, and is exactly what mypy produces for a variable
@@ -336,6 +380,14 @@ std::optional<Type> element_type(const Type& iterable) {
         return Type::int_();
     }
     if (iterable.kind == TypeKind::Tuple) {
+        // Same reasoning as subscript_result's Tuple arm: an empty tuple has
+        // no element to yield and nothing reported that, so this must not
+        // silently hand back the absorbing Unknown -- `for v in ()` would
+        // otherwise bind v: Unknown and silence every genuine error in the
+        // loop body.
+        if (iterable.args.empty()) {
+            return std::nullopt;
+        }
         return Type::union_of(iterable.args);
     }
     return std::nullopt;
