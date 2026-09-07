@@ -122,6 +122,45 @@ std::optional<Type> integer_only_result(const Type& left, const Type& right) {
     return std::nullopt;
 }
 
+// Everything `in` accepts on its right and `for` can iterate. ByteArray is
+// included even though the spec's table omits it: a bytearray is iterable and
+// a container in Python, and its absence reads as an oversight rather than a
+// decision. Adding it can only accept more, never report more, so the hard
+// invariant is untouched.
+bool is_container(TypeKind kind) {
+    return kind == TypeKind::List || kind == TypeKind::Dict || kind == TypeKind::Set ||
+           kind == TypeKind::FrozenSet || kind == TypeKind::Tuple || kind == TypeKind::Str ||
+           kind == TypeKind::Bytes || kind == TypeKind::ByteArray || kind == TypeKind::Range;
+}
+
+std::optional<Type> ordered_result(const Type& left, const Type& right) {
+    // Bool rather than a report: the root cause already reported, and a
+    // comparison's result type never depends on its operands.
+    if (left.kind == TypeKind::Unknown || right.kind == TypeKind::Unknown) {
+        return Type::bool_();
+    }
+    if (numeric_rank(left.kind) != 0 && numeric_rank(right.kind) != 0) {
+        return Type::bool_();
+    }
+    if (left.kind != right.kind) {
+        return std::nullopt;
+    }
+    if (left.kind == TypeKind::Str || left.kind == TypeKind::Bytes ||
+        left.kind == TypeKind::ByteArray) {
+        return Type::bool_();
+    }
+    if (left.kind == TypeKind::List && left == right) {
+        return Type::bool_();
+    }
+    if (left.kind == TypeKind::Tuple) {
+        // Elementwise at runtime, and heterogeneous tuples compare fine, so
+        // the element types are not constrained here.
+        return Type::bool_();
+    }
+    // Sets support subset comparison in Python; not modelled, a recorded gap.
+    return std::nullopt;
+}
+
 } // namespace
 
 std::optional<Type> binary_result(lexer::token_type op, const Type& left, const Type& right) {
@@ -165,6 +204,65 @@ std::optional<Type> binary_result(lexer::token_type op, const Type& left, const 
         // Not a binary arithmetic or bitwise operator. A default is right in
         // a switch over token_type, which has well over a hundred
         // enumerators; Global Constraint 5 forbids one only over TypeKind.
+        return std::nullopt;
+    }
+}
+
+std::optional<Type> unary_result(lexer::token_type op, const Type& operand) {
+    // BEFORE the Unknown guard, deliberately. Truthiness is universal in
+    // Python, so `not` is total and always yields bool; absorbing Unknown
+    // here would turn Bool into Unknown and silence a genuine error
+    // downstream.
+    if (op == lexer::token_type::OP_NOT) {
+        return Type::bool_();
+    }
+    if (operand.kind == TypeKind::Unknown) {
+        return Type::unknown();
+    }
+
+    switch (op) {
+    case lexer::token_type::OP_PLUS:
+    case lexer::token_type::OP_MINUS: {
+        const int rank = numeric_rank(operand.kind);
+        if (rank == 0) {
+            return std::nullopt;
+        }
+        // Floored at Int, so -True is int, consistent with the binary rules.
+        return numeric_of_rank(std::max(2, rank));
+    }
+    case lexer::token_type::OP_TILDE:
+        if (is_integral(operand.kind)) {
+            return Type::int_();
+        }
+        return std::nullopt;
+    default:
+        return std::nullopt;
+    }
+}
+
+std::optional<Type> comparison_result(lexer::token_type op, const Type& left, const Type& right) {
+    switch (op) {
+    case lexer::token_type::OP_EQUAL:
+    case lexer::token_type::OP_NOT_EQUAL:
+    case lexer::token_type::OP_IS:
+    case lexer::token_type::OP_IS_NOT:
+        // Total: any operands, always bool, never a report. Whether the
+        // operands could ever be equal is mypy's strict-equality rule, which
+        // the spec puts out of scope. Note this deliberately does NOT absorb
+        // Unknown -- the result type does not depend on the operands.
+        return Type::bool_();
+    case lexer::token_type::OP_IN:
+    case lexer::token_type::OP_NOT_IN:
+        if (right.kind == TypeKind::Unknown || is_container(right.kind)) {
+            return Type::bool_();
+        }
+        return std::nullopt;
+    case lexer::token_type::OP_LESS:
+    case lexer::token_type::OP_LESS_EQUAL:
+    case lexer::token_type::OP_GREATER:
+    case lexer::token_type::OP_GREATER_EQUAL:
+        return ordered_result(left, right);
+    default:
         return std::nullopt;
     }
 }

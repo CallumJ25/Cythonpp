@@ -29,6 +29,33 @@ void expect_no_binary(token_type op, const Type& left, const Type& right) {
         << (result ? type_name(*result) : "nullopt");
 }
 
+void expect_unary(token_type op, const Type& operand, const Type& expected) {
+    const std::optional<Type> result = unary_result(op, operand);
+    ASSERT_TRUE(result.has_value()) << "unary op on " << type_name(operand)
+                                    << " should have a result type";
+    EXPECT_EQ(*result, expected) << "got " << type_name(*result);
+}
+
+void expect_no_unary(token_type op, const Type& operand) {
+    const std::optional<Type> result = unary_result(op, operand);
+    EXPECT_FALSE(result.has_value()) << "unary op on " << type_name(operand)
+                                     << " should not apply";
+}
+
+void expect_comparison(token_type op, const Type& left, const Type& right) {
+    const std::optional<Type> result = comparison_result(op, left, right);
+    ASSERT_TRUE(result.has_value()) << type_name(left) << " cmp " << type_name(right)
+                                    << " should have a result type";
+    EXPECT_EQ(*result, Type::bool_()) << "a comparison must yield bool, got "
+                                      << type_name(*result);
+}
+
+void expect_no_comparison(token_type op, const Type& left, const Type& right) {
+    const std::optional<Type> result = comparison_result(op, left, right);
+    EXPECT_FALSE(result.has_value())
+        << type_name(left) << " cmp " << type_name(right) << " should not apply";
+}
+
 TEST(BinaryResult, UnknownIsAbsorbingAndNeverNullopt) {
     expect_binary(token_type::OP_PLUS, Type::unknown(), Type::int_(), Type::unknown());
     expect_binary(token_type::OP_PLUS, Type::int_(), Type::unknown(), Type::unknown());
@@ -190,6 +217,132 @@ TEST(BinaryResult, UnionOperandsDoNotApply) {
     expect_no_binary(token_type::OP_PLUS, optional_int, Type::int_());
     expect_no_binary(token_type::OP_PLUS, Type::int_(), optional_int);
     expect_no_binary(token_type::OP_PLUS, optional_int, optional_int);
+}
+
+TEST(UnaryResult, NegationAndPlusKeepTheNumericKind) {
+    expect_unary(token_type::OP_MINUS, Type::int_(), Type::int_());
+    expect_unary(token_type::OP_MINUS, Type::float_(), Type::float_());
+    expect_unary(token_type::OP_MINUS, Type::complex_(), Type::complex_());
+    expect_unary(token_type::OP_PLUS, Type::int_(), Type::int_());
+    expect_unary(token_type::OP_PLUS, Type::float_(), Type::float_());
+}
+
+// Consistent with the binary rules: Bool widens to Int under arithmetic.
+TEST(UnaryResult, NegatingABoolYieldsInt) {
+    expect_unary(token_type::OP_MINUS, Type::bool_(), Type::int_());
+    expect_unary(token_type::OP_PLUS, Type::bool_(), Type::int_());
+}
+
+TEST(UnaryResult, NegationDoesNotApplyToNonNumericTypes) {
+    expect_no_unary(token_type::OP_MINUS, Type::str());
+    expect_no_unary(token_type::OP_MINUS, Type::list_of(Type::int_()));
+    expect_no_unary(token_type::OP_MINUS, Type::none());
+    expect_no_unary(token_type::OP_MINUS, Type::class_of("Widget"));
+}
+
+TEST(UnaryResult, BitwiseNotIsIntegerOnly) {
+    expect_unary(token_type::OP_TILDE, Type::int_(), Type::int_());
+    expect_unary(token_type::OP_TILDE, Type::bool_(), Type::int_());
+    expect_no_unary(token_type::OP_TILDE, Type::float_());
+    expect_no_unary(token_type::OP_TILDE, Type::str());
+}
+
+// Truthiness is universal in Python: `if xs:` on a list is clean, verified.
+TEST(UnaryResult, NotAcceptsAnyTypeAndAlwaysYieldsBool) {
+    expect_unary(token_type::OP_NOT, Type::int_(), Type::bool_());
+    expect_unary(token_type::OP_NOT, Type::str(), Type::bool_());
+    expect_unary(token_type::OP_NOT, Type::list_of(Type::int_()), Type::bool_());
+    expect_unary(token_type::OP_NOT, Type::none(), Type::bool_());
+    expect_unary(token_type::OP_NOT, Type::class_of("Widget"), Type::bool_());
+    expect_unary(token_type::OP_NOT, Type::union_of({Type::int_(), Type::none()}),
+                 Type::bool_());
+}
+
+// The one place Unknown must NOT be absorbed: `not` always yields bool, and
+// returning Unknown here would silence a genuine error downstream.
+TEST(UnaryResult, NotOnUnknownIsStillBool) {
+    expect_unary(token_type::OP_NOT, Type::unknown(), Type::bool_());
+}
+
+TEST(UnaryResult, UnknownIsAbsorbingForEveryOtherUnaryOperator) {
+    expect_unary(token_type::OP_MINUS, Type::unknown(), Type::unknown());
+    expect_unary(token_type::OP_PLUS, Type::unknown(), Type::unknown());
+    expect_unary(token_type::OP_TILDE, Type::unknown(), Type::unknown());
+}
+
+TEST(UnaryResult, IsNulloptForATokenThatIsNotAUnaryOperator) {
+    expect_no_unary(token_type::OP_STAR, Type::int_());
+    expect_no_unary(token_type::OP_ASSIGN, Type::int_());
+    expect_no_unary(token_type::OP_AND, Type::bool_());
+}
+
+// Verified: reveal_type(1 == "a") is bool, and the only complaint is
+// comparison-overlap, which the spec puts out of scope.
+TEST(ComparisonResult, EqualityAndIdentityAcceptAnyOperands) {
+    for (const token_type op : {token_type::OP_EQUAL, token_type::OP_NOT_EQUAL,
+                                token_type::OP_IS, token_type::OP_IS_NOT}) {
+        expect_comparison(op, Type::int_(), Type::str());
+        expect_comparison(op, Type::none(), Type::int_());
+        expect_comparison(op, Type::list_of(Type::int_()), Type::class_of("Widget"));
+        expect_comparison(op, Type::unknown(), Type::int_());
+        expect_comparison(op, Type::union_of({Type::int_(), Type::none()}), Type::none());
+    }
+}
+
+TEST(ComparisonResult, OrderedComparisonsRequireCompatibleOperands) {
+    for (const token_type op : {token_type::OP_LESS, token_type::OP_LESS_EQUAL,
+                                token_type::OP_GREATER, token_type::OP_GREATER_EQUAL}) {
+        expect_comparison(op, Type::int_(), Type::int_());
+        expect_comparison(op, Type::int_(), Type::float_());
+        expect_comparison(op, Type::bool_(), Type::int_());
+        expect_comparison(op, Type::str(), Type::str());
+        expect_comparison(op, Type::bytes(), Type::bytes());
+        expect_comparison(op, Type::list_of(Type::int_()), Type::list_of(Type::int_()));
+        expect_comparison(op, Type::tuple_of({Type::int_()}), Type::tuple_of({Type::str()}));
+
+        // Verified: 1 < "a" is "Unsupported operand types for <".
+        expect_no_comparison(op, Type::int_(), Type::str());
+        expect_no_comparison(op, Type::none(), Type::none());
+        expect_no_comparison(op, Type::list_of(Type::int_()), Type::list_of(Type::str()));
+        expect_no_comparison(op, Type::class_of("Widget"), Type::class_of("Widget"));
+    }
+}
+
+TEST(ComparisonResult, AnOrderedComparisonWithUnknownIsBoolNotAnError) {
+    expect_comparison(token_type::OP_LESS, Type::unknown(), Type::str());
+    expect_comparison(token_type::OP_LESS, Type::int_(), Type::unknown());
+}
+
+TEST(ComparisonResult, MembershipRequiresAContainerOnTheRight) {
+    for (const token_type op : {token_type::OP_IN, token_type::OP_NOT_IN}) {
+        expect_comparison(op, Type::int_(), Type::list_of(Type::int_()));
+        expect_comparison(op, Type::str(), Type::dict_of(Type::str(), Type::int_()));
+        expect_comparison(op, Type::int_(), Type::set_of(Type::int_()));
+        expect_comparison(op, Type::int_(), Type::frozenset_of(Type::int_()));
+        expect_comparison(op, Type::int_(), Type::tuple_of({Type::int_()}));
+        expect_comparison(op, Type::str(), Type::str());
+        expect_comparison(op, Type::int_(), Type::bytes());
+        expect_comparison(op, Type::int_(), Type::bytearray_());
+        expect_comparison(op, Type::int_(), Type::range_());
+
+        // Element compatibility is NOT checked: mypy's complaint about
+        // `"a" in [1]` is comparison-overlap, which is out of scope.
+        expect_comparison(op, Type::str(), Type::list_of(Type::int_()));
+
+        expect_no_comparison(op, Type::int_(), Type::int_());
+        expect_no_comparison(op, Type::int_(), Type::none());
+        expect_no_comparison(op, Type::int_(), Type::class_of("Widget"));
+    }
+}
+
+TEST(ComparisonResult, MembershipInUnknownIsBoolNotAnError) {
+    expect_comparison(token_type::OP_IN, Type::int_(), Type::unknown());
+}
+
+TEST(ComparisonResult, IsNulloptForATokenThatIsNotAComparison) {
+    expect_no_comparison(token_type::OP_PLUS, Type::int_(), Type::int_());
+    expect_no_comparison(token_type::OP_AND, Type::bool_(), Type::bool_());
+    expect_no_comparison(token_type::COLON, Type::int_(), Type::int_());
 }
 
 } // namespace
