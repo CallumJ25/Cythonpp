@@ -19,6 +19,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/parser/assignability.cpp
     src/domain/parser/expression_parser.cpp
     src/domain/parser/statement_parser.cpp
+    src/domain/semantic/rule_result.cpp
     src/domain/semantic/type_name.cpp
     src/domain/semantic/type_compatibility.cpp
     src/domain/semantic/literal_type.cpp
@@ -71,6 +72,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/parser/statement_parser_test.cpp
         tests/domain/parser/statement_parser_error_test.cpp
         tests/domain/semantic/type_test.cpp
+        tests/domain/semantic/rule_result_test.cpp
         tests/domain/semantic/type_name_test.cpp
         tests/domain/semantic/type_compatibility_test.cpp
         tests/domain/semantic/literal_type_test.cpp
