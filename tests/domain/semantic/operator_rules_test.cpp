@@ -59,6 +59,22 @@ void expect_no_comparison(token_type op, const Type& left, const Type& right) {
         << type_name(left) << " cmp " << type_name(right) << " should be a type error";
 }
 
+void expect_unsupported_binary(token_type op, const Type& left, const Type& right,
+                               UnsupportedReason reason) {
+    const RuleResult result = binary_result(op, left, right);
+    ASSERT_EQ(result.status, RuleResult::Status::Unsupported)
+        << type_name(left) << " op " << type_name(right)
+        << " should be a modelling limit, not a type error";
+    EXPECT_EQ(result.reason, reason);
+}
+
+void expect_unsupported_comparison(token_type op, const Type& left, const Type& right,
+                                   UnsupportedReason reason) {
+    const RuleResult result = comparison_result(op, left, right);
+    ASSERT_EQ(result.status, RuleResult::Status::Unsupported);
+    EXPECT_EQ(result.reason, reason);
+}
+
 TEST(BinaryResult, UnknownIsAbsorbingAndNeverNullopt) {
     expect_binary(token_type::OP_PLUS, Type::unknown(), Type::int_(), Type::unknown());
     expect_binary(token_type::OP_PLUS, Type::int_(), Type::unknown(), Type::unknown());
@@ -138,46 +154,67 @@ TEST(BinaryResult, ByteArrayConcatenatesRepeatsAndFormats) {
     // checks against. Modelling this as bytearray would make
     // `z: bytes = ba % 3` (mypy-clean) fail our own is_subtype check.
     expect_binary(token_type::OP_PERCENT, Type::bytearray_(), Type::int_(), Type::bytes());
+}
 
-    // Recorded gap, not fixed in this wave (out of the four instructed
-    // arms): mypy --strict actually ACCEPTS mixed bytearray + bytes, typed as
-    // bytearray (verified: reveal_type(bytearray(b"x") + b"y") is
-    // builtins.bytearray). plus_result requires an exact kind match on both
-    // sides, so this is a missed error rather than a false one -- acceptable
-    // under invariant (a), but worth a follow-up arm in a future spec.
-    expect_no_binary(token_type::OP_PLUS, Type::bytearray_(), Type::bytes());
+// Verified: reveal_type(b + ba) is bytes and reveal_type(ba + b) is
+// bytearray -- concatenation is LEFT-TYPED and asymmetric. plus_result
+// required an exact kind match, so both were false TypeErrors.
+//
+// CORRECTS A BACKWARDS COMMENT: the old note on
+// ByteArrayConcatenatesRepeatsAndFormats called this "a missed error rather
+// than a false one -- acceptable under invariant (a)". That is inverted.
+// nullopt means the CALLER reports, so a caller makes this a FALSE TypeError
+// on a program mypy accepts.
+TEST(BinaryResult, MixedBytesAndByteArrayConcatenateToTheLeftOperandsType) {
+    expect_binary(token_type::OP_PLUS, Type::bytes(), Type::bytearray_(), Type::bytes());
+    expect_binary(token_type::OP_PLUS, Type::bytearray_(), Type::bytes(), Type::bytearray_());
 }
 
 // Verified: reveal_type([1] + [2]) is list[int], reveal_type([1] * 2) is
 // list[int], and reveal_type([1] * True) is list[int].
-TEST(BinaryResult, ListsConcatenateWhenTheirElementsMatchExactly) {
+TEST(BinaryResult, ListsConcatenateAndRepeat) {
     const Type ints = Type::list_of(Type::int_());
-    const Type floats = Type::list_of(Type::float_());
 
     expect_binary(token_type::OP_PLUS, ints, ints, ints);
     expect_binary(token_type::OP_STAR, ints, Type::int_(), ints);
     expect_binary(token_type::OP_STAR, Type::int_(), ints, ints);
     expect_binary(token_type::OP_STAR, ints, Type::bool_(), ints);
 
-    // Element types are compared exactly, matching list's invariance: there
-    // is no join that would be sound for a mutable container.
-    expect_no_binary(token_type::OP_PLUS, ints, floats);
     expect_no_binary(token_type::OP_MINUS, ints, ints);
 }
 
-// Elementwise EQUIVALENCE, not ==: list[int | str] and list[str | int] are
-// the same type despite the differently-ordered union spelling, and mypy
-// --strict accepts concatenating them. Genuinely different element types
-// (int vs float) must still fail, in both directions.
+// Verified: reveal_type([1] + ["s"]) is list[str | int] -- mypy unions ANY
+// element types, with no equivalence requirement. plus_result required
+// is_equivalent, so list[int] + list[str] was a false TypeError.
+//
+// This looks wrong next to list invariance and is not: invariance governs
+// ASSIGNING one list to another, while `+` builds a NEW list, so there is no
+// aliasing hazard. mypy's union member order is right-then-left; ours is
+// construction order, and is_equivalent makes the difference unobservable.
+TEST(BinaryResult, ListsConcatenateAcrossDifferentElementTypes) {
+    expect_binary(token_type::OP_PLUS, Type::list_of(Type::int_()),
+                  Type::list_of(Type::str()),
+                  Type::list_of(Type::union_of({Type::int_(), Type::str()})));
+    expect_binary(token_type::OP_PLUS, Type::list_of(Type::int_()),
+                  Type::list_of(Type::float_()),
+                  Type::list_of(Type::union_of({Type::int_(), Type::float_()})));
+
+    // Equivalent elements still collapse, because union_of de-duplicates.
+    expect_binary(token_type::OP_PLUS, Type::list_of(Type::int_()),
+                  Type::list_of(Type::int_()), Type::list_of(Type::int_()));
+}
+
+// Concatenation unions ANY element types (see ListsConcatenateAcrossDifferentElementTypes),
+// so this test's remaining purpose is narrower than its name once implied: it
+// pins that union_of's flattening makes the differently-ordered union
+// spellings list[int | str] and list[str | int] concatenate to the same
+// result regardless of which side is which.
 TEST(BinaryResult, ListsConcatenateAcrossUnionMemberOrder) {
     const Type list_int_str = Type::list_of(Type::union_of({Type::int_(), Type::str()}));
     const Type list_str_int = Type::list_of(Type::union_of({Type::str(), Type::int_()}));
 
     expect_binary(token_type::OP_PLUS, list_int_str, list_str_int, list_int_str);
     expect_binary(token_type::OP_PLUS, list_str_int, list_int_str, list_str_int);
-
-    expect_no_binary(token_type::OP_PLUS, Type::list_of(Type::int_()), Type::list_of(Type::float_()));
-    expect_no_binary(token_type::OP_PLUS, Type::list_of(Type::float_()), Type::list_of(Type::int_()));
 }
 
 // Verified: reveal_type((1,) + (2,)) is tuple[int, int].
@@ -186,6 +223,18 @@ TEST(BinaryResult, TuplesConcatenateBySummingTheirArity) {
                   Type::tuple_of({Type::str()}), Type::tuple_of({Type::int_(), Type::str()}));
     expect_binary(token_type::OP_PLUS, Type::tuple_of({}), Type::tuple_of({Type::int_()}),
                   Type::tuple_of({Type::int_()}));
+}
+
+// The three Unsupported arms, each a program mypy accepts.
+//
+// Verified: reveal_type(t * 2) on a tuple[int, str] is
+// tuple[int, str, int, str] -- mypy unrolls the LITERAL count, so the result
+// depends on an operand's value. Constant folding, which Spec 2 ruled out.
+TEST(BinaryResult, RepeatingATupleIsUnsupportedNotAnError) {
+    expect_unsupported_binary(token_type::OP_STAR, Type::tuple_of({Type::int_(), Type::str()}),
+                              Type::int_(), UnsupportedReason::TupleRepeat);
+    expect_unsupported_binary(token_type::OP_STAR, Type::int_(),
+                              Type::tuple_of({Type::int_()}), UnsupportedReason::TupleRepeat);
 }
 
 TEST(BinaryResult, ModuloIsArithmeticAndAlsoStringFormatting) {
@@ -251,6 +300,34 @@ TEST(BinaryResult, SetsIntersectAcrossUnionMemberOrder) {
     expect_binary(token_type::OP_PIPE, set_str_int, set_int_str, set_str_int);
 }
 
+// Verified: reveal_type(d1 | d2) on two dict[str, int] is dict[str, int], and
+// reveal_type on dict[str, int] | dict[str, str] is dict[str, int | str] --
+// the VALUE types union, the key types must match. PEP 584, Python 3.9+.
+// intersection_or_union_result had no Dict arm at all, so this was a false
+// TypeError on a mypy-clean program.
+TEST(BinaryResult, DictsUnionTheirValueTypes) {
+    const Type str_int = Type::dict_of(Type::str(), Type::int_());
+    const Type str_str = Type::dict_of(Type::str(), Type::str());
+
+    expect_binary(token_type::OP_PIPE, str_int, str_int, str_int);
+    expect_binary(token_type::OP_PIPE, str_int, str_str,
+                  Type::dict_of(Type::str(), Type::union_of({Type::int_(), Type::str()})));
+
+    // Keys must match. Verified: dict[str, int] | dict[int, int] is an error.
+    expect_no_binary(token_type::OP_PIPE, str_int, Type::dict_of(Type::int_(), Type::int_()));
+}
+
+// Verified: dict & dict, dict - dict and dict ^ dict are all genuine
+// [operator] errors ("Unsupported left operand type for &"). Pinned so the
+// `|` arm above cannot be written as "any dict operator".
+TEST(BinaryResult, DictsSupportNoOtherSetOperator) {
+    const Type str_int = Type::dict_of(Type::str(), Type::int_());
+
+    expect_no_binary(token_type::OP_AMPERSAND, str_int, str_int);
+    expect_no_binary(token_type::OP_CARET, str_int, str_int);
+    expect_no_binary(token_type::OP_MINUS, str_int, str_int);
+}
+
 // The semantic half of OP_AT's two readings. Spec 4 settled the syntactic
 // half -- decorator at statement position, matrix-multiply elsewhere -- and
 // no builtin type supports matrix multiplication, so this never applies.
@@ -267,22 +344,36 @@ TEST(BinaryResult, IsNulloptForATokenThatIsNotABinaryOperator) {
     expect_no_binary(token_type::COMMA, Type::int_(), Type::int_());
 }
 
-TEST(BinaryResult, NoneAndClassesSupportNoArithmetic) {
+TEST(BinaryResult, NoneSupportsNoArithmetic) {
     expect_no_binary(token_type::OP_PLUS, Type::none(), Type::none());
     expect_no_binary(token_type::OP_PLUS, Type::none(), Type::int_());
-    expect_no_binary(token_type::OP_PLUS, Type::class_of("Widget"), Type::int_());
     expect_no_binary(token_type::OP_PLUS, Type::object(), Type::object());
 }
 
-// A union-typed operand does not get an arithmetic result: the spec defers
-// narrowing, so the CALLER reports "operations on a union-typed value require
-// narrowing, which is not supported". nullopt is what makes that possible.
-TEST(BinaryResult, UnionOperandsDoNotApply) {
+// Verified: `v + 1` where V defines __add__(self, other: int) -> int is
+// clean, result int. So a TypeError here would be false. `w + 1` on a class
+// with no __add__ IS a genuine error, but distinguishing them needs dunder
+// dispatch, which is deferred.
+TEST(BinaryResult, OperatorsOnUserClassesAreUnsupportedNotErrors) {
+    expect_unsupported_binary(token_type::OP_PLUS, Type::class_of("Widget"), Type::int_(),
+                              UnsupportedReason::UserClassOperator);
+    expect_unsupported_binary(token_type::OP_PLUS, Type::int_(), Type::class_of("Widget"),
+                              UnsupportedReason::UserClassOperator);
+    expect_unsupported_binary(token_type::OP_PLUS, Type::class_of("A"), Type::class_of("B"),
+                              UnsupportedReason::UserClassOperator);
+}
+
+// The narrowing deferral, which already existed but travelled through
+// nullopt and relied on every caller remembering to check for a Union first.
+TEST(BinaryResult, UnionOperandsAreUnsupportedNotErrors) {
     const Type optional_int = Type::union_of({Type::int_(), Type::none()});
 
-    expect_no_binary(token_type::OP_PLUS, optional_int, Type::int_());
-    expect_no_binary(token_type::OP_PLUS, Type::int_(), optional_int);
-    expect_no_binary(token_type::OP_PLUS, optional_int, optional_int);
+    expect_unsupported_binary(token_type::OP_PLUS, optional_int, Type::int_(),
+                              UnsupportedReason::UnionOperand);
+    expect_unsupported_binary(token_type::OP_PLUS, Type::int_(), optional_int,
+                              UnsupportedReason::UnionOperand);
+    expect_unsupported_binary(token_type::OP_PLUS, optional_int, optional_int,
+                              UnsupportedReason::UnionOperand);
 }
 
 TEST(UnaryResult, NegationAndPlusKeepTheNumericKind) {
@@ -303,7 +394,16 @@ TEST(UnaryResult, NegationDoesNotApplyToNonNumericTypes) {
     expect_no_unary(token_type::OP_MINUS, Type::str());
     expect_no_unary(token_type::OP_MINUS, Type::list_of(Type::int_()));
     expect_no_unary(token_type::OP_MINUS, Type::none());
-    expect_no_unary(token_type::OP_MINUS, Type::class_of("Widget"));
+}
+
+// Unary on a user class: verified `-w` with no __neg__ is an error but with
+// __neg__ is clean. Unsupported. `not w` is clean on ANY type and stays Ok.
+TEST(UnaryResult, ArithmeticOnUserClassesIsUnsupportedButNotIsNot) {
+    const RuleResult negated = unary_result(token_type::OP_MINUS, Type::class_of("Widget"));
+    ASSERT_EQ(negated.status, RuleResult::Status::Unsupported);
+    EXPECT_EQ(negated.reason, UnsupportedReason::UserClassOperator);
+
+    expect_unary(token_type::OP_NOT, Type::class_of("Widget"), Type::bool_());
 }
 
 TEST(UnaryResult, BitwiseNotIsIntegerOnly) {
@@ -370,7 +470,6 @@ TEST(ComparisonResult, OrderedComparisonsRequireCompatibleOperands) {
         expect_no_comparison(op, Type::int_(), Type::str());
         expect_no_comparison(op, Type::none(), Type::none());
         expect_no_comparison(op, Type::list_of(Type::int_()), Type::list_of(Type::str()));
-        expect_no_comparison(op, Type::class_of("Widget"), Type::class_of("Widget"));
     }
 }
 
@@ -386,6 +485,52 @@ TEST(ComparisonResult, OrderedComparisonAppliesAcrossUnionMemberOrder) {
         expect_comparison(op, list_int_str, list_str_int);
         expect_comparison(op, list_str_int, list_int_str);
     }
+}
+
+// Verified: set[int] <= set[int], <, >, >= are all clean and yield bool; so
+// is set[int] <= set[str] with DISJOINT elements; so is
+// frozenset[int] <= set[int] in both directions.
+//
+// CORRECTS A BACKWARDS COMMENT: ordered_result's note called this a "cannot
+// model" gap left nullopt "because this compiler's table has no way to
+// distinguish 'cannot model' from 'type error'". Both halves are wrong. The
+// answer is plainly bool, so it IS modellable -- it was a missing rule row,
+// not a modelling limit.
+TEST(ComparisonResult, SetsAndFrozenSetsSupportSubsetComparison) {
+    const Type set_int = Type::set_of(Type::int_());
+    const Type set_str = Type::set_of(Type::str());
+    const Type frozen_int = Type::frozenset_of(Type::int_());
+
+    for (const token_type op : {token_type::OP_LESS, token_type::OP_LESS_EQUAL,
+                                token_type::OP_GREATER, token_type::OP_GREATER_EQUAL}) {
+        expect_comparison(op, set_int, set_int);
+        // Element types are NOT checked -- verified clean even when disjoint.
+        expect_comparison(op, set_int, set_str);
+        expect_comparison(op, frozen_int, frozen_int);
+        expect_comparison(op, frozen_int, set_int);
+        expect_comparison(op, set_int, frozen_int);
+    }
+}
+
+// Verified: reveal_type(b < ba) is bool. ordered_result required matching
+// kinds, so this was a false TypeError.
+TEST(ComparisonResult, MixedBytesAndByteArrayCompare) {
+    for (const token_type op : {token_type::OP_LESS, token_type::OP_LESS_EQUAL,
+                                token_type::OP_GREATER, token_type::OP_GREATER_EQUAL}) {
+        expect_comparison(op, Type::bytes(), Type::bytearray_());
+        expect_comparison(op, Type::bytearray_(), Type::bytes());
+    }
+}
+
+// Ordered comparison of a user class: verified `w < 1` with no __lt__ is a
+// genuine error, but `l < 1` with __lt__ defined is clean. Unsupported.
+// EQUALITY is different and stays Ok: == and is accept ANY operands and
+// always yield bool, dunders or not.
+TEST(ComparisonResult, OrderedComparisonOfUserClassesIsUnsupportedButEqualityIsNot) {
+    expect_unsupported_comparison(token_type::OP_LESS, Type::class_of("Widget"),
+                                  Type::int_(), UnsupportedReason::UserClassOperator);
+    expect_comparison(token_type::OP_EQUAL, Type::class_of("Widget"), Type::int_());
+    expect_comparison(token_type::OP_IS, Type::class_of("Widget"), Type::none());
 }
 
 TEST(ComparisonResult, AnOrderedComparisonWithUnknownIsBoolNotAnError) {
@@ -526,9 +671,21 @@ TEST(SubscriptResult, NonSubscriptableTypesDoNotApply) {
     expect_no_subscript(Type::int_(), Type::int_());
     expect_no_subscript(Type::none(), Type::int_());
     expect_no_subscript(Type::set_of(Type::int_()), Type::int_());
-    expect_no_subscript(Type::class_of("Widget"), Type::int_());
-    expect_no_subscript(Type::union_of({Type::list_of(Type::int_()), Type::none()}),
-                        Type::int_());
+}
+
+// Subscripting a user class: verified `s[0]` with
+// __getitem__(self, i: int) -> str is clean. Unsupported, not an error.
+TEST(SubscriptResult, SubscriptingAUserClassIsUnsupportedNotAnError) {
+    const RuleResult result = subscript_result(Type::class_of("Widget"), Type::int_());
+    ASSERT_EQ(result.status, RuleResult::Status::Unsupported);
+    EXPECT_EQ(result.reason, UnsupportedReason::UserClassOperator);
+}
+
+TEST(SubscriptResult, SubscriptingAUnionIsUnsupported) {
+    const RuleResult result =
+        subscript_result(Type::union_of({Type::list_of(Type::int_()), Type::none()}), Type::int_());
+    ASSERT_EQ(result.status, RuleResult::Status::Unsupported);
+    EXPECT_EQ(result.reason, UnsupportedReason::UnionOperand);
 }
 
 TEST(ElementType, IteratingASequenceYieldsItsElement) {
@@ -566,9 +723,22 @@ TEST(ElementType, NonIterableTypesDoNotApply) {
     expect_not_iterable(Type::int_());
     expect_not_iterable(Type::none());
     expect_not_iterable(Type::bool_());
-    expect_not_iterable(Type::class_of("Widget"));
     expect_not_iterable(Type::object());
-    expect_not_iterable(Type::union_of({Type::list_of(Type::int_()), Type::none()}));
+}
+
+// Iteration is the DELIBERATE exception and stays a genuine error. Inside the
+// import-free subset there is no way to make a user class iterable to mypy:
+// it requires __iter__ to return something with __next__, which cannot be
+// spelled without typing/collections.abc, and mypy rejects even the legacy
+// __getitem__ iteration protocol that CPython honours. Verified all three.
+TEST(ElementType, IteratingAUserClassStaysAGenuineError) {
+    expect_not_iterable(Type::class_of("Widget"));
+}
+
+TEST(ElementType, IteratingAUnionIsUnsupported) {
+    const RuleResult result = element_type(Type::union_of({Type::list_of(Type::int_()), Type::none()}));
+    ASSERT_EQ(result.status, RuleResult::Status::Unsupported);
+    EXPECT_EQ(result.reason, UnsupportedReason::UnionOperand);
 }
 
 // CORRECTED (Fix 4): this test used to pin element_type(tuple[()]) ==
@@ -576,8 +746,9 @@ TEST(ElementType, NonIterableTypesDoNotApply) {
 // the ABSORBING bottom for an error that was already reported, and nothing
 // reports one for `tuple[()]` -- resolve_subscript accepts it silently. The
 // old behaviour meant `for v in ()` bound v: Unknown and silenced every
-// genuine error in the loop body. element_type now returns nullopt before
-// consulting union_of, so the CALLER reports instead of silently absorbing.
+// genuine error in the loop body. element_type now returns NotApplicable
+// before consulting union_of, so the CALLER reports instead of silently
+// absorbing.
 TEST(ElementType, IteratingAnEmptyTupleDoesNotApply) {
     expect_not_iterable(Type::tuple_of({}));
 }

@@ -42,18 +42,20 @@ std::optional<Type> plus_result(const Type& left, const Type& right) {
     if (left.kind == TypeKind::Str && right.kind == TypeKind::Str) {
         return Type::str();
     }
-    if (left.kind == TypeKind::Bytes && right.kind == TypeKind::Bytes) {
-        return Type::bytes();
+    // Verified: reveal_type(b + ba) is bytes, reveal_type(ba + b) is
+    // bytearray. Concatenation takes the LEFT operand's type and is
+    // asymmetric, so this cannot be written as a kind-equality check.
+    if ((left.kind == TypeKind::Bytes || left.kind == TypeKind::ByteArray) &&
+        (right.kind == TypeKind::Bytes || right.kind == TypeKind::ByteArray)) {
+        return left.kind == TypeKind::Bytes ? Type::bytes() : Type::bytearray_();
     }
-    if (left.kind == TypeKind::ByteArray && right.kind == TypeKind::ByteArray) {
-        return Type::bytearray_();
-    }
-    if (left.kind == TypeKind::List && right.kind == TypeKind::List && is_equivalent(left, right)) {
-        // Equivalent, not ==, matching list's invariance the way is_subtype
-        // now does: list[int | str] and list[str | int] are the same type
-        // even though they are not ==, and there is still no join that would
-        // be sound for a mutable container beyond that.
-        return left;
+    // Verified: reveal_type([1] + ["s"]) is list[str | int]. mypy unions ANY
+    // element types here. Invariance governs ASSIGNMENT; `+` builds a new
+    // list, so there is no aliasing hazard and nothing to be invariant about.
+    // union_of de-duplicates, so equivalent elements still collapse.
+    if (left.kind == TypeKind::List && right.kind == TypeKind::List &&
+        left.args.size() == 1 && right.args.size() == 1) {
+        return Type::list_of(Type::union_of({left.args[0], right.args[0]}));
     }
     if (left.kind == TypeKind::Tuple && right.kind == TypeKind::Tuple) {
         std::vector<Type> elements = left.args;
@@ -144,6 +146,23 @@ std::optional<Type> intersection_or_union_result(const Type& left, const Type& r
     return std::nullopt;
 }
 
+// PEP 584, Python 3.9+. Verified: dict[str,int] | dict[str,str] is
+// dict[str, int | str] -- the VALUE types union and the keys must match.
+// Only `|` does this: &, - and ^ on dicts are genuine [operator] errors,
+// which is why this cannot live in the shared &/| helper.
+std::optional<Type> dict_union_result(const Type& left, const Type& right) {
+    if (left.kind != TypeKind::Dict || right.kind != TypeKind::Dict) {
+        return std::nullopt;
+    }
+    if (left.args.size() != 2 || right.args.size() != 2) {
+        return std::nullopt;
+    }
+    if (!is_equivalent(left.args[0], right.args[0])) {
+        return std::nullopt;
+    }
+    return Type::dict_of(left.args[0], Type::union_of({left.args[1], right.args[1]}));
+}
+
 std::optional<Type> integer_only_result(const Type& left, const Type& right) {
     if (is_integral(left.kind) && is_integral(right.kind)) {
         return Type::int_();
@@ -171,6 +190,22 @@ std::optional<Type> ordered_result(const Type& left, const Type& right) {
     if (numeric_rank(left.kind) != 0 && numeric_rank(right.kind) != 0) {
         return Type::bool_();
     }
+    // Verified: b < ba is clean and yields bool. Mixed bytes/bytearray
+    // ordering works, so this must be checked BEFORE the kind-equality gate.
+    if ((left.kind == TypeKind::Bytes || left.kind == TypeKind::ByteArray) &&
+        (right.kind == TypeKind::Bytes || right.kind == TypeKind::ByteArray)) {
+        return Type::bool_();
+    }
+    // Verified: set[int] <= set[int], set[int] <= set[str] (DISJOINT
+    // elements!) and frozenset[int] <= set[int] are all clean and yield
+    // bool. Subset comparison does not constrain element types at all, and
+    // it works across set/frozenset. The previous comment here called this a
+    // "cannot model" gap; it is plainly modellable and was a missing row.
+    const bool left_is_set = left.kind == TypeKind::Set || left.kind == TypeKind::FrozenSet;
+    const bool right_is_set = right.kind == TypeKind::Set || right.kind == TypeKind::FrozenSet;
+    if (left_is_set && right_is_set) {
+        return Type::bool_();
+    }
     if (left.kind != right.kind) {
         return std::nullopt;
     }
@@ -187,11 +222,6 @@ std::optional<Type> ordered_result(const Type& left, const Type& right) {
         // the element types are not constrained here.
         return Type::bool_();
     }
-    // Sets support subset comparison in Python (`s1 <= s2`); not modelled,
-    // a recorded gap -- verified against mypy 1.18.1, which types it bool
-    // with no error. Left nullopt because this compiler's table has no way
-    // to distinguish "cannot model" from "type error"; see the same
-    // observation at plus_result/star_result's tuple-repetition gap.
     return std::nullopt;
 }
 
@@ -210,6 +240,22 @@ RuleResult binary_result(lexer::token_type op, const Type& left, const Type& rig
     // that would otherwise never apply: the root cause already reported.
     if (left.kind == TypeKind::Unknown || right.kind == TypeKind::Unknown) {
         return RuleResult::ok(Type::unknown());
+    }
+
+    // Order matters: Unknown absorbs first (above), then modelling limits,
+    // then the operator table. A Union or Class operand reaching the table
+    // would return nullopt and the caller would report a false TypeError.
+    if (left.kind == TypeKind::Union || right.kind == TypeKind::Union) {
+        return RuleResult::unsupported(UnsupportedReason::UnionOperand);
+    }
+    if (left.kind == TypeKind::Class || right.kind == TypeKind::Class) {
+        return RuleResult::unsupported(UnsupportedReason::UserClassOperator);
+    }
+    if ((left.kind == TypeKind::Tuple && is_integral(right.kind)) ||
+        (is_integral(left.kind) && right.kind == TypeKind::Tuple)) {
+        if (op == lexer::token_type::OP_STAR) {
+            return RuleResult::unsupported(UnsupportedReason::TupleRepeat);
+        }
     }
 
     switch (op) {
@@ -236,7 +282,11 @@ RuleResult binary_result(lexer::token_type op, const Type& left, const Type& rig
         // applies. The semantic half of OP_AT's two readings.
         return RuleResult::not_applicable();
     case lexer::token_type::OP_AMPERSAND:
+        return lift(intersection_or_union_result(left, right));
     case lexer::token_type::OP_PIPE:
+        if (const std::optional<Type> dicts = dict_union_result(left, right)) {
+            return RuleResult::ok(*dicts);
+        }
         return lift(intersection_or_union_result(left, right));
     case lexer::token_type::OP_CARET:
     case lexer::token_type::OP_LEFT_SHIFT:
@@ -260,6 +310,14 @@ RuleResult unary_result(lexer::token_type op, const Type& operand) {
     }
     if (operand.kind == TypeKind::Unknown) {
         return RuleResult::ok(Type::unknown());
+    }
+    // `not` already returned above: it is total over every type, verified
+    // clean on a plain user class instance and on a union.
+    if (operand.kind == TypeKind::Class) {
+        return RuleResult::unsupported(UnsupportedReason::UserClassOperator);
+    }
+    if (operand.kind == TypeKind::Union) {
+        return RuleResult::unsupported(UnsupportedReason::UnionOperand);
     }
 
     switch (op) {
@@ -303,6 +361,12 @@ RuleResult comparison_result(lexer::token_type op, const Type& left, const Type&
     case lexer::token_type::OP_LESS_EQUAL:
     case lexer::token_type::OP_GREATER:
     case lexer::token_type::OP_GREATER_EQUAL:
+        if (left.kind == TypeKind::Class || right.kind == TypeKind::Class) {
+            return RuleResult::unsupported(UnsupportedReason::UserClassOperator);
+        }
+        if (left.kind == TypeKind::Union || right.kind == TypeKind::Union) {
+            return RuleResult::unsupported(UnsupportedReason::UnionOperand);
+        }
         return lift(ordered_result(left, right));
     default:
         return RuleResult::not_applicable();
@@ -312,6 +376,12 @@ RuleResult comparison_result(lexer::token_type op, const Type& left, const Type&
 RuleResult subscript_result(const Type& container, const Type& index, const ClassLookup* classes) {
     if (container.kind == TypeKind::Unknown || index.kind == TypeKind::Unknown) {
         return RuleResult::ok(Type::unknown());
+    }
+    if (container.kind == TypeKind::Class) {
+        return RuleResult::unsupported(UnsupportedReason::UserClassOperator);
+    }
+    if (container.kind == TypeKind::Union) {
+        return RuleResult::unsupported(UnsupportedReason::UnionOperand);
     }
 
     // Dict first, because it is the one container whose index is not an
@@ -370,6 +440,9 @@ RuleResult subscript_result(const Type& container, const Type& index, const Clas
 RuleResult element_type(const Type& iterable) {
     if (iterable.kind == TypeKind::Unknown) {
         return RuleResult::ok(Type::unknown());
+    }
+    if (iterable.kind == TypeKind::Union) {
+        return RuleResult::unsupported(UnsupportedReason::UnionOperand);
     }
     if (iterable.kind == TypeKind::List || iterable.kind == TypeKind::Set ||
         iterable.kind == TypeKind::FrozenSet || iterable.kind == TypeKind::Dict) {
