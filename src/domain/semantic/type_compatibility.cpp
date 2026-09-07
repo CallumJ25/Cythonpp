@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "builtin_type_names.h"
+#include "type_name.h"
 
 namespace cythonpp::domain::semantic {
 namespace {
@@ -139,6 +140,82 @@ bool class_reaches(const ClassLookup& classes, const std::string& derived, const
         }
     }
     return false;
+}
+
+// Every class canonically reachable from `start`, closest first, with `start`
+// itself (canonicalised) included as the first element -- so a common-base
+// search comparing two chains can find that one class is simply a base of the
+// other, not only a shared ancestor further up.
+//
+// Same iterative worklist + visited-list shape as class_reaches, and for the
+// same reason: `class A(B)` / `class B(A)` is constructible and nothing here
+// may assume the table it is handed is well-formed, so a recursive walk would
+// not return.
+std::vector<std::string> class_ancestor_chain(const ClassLookup& classes, const std::string& start) {
+    std::vector<std::string> chain = {classes.canonical_name(start)};
+    std::vector<std::string> pending = classes.bases_of(chain.front());
+
+    while (!pending.empty()) {
+        const std::string current = classes.canonical_name(pending.back());
+        pending.pop_back();
+
+        bool already_seen = false;
+        for (const std::string& visited : chain) {
+            if (visited == current) {
+                already_seen = true;
+                break;
+            }
+        }
+        if (already_seen) {
+            continue;
+        }
+        chain.push_back(current);
+
+        const std::vector<std::string> bases = classes.bases_of(current);
+        for (const std::string& next : bases) {
+            pending.push_back(next);
+        }
+    }
+    return chain;
+}
+
+// The nearest common base of two Class types, for join's both-Class arm.
+// Walks `left`'s ancestor chain closest-first (self included) and returns the
+// first ancestor that `right` is also a subtype of -- for single inheritance
+// this is exactly mypy's nominal least-upper-bound. A chain entry may itself
+// be a builtin base name (`class Sub(int)`), so each entry is turned back
+// into a real Type via builtin_type_kind before the is_subtype check, exactly
+// as class_reaches does.
+//
+// Nothing seeds Object into a user class's bases_of() chain, so two genuinely
+// unrelated classes fall off the end of the loop; the caller supplies Object.
+Type nearest_common_base(const ClassLookup& classes, const Type& left, const Type& right) {
+    for (const std::string& ancestor : class_ancestor_chain(classes, left.name)) {
+        Type candidate;
+        if (const std::optional<TypeKind> kind = builtin_type_kind(ancestor)) {
+            candidate = builtin_base_type(*kind);
+        } else {
+            candidate = Type::class_of(ancestor);
+        }
+        if (is_subtype(right, candidate, &classes)) {
+            return candidate;
+        }
+    }
+    return Type::object();
+}
+
+// A copy of `type` with its Class name (if any) resolved through `classes`.
+// Class::name is the one field two otherwise-equivalent Types can legitimately
+// differ on for a reason the caller does not control:
+// EnvironmentError/IOError/WindowsError are one class under three spellings.
+// This is what lets join's equivalence tie-break (below) pick the ONE
+// spelling ClassLookup considers real, rather than whichever alias happened
+// to be passed as the first argument.
+Type canonicalised(Type type, const ClassLookup* classes) {
+    if (classes != nullptr && type.kind == TypeKind::Class) {
+        type.name = classes->canonical_name(type.name);
+    }
+    return type;
 }
 
 } // namespace
@@ -306,6 +383,80 @@ bool is_subtype(const Type& source, const Type& target, const ClassLookup* class
 
 bool is_equivalent(const Type& left, const Type& right, const ClassLookup* classes) {
     return is_subtype(left, right, classes) && is_subtype(right, left, classes);
+}
+
+Type join(const Type& left, const Type& right, const ClassLookup* classes) {
+    // Absorbing bottom, checked first: one root cause draws one diagnostic,
+    // not a fresh "unrelated types" complaint at every later use of an
+    // un-annotated display that already failed to type one element.
+    if (left.kind == TypeKind::Unknown || right.kind == TypeKind::Unknown) {
+        return Type::unknown();
+    }
+    // Must run before the None arm below: two Nones are equivalent, and this
+    // is what makes them collapse to None rather than union to `None | None`
+    // (which union_of would in fact also collapse, but via a different path
+    // than intended -- the equivalence check is the one actually specified).
+    // Uses is_equivalent, never ==, so list[int | str] and list[str | int]
+    // are recognised as the one type despite the differently-ordered union
+    // spelling.
+    //
+    // Equivalent does not mean identical, though: that same union-order case
+    // renders differently depending on which side happens to be "left", and
+    // an aliased class (IOError vs. its canonical OSError) does too. join
+    // must be commutative -- join(A, B) and join(B, A) the SAME answer -- so
+    // rather than literally returning `left`, canonicalise each side's Class
+    // spelling and then break any remaining tie by rendered name. That makes
+    // the result a function of the unordered pair {left, right}, never of
+    // which argument position the caller happened to use.
+    if (is_equivalent(left, right, classes)) {
+        const Type canonical_left = canonicalised(left, classes);
+        const Type canonical_right = canonicalised(right, classes);
+        return type_name(canonical_left) <= type_name(canonical_right) ? canonical_left
+                                                                        : canonical_right;
+    }
+    // THE exception to "join, don't union": None really does union. Checked
+    // before the numeric-tower and Class arms below, neither of which could
+    // ever fire for a NoneType operand anyway (NoneType's numeric_rank is 0
+    // and its kind is never Class), but stated here as its own arm because
+    // that is where the rule table places it.
+    if (left.kind == TypeKind::NoneType || right.kind == TypeKind::NoneType) {
+        const Type& other = left.kind == TypeKind::NoneType ? right : left;
+        return Type::union_of({other, Type::none()});
+    }
+
+    // Must run before the Class arm: numeric_rank is 0 for TypeKind::Class,
+    // so the two arms cannot both fire for the same pair, but ordering them
+    // this way matches the rule table and keeps the numeric tower's own
+    // reasoning (a wider rank is always a supertype) from ever being
+    // shadowed by a class-chain walk.
+    const int left_rank = numeric_rank(left.kind);
+    const int right_rank = numeric_rank(right.kind);
+    if (left_rank != 0 && right_rank != 0) {
+        return left_rank >= right_rank ? left : right;
+    }
+
+    if (classes != nullptr) {
+        if (left.kind == TypeKind::Class && right.kind == TypeKind::Class) {
+            return nearest_common_base(*classes, left, right);
+        }
+        // One side a class whose base chain reaches the other side's builtin
+        // kind -- `class Sub(int)` joins with `1` to `int`, and through the
+        // tower, to `float` or `complex` too, via class_reaches recursing
+        // into is_subtype's numeric-tower arm.
+        if (left.kind == TypeKind::Class &&
+            class_reaches(*classes, classes->canonical_name(left.name), right)) {
+            return right;
+        }
+        if (right.kind == TypeKind::Class &&
+            class_reaches(*classes, classes->canonical_name(right.name), left)) {
+            return left;
+        }
+    }
+
+    // Anything else -- unrelated scalars, unrelated classes, two containers
+    // whose element types differ (join does not recurse into them) -- joins
+    // to Object, mypy's least upper bound when nothing narrower is common.
+    return Type::object();
 }
 
 } // namespace cythonpp::domain::semantic

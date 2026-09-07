@@ -79,6 +79,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/semantic/rule_result_test.cpp
         tests/domain/semantic/type_name_test.cpp
         tests/domain/semantic/type_compatibility_test.cpp
+        tests/domain/semantic/join_test.cpp
         tests/domain/semantic/literal_type_test.cpp
         tests/domain/semantic/operator_rules_test.cpp
         tests/domain/semantic/builtin_type_names_test.cpp
