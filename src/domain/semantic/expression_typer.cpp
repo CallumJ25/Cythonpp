@@ -319,8 +319,26 @@ Type ExpressionTyper::type_of_attribute(const ast::Attribute& attribute) {
     // receiver (`Outer.Inner.x`) is out of scope: its own receiver is an
     // Attribute, not a Name, so it falls through to the ordinary path below
     // and reports (rather than guesses) once it gets there.
+    //
+    // PRECEDENCE, checked here to fix a shadowing bug from fix round 1: a
+    // local binding of the SAME name as a class must win over the
+    // class-object reading. `def f(Widget: int): return Widget.bit_length()`
+    // is legal Python where `Widget` is an int parameter, not the class --
+    // scopes_.resolve() is consulted FIRST, and the class-object path is
+    // only taken when it comes back null. This is correct only as long as
+    // class names are never themselves bound into ScopeStack. Today the
+    // statement checker (a later task) declares classes into ClassTable
+    // without also binding their names as scope values, which is exactly
+    // why the class-object path exists at all. If a later task starts
+    // binding class names into ScopeStack (e.g. so a class can be passed
+    // around as a first-class value), this precedence check silently
+    // inverts: scopes_.resolve() would then find the class's own binding
+    // and this whole branch would never fire, turning every `C.x` into
+    // whatever the ordinary value path does with a class-valued binding.
+    // Revisit this check at that point.
     if (const auto* receiver_name = dynamic_cast<const ast::Name*>(&attribute.value())) {
-        if (classes_.is_class(receiver_name->identifier())) {
+        if (classes_.is_class(receiver_name->identifier()) &&
+            scopes_.resolve(receiver_name->identifier()).binding == nullptr) {
             const Type class_type = Type::class_of(receiver_name->identifier());
             // Recorded by hand, not through type_of(), since type_of_name()
             // -- which would consult ScopeStack and report NameError -- is

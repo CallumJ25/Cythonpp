@@ -710,6 +710,47 @@ TEST(ExpressionTyper, ReportsAMissingAttributeOnAClassObjectReceiver) {
     EXPECT_EQ(error.message, "\"Widget\" has no attribute \"nope\"");
 }
 
+// Fix round 2: a LOCAL BINDING with the same name as a declared class must
+// win over the class-object reading. `def f(Widget: int): return
+// Widget.bit_length()` is legal Python -- `Widget` is an int parameter, not
+// the class -- so the receiver must go down the ordinary VALUE path
+// (scopes_.resolve() first), landing on the builtin-receiver carve-out, NOT
+// a class-object member lookup (which would find no member at all, or worse,
+// the wrong one).
+TEST(ExpressionTyper, AShadowingVariableWinsOverAClassNameForABuiltinReceiver) {
+    ClassTable table;
+    table.declare("Widget", {});
+
+    const Typed typed = type_expression("Widget.bit_length", {{"Widget", Type::int_()}},
+                                        Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "methods on builtin types are not supported")
+        << "the int parameter must win over the class name -- this must NOT be a "
+           "class-object member lookup";
+}
+
+// Same shadowing bug, but with a user-class-typed binding: `Widget` the
+// PARAMETER has type `Other` (with member `x`); `Widget` the CLASS (a
+// distinct declaration) has a different member, `y`. If the class-object
+// path won incorrectly, `Widget.x` would look up `x` on the Widget class
+// (a miss, since Widget only declares `y`) instead of on Other. Asserting
+// the resolved type is Other's `x` (str) -- not a TypeError -- proves the
+// variable won.
+TEST(ExpressionTyper, AShadowingVariableWinsOverAClassNameForAUserClassReceiver) {
+    ClassTable table;
+    table.declare("Other", {});
+    table.declare_member("Other", "x", Type::str(), 2);
+    table.declare("Widget", {});
+    table.declare_member("Widget", "y", Type::int_(), 2);
+
+    const Typed typed = type_expression("Widget.x", {{"Widget", Type::class_of("Other")}},
+                                        Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty());
+    EXPECT_EQ(typed.printed, "str")
+        << "the shadowing variable's type (Other) must win over the class name (Widget)";
+}
+
 // A class defining __getattr__ makes ARBITRARY attribute access mypy-clean.
 // Verified against mypy 1.18.1: `class G: def __getattr__(self, name: str)
 // -> int: ...` then `g.anything` is mypy-CLEAN, revealing builtins.int.
