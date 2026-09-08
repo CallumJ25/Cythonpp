@@ -48,6 +48,27 @@ std::string operand_type_error_message(lexer::token_type op, const Type& left, c
 // constant so the two call sites cannot drift apart.
 const char* kBuiltinMemberMessage = "methods on builtin types are not supported";
 
+// RAII guard for the ONE expression (ListComp, Task 16) that pushes a scope.
+// Several paths through that arm report and return early -- a non-iterable
+// iterable, a tuple target -- and a bare pop() skipped by any one of them
+// would corrupt every subsequent lookup in the file. Binding the pop to this
+// guard's destructor means every return path is correct by construction,
+// paired push/pop calls are not needed, and there is nothing to keep in
+// sync when the arm grows another early return later.
+class ComprehensionScopeGuard {
+public:
+    explicit ComprehensionScopeGuard(ScopeStack& scopes) : scopes_(scopes) {
+        scopes_.push(ScopeKind::Comprehension);
+    }
+    ~ComprehensionScopeGuard() { scopes_.pop(); }
+
+    ComprehensionScopeGuard(const ComprehensionScopeGuard&) = delete;
+    ComprehensionScopeGuard& operator=(const ComprehensionScopeGuard&) = delete;
+
+private:
+    ScopeStack& scopes_;
+};
+
 } // namespace
 
 ExpressionTyper::ExpressionTyper(ScopeStack& scopes, const ClassTable& classes, TypeMap& types,
@@ -80,10 +101,12 @@ Type ExpressionTyper::type_of(const ast::Expr& expr, const Type& expected) {
         result = type_of_attribute(*attribute);
     } else if (const auto* call = dynamic_cast<const ast::Call*>(&expr)) {
         result = type_of_call(*call, expected);
+    } else if (const auto* list_comp = dynamic_cast<const ast::ListComp*>(&expr)) {
+        result = type_of_list_comp(*list_comp);
     } else {
-        // Every other Expr kind is a later task's arm (ListComp: 16, ...).
-        // Deliberately SILENT -- not error() -- so an intermediate build
-        // never emits a diagnostic a later task has to un-emit.
+        // Every other Expr kind is not yet implemented. Deliberately SILENT
+        // -- not error() -- so an intermediate build never emits a
+        // diagnostic a later task has to un-emit.
         result = Type::unknown();
     }
     // Every expression the typer types gets an entry, unconditionally --
@@ -478,6 +501,64 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
 // expression_typer_calls.cpp -- a second translation unit for this same
 // class, split out in fix round 1 once this file passed 700 lines. See that
 // file's header comment for why this particular block was the seam.
+
+Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
+    // Constructed on the FIRST clause only, right before that clause's
+    // target is bound -- not at the top of the function -- because the
+    // first clause's own `iterable` is evaluated in the ENCLOSING scope
+    // (Python semantics: `for x in xs` in `[y for x in xs]` sees `xs` from
+    // outside), while every later clause's `iterable` is evaluated inside
+    // the comprehension scope so it can read an earlier clause's target.
+    // std::optional rather than a bare guard because "not pushed yet" is a
+    // real state this function passes through, not merely a deferred
+    // construction.
+    std::optional<ComprehensionScopeGuard> guard;
+
+    for (const ast::ComprehensionClause& clause : list_comp.clauses()) {
+        const Type iterable = type_of(*clause.iterable, Type::unknown());
+        const RuleResult element_result = element_type(iterable);
+        const Type element_type_value = apply(
+            element_result, *clause.iterable, "\"" + type_name(iterable) + "\" is not iterable");
+        if (element_result.status != RuleResult::Status::Ok) {
+            // apply() already reported. If this is the first clause, the
+            // guard was never constructed and there is nothing to pop; if it
+            // is a later clause, the guard's destructor pops on the way out
+            // of this return -- exactly the case an RAII guard exists for.
+            return Type::unknown();
+        }
+
+        if (!guard.has_value()) {
+            guard.emplace(scopes_);
+        }
+
+        if (dynamic_cast<const ast::TupleExpr*>(clause.target.get()) != nullptr) {
+            // mypy accepts a tuple target (`[k for k, v in pairs]` is
+            // mypy-clean, revealing list[int]), so this must be
+            // NotImplementedError, not TypeError. element_type of a
+            // tuple[K, V] is the UNION K | V, not a positional pair, so
+            // there is nothing correct to bind k/v to element-wise.
+            return error(*clause.target, "NotImplementedError",
+                         "tuple targets in comprehensions are not supported");
+        }
+
+        if (const auto* name_target = dynamic_cast<const ast::Name*>(clause.target.get())) {
+            const ast::SourceSpan target_span = name_target->span();
+            Binding binding;
+            binding.type = element_type_value;
+            binding.declared_line = target_span.start_line;
+            scopes_.bind(name_target->identifier(), binding);
+        }
+        // Every other assignable target shape (Attribute, Subscript) binds
+        // no new name at all, so there is nothing to do for it here.
+
+        for (const ast::ExprPtr& condition : clause.conditions) {
+            type_of(*condition, Type::unknown());
+        }
+    }
+
+    const Type element = type_of(list_comp.element(), Type::unknown());
+    return Type::list_of(element);
+}
 
 Type ExpressionTyper::apply(const RuleResult& result, const ast::Expr& at,
                             std::string type_error_message) {

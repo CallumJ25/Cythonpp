@@ -253,25 +253,6 @@ TEST(ExpressionTyper, RecordsTheNegatedConstantInTheTypeMapToo) {
     EXPECT_EQ(typed.map_size, 2u);
 }
 
-// The brief's hard invariant for this task: every arm Tasks 13-16 have not
-// filled yet must return Unknown SILENTLY, including for constructs whose
-// children could themselves fail to resolve (an unbound `x` inside `x[0]`,
-// say) -- because the silent arm never recurses into its children at all.
-// Tasks 13-16 fill these arms one at a time; without this guard, an arm that
-// starts reporting prematurely, or one that is filled but still silently
-// returns Unknown, would pass unnoticed. Call (`f()`) is real as of Task 15
-// and dropped from this list -- see the Call arm's own tests below.
-TEST(ExpressionTyper, SilentlyReturnsUnknownForEveryArmNotYetImplemented) {
-    const std::vector<std::string> not_yet_implemented = {
-        "[v for v in [1]]", // ListComp -- Task 16.
-    };
-    for (const std::string& expression : not_yet_implemented) {
-        const Typed typed = type_expression(expression);
-        EXPECT_EQ(typed.printed, "Unknown") << expression;
-        EXPECT_TRUE(typed.diagnostics.empty()) << expression;
-    }
-}
-
 // `not` is TOTAL: always Bool for every operand type, and operator_rules.cpp
 // documents that unary_result checks OP_NOT before the Unknown guard so it
 // must NOT absorb Unknown. That totality lives in operator_rules.cpp, not
@@ -1079,6 +1060,84 @@ TEST(ExpressionTyper, ReportsCallingAUnionAsNeedingNarrowing) {
     EXPECT_EQ(error.code, "NotImplementedError");
     EXPECT_EQ(error.message,
               "operations on a union-typed value require narrowing, which is not supported");
+}
+
+// ListComp (Task 16), the only expression that pushes a scope. Verified
+// against mypy 1.18.1: iterating a dict yields its keys.
+TEST(ExpressionTyper, TypesAListComprehension) {
+    EXPECT_EQ(typed_name("[i for i in [1, 2]]"), "list[int]");
+    EXPECT_EQ(typed_name("[s for s in \"abc\"]"), "list[str]");
+    EXPECT_EQ(typed_name("[k for k in d]", {{"d", Type::dict_of(Type::str(), Type::int_())}}),
+             "list[str]") << "iterating a dict yields its keys";
+}
+
+// Verified against mypy 1.18.1: `xs = [i for i in [1, 2]]` then `print(i)`
+// reports `Name "i" is not defined`. Each type_expression() call below gets
+// its OWN fresh ScopeStack, so this alone cannot distinguish a real pop from
+// a leak -- AFailedClauseStillPopsTheComprehensionScope below is the test
+// that pins the RAII guard within a single ScopeStack.
+TEST(ExpressionTyper, TheComprehensionTargetDoesNotLeak) {
+    const Typed typed = type_expression("[i for i in [1]]");
+    EXPECT_TRUE(typed.diagnostics.empty());
+
+    // A second expression referring to i must not resolve.
+    const Typed after = type_expression("i");
+    EXPECT_EQ(only_error(after).code, "NameError");
+}
+
+TEST(ExpressionTyper, AComprehensionReadsOutward) {
+    EXPECT_EQ(typed_name("[g for i in [1]]", {{"g", Type::str()}}), "list[str]");
+}
+
+TEST(ExpressionTyper, ComprehensionConditionsAreChecked) {
+    const Typed typed = type_expression("[i for i in [1] if nope]");
+
+    EXPECT_EQ(only_error(typed).code, "NameError");
+}
+
+TEST(ExpressionTyper, ALaterClauseSeesAnEarlierClausesTarget) {
+    EXPECT_EQ(typed_name("[b for a in [[1]] for b in a]"), "list[int]");
+}
+
+TEST(ExpressionTyper, ReportsIteratingANonIterable) {
+    const Typed typed = type_expression("[i for i in 1]");
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"int\" is not iterable");
+}
+
+// mypy ACCEPTS tuple targets, so this must not be a TypeError. Binding
+// element-wise is wrong because element_type of a tuple[K, V] is the union
+// K | V, not a positional pair.
+TEST(ExpressionTyper, ReportsATupleTargetAsUnsupported) {
+    const Typed typed = type_expression("[k for k, v in [(1, \"a\")]]");
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "tuple targets in comprehensions are not supported");
+}
+
+// Pins the RAII guard specifically: `a` (clause 0's own target, bound int
+// from [1]) is a "bad name" as clause 1's iterable -- typing it succeeds
+// (it resolves fine), but its element_type is NotApplicable (int is not
+// iterable), so the arm takes an early return AFTER the guard has already
+// pushed the comprehension scope on clause 0. Both halves of this tuple are
+// typed by the SAME ExpressionTyper/ScopeStack instance (one type_expression
+// call, one statement), unlike TheComprehensionTargetDoesNotLeak above, so a
+// guard that failed to pop on this early return would leave `a` still bound
+// when the tuple's second element is typed -- turning the expected NameError
+// below into a silent, wrong resolution to int.
+TEST(ExpressionTyper, AFailedClauseStillPopsTheComprehensionScope) {
+    const Typed typed = type_expression("([b for a in [1] for b in a], a)");
+
+    ASSERT_EQ(typed.diagnostics.size(), 2u)
+        << "one TypeError for the non-iterable clause, one NameError for `a` "
+           "read back outside the (properly popped) comprehension scope";
+    EXPECT_EQ(typed.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(typed.diagnostics[0].message, "\"int\" is not iterable");
+    EXPECT_EQ(typed.diagnostics[1].code, "NameError");
+    EXPECT_EQ(typed.diagnostics[1].message, "name 'a' is not defined");
 }
 
 } // namespace

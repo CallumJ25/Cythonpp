@@ -12,6 +12,7 @@
 #include "domain/ast/constant.h"
 #include "domain/ast/dict_expr.h"
 #include "domain/ast/expr.h"
+#include "domain/ast/list_comp.h"
 #include "domain/ast/list_expr.h"
 #include "domain/ast/name.h"
 #include "domain/ast/subscript.h"
@@ -29,10 +30,10 @@ namespace cythonpp::domain::semantic {
 //
 // SCOPE: Constant, Name, UnaryOp, BinOp, Compare, BoolOp (Task 12), the
 // three container displays -- ListExpr, DictExpr, TupleExpr (Task 13) --
-// Subscript/Attribute (Task 14), and Call (Task 15) are real. Every other
-// Expr kind -- ListComp (Task 16), ... -- returns Type::unknown() SILENTLY,
-// with no report, so an intermediate build never emits a diagnostic a later
-// task has to un-emit.
+// Subscript/Attribute (Task 14), Call (Task 15), and ListComp (Task 16) are
+// real. Every other Expr kind returns Type::unknown() SILENTLY, with no
+// report, so an intermediate build never emits a diagnostic a later task has
+// to un-emit.
 //
 // Dispatch is dynamic_cast, following domain/parser/assignability.cpp and
 // annotation_resolver.cpp, not a Visitor: a Visitor::visit returns void and
@@ -222,6 +223,27 @@ private:
     // though there is no parameter list to check it against.
     Type type_of_call_result(const Type& callee_type, const ast::Call& call,
                              const std::string& label);
+
+    // `[element for target in iterable if condition...]` (Task 16), the
+    // ONLY expression that pushes a scope. Clause order: type the clause's
+    // `iterable` in whatever scope is CURRENT (the enclosing scope for the
+    // first clause, since the comprehension's own scope is not pushed yet;
+    // the comprehension's own scope for every later clause, so a later
+    // clause's iterable can read an earlier clause's target), take its
+    // element_type, push the Comprehension scope on the first clause only,
+    // bind `target` to the element type, type each `condition`. Once every
+    // clause is processed, type `element` and wrap it in list_of.
+    //
+    // A tuple target (`[k for k, v in pairs]`) is mypy-clean but reported
+    // here as NotImplementedError -- see the .cpp definition for why binding
+    // element-wise from element_type's union would be wrong rather than
+    // merely unsupported.
+    //
+    // The push is owned by a small RAII guard, not a paired push()/pop():
+    // there are several report-and-return paths below (a non-iterable
+    // iterable, a tuple target), and a bare pop() skipped by one of them
+    // would corrupt every subsequent lookup in the file.
+    Type type_of_list_comp(const ast::ListComp& list_comp);
 
     // The three-way switch, in one place. Every rule-table call goes through
     // this, which is what makes the false-TypeError path unreachable by
