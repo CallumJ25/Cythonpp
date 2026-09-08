@@ -42,6 +42,12 @@ Type literal_type(lexer::token_type type);
 // compares against a fixed limit, the same way it always has; it never
 // produces a value a caller could read back out.
 //
+// REQUIRED, not defaulted: a caller that forgot which side of the sign it is
+// on should fail to compile, not silently inherit the loose (2^63-inclusive)
+// bound. There are exactly two callers today -- ExpressionTyper's
+// UnaryOp(-, Constant) special case (true) and every other Constant site
+// (false) -- and both must say so explicitly.
+//
 // Reports nothing, so its tests need no sink. The caller reports, and the
 // code is OverflowError rather than TypeError: mypy --strict ACCEPTS
 // arbitrarily large integer literals, so a TypeError here would break the
@@ -52,7 +58,7 @@ Type literal_type(lexer::token_type type);
 // Underscore separators are ignored and the 0x/0o/0b prefixes are read. A
 // lexeme carrying anything else is accepted: it is not an integer literal
 // this function can validate, and a false report is worse than no report.
-bool integer_literal_fits_64_bits(const std::string& lexeme, bool allow_two_to_63 = true);
+bool integer_literal_fits_64_bits(const std::string& lexeme, bool allow_two_to_63);
 
 } // namespace cythonpp::domain::semantic
 

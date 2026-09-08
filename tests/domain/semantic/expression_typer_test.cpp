@@ -242,5 +242,86 @@ TEST(ExpressionTyper, RecordsEverySubexpressionInTheTypeMap) {
     EXPECT_EQ(typed.map_size, 3u);
 }
 
+// The UnaryOp(-, Constant LITERAL_INT) special case bypasses type_of() for
+// its operand (see type_of_unary_op) and inserts the operand's TypeMap entry
+// by hand instead. Pin that the hand-insertion actually happens, the same
+// way RecordsEverySubexpressionInTheTypeMap pins the ordinary path.
+TEST(ExpressionTyper, RecordsTheNegatedConstantInTheTypeMapToo) {
+    const Typed typed = type_expression("-9223372036854775808");
+
+    // UnaryOp, Constant.
+    EXPECT_EQ(typed.map_size, 2u);
+}
+
+// The brief's hard invariant for this task: every arm Tasks 13-16 have not
+// filled yet must return Unknown SILENTLY, including for constructs whose
+// children could themselves fail to resolve (an unbound `x` inside `x[0]`,
+// say) -- because the silent arm never recurses into its children at all.
+// Tasks 13-16 fill these arms one at a time; without this guard, an arm that
+// starts reporting prematurely, or one that is filled but still silently
+// returns Unknown, would pass unnoticed.
+TEST(ExpressionTyper, SilentlyReturnsUnknownForEveryArmNotYetImplemented) {
+    const std::vector<std::string> not_yet_implemented = {
+        "[1]",             // ListExpr -- Task 13.
+        "{1: 2}",          // DictExpr -- Task 13.
+        "(1, 2)",          // TupleExpr -- Task 13.
+        "x[0]",            // Subscript -- Task 14.
+        "x.y",             // Attribute -- Task 14.
+        "f()",             // Call -- Task 15.
+        "[v for v in [1]]", // ListComp -- Task 16.
+    };
+    for (const std::string& expression : not_yet_implemented) {
+        const Typed typed = type_expression(expression);
+        EXPECT_EQ(typed.printed, "Unknown") << expression;
+        EXPECT_TRUE(typed.diagnostics.empty()) << expression;
+    }
+}
+
+// `not` is TOTAL: always Bool for every operand type, and operator_rules.cpp
+// documents that unary_result checks OP_NOT before the Unknown guard so it
+// must NOT absorb Unknown. That totality lives in operator_rules.cpp, not
+// here -- but these are what catch a regression where ExpressionTyper itself
+// started absorbing Unknown (or gating on Class/Union) before ever calling
+// unary_result.
+TEST(ExpressionTyper, NotIsTotalAndNeverAbsorbsUnknownClassOrUnion) {
+    const Typed unbound = type_expression("not nope");
+    EXPECT_EQ(unbound.printed, "bool") << "not must stay bool, not collapse to Unknown";
+    const diagnostics::Diagnostic error = only_error(unbound);
+    EXPECT_EQ(error.code, "NameError") << "the NameError is nope's, not not's";
+
+    EXPECT_EQ(typed_name("not w", {{"w", Type::class_of("Widget")}}), "bool")
+        << "truthiness needs no dunder, verified mypy-clean on a plain class";
+    EXPECT_EQ(typed_name("not u", {{"u", Type::union_of({Type::int_(), Type::none()})}}), "bool")
+        << "truthiness is total over a union operand too";
+}
+
+// See type_of_compare's comment: a BinOp reports at the whole expression
+// (one operator, one useful anchor) while a Compare chain reports at the
+// failing link's operand (each link is its own root cause). Pinned here so
+// the divergence is a deliberate, tested choice rather than an accident the
+// Task 25 corpus would otherwise lock in unexamined.
+TEST(ExpressionTyper, BinOpReportsAtTheWholeExpressionButCompareReportsAtTheFailingOperand) {
+    const Typed bin_op = type_expression("1 + \"s\"");
+    const diagnostics::Diagnostic bin_op_error = only_error(bin_op);
+    EXPECT_EQ(bin_op_error.line, 1);
+    EXPECT_EQ(bin_op_error.column, 1) << "column of the whole `1 + \"s\"` expression";
+
+    const Typed compare = type_expression("1 < \"s\"");
+    const diagnostics::Diagnostic compare_error = only_error(compare);
+    EXPECT_EQ(compare_error.line, 1);
+    EXPECT_EQ(compare_error.column, 5) << "column of the failing \"s\" operand, not the chain start";
+}
+
+// The UnaryOp TypeError wording was invented but never test-driven in this
+// task's original pass. Pin it now, before Task 25's corpus matches it
+// character for character.
+TEST(ExpressionTyper, ReportsAGenuineUnaryOperandTypeError) {
+    const Typed typed = type_expression("-\"s\"");
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand type for unary - (\"str\")");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

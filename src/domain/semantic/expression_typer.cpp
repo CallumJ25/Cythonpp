@@ -128,6 +128,17 @@ Type ExpressionTyper::type_of_compare(const ast::Compare& compare) {
     // Unknown, so the chain's type is ALWAYS Bool -- even when a link
     // failed -- and each failing link reports exactly once, through apply();
     // the chain itself adds nothing.
+    //
+    // DELIBERATE DIVERGENCE from type_of_bin_op: apply() is called here with
+    // `*link.operand` -- the failing link's RIGHT-HAND operand -- not
+    // `compare` (the whole chain), whereas type_of_bin_op reports at `bin_op`
+    // (the whole expression). A BinOp has exactly one operator, so its own
+    // span is the only useful anchor. A Compare chain can have several
+    // links, each its own root cause (see EachFailingChainLinkIsItsOwnRootCause
+    // below), and anchoring every failure at the chain's start would collapse
+    // two distinct failures onto one column. So `1 < "s"` reports at column 5
+    // (the `"s"`) while `1 + "s"` reports at column 1 (the whole `1 + "s"`).
+    // Pinned by BinOpReportsAtTheWholeExpressionButCompareReportsAtTheFailingOperand.
     Type previous = type_of(compare.left(), Type::unknown());
     for (const ast::Compare::Rest& link : compare.rest()) {
         const Type operand = type_of(*link.operand, Type::unknown());
