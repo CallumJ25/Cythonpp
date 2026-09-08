@@ -1,12 +1,12 @@
 #include "type_compatibility.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "builtin_type_names.h"
-#include "type_name.h"
 
 namespace cythonpp::domain::semantic {
 namespace {
@@ -80,80 +80,32 @@ Type builtin_base_type(TypeKind kind) {
     return Type::unknown();
 }
 
-// Whether `derived`'s base chain reaches something assignable to `target`.
-// A visited base NAME may denote either another class (walked further) or a
-// builtin KIND -- recursing through the ordinary is_subtype rules once one is
-// found means the numeric tower (int -> float -> complex) and the Object top
-// arm apply without being restated in this walk.
+// Every class canonically reachable from `start`, DEPTH-FIRST LEFT TO RIGHT,
+// with `start` itself (canonicalised) included as the first element -- so a
+// common-base search comparing two chains can find that one class is simply
+// a base of the other, not only a shared ancestor further up. Matches
+// class_table.h's own stated convention ("Depth-first, left to right through
+// the base chain") and its recursive walk_chain exactly: `class X(P, Q)`
+// with `Q(R)` yields `[X, P, Q, R]`, visiting P (and its whole subtree, if
+// it had one) before Q, never the reverse. That ordering is load-bearing for
+// join's nearest-common-base search below, which is deliberately left-biased
+// under multiple inheritance to match mypy.
 //
-// `derived` is expected already canonicalised by the caller (is_subtype);
-// every name visited DURING the walk is canonicalised here, once, at the
-// point it is read off `pending` -- the single place that feeds both the
-// target-name comparison and the `seen` guard, so canonicalisation can never
-// let the same class be visited twice under two different spellings (which
-// would also risk the cycle guard missing a cycle spelled inconsistently).
+// Iterative with an explicit worklist and a visited list (this vector,
+// `chain`, doubles as both) rather than recursive: a malformed class table
+// can contain a cycle -- `class A(B)` with `class B(A)` is rejected by
+// Python, but nothing here guarantees the table it is handed is
+// well-formed. To keep the LIFO worklist producing left-to-right preorder
+// despite popping from the back, each class's bases are pushed in REVERSE
+// order, so the leftmost base is pushed last and therefore popped first --
+// the standard iterative-preorder trick.
 //
-// Only one ClassLookup parameter: `classes` is also what the recursive
-// is_subtype call below needs, and every caller already has exactly one
-// lookup in hand -- a second parameter for "the same object, as a pointer"
-// answered no question a caller could ever answer differently.
-//
-// Iterative with an explicit worklist and a visited list rather than
-// recursive: a malformed class table can contain a cycle -- `class A(B)` with
-// `class B(A)` is rejected by Python, but nothing here guarantees the table
-// it is handed is well-formed -- and a recursive walk would not return.
-bool class_reaches(const ClassLookup& classes, const std::string& derived, const Type& target) {
-    const std::string canonical_target =
-        target.kind == TypeKind::Class ? classes.canonical_name(target.name) : std::string();
-
-    std::vector<std::string> pending = classes.bases_of(derived);
-    std::vector<std::string> seen;
-
-    while (!pending.empty()) {
-        const std::string current = classes.canonical_name(pending.back());
-        pending.pop_back();
-
-        bool already_seen = false;
-        for (const std::string& visited : seen) {
-            if (visited == current) {
-                already_seen = true;
-                break;
-            }
-        }
-        if (already_seen) {
-            continue;
-        }
-        seen.push_back(current);
-
-        if (target.kind == TypeKind::Class && current == canonical_target) {
-            return true;
-        }
-        if (const std::optional<TypeKind> kind = builtin_type_kind(current)) {
-            if (is_subtype(builtin_base_type(*kind), target, &classes)) {
-                return true;
-            }
-        }
-
-        const std::vector<std::string> bases = classes.bases_of(current);
-        for (const std::string& next : bases) {
-            pending.push_back(next);
-        }
-    }
-    return false;
-}
-
-// Every class canonically reachable from `start`, closest first, with `start`
-// itself (canonicalised) included as the first element -- so a common-base
-// search comparing two chains can find that one class is simply a base of the
-// other, not only a shared ancestor further up.
-//
-// Same iterative worklist + visited-list shape as class_reaches, and for the
-// same reason: `class A(B)` / `class B(A)` is constructible and nothing here
-// may assume the table it is handed is well-formed, so a recursive walk would
-// not return.
+// THE ONE guarded walk: class_reaches (below) is expressed in terms of this
+// function rather than repeating the cycle guard a second time.
 std::vector<std::string> class_ancestor_chain(const ClassLookup& classes, const std::string& start) {
     std::vector<std::string> chain = {classes.canonical_name(start)};
     std::vector<std::string> pending = classes.bases_of(chain.front());
+    std::reverse(pending.begin(), pending.end());
 
     while (!pending.empty()) {
         const std::string current = classes.canonical_name(pending.back());
@@ -171,7 +123,8 @@ std::vector<std::string> class_ancestor_chain(const ClassLookup& classes, const 
         }
         chain.push_back(current);
 
-        const std::vector<std::string> bases = classes.bases_of(current);
+        std::vector<std::string> bases = classes.bases_of(current);
+        std::reverse(bases.begin(), bases.end());
         for (const std::string& next : bases) {
             pending.push_back(next);
         }
@@ -179,41 +132,157 @@ std::vector<std::string> class_ancestor_chain(const ClassLookup& classes, const 
     return chain;
 }
 
-// The nearest common base of two Class types, for join's both-Class arm.
-// Walks `left`'s ancestor chain closest-first (self included) and returns the
-// first ancestor that `right` is also a subtype of -- for single inheritance
-// this is exactly mypy's nominal least-upper-bound. A chain entry may itself
-// be a builtin base name (`class Sub(int)`), so each entry is turned back
-// into a real Type via builtin_type_kind before the is_subtype check, exactly
-// as class_reaches does.
+// Whether `derived`'s base chain reaches something assignable to `target`.
+// A visited base NAME may denote either another class (walked further) or a
+// builtin KIND -- recursing through the ordinary is_subtype rules once one is
+// found means the numeric tower (int -> float -> complex) and the Object top
+// arm apply without being restated in this walk.
 //
-// Nothing seeds Object into a user class's bases_of() chain, so two genuinely
-// unrelated classes fall off the end of the loop; the caller supplies Object.
+// Expressed in terms of class_ancestor_chain rather than its own worklist:
+// class_table.h:126-127 states the project rule that the cycle guard exists
+// in exactly one place, and this function's walk was previously a
+// line-for-line copy of that one. `derived` itself (chain[0]) is skipped --
+// class_reaches only ever asked about derived's PROPER ancestors, matching
+// the old code's own starting worklist of `bases_of(derived)` rather than
+// `{derived}`.
+//
+// Traversal order does not matter for correctness here (unlike in
+// nearest_common_base): this function stops at the first match found by
+// EITHER search, not the first found in chain order, so any order that
+// visits every ancestor exactly once answers the same true/false.
+//
+// Only one ClassLookup parameter: `classes` is also what the recursive
+// is_subtype call below needs, and every caller already has exactly one
+// lookup in hand -- a second parameter for "the same object, as a pointer"
+// answered no question a caller could ever answer differently.
+bool class_reaches(const ClassLookup& classes, const std::string& derived, const Type& target) {
+    const std::string canonical_target =
+        target.kind == TypeKind::Class ? classes.canonical_name(target.name) : std::string();
+
+    const std::vector<std::string> chain = class_ancestor_chain(classes, derived);
+    for (std::size_t index = 1; index < chain.size(); ++index) {
+        const std::string& current = chain[index];
+
+        if (target.kind == TypeKind::Class && current == canonical_target) {
+            return true;
+        }
+        if (const std::optional<TypeKind> kind = builtin_type_kind(current)) {
+            if (is_subtype(builtin_base_type(*kind), target, &classes)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The Type an ancestor-chain entry denotes: a builtin base name
+// (`class Sub(int)`) turns back into that builtin Type via builtin_type_kind,
+// exactly as class_reaches does; anything else is an ordinary Class.
+Type ancestor_type(const std::string& ancestor) {
+    if (const std::optional<TypeKind> kind = builtin_type_kind(ancestor)) {
+        return builtin_base_type(*kind);
+    }
+    return Type::class_of(ancestor);
+}
+
+// The nearest common base of two Class types, for join's both-Class arm.
+//
+// Walks `left`'s ancestor chain closest-first (self included, depth-first
+// left to right per class_ancestor_chain) and returns the first ancestor
+// that `right` is also a subtype of. For single inheritance this is exactly
+// mypy's nominal least-upper-bound; for multiple inheritance it is
+// DELIBERATELY left-biased, matching mypy itself -- verified against mypy
+// 1.18.1: `class P`, `class Q`, `class X(P, Q)`, `class Y(Q, P)` join
+// `join(X, Y)` to `P` and `join(Y, X)` to `Q`, the LEFT operand's first base
+// winning each time. Do not "fix" this into a symmetric search; that would
+// disagree with mypy.
+//
+// If left's chain is exhausted with no match, that does NOT mean the two are
+// unrelated: is_subtype recognises a supertype that appears in NO bases_of
+// chain at all -- the numeric tower. `class S(int)` and `class T(float)`
+// share no name in either chain, yet is_subtype(Class(S), float) is true, so
+// a left-chain-only search would find `object` for `join(S, T)` while
+// finding `float` for `join(T, S)` -- verified WRONG against mypy 1.18.1,
+// which says `float` in BOTH directions there (the numeric tower, unlike
+// multiple inheritance, is not left-biased). Falling back to a walk of
+// right's chain -- testing `left` against each candidate -- catches exactly
+// this case. This fallback cannot undo the left-bias above: the left chain
+// is always searched to exhaustion FIRST, in its own left-to-right order, so
+// any match reachable from `left`'s side -- including the multiple-
+// inheritance case above, where each of X and Y sits directly in the
+// other's base chain -- is found and returned before the right-chain loop
+// ever runs. The right-chain walk only ever contributes an answer the left
+// chain could not have found by any ordering: a supertype belonging to
+// neither operand's nominal bases_of chain at all.
+//
+// Nothing seeds Object into a user class's bases_of() chain, so two
+// genuinely unrelated classes fall off the end of both loops; the caller
+// supplies Object.
 Type nearest_common_base(const ClassLookup& classes, const Type& left, const Type& right) {
     for (const std::string& ancestor : class_ancestor_chain(classes, left.name)) {
-        Type candidate;
-        if (const std::optional<TypeKind> kind = builtin_type_kind(ancestor)) {
-            candidate = builtin_base_type(*kind);
-        } else {
-            candidate = Type::class_of(ancestor);
-        }
+        const Type candidate = ancestor_type(ancestor);
         if (is_subtype(right, candidate, &classes)) {
+            return candidate;
+        }
+    }
+    for (const std::string& ancestor : class_ancestor_chain(classes, right.name)) {
+        const Type candidate = ancestor_type(ancestor);
+        if (is_subtype(left, candidate, &classes)) {
             return candidate;
         }
     }
     return Type::object();
 }
 
-// A copy of `type` with its Class name (if any) resolved through `classes`.
-// Class::name is the one field two otherwise-equivalent Types can legitimately
-// differ on for a reason the caller does not control:
-// EnvironmentError/IOError/WindowsError are one class under three spellings.
-// This is what lets join's equivalence tie-break (below) pick the ONE
-// spelling ClassLookup considers real, rather than whichever alias happened
-// to be passed as the first argument.
+// Structural order over Type -- kind, then name, then args pairwise --
+// deliberately NOT type_name. type_name.h states outright that its rendering
+// is a diagnostics spelling, not pinned across changes; keying a domain
+// decision (which of two equivalent Types join returns) on that presentation
+// function would let an unrelated rendering change silently flip the answer.
+// A strict weak order, used only to break the equivalence-arm tie
+// deterministically -- there is no meaning attached to "less than" beyond
+// picking one of two equivalent Types in a way that does not depend on which
+// was passed as `left`.
+bool type_less(const Type& left, const Type& right) {
+    if (left.kind != right.kind) {
+        return left.kind < right.kind;
+    }
+    if (left.name != right.name) {
+        return left.name < right.name;
+    }
+    if (left.args.size() != right.args.size()) {
+        return left.args.size() < right.args.size();
+    }
+    for (std::size_t index = 0; index < left.args.size(); ++index) {
+        if (type_less(left.args[index], right.args[index])) {
+            return true;
+        }
+        if (type_less(right.args[index], left.args[index])) {
+            return false;
+        }
+    }
+    return false;
+}
+
+// A copy of `type` with every Class name reachable from it -- its own, and
+// any nested inside `args` -- resolved through `classes`. Class::name is the
+// one field two otherwise-equivalent Types can legitimately differ on for a
+// reason the caller does not control: EnvironmentError/IOError/WindowsError
+// are one class under three spellings. This is what lets join's equivalence
+// tie-break (below) pick the ONE spelling ClassLookup considers real, rather
+// than whichever alias happened to be passed as the first argument --
+// recursively, so `join(list[IOError], list[OSError])` returns
+// `list[OSError]`, not `list[IOError]` left untouched inside an otherwise-
+// canonicalised container.
 Type canonicalised(Type type, const ClassLookup* classes) {
-    if (classes != nullptr && type.kind == TypeKind::Class) {
+    if (classes == nullptr) {
+        return type;
+    }
+    if (type.kind == TypeKind::Class) {
         type.name = classes->canonical_name(type.name);
+    }
+    for (Type& arg : type.args) {
+        arg = canonicalised(std::move(arg), classes);
     }
     return type;
 }
@@ -402,17 +471,20 @@ Type join(const Type& left, const Type& right, const ClassLookup* classes) {
     //
     // Equivalent does not mean identical, though: that same union-order case
     // renders differently depending on which side happens to be "left", and
-    // an aliased class (IOError vs. its canonical OSError) does too. join
-    // must be commutative -- join(A, B) and join(B, A) the SAME answer -- so
-    // rather than literally returning `left`, canonicalise each side's Class
-    // spelling and then break any remaining tie by rendered name. That makes
-    // the result a function of the unordered pair {left, right}, never of
-    // which argument position the caller happened to use.
+    // an aliased class (IOError vs. its canonical OSError) does too. For
+    // EQUIVALENT inputs specifically there is no reason to prefer either
+    // spelling -- both denote the same type -- so rather than literally
+    // returning `left`, canonicalise each side's Class spelling (recursively,
+    // via canonicalised) and then break any remaining tie with type_less, a
+    // structural order over Type, NOT type_name: type_name is a diagnostics
+    // spelling that is explicitly not pinned, so keying this choice on it
+    // would let an unrelated rendering change silently flip which Type join
+    // returns. That makes the result a function of the unordered pair
+    // {left, right}, never of which argument position the caller used.
     if (is_equivalent(left, right, classes)) {
         const Type canonical_left = canonicalised(left, classes);
         const Type canonical_right = canonicalised(right, classes);
-        return type_name(canonical_left) <= type_name(canonical_right) ? canonical_left
-                                                                        : canonical_right;
+        return type_less(canonical_right, canonical_left) ? canonical_right : canonical_left;
     }
     // THE exception to "join, don't union": None really does union. Checked
     // before the numeric-tower and Class arms below, neither of which could

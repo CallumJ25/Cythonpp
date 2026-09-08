@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "domain/semantic/class_table.h"
 #include "domain/semantic/type.h"
 #include "domain/semantic/type_compatibility.h"
 #include "domain/semantic/type_name.h"
@@ -10,13 +11,28 @@ namespace {
 
 // Named both ways round on failure, and asserted BOTH DIRECTIONS in every
 // test: join must be commutative, and mypy's results were symmetric in every
-// probe.
+// probe -- EXCEPT the nearest-common-base search under multiple inheritance,
+// which is deliberately left-biased to match mypy (see expect_join_directed
+// below). Do not use this helper for that case; use the directed one.
 void expect_join(const Type& left, const Type& right, const Type& expected,
                  const ClassLookup* classes = nullptr) {
     EXPECT_EQ(type_name(join(left, right, classes)), type_name(expected))
         << "join(" << type_name(left) << ", " << type_name(right) << ")";
     EXPECT_EQ(type_name(join(right, left, classes)), type_name(expected))
         << "join is not commutative for " << type_name(left) << " and " << type_name(right);
+}
+
+// For the ONE arm where join is not commutative by design: the nearest-
+// common-base search under multiple inheritance. Verified against mypy
+// 1.18.1: with `class P`, `class Q`, `class X(P, Q)`, `class Y(Q, P)`,
+// `join(X, Y)` is `P` while `join(Y, X)` is `Q` -- mypy itself takes the left
+// operand's first base, so the two call orders genuinely disagree. Asserts
+// ONLY the given direction; do not "fix" a future failure here by switching
+// to expect_join, which would silently paper over a left-bias regression.
+void expect_join_directed(const Type& left, const Type& right, const Type& expected,
+                          const ClassLookup* classes = nullptr) {
+    EXPECT_EQ(type_name(join(left, right, classes)), type_name(expected))
+        << "join(" << type_name(left) << ", " << type_name(right) << ")";
 }
 
 // Verified: reveal_type([1, 2]) is list[int].
@@ -106,6 +122,42 @@ TEST(Join, ClassesAreUnrelatedWithoutALookup) {
     expect_join(Type::class_of("B"), Type::class_of("C"), Type::object());
 }
 
+// CRITICAL regression: the nearest-common-base search used to walk only the
+// LEFT operand's ancestor chain, but is_subtype recognises a supertype that
+// appears in NO bases_of chain at all -- the numeric tower. `class S(int)`
+// and `class T(float)` share no name in either chain, yet
+// is_subtype(Class(S), float) is true, so a left-chain-only search finds
+// `object` for `join(S, T)` while finding `float` for `join(T, S)`. Verified
+// against mypy 1.18.1: `reveal_type([S(), T()])` and `reveal_type([T(), S()])`
+// are BOTH `builtins.list[builtins.float]` -- the numeric tower stays
+// commutative even though multiple inheritance (below) does not.
+TEST(Join, ClassesInheritingDifferentNumericTowerMembersJoinToTheWiderOne) {
+    const semantic_test_support::FakeClassLookup classes({{"S", {"int"}}, {"T", {"float"}}});
+
+    expect_join(Type::class_of("S"), Type::class_of("T"), Type::float_(), &classes);
+}
+
+// The nearest-common-base search is deliberately LEFT-BIASED under multiple
+// inheritance, matching mypy exactly rather than "fixing" it into a
+// symmetric answer. Verified against mypy 1.18.1:
+//   class P: pass
+//   class Q: pass
+//   class X(P, Q): pass
+//   class Y(Q, P): pass
+//   reveal_type([X(), Y()])  # builtins.list[a.P]
+//   reveal_type([Y(), X()])  # builtins.list[a.Q]  -- NOT the same answer.
+// join(X, Y) finds P because P is X's own first base (and Y's base chain
+// reaches P directly too); join(Y, X) finds Q by the same reasoning with the
+// operands swapped. Uses expect_join_directed, NOT expect_join: asserting
+// both directions against one `expected` would be wrong here on purpose.
+TEST(Join, MultipleInheritanceNearestCommonBaseIsLeftBiasedLikeMypy) {
+    const semantic_test_support::FakeClassLookup classes(
+        {{"P", {}}, {"Q", {}}, {"X", {"P", "Q"}}, {"Y", {"Q", "P"}}});
+
+    expect_join_directed(Type::class_of("X"), Type::class_of("Y"), Type::class_of("P"), &classes);
+    expect_join_directed(Type::class_of("Y"), Type::class_of("X"), Type::class_of("Q"), &classes);
+}
+
 // Absorbing, so one root cause draws one diagnostic. An un-annotated
 // [x, <error>] must not become list[object] and then fail an unrelated
 // assignment check downstream.
@@ -136,27 +188,32 @@ TEST(Join, DoesNotWalkIntoStructuralSupertypes) {
 // otherwise join(Class("IOError"), Class("OSError")) would wrongly fall to
 // Object instead of recognising the two spellings as the very same class.
 // ClassLookup grew canonical_name in Task 9, after this brief was written.
+//
+// Uses the REAL ClassTable, not a hand-rolled fake: fake_class_lookup.h's own
+// doc comment states the convention -- FakeClassLookup's canonical_name is
+// identity, and a test that needs to exercise actual canonicalisation uses
+// ClassTable instead, exactly as type_compatibility_test.cpp already does.
+// A hand-rolled alias mapping here would restate ClassTable's own table and
+// never notice if the real one diverged.
 TEST(Join, CanonicalisesClassNamesBeforeComparing) {
-    class AliasingClassLookup : public ClassLookup {
-    public:
-        bool is_class(const std::string& name) const override {
-            return name == "OSError" || name == "IOError" || name == "EnvironmentError" ||
-                   name == "WindowsError";
-        }
-        std::vector<std::string> bases_of(const std::string&) const override { return {}; }
-        std::string canonical_name(const std::string& name) const override {
-            if (name == "IOError" || name == "EnvironmentError" || name == "WindowsError") {
-                return "OSError";
-            }
-            return name;
-        }
-    };
-    const AliasingClassLookup classes;
+    const ClassTable classes;
 
     expect_join(Type::class_of("IOError"), Type::class_of("OSError"), Type::class_of("OSError"),
                 &classes);
     expect_join(Type::class_of("EnvironmentError"), Type::class_of("WindowsError"),
                 Type::class_of("OSError"), &classes);
+}
+
+// The canonicalisation above is not top-level only: it recurses into `args`,
+// so an aliased class name nested inside a container is resolved too, not
+// left as whichever spelling happened to be passed as `left`.
+// join(list[IOError], list[OSError]) must return list[OSError], matching the
+// bare-class case above rather than reading as a narrower guarantee.
+TEST(Join, CanonicalisesClassNamesNestedInsideContainerArguments) {
+    const ClassTable classes;
+
+    expect_join(Type::list_of(Type::class_of("IOError")), Type::list_of(Type::class_of("OSError")),
+                Type::list_of(Type::class_of("OSError")), &classes);
 }
 
 } // namespace

@@ -57,10 +57,23 @@ bool is_equivalent(const Type& left, const Type& right, const ClassLookup* class
 //
 // Equivalent does not mean identical: that same union-order case, and an
 // aliased class name (IOError vs. its canonical OSError), both render
-// differently depending on which side is passed as `left`. join is
-// commutative -- join(a, b) and join(b, a) always agree -- so when the two
-// sides are merely equivalent, the result is a canonicalised, deterministic
-// choice between them rather than literally `left`.
+// differently depending on which side is passed as `left`. For the
+// equivalence arm specifically, both sides denote the SAME type, so there is
+// no reason to prefer one spelling over the other based on argument
+// position: the result is a canonicalised (recursively, into every nested
+// Class name in `args`, not just a top-level one), deterministic choice
+// between them rather than literally `left`.
+//
+// join is CROSS THE ARMS ABOVE commutative, but NOT for the nearest-common-
+// base search below, where mypy itself is left-biased by design under
+// multiple inheritance -- this is not a defect to "fix" into symmetry.
+// Verified against mypy 1.18.1: with `class P`, `class Q`, `class X(P, Q)`
+// and `class Y(Q, P)`, `join(X, Y)` is `P` while `join(Y, X)` is `Q` -- the
+// LEFT operand's FIRST base wins, and the two orders genuinely disagree.
+// (Contrast the numeric tower, where join stays commutative: `class S(int)`
+// and `class T(float)` join to `float` in both directions, because
+// is_subtype's numeric-tower rule -- unlike a base-chain walk -- does not
+// care which side started the search.)
 //
 // Deliberately NOT recursive into invariant type arguments. `[[1], ["a"]]` is
 // `list[object]`, verified -- NOT `list[list[object]]`. join is applied once,
