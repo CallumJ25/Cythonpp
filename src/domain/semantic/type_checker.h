@@ -93,14 +93,13 @@ namespace cythonpp::domain::semantic {
 // is always assumed skippable (false).
 //
 // This is a syntactic approximation of mypy's real reachability analysis, and
-// fix round 1 (Finding 4) corrects a false claim that used to live here: it
-// does NOT err in only one direction. Both are reachable, verified against
+// it does NOT err in only one direction. Both are reachable, verified against
 // mypy 1.18.1:
 //   - mypy reports "missing return statement"; we do not: `while True: / for
 //     x in xs: pass / else: break` with no return after it. A loop's else
 //     runs outside that loop's own break scope, so mypy sees the `break`
-//     escape the `while True` and demands a return. Before fix round 1 this
-//     checker did not look inside a nested loop's orelse at all, so it
+//     escape the `while True` and demands a return. This
+//     checker once did not look inside a nested loop's orelse at all, so it
 //     stayed silent.
 //   - we report "missing return statement"; mypy does not: `while True: / if
 //     False: / break / return 1`. mypy prunes the `if False:` block as
@@ -163,8 +162,8 @@ namespace cythonpp::domain::semantic {
 //     the ordinary scope-bind bind_annotation already performs. Declared
 //     whether or not the AnnAssign carries a value -- verified mypy accepts
 //     `C.x` for a bare `x: int` class-body annotation.
-//   - A class-body plain Assign to a bare Name (fix round 1, Finding 3:
-//     `class D: x = 5` did not declare a member AT ALL before this) --
+//   - A class-body plain Assign to a bare Name (`class D: x = 5` did not
+//     declare a member AT ALL at one point) --
 //     handled in assign_to's own Name-target branch, exactly parallel to the
 //     AnnAssign case, gated on the SAME is_new_definition this checker
 //     already computes for the ordinary bare-empty-container check, so the
@@ -174,9 +173,9 @@ namespace cythonpp::domain::semantic {
 //     assign_attribute, checked BEFORE the ordinary read path so a brand-new
 //     attribute is not a false attr-defined miss.
 //
-// Fix round 1, Finding 1 (CRITICAL): before this round, ALL THREE of the
-// above were purely single-pass -- declared only when TypeChecker's own
-// visitation actually reached the declaring statement, in body order. That
+// ALL THREE of the above were once purely single-pass -- declared only when
+// TypeChecker's own visitation actually reached the declaring statement, in
+// body order. That
 // made a method appearing ABOVE the one that first assigns (or the
 // class-body statement that first annotates) an attribute it reads via
 // self -- e.g. `def a(self): self.b()` calling a method `b` defined BELOW
@@ -203,8 +202,8 @@ namespace cythonpp::domain::semantic {
 // already had the matching skip for a colliding FunctionDef, so this was an
 // asymmetry, not a deliberate choice.
 
-// One enclosing function's worth of scope-limited class aliases (fix round 3,
-// Critical 2): every bare class name TypeChecker installed into ClassTable
+// One enclosing function's worth of scope-limited class aliases: every bare
+// class name TypeChecker installed into ClassTable
 // while walking that function's body, each paired with whatever that same
 // bare name resolved to in ClassTable's scoped-alias map BEFORE the install
 // (nullopt when nothing did). Torn down in REVERSE order, restoring rather
@@ -270,9 +269,9 @@ private:
     // declare_class_recursive) -- so `x: Outer.Inner` resolves in Phase 2,
     // which runs before Phase 3 (the ordinary walk) ever reaches Inner's own
     // ClassDef node. A top-level ClassDef scan_top_level_names already
-    // reported as a collided redefinition is SKIPPED here (Task 19 fix: it
-    // used to be declared anyway, silently overwriting the winning
-    // same-named class's ClassTable entry). THEN -- once every class is
+    // reported as a collided redefinition is SKIPPED here: declaring it
+    // anyway silently overwrote the winning
+    // same-named class's ClassTable entry. THEN -- once every class is
     // declared -- validate that each bare-Name base actually resolves,
     // reporting NameError for one that does not (e.g. `class C(Generic):`,
     // since Generic cannot be imported in this subset).
@@ -288,25 +287,26 @@ private:
     void declare_class_recursive(const ast::ClassDef& class_def, const std::string& qualified_prefix,
                                  std::vector<const ast::ClassDef*>& all_classes);
 
-    // The base-validation half of collect_classes, extracted (fix round 1)
+    // The base-validation half of collect_classes, extracted
     // so declare_isolated_class below can reuse it for a class ClassTable
     // never saw during Phase 1 -- same rule either way: a bare-Name base
     // that does not resolve is a NameError, checked only once every
     // declaration in `all_classes` exists.
     void validate_class_bases(const std::vector<const ast::ClassDef*>& all_classes);
 
-    // Fix round 1, Findings 4 and 7: declares `node` (and, recursively, every
+    // Declares `node` (and, recursively, every
     // ClassDef nested in its own body) into ClassTable under `qualified_name`
     // -- returned back to the caller unchanged, for use exactly like an
     // ordinarily-declared one for the REST of that class's handling
     // (ClassContextGuard, pre_collect_class_body, self's binding). Both
-    // callers (Finding 4's function-local case, and Finding 7's losing
-    // top-level collision) now ALWAYS pass a freshly synthesised name that
+    // callers (the function-local case, and the losing
+    // top-level collision -- both listed below) ALWAYS pass a freshly
+    // synthesised name that
     // embeds `#`, a character no Python identifier can ever contain, so it
     // can never collide with any legitimately dotted "Outer.Inner" name
     // collect_classes produced, or with any other class's bare name.
     //
-    // Fix round 2, Finding B: Finding 4's own case used to pass the class's
+    // The function-local case used to pass the class's
     // plain BARE name whenever that name was not already live in ClassTable
     // -- kept, back then, specifically so a function-local `Local()` call
     // stayed resolvable as a constructor from inside its own defining
@@ -324,7 +324,7 @@ private:
     // acceptance. Always isolating under the synthetic name closes both
     // holes.
     //
-    // Fix round 3, Critical 2: round 2 accepted, as a supposed cost of that
+    // An earlier version accepted, as a supposed cost of that
     // isolation, that `Local()` could no longer be resolved as a constructor
     // call at all -- even from inside its own defining function. That was
     // not a missed error but a FALSE one (`NameError: name 'Local' is not
@@ -339,11 +339,11 @@ private:
     // Two, unrelated situations both need this because neither one was ever
     // reached by collect_classes' Phase-1 walk, which only recurses into
     // MODULE-level and CLASS-level bodies:
-    //   - Finding 4: a ClassDef lexically inside a `def` (or any other
-    //     non-module, non-class scope).
-    //   - Finding 7: a top-level ClassDef scan_top_level_names already
+    //   - a ClassDef lexically inside a `def` (or any other
+    //     non-module, non-class scope);
+    //   - a top-level ClassDef scan_top_level_names already
     //     reported as a LOSING same-name collision. Phase 1 already skips
-    //     the loser's own declare() call (Task 19's gap-5(b) fix), but Phase
+    //     the loser's own declare() call, but Phase
     //     3 still walks its body like any other statement (matching how a
     //     colliding top-level FunctionDef's body is still checked) -- without
     //     this, that walk would write the loser's members/methods (and,
@@ -360,18 +360,18 @@ private:
     //     redefinition and no downstream lookup resolves "C" to it.
     std::string declare_isolated_class(const ast::ClassDef& node, const std::string& qualified_name);
 
-    // Fix round 1, Finding 1 (CRITICAL, method half): the exact analogue of
+    // The exact analogue of
     // collect_signatures at module level, but for ONE class body, run from
     // visit(ClassDef) right after ClassContextGuard is constructed and
     // BEFORE any of the class's own body statements are walked --
     //   - every direct AnnAssign's annotation is resolved (and, if a bad
     //     annotation, reported) FIRST, in its own dedicated sub-pass over the
-    //     WHOLE body (fix round 2, Finding E -- see below), cached in
+    //     WHOLE body, cached in
     //     class_body_annotation_types_ so visit(AnnAssign)'s own later walk
     //     of that SAME node reuses it rather than invoking AnnotationResolver
     //     (and so double-reporting a bad annotation) a second time, and
     //     declared into ClassTable via declare_member UNLESS a member or
-    //     method under that name already exists (Finding 5's own
+    //     method under that name already exists (the same
     //     has_value() guard -- reachable now only for a second class-body
     //     AnnAssign of the same name, since this sub-pass runs before any
     //     self.x placeholder ever could exist);
@@ -385,11 +385,11 @@ private:
     //   - every direct plain Assign to a bare Name is placeholder-declared
     //     (Type::unknown(), at ITS OWN line) the same has_value()-guarded
     //     way, so `class D: x = 5` registers "x" as an attribute at all
-    //     (Finding 3) -- the REAL inferred type is filled in later, when
+    // -- the REAL inferred type is filled in later, when
     //     Phase 3's own visit(Assign) actually reaches this exact statement
     //     (see assign_to's own is_new_definition-gated declare_member call,
     //     itself now guarded against overwriting a genuine earlier
-    //     declaration -- fix round 2, Finding A);
+    //     declaration);
     //   - every method's OWN body is, in turn, scanned (recursively through
     //     If/While/For, matching pre_bind_function_body's own scope
     //     boundary: NOT into a nested def) for a `self.x = ...` assignment,
@@ -397,17 +397,17 @@ private:
     //     exists (as an Unknown placeholder, at the line of its own FIRST
     //     such assignment) before ANY method's body -- including one
     //     occurring EARLIER in the class body -- is actually walked. This is
-    //     Finding 1's own critical fix: `def a(self): self.b()` reading a
+    //     the whole point of the sub-pass: `def a(self): self.b()` reading a
     //     method `b` defined below `a`, or reading an attribute a later
     //     method first assigns, no longer depends on visitation order.
     //
-    // Fix round 2, Finding E: the AnnAssign sub-pass runs BEFORE the
+    // The AnnAssign sub-pass runs BEFORE the
     // method/plain-Assign sub-pass below, over the WHOLE body, rather than
-    // interleaved with it in textual order as round 1 had it -- verified
+    // interleaved with it in textual order -- verified
     // against mypy 1.18.1, a class-body annotation is the DECLARED type of
     // that attribute for the WHOLE class body regardless of where it
     // appears textually, so it must win over a self.x placeholder
-    // REGARDLESS of which one is textually first (round 1's interleaved,
+    // REGARDLESS of which one is textually first (an interleaved,
     // textual-order pass got this backwards whenever the annotation
     // appeared BELOW the self.x assignment it conflicts with -- see
     // AClassBodyAnnotationConflictingWithAnEarlierSelfAssignmentIsReported).
@@ -432,7 +432,7 @@ private:
     // than re-deriving it).
     Type resolve_method_signature(const ast::FunctionDef& method, const std::string& qualified_name);
 
-    // Fix round 1, Finding 1 (CRITICAL, attribute half): the recursive walk
+    // The recursive walk
     // pre_collect_class_body runs over EVERY method's own body (If/While/For
     // recursed into, matching pre_bind_function_body's scope boundary -- a
     // nested def is NOT recursed into, since 'self' there may be shadowed or
@@ -516,7 +516,7 @@ private:
     AnnotationBinding bind_annotation(const ast::Name& target, const ast::Expr& annotation,
                                       int line);
 
-    // Fix round 1: the scope-binding HALF of bind_annotation, factored out so
+    // The scope-binding HALF of bind_annotation, factored out so
     // a class-body AnnAssign whose annotation was ALREADY resolved (and
     // reported on) by pre_collect_class_body's own eager pass can still get
     // the ordinary scope-bind/redefinition treatment without invoking
@@ -556,7 +556,7 @@ private:
     // pre_bind_assignment_targets for what "my own still-unfilled
     // placeholder" means and why declared_line == line is the signal for it.
     //
-    // `order_exempt` (fix round 1, Finding 1, CRITICAL) defaults to false for
+    // `order_exempt` defaults to false for
     // every ordinary assignment, but a `for` target's own first bind passes
     // true: like a parameter, it is bound before its body ever runs, so a
     // one-line suite (`for i in range(3): print(i)`) reading it within that
@@ -568,7 +568,7 @@ private:
     void assign_name(const ast::Name& target, const Type& value_type, int line,
                      bool order_exempt = false);
 
-    // Task 18 fix round 1, Finding 1: true when `binding` is THIS exact
+    // True when `binding` is THIS exact
     // statement's own still-unfilled placeholder (from
     // pre_bind_assignment_targets / pre_bind_function_body) rather than a
     // genuine prior binding -- the signal being declared_line == line, AS
@@ -598,7 +598,7 @@ private:
     // Task 20's return-path check. Purely syntactic -- it touches no member,
     // no scope, no ClassTable, nothing but the AST shape -- so it can be (and
     // is) called after the function's own body has already been visited,
-    // with no ordering hazard either way. static (fix round 1, Finding 10),
+    // with no ordering hazard either way. static,
     // matching contains_reachable_break right below it for the same reason.
     // See the class-level comment for the exact per-statement rule; "a body
     // always returns if ANY of its statements does" is the fold this
@@ -610,7 +610,7 @@ private:
     // contains a `break` at any depth EXCEPT inside a nested For/While's own
     // BODY -- a break belonging to a nested loop's body can only ever escape
     // THAT loop, never this one, so recursing into one would over-count. Its
-    // ORELSE is the opposite case (fix round 1, Finding 3) and IS recursed
+    // ORELSE is the opposite case and IS recursed
     // into: a loop's `else` runs outside that loop's own break scope, so a
     // break there targets the enclosing loop. Recurses into If's body/orelse
     // unconditionally (an `if` is not a loop at all, so a break inside one
@@ -650,7 +650,7 @@ private:
     // directly in visit(FunctionDef), the only time it is ever resolved.
     std::map<const ast::FunctionDef*, Type> top_level_signatures_;
 
-    // Fix round 1: pre_collect_class_body's own resolved-signature cache, one
+    // Pre_collect_class_body's own resolved-signature cache, one
     // entry per METHOD (a direct FunctionDef in a class body) -- the exact
     // analogue of top_level_signatures_ above, kept as a SEPARATE map (rather
     // than folded into it) because that map's own contract explicitly reads
@@ -661,7 +661,7 @@ private:
     // maps.
     std::map<const ast::FunctionDef*, Type> class_method_signatures_;
 
-    // Fix round 1: pre_collect_class_body's resolved-annotation cache for a
+    // Pre_collect_class_body's resolved-annotation cache for a
     // class-body-DIRECT AnnAssign (never a nested one, matching that
     // function's own module.body()-only-style simplification) -- the exact
     // analogue of module_level_annotations_, so visit(AnnAssign)'s
@@ -695,7 +695,7 @@ private:
     // annotation itself).
     Type current_return_type_ = Type::unknown();
 
-    // Fix round 3, Critical 2. One frame per function body currently being
+    // One frame per function body currently being
     // walked, innermost last (pushed and popped by LocalClassAliasGuard, in
     // the .cpp, alongside the FunctionScopeGuard that pushes that body's own
     // ScopeKind::Function). A function-local ClassDef is declared into

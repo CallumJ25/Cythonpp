@@ -161,7 +161,7 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
     // before the target is bound, so a read on the SAME line as its own
     // binding is already too late.
     //
-    // Task 18 fix round 1, Finding 1 (CRITICAL): order_exempt is checked
+    // order_exempt is checked
     // FIRST, ahead of the `>=`, because a parameter's declared_line is the
     // `def` line -- which for a one-line suite (`def f(x: int) -> None:
     // print(x)`) is the SAME line the body statement sits on, so `>=` alone
@@ -392,7 +392,7 @@ Type ExpressionTyper::type_of_attribute(const ast::Attribute& attribute) {
     // Attribute, not a Name, so it falls through to the ordinary path below
     // and reports (rather than guesses) once it gets there.
     //
-    // PRECEDENCE, checked here to fix a shadowing bug from fix round 1: a
+    // PRECEDENCE, checked here to fix a shadowing bug: a
     // local binding of the SAME name as a class must win over the
     // class-object reading. `def f(Widget: int): return Widget.bit_length()`
     // is legal Python where `Widget` is an int parameter, not the class --
@@ -597,7 +597,7 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
     // exception class -- inherits_builtin is deliberately false for those),
     // so a miss here is a genuine mypy attr-defined error.
     //
-    // Fix round 2 (Task 19 fix round 2, Finding C): routed through
+    // Routed through
     // strip_synthetic_class_prefix rather than quoting receiver.name raw --
     // an ISOLATED class (a losing top-level redefinition, or a function-local
     // class -- see type_checker.cpp's declare_isolated_class) has a
@@ -614,7 +614,7 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
 // type_of_call, type_of_name_call, type_of_positional_call and
 // type_of_call_result (the Call arm, Task 15) live in
 // expression_typer_calls.cpp -- a second translation unit for this same
-// class, split out in fix round 1 once this file passed 700 lines. See that
+// class, split out once this file passed 700 lines. See that
 // file's header comment for why this particular block was the seam.
 
 Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {

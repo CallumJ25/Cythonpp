@@ -24,7 +24,7 @@ namespace cythonpp::domain::semantic {
 namespace {
 
 // RAII guard for the Function scope TypeChecker::visit(FunctionDef) pushes
-// (fix round 1, Finding 1) -- mirrors ExpressionTyper's ComprehensionScopeGuard
+// -- mirrors ExpressionTyper's ComprehensionScopeGuard
 // (expression_typer.cpp) so a report-and-return early exit from a future
 // task's fuller FunctionDef arm can never skip the matching pop().
 class FunctionScopeGuard {
@@ -72,7 +72,7 @@ private:
 };
 
 // RAII guard for one function body's worth of scope-limited class aliases
-// (fix round 3, Critical 2): pushes an empty frame onto
+//: pushes an empty frame onto
 // local_class_alias_frames_ alongside the FunctionScopeGuard that pushes that
 // body's own ScopeKind::Function, and on destruction undoes every alias
 // visit(ClassDef) registered in it -- in REVERSE order, RESTORING each bare
@@ -215,7 +215,7 @@ void TypeChecker::collect_classes(const ast::Module& module) {
     for (const ast::StmtPtr& statement : module.body()) {
         if (const auto* class_def = dynamic_cast<const ast::ClassDef*>(statement.get())) {
             if (collided_top_level_.count(class_def) != 0) {
-                // Task 19 fix: scan_top_level_names already reported this
+                // scan_top_level_names already reported this
                 // ClassDef as a redefinition. Declaring it anyway used to
                 // silently OVERWRITE the winning same-named class's
                 // ClassTable entry (declare() has no collision detection of
@@ -312,7 +312,7 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
             const Type signature_type = Type::callable(params, return_type,
                                                        defaulted_param_count(function_def->params()));
             top_level_signatures_.emplace(function_def, signature_type);
-            // Fix round 1, Finding 2: the bool `bind` returns MUST be
+            // The bool `bind` returns MUST be
             // checked -- `bind` itself has no sink and never reported
             // anything on its own, contrary to what the previous comment
             // here claimed. A def/def or def/class collision never reaches
@@ -418,7 +418,7 @@ TypeChecker::AnnotationBinding TypeChecker::bind_resolved_annotation(const ast::
             // so this branch is new surface area with no existing caller to
             // disturb.
             //
-            // Fix round 2: routed through is_unfilled_placeholder (rather
+            // Routed through is_unfilled_placeholder (rather
             // than the raw declared_line == line this used before) so an
             // order_exempt PARAMETER binding is never mistaken for this
             // function's own unfilled placeholder -- a same-line annotated
@@ -488,7 +488,7 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
         }
         assign_name(*name, value_type, line);
         if (is_new_definition && scopes_.current_kind() == ScopeKind::Class) {
-            // Fix round 1, Finding 3: a plain class-body Assign (`class D:
+            // A plain class-body Assign (`class D:
             // x = 5`) never declared an instance attribute at all before
             // this -- only the AnnAssign path did. Declared on the FIRST
             // real assignment only (is_new_definition, already computed
@@ -498,14 +498,14 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
             // this exact name as Unknown at this exact line (so a method
             // ABOVE this statement reading self.x already sees it exists).
             //
-            // Fix round 2, Finding A: round 1's own fix here had NO guard at
-            // all -- unconditionally overwriting classes_.declare_member,
+            // An earlier version of this arm had NO guard at all --
+            // unconditionally overwriting classes_.declare_member,
             // even when a member ALREADY exists under a DIFFERENT line (a
             // genuine earlier self.x = ... assignment in a method ABOVE this
             // statement), silently RE-TYPING the attribute with zero
-            // diagnostics. That is the exact defect round 1's own Finding 5
-            // already fixed for the AnnAssign sibling and assign_attribute's
-            // own self.x path; this was the one place the guard was missed.
+            // diagnostics. That is the exact defect already fixed for the
+            // AnnAssign sibling and assign_attribute's own self.x path; this
+            // was the one place the guard was missed.
             // Routed through the SAME member_declared_line line-equality
             // disambiguation assign_attribute already uses: a member at
             // THIS exact line is this statement's own placeholder (fill in
@@ -513,23 +513,23 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
             // against yet); anything else is a genuine earlier declaration,
             // compared rather than silently overwritten.
             //
-            // Fix round 3, Critical 1: round 2's comparison ran the WRONG
-            // WAY ROUND, and that alone made two mypy-clean programs false
+            // The comparison must run in THIS direction and not the
+            // reverse, which alone made two mypy-clean programs false
             // TypeErrors. mypy's precedence here (verified against mypy
             // 1.18.1, including reveal_type on the resulting attribute) is
             // that a class-body assignment's inferred type is the DECLARED
             // type of the attribute for the whole class body, and the
             // earlier `self.x = ...` value is what gets checked AGAINST it
-            // -- exactly the rule fix round 2's Finding E already
-            // established for a class-body ANNOTATION. So `self.x = True`
+            // -- exactly the rule already established for a class-body
+            // ANNOTATION. So `self.x = True`
             // above `x = 5` is clean (bool widens into the declared int),
             // `self.x = 5` above `x = 1.5` is clean (int widens into float),
             // and only a genuine mismatch such as `self.x = 5` above
             // `x = "s"` reports -- with mypy's own exact wording,
             // `expression has type "int", variable has type "str"`. The LINE
             // still differs from mypy's (we report at this class-body
-            // statement, mypy at the self.x assignment), the residual round
-            // 2 already recorded and this round does not close.
+            // statement, mypy at the self.x assignment), a recorded
+            // residual this does not close.
             const bool already_method =
                 classes_.method_type(current_class_qualified_name_, name->identifier()).has_value();
             const std::optional<int> existing_line =
@@ -593,8 +593,7 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
     // branch above): the FIRST assignment's inferred type is sticky, so this
     // is a compatibility check only, never a rebind. This is what makes
     // `def f(x: int) -> None: x = "s"` a reported incompatible assignment
-    // instead of a silent rebind that discards the parameter's annotation
-    // (Task 18 fix round 1, Finding 1's second symptom).
+    // instead of a silent rebind that discards the parameter's annotation.
     if (value_type.kind != TypeKind::Unknown && existing.binding->type.kind != TypeKind::Unknown &&
         !is_subtype(value_type, existing.binding->type, &classes_)) {
         report_incompatible_assignment(target, value_type, existing.binding->type, "variable");
@@ -653,7 +652,7 @@ void TypeChecker::assign_attribute(const ast::Attribute& target, const ast::Expr
     // some unrelated nested function that happens to have a parameter also
     // named "self".
     //
-    // Fix round 1, Finding 1: pre_collect_class_body now placeholder-declares
+    // pre_collect_class_body now placeholder-declares
     // (Unknown, at ITS OWN line) the first self.x = ... it finds scanning
     // EVERY method's body up front, so by the time this real, single-pass
     // walk reaches ANY self.x = ..., classes_.member_type already has_value()
@@ -719,7 +718,7 @@ void TypeChecker::assign_attribute(const ast::Attribute& target, const ast::Expr
     // assign_name's own "first assignment's type is sticky" rule -- no join,
     // no union, just a compatibility check against the already-declared type.
     //
-    // Fix round 2, Finding E: label corrected from "target" to "variable" --
+    // Label corrected from "target" to "variable" --
     // verified against mypy 1.18.1 (both a same-class conflicting self.x
     // assignment and an outside-the-class `c.x = ...` reassignment) that an
     // attribute target's own incompatible-assignment message always reads
@@ -749,7 +748,7 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
         // reference to a class still works: Phase 1 already declared every
         // top-level class before Phase 3 (this walk) ever started.
         //
-        // Fix round 1: a DIRECT class-body AnnAssign was already resolved
+        // A DIRECT class-body AnnAssign was already resolved
         // once by pre_collect_class_body's own eager pass -- reuse that
         // cached Type via bind_resolved_annotation (the scope-bind half of
         // bind_annotation) rather than invoking AnnotationResolver a second
@@ -773,7 +772,7 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
             // inside it (Python itself does not scope those), which is
             // exactly the set of positions mypy treats as class-body level.
             //
-            // Fix round 1, Finding 5: guarded by has_value() exactly like
+            // Guarded by has_value() exactly like
             // assign_attribute's own check -- without it, an EARLIER self.x
             // = ... assignment (in a method occurring ABOVE this annotation
             // in the class body) is silently re-typed with zero diagnostics,
@@ -794,10 +793,10 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
                 classes_.declare_member(current_class_qualified_name_, target_name->identifier(),
                                         info.type, node.span().start_line);
             } else if (already_member) {
-                // Fix round 3, Critical 1 (the second, undisclosed arm). The
-                // comparison here ran the WRONG WAY ROUND for exactly the
-                // same reason assign_to's plain-Assign sibling did, and it
-                // is still reachable: pre_collect_class_body's Finding-E
+                // The comparison here once ran the WRONG WAY ROUND for
+                // exactly the same reason assign_to's plain-Assign sibling
+                // did, and it is still reachable: pre_collect_class_body's
+                // annotation
                 // sub-pass only handles a DIRECT class-body AnnAssign, so
                 // one NESTED inside an `if` within the class body arrives
                 // here with an earlier `self.x = ...` already declared.
@@ -881,8 +880,8 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         // not). There is no self to exempt, so the "missing an annotation"
         // completeness check makes no sense here and is skipped -- but the
         // RETURN annotation, if present, is still a real expression naming a
-        // real (possibly bogus) type, and mypy still reports it. Task 18 fix
-        // round 1, Finding 5: this was skipped entirely before, so
+        // real (possibly bogus) type, and mypy still reports it. This was
+        // skipped entirely at one point, so
         // `def m() -> Bogus:` inside a class silently swallowed the bad
         // annotation. Resolved for its diagnostic side effect only -- the
         // result feeds nothing, since the function's OWN diagnostic above is
@@ -919,7 +918,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // annotation" -- self (a method's own first parameter) is exempt, per
     // mypy's disallow-untyped-defs. A top-level FunctionDef was already
     // resolved once by collect_signatures's Phase 2 (top_level_signatures_),
-    // and a METHOD (fix round 1) by pre_collect_class_body's own pre-pass
+    // and a METHOD by pre_collect_class_body's own pre-pass
     // (class_method_signatures_) -- reusing whichever cache has it is what
     // keeps AnnotationResolver from running -- and potentially
     // double-reporting a bad annotation -- a second time on the exact same
@@ -941,7 +940,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     }
 
     if (cached_signature != nullptr && !cached_signature->args.empty()) {
-        // Task 18 fix round 1, Finding 6: `args.end() - 1`/`args.back()` are
+        // `args.end() - 1`/`args.back()` are
         // safe TODAY -- Type::callable (both caching call sites' own caller)
         // always pushes the return, so a cached entry's args is never empty
         // -- but this cache is populated by a DIFFERENT function than the
@@ -958,7 +957,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
             if (parameter.annotation != nullptr) {
                 any_param_annotated = true;
             } else if (is_method && i == 0) {
-                // Fix round 1: a METHOD can now reach this cached branch too
+                // A METHOD can now reach this cached branch too
                 // (class_method_signatures_) -- self (index 0, unannotated)
                 // is exempt from "missing an annotation" here exactly like
                 // it already is in the uncached branch below. A top-level
@@ -1064,7 +1063,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         const Binding signature{signature_type, def_line, /*annotated=*/true};
         if (scopes_.bound_in_current_scope(node.name())) {
             const Resolution existing = scopes_.resolve(node.name());
-            // Fix round 2: routed through is_unfilled_placeholder for
+            // Routed through is_unfilled_placeholder for
             // consistency with every other same-line-rebind site, though the
             // order_exempt guard is unreachable here in practice -- an
             // order_exempt binding is only ever a PARAMETER, whose
@@ -1090,7 +1089,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // the brief -- a parameter's annotation is a declaration for the whole
     // body (`def f(x: int)` then `x = "s"` inside is a TypeError, checked
     // via assign_to/assign_name exactly like any other reassignment).
-    // order_exempt=true (Task 18 fix round 1, Finding 1, CRITICAL): a
+    // order_exempt=true: a
     // parameter is bound before its body runs, so it can NEVER genuinely be
     // used-before-definition inside that same body -- see Binding::
     // order_exempt's own comment for why the ordinary `>=` ordering check
@@ -1098,7 +1097,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // is_unfilled_placeholder needs this same flag to avoid mistaking a
     // same-line parameter for its own placeholder-fill case.
     FunctionScopeGuard guard(scopes_);
-    // Fix round 3, Critical 2: the frame every function-local `class`
+    // The frame every function-local `class`
     // statement in THIS body registers its bare-name alias into, torn down
     // (restoring any shadowed outer one) when this body's walk is done -- so
     // a local class's bare name resolves inside its defining function and
@@ -1113,9 +1112,8 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     ReturnContextGuard return_guard(current_return_type_, return_type);
     for (std::size_t i = 0; i < params.size(); ++i) {
         const ast::Parameter& parameter = params[i];
-        // Task 18 fix round 1, Finding 4: the bool `bind` returns MUST be
-        // checked, exactly as Finding 2 of the PRIOR fix round already
-        // established for collect_signatures's own def/def-collision bind
+        // The bool `bind` returns MUST be checked, exactly as it is for
+        // collect_signatures's own def/def-collision bind
         // call -- otherwise `def f(x: int, x: str) -> None` silently binds
         // `x` once (keeping only the FIRST parameter's type) instead of
         // reporting the duplicate. Verified against mypy 1.18.1: `Duplicate
@@ -1170,7 +1168,7 @@ void TypeChecker::visit(const ast::ClassDef& node) {
 
     std::string qualified_name;
     if (collided_top_level_.count(&node) != 0) {
-        // Fix round 1, Finding 7: this top-level ClassDef is a LOSING
+        // This top-level ClassDef is a LOSING
         // same-name collision scan_top_level_names already reported --
         // collect_classes' Phase 1 skipped its declare() call, so it has no
         // entry under its own bare name at all. Isolate it under a name
@@ -1182,11 +1180,11 @@ void TypeChecker::visit(const ast::ClassDef& node) {
         qualified_name = declare_isolated_class(
             node, "<shadowed-class>#" + std::to_string(node.span().start_line) + "#" + node.name());
     } else if (scopes_.current_kind() != ScopeKind::Module && scopes_.current_kind() != ScopeKind::Class) {
-        // Fix round 1, Finding 4: a ClassDef lexically inside a `def` (or any
+        // A ClassDef lexically inside a `def` (or any
         // other non-module, non-class scope) was never seen by
         // collect_classes' Phase-1 walk either, for the identical reason.
         //
-        // Fix round 2, Finding B: round 1's own fix declared a NON-colliding
+        // An earlier version declared a NON-colliding
         // local class under its own BARE name -- but `declare()` has no
         // collision detection of its own, so a SECOND, later-declared local
         // class of the identical name (in a DIFFERENT function, or a second
@@ -1208,7 +1206,7 @@ void TypeChecker::visit(const ast::ClassDef& node) {
         // Python identifier can ever contain) -- never the bare name, even
         // when nothing else currently uses it.
         //
-        // Fix round 3, Critical 2: round 2 stopped there, and that alone
+        // Stopping at that isolation alone, though,
         // made EVERY function-local class construction a FALSE NameError --
         // `def make(): class Local: ...; v = Local()` is mypy-clean
         // (verified against mypy 1.18.1) and reported `name 'Local' is not
@@ -1216,11 +1214,11 @@ void TypeChecker::visit(const ast::ClassDef& node) {
         // (ExpressionTyper::type_of_name_call's classes_.is_class(identifier)
         // lookup, expression_typer_calls.cpp) looks up the literal
         // source-level identifier and has no scope awareness of its own.
-        // Round 2 traded a NARROW false attr-defined for a BROAD false
+        // That traded a NARROW false attr-defined for a BROAD false
         // NameError -- strictly worse, and "a missed error beats a false
         // one" does not apply when the outcome is itself a false diagnostic.
         //
-        // Isolation of the ClassTable KEY is kept exactly as round 2 left it
+        // Isolation of the ClassTable KEY is therefore kept
         // (it is what closes the cross-function overwrite and the
         // module-level leak); what is added is a SCOPE-LIMITED ALIAS from
         // the class's BARE source-level name to that isolated key, installed
@@ -1261,7 +1259,7 @@ void TypeChecker::visit(const ast::ClassDef& node) {
     }
 
     ClassContextGuard guard(scopes_, current_class_qualified_name_, qualified_name);
-    // Fix round 1, Finding 1: declares every method signature and
+    // Declares every method signature and
     // placeholder-declares every attribute BEFORE any of this class's own
     // body statements are walked for real -- see pre_collect_class_body's
     // own comment for the full mechanism.
@@ -1273,7 +1271,7 @@ void TypeChecker::visit(const ast::ClassDef& node) {
 
 void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
                                          const std::string& qualified_name) {
-    // Fix round 2, Finding E: every direct class-body AnnAssign is resolved
+    // Every direct class-body AnnAssign is resolved
     // and declared in its OWN sub-pass, over the WHOLE body, strictly BEFORE
     // any method's self.x scan runs below -- verified against mypy 1.18.1:
     // a class-body annotation is the DECLARED type of that attribute for the
@@ -1296,7 +1294,7 @@ void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
                 AnnotationResolver resolver(classes_, sink_);
                 const Type type = resolver.resolve(ann_assign->annotation());
                 class_body_annotation_types_.emplace(ann_assign, type);
-                // Fix round 1, Finding 5: guarded exactly like assign_attribute's
+                // Guarded exactly like assign_attribute's
                 // own has_value() check -- a SECOND class-body AnnAssign
                 // under the same name (the only remaining way `already_member`
                 // can be true here, now that this sub-pass runs before any
@@ -1329,7 +1327,7 @@ void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
             collect_self_attribute_placeholders(qualified_name, function_def->body());
         } else if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
             if (const auto* target_name = dynamic_cast<const ast::Name*>(&assign->target())) {
-                // Fix round 1, Finding 3: a plain class-body Assign
+                // A plain class-body Assign
                 // placeholder-declares the SAME way self.x = ... does (real
                 // type filled in later, by assign_to's own is_new_definition
                 // check, when Phase 3 actually reaches this statement) --
@@ -1449,7 +1447,7 @@ void TypeChecker::visit(const ast::For& node) {
         // type_of_list_comp's identical tuple-target arm.
         report(*tuple_target, "NotImplementedError",
               "tuple targets in for loops are not supported");
-        // Fix round 1, Finding 8: bind each element to Unknown anyway, the
+        // Bind each element to Unknown anyway, the
         // same precedent assign_tuple's own arity-mismatch fallback sets --
         // otherwise the body is still walked (unlike a `pass`-only fixture, a
         // real body reading `a`/`b` here would see them wholly UNBOUND) and a
@@ -1475,14 +1473,14 @@ void TypeChecker::visit(const ast::For& node) {
         // the loop and a reassignment through a second loop is checked for
         // compatibility rather than silently rebound.
         //
-        // order_exempt=true (fix round 1, Finding 1, CRITICAL): a for target
+        // order_exempt=true: a for target
         // is bound before its OWN body ever runs, exactly like a parameter --
         // so a one-line suite (`for i in range(3): print(i)`) reading it
         // within that same body is never a genuine use-before-definition.
         // Without this, the body's ExprStmt sets statement_line_ to this same
         // line, and the ordinary `declared_line >= statement_line_` ordering
         // check (declared_line == line here too) misfires exactly like it did
-        // for a one-line def's own parameter before Task 18 fixed that case.
+        // for a one-line def's own parameter before that case was fixed.
         // A read BEFORE the loop is untouched by this: the name is not bound
         // at all yet, so it still correctly reports "is not defined".
         assign_name(*name_target, element, line, /*order_exempt=*/true);
@@ -1570,7 +1568,7 @@ bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body
             }
             continue;
         }
-        // Fix round 1, Finding 3: a nested For/While's own BODY is
+        // A nested For/While's own BODY is
         // deliberately not recursed into -- a break there can only ever
         // escape THAT loop, never this one. But its ORELSE is the opposite
         // case: a loop's `else` clause runs OUTSIDE the loop's own break
@@ -1643,7 +1641,7 @@ bool TypeChecker::is_bare_empty_container(const ast::Expr& value) {
         if (callee == nullptr) {
             return false;
         }
-        // Fix round 1, Finding 4: reuse builtin_call_table.h's exported
+        // Reuse builtin_call_table.h's exported
         // is_empty_display_builtin rather than a third hardcoded copy of the
         // five-name list -- expression_typer_calls.cpp already carries a
         // comment justifying its own local helper specifically "so the two

@@ -165,7 +165,7 @@ private:
     // resolved OUTSIDE a function that happens to declare its own
     // `class L` re-resolves, inside that function, to the LOCAL class --
     // and a member lookup on it then misses and reports a FALSE
-    // attr-defined error on mypy-clean code (fix round 4's one open
+    // attr-defined error on mypy-clean code (the one open
     // critical). The name-based representation cannot tell the two live
     // meanings of "L" apart, so the queries below CONTAIN the damage
     // instead: on a MISS through a scoped alias they retry against the
@@ -259,7 +259,7 @@ private:
     //  - constructor_type would take the shadowed class's __init__
     //    PARAMETERS: `class L: def __init__(self, a: int)` shadowed by a
     //    local `class L: pass` would make the mypy-clean `L()` a false
-    //    "too few arguments" -- exactly what this round exists to remove.
+    //    "too few arguments" -- exactly what the fallback exists to remove.
     //
     // Safety of the fallback for the four that DO use it: it only ever runs
     // where the lookup had ALREADY missed, and a miss on a Class receiver is

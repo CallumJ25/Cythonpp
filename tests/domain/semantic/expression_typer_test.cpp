@@ -423,7 +423,7 @@ TEST(ExpressionTyper, JoinsDictKeysAndValuesIndependently) {
 }
 
 // The dict-with-context error path (type_of_dict's has_context branch) had
-// NO test at all before this round -- unreachable from the whole suite.
+// NO test at all at one point -- unreachable from the whole suite.
 // Ground truth from real mypy 1.18.1: `x: dict[str,int] = {1: 2}` reports
 // 'Dict entry 0 has incompatible type "int": "int"; expected "str": "int"'
 // -- note the VALUE side ("int": "int") matches perfectly and is still
@@ -462,8 +462,7 @@ TEST(ExpressionTyper, ReportsADictEntryWithOnlyTheValueWrong) {
 }
 
 // Both halves wrong at once: still exactly ONE diagnostic for the entry, not
-// two (one per bad half) -- the specific decision Finding 2 calls out as
-// untested.
+// two (one per bad half) -- a decision that had no test of its own.
 TEST(ExpressionTyper, ReportsADictEntryWithBothHalvesWrongAsOneDiagnostic) {
     const Typed typed = type_expression(
         "{1: \"x\"}", {}, Type::dict_of(Type::str(), Type::int_()));
@@ -652,8 +651,8 @@ TEST(ExpressionTyper, ResolvesAnInheritedAttribute) {
 // must resolve through method_type too, or every ordinary method reference
 // would be a false attr-defined TypeError.
 //
-// THE self CONTRACT (a Fix Round 1 design reversal -- see the report):
-// verified against mypy 1.18.1, an INSTANCE receiver's `self` is dropped AT
+// THE self CONTRACT, verified against mypy 1.18.1: an INSTANCE receiver's
+// `self` is dropped AT
 // THE ATTRIBUTE ACCESS, not at a later call: `c: C = C()` then
 // `reveal_type(c.m)` is `def () -> int`. So `w.resize` below -- `w`'s type
 // is Widget, an instance, not the class object -- must already be BOUND
@@ -716,7 +715,7 @@ TEST(ExpressionTyper, ReportsAMissingAttributeOnAClassObjectReceiver) {
     EXPECT_EQ(error.message, "\"Widget\" has no attribute \"nope\"");
 }
 
-// Fix round 2: a LOCAL BINDING with the same name as a declared class must
+// A LOCAL BINDING with the same name as a declared class must
 // win over the class-object reading. `def f(Widget: int): return
 // Widget.bit_length()` is legal Python -- `Widget` is an int parameter, not
 // the class -- so the receiver must go down the ordinary VALUE path
@@ -876,7 +875,7 @@ TEST(ExpressionTyper, CallsAUserFunction) {
 }
 
 TEST(ExpressionTyper, ReportsCallArityBothWays) {
-    // Fix round 1, Finding 2: verified against real mypy 1.18.1 that a
+    // Verified against real mypy 1.18.1 that a
     // callee with no recoverable parameter names gets mypy's actual
     // name-free spelling, "Too few arguments for \"f\"" -- never an invented
     // count form. Type::callable carries no parameter names, so this is the
@@ -982,7 +981,7 @@ TEST(ExpressionTyper, BareContainerConstructorsFollowTheEmptyDisplayRule) {
     EXPECT_EQ(without.printed, "Unknown");
 }
 
-// Fix round 1, Finding 1 (CRITICAL): a nullopt from builtin_call_result for
+// A nullopt from builtin_call_result for
 // a SUPPORTED name means "this shape is not modelled", never "mypy rejects
 // this" -- so it must be NotImplementedError, not a false TypeError.
 // `list(range(3))` is mypy-clean and about as common as Python gets;

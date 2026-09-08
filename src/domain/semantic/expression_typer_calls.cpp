@@ -6,7 +6,7 @@
 // type_of_call_result, plus their one file-local helper -- a self-contained
 // 224-line block that references no other file-local helper in
 // expression_typer.cpp, not even apply(), which is what makes this a real
-// seam rather than an arbitrary cut. Split out in fix round 1 because
+// seam rather than an arbitrary cut. Split out because
 // expression_typer.cpp had grown to 732 lines and Task 16's ListComp arm
 // still had to land in it.
 #include "expression_typer.h"
@@ -33,7 +33,7 @@ namespace {
 // than duplicating is_empty_display_builtin's own name list, so the two call
 // sites cannot drift apart.
 //
-// Fix round 1, Finding 4: renamed from is_silent_when_argumentless(name,
+// Renamed from is_silent_when_argumentless(name,
 // has_arguments) -- a predicate named "argumentless" whose second parameter
 // was has_arguments, called with !arg_types.empty(), which read backwards at
 // the call site. Taking the count directly reads straight: zero arguments,
@@ -101,7 +101,7 @@ Type ExpressionTyper::type_of_call(const ast::Call& call, const Type& expected) 
         std::string label = "\"" + attribute->attribute() + "\"";
         if (const Type* receiver_type = types_.find(&attribute->value())) {
             if (receiver_type->kind == TypeKind::Class) {
-                // Fix round 2 (Task 19 fix round 2, Finding C): stripped the
+                // Stripped the
                 // same way type_name's own Class case is -- see that
                 // function's comment -- so a call-argument error on an
                 // isolated class's method never quotes TypeChecker's
@@ -171,7 +171,7 @@ Type ExpressionTyper::type_of_name_call(const ast::Name& callee, const ast::Call
             // name to put in it.
             return Type::unknown();
         }
-        // Fix round 1, Finding 1 (CRITICAL): a nullopt from
+        // A nullopt from
         // builtin_call_result for a SUPPORTED name cannot distinguish "mypy
         // would reject this" from "this shape is simply not modelled yet".
         // `list(range(3))`, `round(x, 2)`, `int("ff", 16)`,
@@ -228,7 +228,7 @@ Type ExpressionTyper::type_of_name_call(const ast::Name& callee, const ast::Call
 Type ExpressionTyper::type_of_positional_call(const Type& callable, const ast::Call& call,
                                               const std::string& label) {
     const std::vector<ast::ExprPtr>& arg_exprs = call.args();
-    // Fix round 1, Finding 3: callable.args is [param..., return], return
+    // callable.args is [param..., return], return
     // LAST (Type::callable's convention), so in practice it is never empty --
     // Type::callable always pushes the return, and constructor_type/
     // bind_self's self-drop only ever removes ONE element from an args list

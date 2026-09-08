@@ -348,7 +348,7 @@ TEST(AnnotationResolver, SubscriptingAUserClassIsStillAnError) {
     EXPECT_EQ(error.message, "'Widget' is not subscriptable");
 }
 
-// Finding 5 (fix round 1): ValueError is a seeded builtin class (Task 7) but,
+// ValueError is a seeded builtin class (Task 7) but,
 // unlike zip, is NOT one of the seven names typeshed marks generic --
 // `x: ValueError[int]` is a genuine mypy type-arg error, not merely
 // unimplemented. The old is_seeded_builtin_class matched the WHOLE 97-entry
@@ -381,7 +381,7 @@ TEST(AnnotationResolver, ResolvesAnAliasedBuiltinExceptionToItsCanonicalName) {
     EXPECT_EQ(resolved_name("x: IOError = y\n", classes), "OSError");
 }
 
-// Fix-round-1 regression test (Finding 1): `class IOError: pass` then
+// Regression test: `class IOError: pass` then
 // `x: IOError = IOError()` is mypy --strict clean, ordinary Python shadowing.
 // The OLD annotation_resolver.cpp had its own file-local alias table that
 // mapped IOError -> OSError UNCONDITIONALLY, disagreeing with

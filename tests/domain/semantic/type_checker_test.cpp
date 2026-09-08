@@ -102,7 +102,7 @@ TEST(TypeChecker, ReAnnotatingIsARedefinitionAndReportsOnce) {
     EXPECT_EQ(error.message, "name \"x\" already defined on line 1");
 }
 
-// Fix round 1, Finding 3: pin the MESSAGE, not just the code. The entire
+// Pin the MESSAGE, not just the code. The entire
 // point of scan_top_level_names's true-source-order pre-pass is that the
 // reported line is the genuine FIRST occurrence (line 1, the def) rather
 // than whichever phase happens to run first (Phase 1 always declares
@@ -129,7 +129,7 @@ TEST(TypeChecker, AClassAndADefSharingANameIsARedefinitionInReverseOrder) {
     EXPECT_EQ(error.message, "name \"n\" already defined on line 1");
 }
 
-// Fix round 1, Finding 2: an AnnAssign followed by a colliding `def` was
+// An AnnAssign followed by a colliding `def` was
 // silently missed -- collect_signatures called ScopeStack::bind for the def
 // and discarded the returned bool, so no diagnostic fired AND the def's
 // signature binding was silently dropped (a later call would have been
@@ -186,7 +186,7 @@ TEST(TypeChecker, ABareEmptyTupleIsClean) {
     expect_clean("x = ()\n");
 }
 
-// Fix round 1, Finding 5: ReportsABareEmptyContainer above only pins `[]`.
+// ReportsABareEmptyContainer above only pins `[]`.
 // `{}` and the five zero-argument constructor calls are implemented by the
 // SAME is_bare_empty_container check but had no coverage of their own.
 TEST(TypeChecker, ReportsABareEmptyDictDisplay) {
@@ -248,8 +248,7 @@ TEST(TypeChecker, AnAnnotationMayNameAClassDeclaredLater) {
     expect_clean("class A:\n    x: B\nclass B:\n    pass\n");
 }
 
-// Fix round 1 (of the ORIGINAL task, Task 18-era numbering), Finding 1: this
-// test was VACUOUS before that fix round -- back then `return g` walked to
+// This test was VACUOUS at one point -- back then `return g` walked to
 // RecursiveVisitor::visit(Return), which visits the Name `g` via accept(),
 // and TypeChecker's Name arm was RecursiveVisitor's own no-op default (Name
 // carries nothing to check), so `g` was never typed at all and the test
@@ -261,7 +260,7 @@ TEST(TypeChecker, AnAnnotationMayNameAClassDeclaredLater) {
 // in_own_scope == true and falsely reported "used before definition" against
 // `g`'s later module-level binding.
 //
-// Task 20 fix round 1 update: `return g` is no longer the vacuous half this
+// `return g` is no longer the vacuous half this
 // comment used to describe -- Return is now a real, overridden arm, so `g`
 // in `return g` is typed through ExpressionTyper exactly like `print(g)`
 // already was. Both forms verified mypy-clean.
@@ -270,9 +269,9 @@ TEST(TypeChecker, AFunctionBodySeesGlobalsDefinedBelowIt) {
     expect_clean("def f() -> None:\n    print(x)\nx = 5\n");
 }
 
-// Fix round 1, Finding 6: the in_own_scope gate itself (ExpressionTyper's
+// The in_own_scope gate itself (ExpressionTyper's
 // Name arm) and statement_line_'s INT_MAX default had zero DIRECT coverage
-// before Finding 1 added a Function scope to check against -- every existing
+// until this test added a Function scope to check against -- every existing
 // ordering test ran at module scope, where the reader's own scope IS the
 // binding's scope, so in_own_scope was always true and the exemption branch
 // never ran. This test puts the exact same construct in both scope shapes:
@@ -472,7 +471,7 @@ TEST(TypeChecker, ASuppliedArgumentForADefaultedParameterIsStillTypeChecked) {
 // just walked to the Name "f", whose own visit() is RecursiveVisitor's no-op
 // default, so nothing was ever typed through ExpressionTyper and the test
 // would have passed regardless of whether recursion resolution worked at
-// all. This is the exact same class of defect Task 17's fix round 1 found
+// all. This is the exact same class of defect already found
 // and fixed for `return g` (rewritten to `print(g)`). Rewritten the same way
 // here, inside the `if`, so the call genuinely reaches ExpressionTyper via
 // the TypeChecker-overridden ExprStmt arm -- left as-is now that Return IS
@@ -540,11 +539,7 @@ TEST(TypeChecker, AFunctionLocalUseBeforeDefinitionIsAViolation) {
     EXPECT_EQ(error.message, "name 'x' is used before definition");
 }
 
-// ---------------------------------------------------------------------------
-// Task 18, fix round 1.
-// ---------------------------------------------------------------------------
-
-// Finding 1 (CRITICAL). Reproduced against the built binary before this fix:
+// Reproduced against the built binary before this fix:
 // `def f(x: int) -> None: print(x)` reported a false "used before
 // definition" on `x`, because a one-line suite's body statement sits on the
 // SAME line as the `def` -- exactly the line a parameter is bound at -- so
@@ -555,7 +550,7 @@ TEST(TypeChecker, AOneLineDefReadingItsOwnParameterIsClean) {
     expect_clean("def f(x: int) -> None: print(x)\n");
 }
 
-// Finding 1, second symptom: the SAME root cause, in the opposite direction.
+// The SAME root cause, in the opposite direction.
 // `assign_name` mistook a one-line def's parameter (declared_line == the
 // body statement's own line) for pre_bind_function_body's "still-unfilled
 // placeholder" and silently REBOUND over it, discarding the parameter's
@@ -573,7 +568,7 @@ TEST(TypeChecker, AOneLineDefAssigningTheWrongTypeToItsParameterIsAnError) {
               "variable has type \"int\")");
 }
 
-// Finding 2 (IMPORTANT). Pins top_level_signatures_'s entire reason to
+// Pins top_level_signatures_'s entire reason to
 // exist: without the cache, visit(FunctionDef) would call AnnotationResolver
 // a SECOND time on the same bad annotation collect_signatures's Phase 2
 // already resolved once, double-reporting it. Deleting the cache (and
@@ -585,7 +580,7 @@ TEST(TypeChecker, ATopLevelDefsBadAnnotationIsReportedExactlyOnce) {
     EXPECT_EQ(only_error(checked).code, "NameError");
 }
 
-// Finding 3 (IMPORTANT). ANestedDefIsNotHoisted only pins the NEGATIVE case
+// ANestedDefIsNotHoisted only pins the NEGATIVE case
 // (a nested def is not visible before its own line). Nothing previously
 // pinned that a nested def defined EARLIER is actually filled in with its
 // REAL signature -- AClosureMayReadALocalAssignedAfterItsOwnDef's own
@@ -607,7 +602,7 @@ TEST(TypeChecker, ANestedDefDefinedEarlierIsCallableWithItsRealSignature) {
     EXPECT_EQ(error.message, "too many arguments for \"inner\"");
 }
 
-// Finding 4 (Minor). collect_signatures already checked ScopeStack::bind's
+// Collect_signatures already checked ScopeStack::bind's
 // return value for a top-level def/def collision (prior fix round); the
 // parameter-binding loop below it did not, so `def f(x: int, x: str) ->
 // None` silently kept only the FIRST parameter's binding instead of
@@ -621,7 +616,7 @@ TEST(TypeChecker, ADuplicateParameterNameIsReported) {
     EXPECT_EQ(error.message, "duplicate argument \"x\" in function definition");
 }
 
-// Finding 5 (Minor). The zero-parameter-method path reported its own
+// The zero-parameter-method path reported its own
 // "method must have at least one argument" error and returned WITHOUT ever
 // resolving the return annotation, so a bad one went unreported alongside
 // it. Both are real, independent errors on this input; asserting the
@@ -685,14 +680,14 @@ TEST(TypeChecker, TheFirstSelfAssignmentDeclaresTheAttributeType) {
 }
 
 // ---------------------------------------------------------------------------
-// Task 19 fix round 1: forward references through self (Finding 1, CRITICAL),
-// a plain class-body Assign (Finding 3), a function-local class (Finding 4),
+// Forward references through self,
+// a plain class-body Assign, a function-local class,
 // a class-body annotation conflicting with an earlier self assignment
-// (Finding 5), and a losing class redefinition's own body no longer
-// corrupting the winner's constructor (Finding 7).
+//, and a losing class redefinition's own body no longer
+// corrupting the winner's constructor.
 // ---------------------------------------------------------------------------
 
-// Fix round 1, Finding 1 (CRITICAL, method half). Reproduced against the
+// Reproduced against the
 // built binary before this fix: `self.b()` called from a method defined
 // ABOVE `b` reported a false "C has no attribute b" -- one of the single
 // most common Python shapes there is (e.g. __init__ calling a helper defined
@@ -709,7 +704,7 @@ TEST(TypeChecker, AMethodMayCallAnotherMethodDefinedBelowIt) {
         "        pass\n");
 }
 
-// Fix round 1, Finding 1 (CRITICAL, attribute half): a method reading
+// A method reading
 // self.x where the attribute is first ASSIGNED by a method occurring BELOW
 // it in the class body. pre_collect_class_body's own recursive scan over
 // every method's body (collect_self_attribute_placeholders) placeholder-
@@ -733,7 +728,7 @@ TEST(TypeChecker, AMethodMayReadAClassBodyAttributeDeclaredBelowIt) {
         "    x: int\n");
 }
 
-// Fix round 1, Finding 3 (IMPORTANT). Reproduced against the built binary
+// Reproduced against the built binary
 // before this fix: `class D: x = 5` then `d.x` reported a false "D has no
 // attribute x" -- only the AnnAssign path ever called declare_member; a bare
 // class-body constant (mypy-clean) did not. Handled in assign_to's own
@@ -741,7 +736,7 @@ TEST(TypeChecker, AMethodMayReadAClassBodyAttributeDeclaredBelowIt) {
 // the FIRST assignment's, matching every other "first assignment is sticky"
 // rule in this file.
 //
-// Fix round 2, Finding D: the positive half ALONE is VACUOUS -- deleting the
+// The positive half ALONE is VACUOUS -- deleting the
 // declare_member call this test is meant to pin still leaves it passing,
 // because pre_collect_class_body's own pre-pass placeholder-declares "x" as
 // Unknown regardless, type_of_attribute returns that Unknown for `d.x`, and
@@ -760,14 +755,14 @@ TEST(TypeChecker, CollectsAPlainClassBodyAssignment) {
               "variable has type \"str\")");
 }
 
-// Fix round 2, Finding A. Round 1's own Finding 3 fix (the plain class-body
-// Assign path, in assign_to) had NO has_value()/line guard at all, unlike
-// its AnnAssign sibling (Finding 5) and assign_attribute's own self.x path
+// The plain class-body
+// Assign path (in assign_to) had NO has_value()/line guard at all, unlike
+// its AnnAssign sibling and assign_attribute's own self.x path
 // -- so a plain class-body Assign appearing BELOW a method that already
 // assigned self.x silently RE-TYPED the attribute with ZERO diagnostics.
 // Reproduced against the built binary before this fix.
 //
-// Fix round 3, Critical 1: round 2's comparison here ran the WRONG WAY
+// The comparison here once ran the WRONG WAY
 // ROUND, which is why this test originally asserted the OPPOSITE polarity
 // from mypy's. Verified against real mypy 1.18.1 on this exact program:
 //   c3.py:3: error: Incompatible types in assignment (expression has type
@@ -776,7 +771,7 @@ TEST(TypeChecker, CollectsAPlainClassBodyAssignment) {
 // type, and the earlier self.x's value is what gets checked against it, so
 // the message below is now mypy's own wording verbatim. Only the LINE still
 // differs (mypy reports at the self.x assignment, line 3; we report at the
-// class-body statement, line 4), the residual round 2 recorded and round 3
+// class-body statement, line 4), the residual recorded earlier and now
 // does not close.
 TEST(TypeChecker, APlainClassBodyAssignmentConflictingWithAnEarlierSelfAssignmentIsReported) {
     const Checked checked = check_module(
@@ -792,12 +787,12 @@ TEST(TypeChecker, APlainClassBodyAssignmentConflictingWithAnEarlierSelfAssignmen
               "variable has type \"str\")");
 }
 
-// Fix round 3, Critical 1 (the false-positive half, and the whole reason the
-// direction above had to be swapped). Both of these are mypy-clean --
+// The false-positive half, and the whole reason the
+// direction above had to be swapped. Both of these are mypy-clean --
 // verified against real mypy 1.18.1, including reveal_type of the resulting
 // attribute, which is the CLASS-BODY assignment's type in both cases
 // ("builtins.int" for the first, "builtins.float" for the second) -- and
-// round 2's backwards comparison made both a false TypeError, the hard
+// the backwards comparison made both a false TypeError, the hard
 // invariant this project exists to protect.
 TEST(TypeChecker, AClassBodyAssignmentWideningAnEarlierSelfAssignmentIsClean) {
     // bool widens into the declared int.
@@ -814,8 +809,8 @@ TEST(TypeChecker, AClassBodyAssignmentWideningAnEarlierSelfAssignmentIsClean) {
         "    x = 1.5\n");
 }
 
-// Fix round 3, Critical 1 (the SECOND arm, in visit(AnnAssign), which round
-// 2's own report did not disclose). pre_collect_class_body's Finding-E
+// The SECOND arm of the same defect, in visit(AnnAssign).
+// pre_collect_class_body's annotation
 // sub-pass only handles a DIRECT class-body AnnAssign, so one NESTED inside
 // an `if` within the class body still reaches visit(AnnAssign)'s own
 // already_member comparison -- which ran the same wrong way round. Verified
@@ -832,31 +827,31 @@ TEST(TypeChecker, AClassBodyAnnotationNestedInAnIfWideningAnEarlierSelfAssignmen
         "        x: int\n");
 }
 
-// Fix round 1, Finding 4. A ClassDef lexically inside a `def` is never seen
+// A ClassDef lexically inside a `def` is never seen
 // by collect_classes' Phase-1 walk (it only recurses into module- and
 // class-level bodies), so it had no ClassTable entry at all by the time
 // Phase 3 reached it -- every self.attr inside was a false attr-defined
 // TypeError. It is now declared, under an isolated qualified name, exactly
 // when Phase 3's walk reaches it.
 //
-// Fix round 2, Finding B: round 1's own fix declared a NON-colliding local
+// An earlier version declared a NON-colliding local
 // class under its own BARE name, which had no collision detection of its
 // own, so a SECOND same-named local class declared in a DIFFERENT function
-// silently overwrote the first one's ClassTable entry. Round 2 fixed that by
+// silently overwrote the first one's ClassTable entry. That was fixed by
 // ALWAYS isolating under a synthetic name -- and, having done so, rewrote
 // this test to assert a NameError on `Local()`, since bare-name constructor
 // dispatch had been left scope-blind.
 //
-// Fix round 3, Critical 2: that NameError is a FALSE positive. This exact
+// That NameError is a FALSE positive. This exact
 // program is clean under real mypy 1.18.1 (`mypy --strict`: "Success: no
-// issues found in 1 source file"), so round 2 traded a narrow false
+// issues found in 1 source file"), so that traded a narrow false
 // attr-defined for a BROAD false NameError on EVERY function-local class
 // construction -- strictly worse, and not covered by "a missed error beats a
 // false one", since the outcome was itself a false diagnostic. The isolated
 // ClassTable key stays (it is what closes the overwrite and the leak); what
 // is added is a SCOPE-LIMITED alias from the bare name to it, live for
 // exactly the enclosing function's body. So the expect_clean this test
-// carried before round 2 is restored, and it is once again the only
+// carried before that isolation is restored, and it is once again the only
 // assertion that pins bare-name construction of a local class working at
 // all.
 TEST(TypeChecker, AFunctionLocalClassIsConstructibleByItsBareNameInsideItsOwnFunction) {
@@ -869,16 +864,16 @@ TEST(TypeChecker, AFunctionLocalClassIsConstructibleByItsBareNameInsideItsOwnFun
         "    y: int = v.x\n");
 }
 
-// Fix round 2, Finding B (the reviewer's own primary repro). Two DIFFERENT
+// Two DIFFERENT
 // functions each declare their own local class under the identical bare
-// name "L". Before round 2's fix, both computed the same bare "L" qualified
+// name "L". Before the isolation fix, both computed the same bare "L" qualified
 // name (declare() has no collision detection of its own), so the SECOND
 // function's own `L()` call resolved to the FIRST function's class -- not
 // merely "no longer a constructor call", but the WRONG one -- and a member
 // access the first class genuinely lacks (`w.b`) was a FALSE attr-defined
 // TypeError.
 //
-// Fix round 3, Critical 2: round 2 closed that by making `L()` unresolvable
+// That was closed by making `L()` unresolvable
 // altogether, and this test was written to assert the resulting NameError --
 // which is itself a false positive (`mypy --strict` on this exact program:
 // "Success: no issues found in 1 source file"). It now asserts what mypy
@@ -900,7 +895,7 @@ TEST(TypeChecker, AFunctionLocalClassesDoNotLeakOrOverwriteEachOther) {
         "    y: int = w.b\n");
 }
 
-// Fix round 3, Critical 2, the other half of the same coin: the alias is
+// The alias is
 // SCOPE-LIMITED, so a local class is invisible from a SIBLING function that
 // declares no class of its own under that name. Verified against real mypy
 // 1.18.1, which agrees exactly: `d.py:5: error: Name "L" is not defined
@@ -919,7 +914,7 @@ TEST(TypeChecker, AFunctionLocalClassIsNotVisibleFromASiblingFunction) {
     EXPECT_EQ(error.message, "name 'L' is not defined");
 }
 
-// Fix round 3, Critical 2: shadowing composes by stack discipline. An inner
+// Shadowing composes by stack discipline. An inner
 // function's own same-named local class shadows the outer one's for exactly
 // its own body -- so `w.b` resolves against INNER's L -- and the outer one
 // is restored, not deleted, once inner's body walk is done, so `v.a` after
@@ -943,7 +938,7 @@ TEST(TypeChecker, ANestedFunctionsLocalClassShadowsTheEnclosingOnesOnlyForItsOwn
         "    z: int = v.a\n");
 }
 
-// Fix round 3, Critical 2: a function-local class shadows a MODULE-LEVEL
+// A function-local class shadows a MODULE-LEVEL
 // class of the same name for the duration of that function, which is what
 // makes the scoped alias outrank a live ClassTable entry under the identical
 // spelling (see ClassTable::canonical_name's own precedence comment).
@@ -963,7 +958,7 @@ TEST(TypeChecker, AFunctionLocalClassShadowsASameNamedModuleLevelClass) {
         "    y: int = v.b\n");
 }
 
-// Fix round 4, THE open critical. Round 3's two shadowing tests each used
+// The two shadowing tests below each used
 // only ONE of the two same-named classes inside the function -- the local one
 // (above) or the module one (below) -- so neither covered the shape where
 // BOTH are live at the same point: a value whose type was resolved OUTSIDE
@@ -1011,7 +1006,7 @@ TEST(TypeChecker, AParameterAnnotatedWithAModuleLevelClassSurvivesAShadowingLoca
 // fallback. Had constructor_type taken it, the shadowed `L.__init__`'s
 // parameter list would have become the local `L`'s, making this mypy-clean
 // program a false "too few arguments" -- a NEW false positive, i.e. exactly
-// what this round exists to remove. The bare `L()` inside `f` must keep
+// what the scoped alias exists to remove. The bare `L()` inside `f` must keep
 // constructing the LOCAL class, which takes no arguments.
 TEST(TypeChecker, AShadowedClassesConstructorParametersDoNotReachTheLocalClass) {
     expect_clean(
@@ -1025,14 +1020,14 @@ TEST(TypeChecker, AShadowedClassesConstructorParametersDoNotReachTheLocalClass) 
         "    print(v)\n");
 }
 
-// Fix round 2, Finding B (the reviewer's own second repro): a function-local
+// A function-local
 // class's bare name must NOT leak into ClassTable as a permanently live
 // entry for the REST of the module's Phase-3 walk. Before that fix,
 // `class L` inside `f` declared under the bare name "L" the first time
 // Phase 3 reached it, so a module-level `L()` occurring TEXTUALLY AFTER `f`
 // silently resolved as a constructor call instead of reporting NameError --
-// an order-dependent regression from the pre-round-1 (correct) behaviour.
-// Round 3's scoped alias keeps this correct for the same reason: the alias
+// an order-dependent regression from the original (correct) behaviour.
+// The scoped alias keeps this correct for the same reason: the alias
 // is removed when `f`'s own body walk ends, so nothing at module level can
 // see it. Real mypy 1.18.1 agrees this one IS an error:
 // `c6.py:4: error: Name "L" is not defined  [name-defined]`.
@@ -1048,7 +1043,7 @@ TEST(TypeChecker, AFunctionLocalClassBareNameDoesNotLeakToLaterModuleLevelCode) 
     EXPECT_EQ(error.message, "name 'L' is not defined");
 }
 
-// Fix round 1, Finding 4 (the cross-class-corruption half). Before this fix,
+// Before this fix,
 // a function-local class sharing a bare name with a real top-level class
 // would have declared ITS OWN members onto the TOP-LEVEL class's ClassTable
 // entry (both computed the same bare "C" qualified name), since ScopeStack
@@ -1071,13 +1066,13 @@ TEST(TypeChecker, AFunctionLocalClassDoesNotCorruptASameNamedTopLevelClass) {
     EXPECT_EQ(only_error(checked).code, "TypeError");
 }
 
-// Fix round 1, Finding 5 (Minor) / Fix round 2, Finding E. An EARLIER
+// An EARLIER
 // self.x = ... assignment (in a method occurring ABOVE this class-body
 // annotation) declares "x" as int; declare_member has no collision
 // detection of its own, so the conflicting `x: str` below it must not
 // silently re-type the attribute with zero diagnostics.
 //
-// Fix round 2, Finding E: round 1's own fix reported this at the
+// An earlier version of this check reported it at the
 // ANNOTATION's line (4), treating the annotation as "expression" and the
 // self-assignment's inferred type as "variable" -- verified against real
 // mypy 1.18.1 (`mypy --strict` on this exact program) to be BACKWARDS on
@@ -1088,7 +1083,7 @@ TEST(TypeChecker, AFunctionLocalClassDoesNotCorruptASameNamedTopLevelClass) {
 // for the WHOLE class body regardless of where it appears textually, and
 // reports the conflict at the ASSIGNMENT's own line (3, self.x = 5) with the
 // assignment's inferred type as "expression" and the annotation's declared
-// type as "variable" -- exactly the reverse of round 1's own polarity and
+// type as "variable" -- exactly the reverse of the original polarity and
 // line. pre_collect_class_body now resolves and declares every direct
 // class-body AnnAssign in its own sub-pass BEFORE any method's self.x scan,
 // so this ordering-independent precedence holds regardless of which
@@ -1109,7 +1104,7 @@ TEST(TypeChecker, AClassBodyAnnotationConflictingWithAnEarlierSelfAssignmentIsRe
               "variable has type \"str\")");
 }
 
-// Fix round 2, Finding E (the reverse ordering, verified mypy-identical):
+//
 // `mypy --strict` on this exact program (annotation ABOVE the conflicting
 // self.x) reports:
 //   case3.py:5: error: Incompatible types in assignment (expression has type
@@ -1132,7 +1127,7 @@ TEST(TypeChecker, AClassBodyAnnotationAboveAConflictingSelfAssignmentIsReported)
               "variable has type \"str\")");
 }
 
-// Fix round 1, Finding 7: a LOSING top-level class redefinition's own body
+// A LOSING top-level class redefinition's own body
 // is still checked (matching how a colliding top-level FunctionDef's body is
 // still checked), but must no longer write onto the WINNING same-named
 // class's ClassTable entry -- specifically, the loser's own __init__ must
@@ -1326,7 +1321,7 @@ TEST(TypeChecker, AClassBodyAnnotationDoesNotLeakIntoModuleScope) {
     expect_clean("class A:\n    x: int\nx: str = \"s\"\n");
 }
 
-// Fix round 1, Finding 2 (CRITICAL, this test rewritten): the ORIGINAL
+// The ORIGINAL
 // version of this test (named ALosingClassRedefinitionDoesNotClobberThe
 // WinningOnesMembers) was VACUOUS -- it passed identically with or without
 // Task 19's own fix. Phase 3 runs entirely AFTER Phase 1 declares every
@@ -1357,7 +1352,7 @@ TEST(TypeChecker, ALosingClassRedefinitionDoesNotClobberTheWinningOnesBases) {
     EXPECT_EQ(error.message, "name \"C\" already defined on line 3");
 }
 
-// Task 18 fix round 2 (the fourth call site the round-1 review missed).
+//
 // bind_annotation handles a function-local AnnAssign target (visit(AnnAssign)
 // routes any non-module-level Name target here) and used to compare
 // `existing.binding->declared_line == line` directly, with no order_exempt
@@ -1419,7 +1414,7 @@ TEST(TypeChecker, TheForTargetSurvivesTheLoop) {
     expect_clean("for i in range(3):\n    pass\nx: int = i\n");
 }
 
-// Fix round 1, Finding 1, CRITICAL: a one-line `for` suite reading its own
+// A one-line `for` suite reading its own
 // target was a false NameError before this fix -- the body's ExprStmt sets
 // statement_line_ to the SAME line the for-loop bound `i` at (there is no
 // separate body line to be strictly greater, exactly the one-line-def shape
@@ -1427,7 +1422,7 @@ TEST(TypeChecker, TheForTargetSurvivesTheLoop) {
 // statement_line_` ordering check misfired as "name 'i' is used before
 // definition" on mypy-clean code. Verified against mypy 1.18.1: --strict
 // clean. Also verified directly against the compiled binary (see the fix
-// round 1 report) with the same fixture.
+// earlier) with the same fixture.
 TEST(TypeChecker, AOneLineForSuiteReadingItsOwnTargetIsClean) {
     expect_clean("for i in range(3): print(i)\n");
 }
@@ -1441,7 +1436,7 @@ TEST(TypeChecker, AMultiLineForSuiteReadingItsOwnTargetIsClean) {
     expect_clean("for i in range(3):\n    print(i)\n");
 }
 
-// The other half of Finding 1: a read BEFORE the loop is untouched by the
+// The other half of the same rule: a read BEFORE the loop is untouched by the
 // order_exempt fix, because `i` is not bound AT ALL yet at that point --
 // neither pre-bind pass covers a For target, so there is no placeholder for
 // an early read to find, unlike an ordinary module-level assignment (compare
@@ -1524,7 +1519,7 @@ TEST(TypeChecker, ReportsATupleForTargetAsUnsupported) {
     EXPECT_EQ(error.message, "tuple targets in for loops are not supported");
 }
 
-// Fix round 1, Finding 8: without binding the tuple target's elements to
+// Without binding the tuple target's elements to
 // Unknown, a REAL use inside the body (unlike every other tuple-for-target
 // fixture in this file, which is pass-only) would cascade its own NameError
 // on top of the NotImplementedError above -- Unknown is absorbing, so
@@ -1627,7 +1622,7 @@ TEST(TypeChecker, ReturningANoneValuedExpressionFromANoneFunctionIsClean) {
                  "    return g()\n");
 }
 
-// Fix round 1, Finding 5: pins the full message text -- the one message this
+// Pins the full message text -- the one message this
 // task invented -- rather than only its code, matching every other new
 // message in this file.
 TEST(TypeChecker, ReportsAnIncompatibleReturnValue) {
@@ -1638,7 +1633,7 @@ TEST(TypeChecker, ReportsAnIncompatibleReturnValue) {
     EXPECT_EQ(error.message, "incompatible return value type (got \"str\", expected \"int\")");
 }
 
-// Fix round 1, Finding 2: the ORIGINAL fixture here (`def f() -> list[int]:
+// The ORIGINAL fixture here (`def f() -> list[int]:
 // return []`) was VACUOUS -- it passes with or without the context
 // propagation this test is supposed to pin, since an empty display with no
 // context takes the no-context path and returns Unknown, which
@@ -1676,7 +1671,7 @@ TEST(TypeChecker, ABreakInANestedLoopDoesNotEscapeTheOuterWhileTrue) {
         "        return 1\n");
 }
 
-// Fix round 1, Finding 3: the OPPOSITE case from the test above -- a break in
+// The OPPOSITE case from the test above -- a break in
 // a nested loop's own ORELSE (not its body) targets the ENCLOSING loop, since
 // a loop's `else` clause runs OUTSIDE that loop's own break scope (which is
 // exactly why a top-level `for x in []: pass` / `else: break` is a plain
@@ -1714,20 +1709,16 @@ TEST(TypeChecker, ANestedDefsReturnTypeDoesNotLeakToTheEnclosingFunction) {
 }
 
 // ---------------------------------------------------------------------------
-// Task 19 fix round 2: an asymmetric guard reintroducing round 1's own
-// Finding 5 defect for the plain-Assign sibling (Finding A), a function-local
-// class's bare name leaking globally and shadowing across sibling functions
-// (Finding B), TypeChecker's internal synthetic-isolation name leaking into a
-// user-facing diagnostic (Finding C), a vacuous test (Finding D), and a
-// class-body-annotation-vs-self.x conflict's line/polarity corrected against
-// real mypy output (Finding E). Findings A, B and D/E each have their own
-// tests placed next to the round 1 test they amend, above; this section holds
-// only Finding C, which has no round 1 predecessor to sit next to.
+// A leak of TypeChecker's internal synthetic-isolation name into a
+// user-facing diagnostic. Every other defect of this family has its test
+// placed next to the one it amends, above; this one has no predecessor to
+// sit next to, so it lives here.
 // ---------------------------------------------------------------------------
 
-// Fix round 2, Finding C. `type.name`/`ClassTable`'s own qualified name for
-// an ISOLATED class (here, a LOSING top-level redefinition -- Finding 7's
-// own mechanism) embeds TypeChecker's internal "<tag>#<line>#" isolation
+// `type.name`/`ClassTable`'s own qualified name for
+// an ISOLATED class (here, a LOSING top-level redefinition, which is one of
+// the two isolation mechanisms) embeds TypeChecker's internal
+// "<tag>#<line>#" isolation
 // prefix. Before this fix, that prefix leaked VERBATIM into any diagnostic
 // naming the class -- reachable via attr-defined, assignment, arg-type,
 // return-type and operator messages, i.e. every path through type_name PLUS
@@ -1735,7 +1726,7 @@ TEST(TypeChecker, ANestedDefsReturnTypeDoesNotLeakToTheEnclosingFunction) {
 // expression_typer_calls.cpp -- not only when `self` is the subject. This
 // asserts the MESSAGE, not merely the diagnostic code (a code-only assertion
 // would pass identically whether or not the leak were fixed): the loser's
-// own body is still checked (Finding 7), so a genuine error INSIDE it (here,
+// own body is still checked, so a genuine error INSIDE it (here,
 // attr-defined on a name the loser itself never declares) must name the
 // class as "C" -- exactly as the user wrote it -- never the internal
 // "<shadowed-class>#4#C" ClassTable key.

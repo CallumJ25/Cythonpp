@@ -93,7 +93,7 @@ std::string type_name(const Type& type) {
     case TypeKind::Callable:
         return callable_name(type.args);
     case TypeKind::Class:
-        // Fix round 2, Finding C: strip TypeChecker's own internal isolation
+        // Strip TypeChecker's own internal isolation
         // prefix (see strip_synthetic_class_prefix's own comment) before
         // display -- an isolated class's `type.name` is a ClassTable KEY,
         // not something the user ever wrote.

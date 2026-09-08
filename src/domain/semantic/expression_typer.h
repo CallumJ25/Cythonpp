@@ -293,7 +293,7 @@ private:
     // omission.
     Type apply(const RuleResult& result, const ast::Expr& at, std::string type_error_message);
 
-    // Fix round 1, Finding 6: the ONE place the "is not iterable" message
+    // The ONE place the "is not iterable" message
     // literal is spelled, shared by type_of_list_comp's own element_type
     // call and the public element_type_of (which For's TypeChecker arm
     // uses) -- previously each built the identical string inline, so this

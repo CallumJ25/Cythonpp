@@ -23,11 +23,11 @@ namespace cythonpp::domain::semantic {
 // normalises identity but not order.
 std::string type_name(const Type& type);
 
-// Fix round 2 (Task 19 fix round 2, Finding C): strips TypeChecker's own
+// Strips TypeChecker's own
 // synthetic class-isolation prefix -- "<tag>#<line>#" (see
 // type_checker.cpp's declare_isolated_class) -- from a class's qualified
 // name, leaving the ORIGINAL, user-written (possibly dotted) name. A losing
-// top-level class redefinition, and (as of TypeChecker fix round 2) EVERY
+// top-level class redefinition, and EVERY
 // function-local class, is declared under such a synthetic name so its
 // ClassTable entry can never collide with a real one; '<', '>' and '#' are
 // used specifically because no Python identifier can contain them. That

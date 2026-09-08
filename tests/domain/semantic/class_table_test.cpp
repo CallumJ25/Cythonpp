@@ -391,7 +391,7 @@ TEST(ClassTable, DeclareMethodOnAnUndeclaredClassDoesNothing) {
     EXPECT_EQ(table.method_type("Typo", "m"), std::nullopt);
 }
 
-// Task 19 fix round 3, Critical 2. A scope-limited alias makes an isolated
+// A scope-limited alias makes an isolated
 // entry reachable under a bare name, and must OUTRANK a live entry under
 // that identical spelling: a function-local `class L` shadows a
 // module-level `class L` for the rest of that function, exactly as Python's
@@ -410,11 +410,12 @@ TEST(ClassTable, AScopedAliasOutranksALiveEntryUnderTheSameSpelling) {
     EXPECT_EQ(table.declare_scoped_alias("L", "<local-class>#5#L"), std::nullopt);
     EXPECT_EQ(table.canonical_name("L"), "<local-class>#5#L");
     EXPECT_EQ(table.member_type("L", "b"), Type::str());
-    // Task 19 fix round 4: `a` lives on the SHADOWED entry, and the lookup
+    // `a` lives on the SHADOWED entry, and the lookup
     // through the alias MISSES it -- but rather than concluding the
     // attribute does not exist, the query falls back to the shadowed entry
-    // and finds it. Round 3 asserted nullopt here, which is precisely the
-    // false attr-defined this round removes: a `Class("L")` resolved OUTSIDE
+    // and finds it. An earlier version asserted nullopt here, which is
+    // precisely the false attr-defined the fallback removes: a `Class("L")`
+    // resolved OUTSIDE
     // the function re-canonicalises to the LOCAL class inside it, so
     // "misses through the alias" and "does not exist" are not the same
     // question. See ClassTable::shadowed_name.
@@ -472,18 +473,19 @@ TEST(ClassTable, AScopedAliasDoesNotDisturbThePermanentBuiltinAliases) {
     EXPECT_EQ(table.canonical_name("EnvironmentError"), "OSError");
 }
 
-// Task 19 fix round 4. The miss-fallback engages ONLY where the scoped alias
+// The miss-fallback engages ONLY where the scoped alias
 // actually shadows something. A function-local class whose name collides
 // with no other class shadows nothing, so a genuine attribute miss on it
 // stays a miss -- the attr-defined check must still be able to fire.
 //
 // HONEST LABEL: this is a BOUNDARY PIN, not a defect-detector. It passes
-// against the pre-round-4 code by construction (there was no fallback at
-// all), and no neutering of shadowed_name breaks it either, because with
+// against the code that predates the fallback by construction (there was
+// none at all), and no neutering of shadowed_name breaks it either, because
+// with
 // nothing declared under the bare spelling there is nothing for any
 // fallback to find. Its value is documenting the intended boundary against
 // a FUTURE implementation that widens the fallback (e.g. into a scan of
-// every entry). The discriminating tests for this round are
+// every entry). The discriminating tests for the fallback are
 // TypeChecker.AModuleLevelTypedValueKeepsItsOwnClassInsideAShadowingFunction
 // and TypeChecker.AShadowedClassesConstructorParametersDoNotReachTheLocalClass.
 TEST(ClassTable, AScopedAliasShadowingNothingKeepsAGenuineMemberMissAMiss) {

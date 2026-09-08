@@ -263,7 +263,7 @@ TEST(IsSubtype, ClassesAreUnrelatedWithNoLookup) {
 // nothing guarantees the table is well-formed, and a recursive walk would
 // not return.
 //
-// Fix round 1 (Finding 2): the previous fixture ({"A": ["B"], "B": ["A"]})
+// The previous fixture ({"A": ["B"], "B": ["A"]})
 // never exercised the walk's builtin-kind check at all -- neither "A" nor
 // "B" is a builtin name, so builtin_type_kind returned nullopt on every
 // iteration and the recursive is_subtype branch was never entered, despite
@@ -326,7 +326,7 @@ TEST(IsSubtype, ASeededExceptionSubclassIsAssignableToItsBase) {
     EXPECT_FALSE(is_subtype(Type::class_of("Exception"), Type::class_of("ValueError"), &classes));
 }
 
-// Fix round 1 (Finding 1): the shadowing program --
+// The shadowing program --
 //   class IOError:
 //       pass
 //   x: IOError = IOError()
@@ -343,7 +343,7 @@ TEST(IsSubtype, AShadowingUserClassIsAssignableToItself) {
     EXPECT_TRUE(is_subtype(Type::class_of("IOError"), Type::class_of("IOError"), &classes));
 }
 
-// The un-shadowed path (Finding 1): with no user declaration, "IOError" and
+// The un-shadowed path: with no user declaration, "IOError" and
 // "OSError" name the SAME class object, so is_subtype must be true in BOTH
 // directions even though the two Types carry different `name` strings and
 // neither is a base of the other -- this is IDENTITY through
