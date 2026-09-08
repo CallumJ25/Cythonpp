@@ -102,10 +102,74 @@ TEST(TypeChecker, ReAnnotatingIsARedefinitionAndReportsOnce) {
     EXPECT_EQ(error.message, "name \"x\" already defined on line 1");
 }
 
+// Fix round 1, Finding 3: pin the MESSAGE, not just the code. The entire
+// point of scan_top_level_names's true-source-order pre-pass is that the
+// reported line is the genuine FIRST occurrence (line 1, the def) rather
+// than whichever phase happens to run first (Phase 1 always declares
+// classes before Phase 2 binds functions, so a naive phase-order collision
+// check would say "line 3", the class, even though the def is textually
+// first). Asserting only `.code` would stay green if that pre-pass were
+// reverted to a naive phase-order comparison.
 TEST(TypeChecker, ADefAndAClassSharingANameIsARedefinition) {
     const Checked checked = check_module("def n() -> None:\n    pass\nclass n:\n    pass\n");
 
-    EXPECT_EQ(only_error(checked).code, "TypeError");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"n\" already defined on line 1");
+}
+
+// Same collision, reverse order: the class is textually first this time, so
+// the reported line must follow it, not flip back to "always the class" or
+// "always the def".
+TEST(TypeChecker, AClassAndADefSharingANameIsARedefinitionInReverseOrder) {
+    const Checked checked = check_module("class n:\n    pass\ndef n() -> None:\n    pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"n\" already defined on line 1");
+}
+
+// Fix round 1, Finding 2: an AnnAssign followed by a colliding `def` was
+// silently missed -- collect_signatures called ScopeStack::bind for the def
+// and discarded the returned bool, so no diagnostic fired AND the def's
+// signature binding was silently dropped (a later call would have been
+// typed against the AnnAssign's `int`, not the function's signature).
+// Verified against mypy 1.18.1: "error: Name "x" already defined on line 1
+// [no-redef]".
+TEST(TypeChecker, AnAnnAssignFollowedByACollidingDefIsARedefinition) {
+    const Checked checked = check_module("x: int = 1\ndef x() -> None:\n    pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"x\" already defined on line 1");
+}
+
+// The reverse order already worked before this fix round, since
+// bind_annotation (unlike the def arm) already checked ScopeStack::bind's
+// return value -- pinned here so a future change cannot silently flip it.
+TEST(TypeChecker, ADefFollowedByACollidingAnnAssignIsARedefinition) {
+    const Checked checked = check_module("def x() -> None:\n    pass\nx: int = 1\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"x\" already defined on line 1");
+}
+
+// A pure def/def collision was already caught pre-fix, via
+// scan_top_level_names (which compares EVERY top-level ClassDef/FunctionDef
+// name against every other, not just class-vs-def) -- unlike the
+// AnnAssign-then-def case above, it never reached the discarded-bool code in
+// collect_signatures at all, since scan_top_level_names's own
+// collided_top_level_ set makes collect_signatures skip the second def
+// entirely. Added here as adjacent regression coverage, not as a case this
+// fix round newly repairs. Verified against mypy 1.18.1.
+TEST(TypeChecker, ADefFollowedByACollidingDefIsARedefinition) {
+    const Checked checked =
+        check_module("def n() -> None:\n    pass\ndef n() -> None:\n    pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"n\" already defined on line 1");
 }
 
 // Verified: bare x = [] is var-annotated.
@@ -120,6 +184,27 @@ TEST(TypeChecker, ReportsABareEmptyContainer) {
 // Verified: x = () is CLEAN -- tuple[()] is a complete non-generic type.
 TEST(TypeChecker, ABareEmptyTupleIsClean) {
     expect_clean("x = ()\n");
+}
+
+// Fix round 1, Finding 5: ReportsABareEmptyContainer above only pins `[]`.
+// `{}` and the five zero-argument constructor calls are implemented by the
+// SAME is_bare_empty_container check but had no coverage of their own.
+TEST(TypeChecker, ReportsABareEmptyDictDisplay) {
+    const Checked checked = check_module("x = {}\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "need type annotation for \"x\"");
+}
+
+TEST(TypeChecker, ReportsABareEmptyContainerConstructorCall) {
+    for (const std::string& ctor : {"list", "dict", "set", "frozenset", "tuple"}) {
+        const Checked checked = check_module("x = " + ctor + "()\n");
+
+        const diagnostics::Diagnostic error = only_error(checked);
+        EXPECT_EQ(error.code, "TypeError") << "constructor: " << ctor;
+        EXPECT_EQ(error.message, "need type annotation for \"x\"") << "constructor: " << ctor;
+    }
 }
 
 // THE ORDERING RULE, module scope. Verified: used-before-def.
@@ -163,9 +248,39 @@ TEST(TypeChecker, AnAnnotationMayNameAClassDeclaredLater) {
     expect_clean("class A:\n    x: B\nclass B:\n    pass\n");
 }
 
-// Verified: a function body sees a module global defined AFTER the def.
+// Fix round 1, Finding 1: this test was VACUOUS before this fix round --
+// `return g` walks to RecursiveVisitor::visit(Return), which visits the Name
+// `g` via accept(), and TypeChecker's Name arm is RecursiveVisitor's own
+// no-op default (Name carries nothing to check), so `g` was never typed at
+// all and the test could not have failed regardless of what the checker did.
+// Swapped for `print(g)`, an ExprStmt TypeChecker DOES override, so `g`
+// actually reaches ExpressionTyper::type_of_name. This also needed
+// TypeChecker::visit(FunctionDef) to push a Function scope (see type_checker.h/
+// .cpp) -- without it, the body was checked in the still-current Module
+// scope, so this read resolved in_own_scope == true and falsely reported
+// "used before definition" against `g`'s later module-level binding. Both
+// forms verified mypy-clean.
 TEST(TypeChecker, AFunctionBodySeesGlobalsDefinedBelowIt) {
-    expect_clean("def f() -> int:\n    return g\ng: int = 5\n");
+    expect_clean("def f() -> int:\n    print(g)\n    return g\ng: int = 5\n");
+    expect_clean("def f() -> None:\n    print(x)\nx = 5\n");
+}
+
+// Fix round 1, Finding 6: the in_own_scope gate itself (ExpressionTyper's
+// Name arm) and statement_line_'s INT_MAX default had zero DIRECT coverage
+// before Finding 1 added a Function scope to check against -- every existing
+// ordering test ran at module scope, where the reader's own scope IS the
+// binding's scope, so in_own_scope was always true and the exemption branch
+// never ran. This test puts the exact same construct in both scope shapes:
+// an outward read (function reading a module global bound later) is exempt,
+// but the identical own-scope shape (module scope reading its own name bound
+// later) is not.
+TEST(TypeChecker, AnOutwardReadIsExemptFromTheOrderingCheckButAnOwnScopeReadIsNot) {
+    expect_clean("def f() -> None:\n    print(x)\nx: int = 5\n");
+
+    const Checked checked = check_module("print(y)\ny: int = 5\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'y' is used before definition");
 }
 
 // mypy does NO definite-assignment analysis for variables by default:

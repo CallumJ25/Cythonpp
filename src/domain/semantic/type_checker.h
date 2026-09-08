@@ -13,6 +13,7 @@
 #include "domain/ast/class_def.h"
 #include "domain/ast/expr.h"
 #include "domain/ast/expr_stmt.h"
+#include "domain/ast/function_def.h"
 #include "domain/ast/module.h"
 #include "domain/ast/name.h"
 #include "domain/ast/node.h"
@@ -38,12 +39,20 @@ namespace cythonpp::domain::semantic {
 // SCOPE (Task 17): Module, Assign, AnnAssign, ExprStmt, and the two-phase
 // module-scope collection. Pass/Break/Continue carry nothing to check and are
 // deliberately left un-overridden -- RecursiveVisitor's empty default is
-// already correct for all three. FunctionDef (Task 18), ClassDef (Task 19)
-// and control flow / Return (Task 20) are also left un-overridden for now,
-// which is exactly the right intermediate behaviour: their children still get
-// walked (and, for a body statement this task DOES handle, still checked),
-// so the worst case is that a construct only Task 18-20 will add real rules
-// for is silently under-checked rather than wrongly flagged.
+// already correct for all three. ClassDef (Task 19) and control flow / Return
+// (Task 20) are also left un-overridden for now, which is exactly the right
+// intermediate behaviour: their children still get walked (and, for a body
+// statement this task DOES handle, still checked), so the worst case is that
+// a construct only Task 19-20 will add real rules for is silently
+// under-checked rather than wrongly flagged.
+//
+// FunctionDef IS overridden, but ONLY to push a Function scope before walking
+// the body (fix round 1, Finding 1) -- without it, a function body walked in
+// the still-current Module scope makes a global read inside it compare as
+// in_own_scope == true, so a global assigned LATER in the module (mypy-clean,
+// PEP 649) falsely reports "used before definition". No parameter binding, no
+// annotation resolution, no return-type checking, no __init__ carve-out --
+// Task 18 fills in the rest of this arm.
 class TypeChecker : public ast::RecursiveVisitor {
 public:
     explicit TypeChecker(diagnostics::DiagnosticSink& sink);
@@ -57,6 +66,7 @@ public:
     void visit(const ast::Assign& node) override;
     void visit(const ast::AnnAssign& node) override;
     void visit(const ast::ExprStmt& node) override;
+    void visit(const ast::FunctionDef& node) override;
 
 private:
     // What resolving (and possibly binding) an AnnAssign's annotation

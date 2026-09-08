@@ -6,8 +6,8 @@
 #include <vector>
 
 #include "annotation_resolver.h"
+#include "builtin_call_table.h"
 #include "domain/ast/call.h"
-#include "domain/ast/constant.h"
 #include "domain/ast/dict_expr.h"
 #include "domain/ast/function_def.h"
 #include "domain/ast/list_expr.h"
@@ -17,6 +17,27 @@
 #include "type_name.h"
 
 namespace cythonpp::domain::semantic {
+namespace {
+
+// RAII guard for the Function scope TypeChecker::visit(FunctionDef) pushes
+// (fix round 1, Finding 1) -- mirrors ExpressionTyper's ComprehensionScopeGuard
+// (expression_typer.cpp) so a report-and-return early exit from a future
+// task's fuller FunctionDef arm can never skip the matching pop().
+class FunctionScopeGuard {
+public:
+    explicit FunctionScopeGuard(ScopeStack& scopes) : scopes_(scopes) {
+        scopes_.push(ScopeKind::Function);
+    }
+    ~FunctionScopeGuard() { scopes_.pop(); }
+
+    FunctionScopeGuard(const FunctionScopeGuard&) = delete;
+    FunctionScopeGuard& operator=(const FunctionScopeGuard&) = delete;
+
+private:
+    ScopeStack& scopes_;
+};
+
+} // namespace
 
 TypeChecker::TypeChecker(diagnostics::DiagnosticSink& sink)
     : sink_(sink), scopes_(), classes_(), types_(), typer_(scopes_, classes_, types_, sink_) {}
@@ -124,13 +145,29 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
             Type return_type = function_def->has_return_annotation()
                                     ? resolver.resolve(function_def->return_annotation())
                                     : Type::unknown();
-            // A pure def/def or def/AnnAssign collision is caught here by
-            // ScopeStack::bind's own detection (both go through this single
-            // ordered loop); a def/class collision was already caught and
-            // reported by scan_top_level_names and skipped above.
-            scopes_.bind(function_def->name(),
-                        Binding{Type::callable(std::move(params), std::move(return_type)),
-                                function_def->span().start_line, /*annotated=*/true});
+            // Fix round 1, Finding 2: the bool `bind` returns MUST be
+            // checked -- `bind` itself has no sink and never reported
+            // anything on its own, contrary to what the previous comment
+            // here claimed. A def/def or def/class collision never reaches
+            // this line at all: scan_top_level_names already caught and
+            // reported both (it compares EVERY top-level ClassDef/FunctionDef
+            // name against every other), and the `continue` above already
+            // skipped the losing def. The ONE collision that reaches `bind`
+            // here is an AnnAssign-then-def collision -- the AnnAssign bound
+            // first, earlier in THIS same ordered loop, and
+            // scan_top_level_names never tracks AnnAssign names at all -- so
+            // this check exists for that case specifically. The reverse,
+            // def-then-AnnAssign, is instead caught by bind_annotation's own
+            // bool check below, since by the time that AnnAssign runs the def
+            // already occupies the name.
+            const Binding signature{Type::callable(std::move(params), std::move(return_type)),
+                                    function_def->span().start_line, /*annotated=*/true};
+            if (!scopes_.bind(function_def->name(), signature)) {
+                const Resolution existing = scopes_.resolve(function_def->name());
+                report(*function_def, "TypeError",
+                      "name \"" + function_def->name() + "\" already defined on line " +
+                          std::to_string(existing.binding->declared_line));
+            }
         } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
             if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
                 module_level_annotations_[ann_assign] = bind_annotation(
@@ -350,6 +387,25 @@ void TypeChecker::visit(const ast::ExprStmt& node) {
     typer_.type_of(node.value(), Type::unknown());
 }
 
+void TypeChecker::visit(const ast::FunctionDef& node) {
+    // Fix round 1, Finding 1: push a Function scope before walking the body.
+    // Without this, the body is checked in whatever scope was already
+    // current (Module, at top level), so ExpressionTyper's Name arm sees
+    // in_own_scope == true for a global and wrongly order-checks it -- a
+    // function reading a module global assigned LATER in the file (mypy-
+    // clean, PEP 649) got a false "used before definition". With the scope
+    // pushed, the same read resolves outward (in_own_scope == false) and is
+    // exempt, per the ordering rule's own "outward reads are exempt" clause.
+    //
+    // Deliberately minimal: no parameter binding, no annotation resolution,
+    // no return-type checking, no __init__ carve-out. Task 18 fills in the
+    // rest of this arm.
+    FunctionScopeGuard guard(scopes_);
+    for (const ast::StmtPtr& statement : node.body()) {
+        statement->accept(*this);
+    }
+}
+
 bool TypeChecker::is_bare_empty_container(const ast::Expr& value) {
     if (const auto* list = dynamic_cast<const ast::ListExpr*>(&value)) {
         return list->elements().empty();
@@ -365,14 +421,13 @@ bool TypeChecker::is_bare_empty_container(const ast::Expr& value) {
         if (callee == nullptr) {
             return false;
         }
-        static constexpr const char* kEmptyContainerConstructors[] = {
-            "list", "dict", "set", "frozenset", "tuple",
-        };
-        for (const char* ctor : kEmptyContainerConstructors) {
-            if (callee->identifier() == ctor) {
-                return true;
-            }
-        }
+        // Fix round 1, Finding 4: reuse builtin_call_table.h's exported
+        // is_empty_display_builtin rather than a third hardcoded copy of the
+        // five-name list -- expression_typer_calls.cpp already carries a
+        // comment justifying its own local helper specifically "so the two
+        // call sites cannot drift apart"; a third copy here would be exactly
+        // the drift that comment warns against.
+        return is_empty_display_builtin(callee->identifier());
     }
     // A bare `()` (TupleExpr) is deliberately NOT here: tuple[()] is a
     // complete, non-generic type needing no annotation.
