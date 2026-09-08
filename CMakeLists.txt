@@ -101,6 +101,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/application/compile_pipeline_test.cpp
         tests/adapters/filesystem/filesystem_source_lister_test.cpp
         tests/adapters/cli/console_diagnostics_reporter_test.cpp
+        tests/adapters/cli/cli_adapter_test.cpp
     )
     target_link_libraries(cythonpp_tests PRIVATE cythonpp_lib gtest_main)
     target_include_directories(cythonpp_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

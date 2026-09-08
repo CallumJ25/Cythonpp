@@ -13,10 +13,16 @@
 #include "domain/ast/ast_printer.h"
 #include "domain/ast/module.h"
 #include "domain/lexer/token_type_name.h"
+#include "domain/semantic/typed_printer.h"
 
 namespace cythonpp::adapters::cli {
 
 namespace {
+
+// Which of the three mutually-exclusive dumps the CLI should print. A third
+// bool alongside dump_tokens would admit a meaningless fourth (tokens AND
+// types) state, so this is an enum instead.
+enum class OutputMode { Tokens, Tree, Types };
 
 // Renders control characters visibly so a NEWLINE or TAB token does not
 // wreck the column alignment of the dump. Presentation only, which is why it
@@ -52,17 +58,29 @@ void print_tree(const std::string& path, const domain::ast::Module& module) {
     std::cout << domain::ast::AstPrinter().print(module) << std::endl;
 }
 
-void print_result(const application::CompileResult& result, bool dump_tokens) {
+void print_typed_tree(const std::string& path, const domain::ast::Module& module,
+                       const domain::semantic::TypeMap& types) {
+    std::cout << "=== " << path << " ===" << std::endl;
+    std::cout << domain::semantic::TypedPrinter().print(module, types) << std::endl;
+}
+
+void print_result(const application::CompileResult& result, OutputMode mode) {
     std::size_t total = 0;
     for (const auto& module : result.modules) {
-        if (dump_tokens) {
-            print_module(module.first, module.second.tokens);
-            total += module.second.tokens.size();
-        } else {
-            print_tree(module.first, *module.second.ast);
+        switch (mode) {
+            case OutputMode::Tokens:
+                print_module(module.first, module.second.tokens);
+                total += module.second.tokens.size();
+                break;
+            case OutputMode::Tree:
+                print_tree(module.first, *module.second.ast);
+                break;
+            case OutputMode::Types:
+                print_typed_tree(module.first, *module.second.ast, module.second.types);
+                break;
         }
     }
-    if (dump_tokens) {
+    if (mode == OutputMode::Tokens) {
         std::cout << result.modules.size() << " files, " << total << " tokens" << std::endl;
     } else {
         std::cout << result.modules.size() << " files" << std::endl;
@@ -72,12 +90,14 @@ void print_result(const application::CompileResult& result, bool dump_tokens) {
 } // namespace
 
 int CliAdapter::run(int argc, char** argv) {
-    bool dump_tokens = false;
+    OutputMode mode = OutputMode::Tree;
     std::string path;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--tokens") {
-            dump_tokens = true;
+            mode = OutputMode::Tokens;
+        } else if (argument == "--types") {
+            mode = OutputMode::Types;
         } else if (path.empty()) {
             path = argument;
         } else {
@@ -86,7 +106,8 @@ int CliAdapter::run(int argc, char** argv) {
         }
     }
     if (path.empty()) {
-        std::cerr << "usage: cythonpp [--tokens] <path-to-python-file-or-directory>" << std::endl;
+        std::cerr << "usage: cythonpp [--tokens|--types] <path-to-python-file-or-directory>"
+                   << std::endl;
         return 1;
     }
 
@@ -103,7 +124,7 @@ int CliAdapter::run(int argc, char** argv) {
         const application::CompileResult result = std::filesystem::is_directory(path)
                                                       ? pipeline.compile_directory(path)
                                                       : pipeline.compile_file(path);
-        print_result(result, dump_tokens);
+        print_result(result, mode);
 
         // The tree is still printed for a file with errors -- seeing the
         // output is exactly what helps when diagnosing one -- but the exit
