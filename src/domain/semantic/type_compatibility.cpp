@@ -289,6 +289,22 @@ Type canonicalised(Type type, const ClassLookup* classes) {
 
 } // namespace
 
+std::optional<Type> builtin_base_of_class(const ClassLookup& classes, const std::string& name) {
+    // The whole chain including index 0, unlike class_reaches, which asks
+    // only about PROPER ancestors: a caller passing a name that is itself a
+    // builtin spelling should get that builtin back rather than nothing,
+    // since "what builtin does this name denote or inherit" is one question.
+    for (const std::string& ancestor : class_ancestor_chain(classes, name)) {
+        if (ancestor == "object") {
+            continue;
+        }
+        if (const std::optional<TypeKind> kind = builtin_type_kind(ancestor)) {
+            return builtin_base_type(*kind);
+        }
+    }
+    return std::nullopt;
+}
+
 int numeric_rank(TypeKind kind) {
     switch (kind) {
     case TypeKind::Bool:

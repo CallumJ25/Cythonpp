@@ -574,7 +574,7 @@ Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
 
     for (const ast::ComprehensionClause& clause : list_comp.clauses()) {
         const Type iterable = type_of(*clause.iterable, Type::unknown());
-        const RuleResult element_result = element_type(iterable);
+        const RuleResult element_result = element_type(iterable, &classes_);
         const Type element_type_value =
             apply(element_result, *clause.iterable, not_iterable_message(iterable));
         if (element_result.status != RuleResult::Status::Ok) {
@@ -631,7 +631,7 @@ Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
 }
 
 Type ExpressionTyper::element_type_of(const ast::Expr& iterable_expr, const Type& iterable_type) {
-    const RuleResult result = element_type(iterable_type);
+    const RuleResult result = element_type(iterable_type, &classes_);
     return apply(result, iterable_expr, not_iterable_message(iterable_type));
 }
 

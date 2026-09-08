@@ -29,6 +29,17 @@ enum class UnsupportedReason {
     // invariant.
     UserClassOperator,
 
+    // Iteration over a user class instance is deferred, for the same reason
+    // and with the same shape as UserClassOperator -- `for v in bag` is
+    // mypy-clean whenever Bag defines an __iter__ returning something with
+    // __next__, which mypy matches STRUCTURALLY and so needs no import to
+    // spell. Its own reason rather than UserClassOperator's because a `for`
+    // statement is not an operator and a diagnostic saying "operators on
+    // user-defined class instances" would send the reader looking for one.
+    // (The element type IS answered precisely where the class inherits a
+    // builtin container that pins it -- see operator_rules' element_type.)
+    UserClassIteration,
+
     // `tuple[int, str] * 2` is mypy-clean and yields
     // tuple[int, str, int, str] -- mypy UNROLLS the literal count. The result
     // therefore depends on an operand's literal VALUE, which is constant

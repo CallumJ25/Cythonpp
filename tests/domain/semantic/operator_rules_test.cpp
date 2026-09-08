@@ -767,13 +767,82 @@ TEST(ElementType, NonIterableTypesDoNotApply) {
     expect_not_iterable(Type::object());
 }
 
-// Iteration is the DELIBERATE exception and stays a genuine error. Inside the
-// import-free subset there is no way to make a user class iterable to mypy:
-// it requires __iter__ to return something with __next__, which cannot be
-// spelled without typing/collections.abc, and mypy rejects even the legacy
-// __getitem__ iteration protocol that CPython honours. Verified all three.
-TEST(ElementType, IteratingAUserClassStaysAGenuineError) {
-    expect_not_iterable(Type::class_of("Widget"));
+// REWRITTEN. This test used to be named IteratingAUserClassStaysAGenuineError
+// and pinned expect_not_iterable(Class("Widget")) -- a TypeError -- on the
+// spec's claim that no import-free user class can be made iterable to mypy,
+// "because __iter__ must return something with __next__, which cannot be
+// spelled without typing/collections.abc". That premise is FALSE, and the
+// test pinning it is why a false TypeError survived a green suite: mypy
+// matches the iterator protocol STRUCTURALLY, so
+//
+//   class Counter:
+//       def __next__(self) -> int: ...
+//   class Bag:
+//       def __iter__(self) -> Counter: ...
+//   for v in Bag(): ...
+//
+// is mypy 1.18.1 --strict CLEAN with no import at all. Whether a user class
+// is iterable therefore depends on members this rule table cannot see, which
+// makes it Unsupported -- the same answer subscript_result and
+// comparison_result already give a Class operand -- never NotApplicable.
+// The cost is a MISSED error on a genuinely non-iterable class; the hard
+// invariant (never a false TypeError) is what that buys.
+TEST(ElementType, IteratingAUserClassIsUnsupportedNotAnError) {
+    const RuleResult without_lookup = element_type(Type::class_of("Widget"));
+    EXPECT_EQ(without_lookup.status, RuleResult::Status::Unsupported);
+    EXPECT_EQ(without_lookup.reason, UnsupportedReason::UserClassIteration);
+
+    // Same answer with a lookup that knows the class and its (empty) bases:
+    // reaching no builtin is not evidence of non-iterability.
+    const semantic_test_support::FakeClassLookup classes({{"Widget", {}}});
+    const RuleResult with_lookup = element_type(Type::class_of("Widget"), &classes);
+    EXPECT_EQ(with_lookup.status, RuleResult::Status::Unsupported);
+    EXPECT_EQ(with_lookup.reason, UnsupportedReason::UserClassIteration);
+}
+
+// The precise half of the same rule: a class inheriting a builtin container
+// iterates as that container's element type. Verified against mypy 1.18.1 --
+// `class Names(str)`, `class Counts(bytes)` and `class Buf(bytearray)` are
+// all clean, and iterating them reveals str, int and int respectively.
+// (`range` is deliberately absent: typeshed marks it @final, so
+// `class Steps(range)` is not a clean program to reason about at all.)
+TEST(ElementType, IteratingAClassThatInheritsABuiltinYieldsTheBuiltinsElement) {
+    const semantic_test_support::FakeClassLookup classes(
+        {{"Names", {"str"}}, {"Counts", {"bytes"}}, {"Buf", {"bytearray"}}, {"Deep", {"Names"}}});
+    const RuleResult names = element_type(Type::class_of("Names"), &classes);
+    ASSERT_EQ(names.status, RuleResult::Status::Ok);
+    EXPECT_EQ(names.type, Type::str());
+
+    const RuleResult counts = element_type(Type::class_of("Counts"), &classes);
+    ASSERT_EQ(counts.status, RuleResult::Status::Ok);
+    EXPECT_EQ(counts.type, Type::int_());
+
+    const RuleResult buf = element_type(Type::class_of("Buf"), &classes);
+    ASSERT_EQ(buf.status, RuleResult::Status::Ok);
+    EXPECT_EQ(buf.type, Type::int_());
+
+    // Transitively, through the same cycle-guarded ancestor walk is_subtype
+    // uses -- not just a direct base.
+    const RuleResult deep = element_type(Type::class_of("Deep"), &classes);
+    ASSERT_EQ(deep.status, RuleResult::Status::Ok);
+    EXPECT_EQ(deep.type, Type::str());
+}
+
+// A NON-iterable builtin base does NOT make iteration an error: the class is
+// free to define its own __iter__ on top of what it inherits, which this rule
+// table cannot see. And a PARAMETRIC base (`class IntList(list[int])`) comes
+// back argument-less, since ClassLookup deals in bare base NAMES, so there is
+// no element type to report -- also Unsupported, never NotApplicable.
+TEST(ElementType, AnInheritedBuiltinThatPinsNoElementTypeIsStillUnsupported) {
+    const semantic_test_support::FakeClassLookup classes(
+        {{"Sub", {"int"}}, {"IntList", {"list"}}});
+    const RuleResult sub = element_type(Type::class_of("Sub"), &classes);
+    EXPECT_EQ(sub.status, RuleResult::Status::Unsupported);
+    EXPECT_EQ(sub.reason, UnsupportedReason::UserClassIteration);
+
+    const RuleResult int_list = element_type(Type::class_of("IntList"), &classes);
+    EXPECT_EQ(int_list.status, RuleResult::Status::Unsupported);
+    EXPECT_EQ(int_list.reason, UnsupportedReason::UserClassIteration);
 }
 
 TEST(ElementType, IteratingAUnionIsUnsupported) {

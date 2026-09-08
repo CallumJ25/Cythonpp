@@ -1,3 +1,5 @@
+#include <optional>
+
 #include <gtest/gtest.h>
 
 #include "domain/semantic/class_table.h"
@@ -369,6 +371,60 @@ TEST(IsSubtype, AClassIsNotAssignableToAnUnrelatedKind) {
 
     EXPECT_FALSE(is_subtype(Type::class_of("Widget"), Type::int_(), &classes));
     EXPECT_FALSE(is_subtype(Type::int_(), Type::class_of("Widget"), &classes));
+}
+
+// The builtin a user class's chain reaches, which operator_rules' element_type
+// needs in order to answer `for ch in names` for `class Names(str)` without
+// re-implementing the base-chain walk.
+TEST(BuiltinBaseOfClass, FindsTheBuiltinAUserClassChainReaches) {
+    const semantic_test_support::FakeClassLookup classes(
+        {{"Names", {"str"}}, {"Deep", {"Names"}}, {"Widget", {}}, {"Pair", {"Widget", "bytes"}}});
+
+    ASSERT_TRUE(builtin_base_of_class(classes, "Names").has_value());
+    EXPECT_EQ(*builtin_base_of_class(classes, "Names"), Type::str());
+
+    // Transitively, not only a direct base.
+    ASSERT_TRUE(builtin_base_of_class(classes, "Deep").has_value());
+    EXPECT_EQ(*builtin_base_of_class(classes, "Deep"), Type::str());
+
+    // Depth-first LEFT TO RIGHT: Widget is searched (and its empty subtree
+    // exhausted) before bytes is reached, so the answer is bytes only because
+    // Widget's own chain has no builtin in it.
+    ASSERT_TRUE(builtin_base_of_class(classes, "Pair").has_value());
+    EXPECT_EQ(*builtin_base_of_class(classes, "Pair"), Type::bytes());
+
+    EXPECT_FALSE(builtin_base_of_class(classes, "Widget").has_value());
+    EXPECT_FALSE(builtin_base_of_class(classes, "NeverDeclared").has_value());
+}
+
+// `object` is excluded on purpose, exactly as ClassTable::inherits_builtin
+// excludes it: every class conceptually derives from it, so counting it would
+// answer Object for every class and make the question useless.
+TEST(BuiltinBaseOfClass, IgnoresObject) {
+    const semantic_test_support::FakeClassLookup classes({{"Plain", {"object"}}});
+
+    EXPECT_FALSE(builtin_base_of_class(classes, "Plain").has_value());
+}
+
+// A PARAMETRIC builtin base comes back argument-less: ClassLookup deals in
+// bare base NAMES, so `class IntList(list[int])` records "list" and the
+// element type in the source spelling is simply not recoverable here. Pinned
+// so a caller cannot mistake the empty args for an error.
+TEST(BuiltinBaseOfClass, AParametricBuiltinBaseComesBackWithoutArguments) {
+    const semantic_test_support::FakeClassLookup classes({{"IntList", {"list"}}});
+
+    const std::optional<Type> base = builtin_base_of_class(classes, "IntList");
+    ASSERT_TRUE(base.has_value());
+    EXPECT_EQ(base->kind, TypeKind::List);
+    EXPECT_TRUE(base->args.empty());
+}
+
+// The cycle guard is inherited from the shared ancestor walk rather than
+// re-implemented, so a malformed table cannot hang this.
+TEST(BuiltinBaseOfClass, SurvivesACycleInTheBaseChain) {
+    const semantic_test_support::FakeClassLookup classes({{"A", {"B"}}, {"B", {"A"}}});
+
+    EXPECT_FALSE(builtin_base_of_class(classes, "A").has_value());
 }
 
 } // namespace

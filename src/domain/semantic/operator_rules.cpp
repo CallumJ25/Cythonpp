@@ -471,12 +471,50 @@ RuleResult subscript_result(const Type& container, const Type& index, const Clas
     return RuleResult::not_applicable();
 }
 
-RuleResult element_type(const Type& iterable) {
+RuleResult element_type(const Type& iterable, const ClassLookup* classes) {
     if (iterable.kind == TypeKind::Unknown) {
         return RuleResult::ok(Type::unknown());
     }
     if (iterable.kind == TypeKind::Union) {
         return RuleResult::unsupported(UnsupportedReason::UnionOperand);
+    }
+    if (iterable.kind == TypeKind::Class) {
+        // A user class NEVER falls through to the NotApplicable at the bottom
+        // of this function. Two separate, common shapes are mypy-clean and
+        // used to draw a false "is not iterable" TypeError here:
+        //
+        //   class IntList(list[int]):        # iterating self, or an instance
+        //   class Bag:                       # __iter__ returning a class
+        //       def __iter__(self) -> Counter: ...
+        //
+        // mypy matches __iter__/__next__ STRUCTURALLY, so no import is
+        // needed to make a bare user class iterable -- verified against mypy
+        // 1.18.1, which accepts the Bag/Counter pair with no typing import
+        // at all. (Spec 5a claimed the opposite, and a test pinned the claim;
+        // both were wrong.) And a builtin-container subclass is iterable
+        // simply by inheritance.
+        //
+        // So the answer is the one subscript_result and comparison_result
+        // already give for a Class operand -- Unsupported, i.e. the caller
+        // reports NotImplementedError -- except where the inherited builtin
+        // pins the element type exactly:
+        if (classes != nullptr) {
+            if (const std::optional<Type> base = builtin_base_of_class(*classes, iterable.name)) {
+                // Recursive, so the builtin's own rules below decide, rather
+                // than a second copy of them. Ok only: a NotApplicable here
+                // means either an argument-less container base
+                // (`class IntList(list[int])`, whose element type
+                // ClassLookup cannot report -- see builtin_base_of_class)
+                // or a non-iterable builtin base (`class Sub(int)`), and
+                // NEITHER may become a TypeError, because the class is free
+                // to define its own __iter__ on top of what it inherits.
+                const RuleResult inherited = element_type(*base, classes);
+                if (inherited.status == RuleResult::Status::Ok) {
+                    return inherited;
+                }
+            }
+        }
+        return RuleResult::unsupported(UnsupportedReason::UserClassIteration);
     }
     if (iterable.kind == TypeKind::List || iterable.kind == TypeKind::Set ||
         iterable.kind == TypeKind::FrozenSet || iterable.kind == TypeKind::Dict) {

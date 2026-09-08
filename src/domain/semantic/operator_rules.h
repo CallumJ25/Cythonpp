@@ -65,7 +65,13 @@ RuleResult subscript_result(const Type& container, const Type& index,
 
 // What iterating `iterable` yields, for `for` and for comprehensions.
 // Iterating a dict yields its KEYS, not its items.
-RuleResult element_type(const Type& iterable);
+//
+// `classes` is what lets a user class inheriting a builtin container answer
+// with the element type it inherits. It may be null, in which case a Class
+// operand is simply Unsupported -- never NotApplicable, since a user class
+// may be iterable through a structurally-matched __iter__ this compiler does
+// not model, and a TypeError there would be false on mypy-clean code.
+RuleResult element_type(const Type& iterable, const ClassLookup* classes = nullptr);
 
 // `a and b`, `a or b` -- one ast::BoolOp, whose `values()` may hold more than
 // two operands because the parser flattens a chain.

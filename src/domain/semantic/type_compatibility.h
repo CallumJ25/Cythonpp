@@ -1,11 +1,38 @@
 #ifndef CYTHONPP_DOMAIN_SEMANTIC_TYPE_COMPATIBILITY_H
 #define CYTHONPP_DOMAIN_SEMANTIC_TYPE_COMPATIBILITY_H
 
+#include <optional>
+#include <string>
+
 #include "class_lookup.h"
 #include "type.h"
 #include "type_kind.h"
 
 namespace cythonpp::domain::semantic {
+
+// The builtin Type a user class's base chain reaches -- Int for
+// `class Sub(int)`, Str for `class Name(str)` -- or nullopt when the chain
+// reaches no builtin at all. Depth-first left to right, first hit wins,
+// through the same cycle-guarded ancestor walk is_subtype and join use, so
+// there is no second walk to keep in step with that one.
+//
+// `object` is excluded, exactly as ClassTable::inherits_builtin excludes it
+// and for the same reason: every class conceptually derives from it, so
+// counting it would make every class "reach a builtin" and answer Object for
+// all of them.
+//
+// Public because operator_rules' element_type needs it: a class inheriting a
+// builtin container is iterable precisely because of what it inherits, and
+// deciding that from the Class name alone is impossible. It answers a
+// question about a NAME rather than a Type because that is what
+// ClassLookup::bases_of deals in.
+//
+// A PARAMETRIC builtin base (`class IntList(list[int])`) comes back with
+// EMPTY args, not `list[int]`: ClassTable stores bases as bare names (see
+// TypeChecker::base_names), so the element type in the source spelling is
+// not recoverable here. Callers must treat an argument-less container as
+// "unknown element type", never as an error.
+std::optional<Type> builtin_base_of_class(const ClassLookup& classes, const std::string& name);
 
 // Position in Python's numeric tower -- Bool 1, Int 2, Float 3, Complex 4 --
 // or 0 for a kind outside it.

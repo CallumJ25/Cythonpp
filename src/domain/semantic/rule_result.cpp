@@ -11,6 +11,8 @@ std::string unsupported_message(UnsupportedReason reason) {
             return "operations on a union-typed value require narrowing, which is not supported";
         case UnsupportedReason::UserClassOperator:
             return "operators on user-defined class instances are not supported";
+        case UnsupportedReason::UserClassIteration:
+            return "iterating an instance of a user-defined class is not supported";
         case UnsupportedReason::TupleRepeat:
             return "repeating a tuple by an integer is not supported";
     }
