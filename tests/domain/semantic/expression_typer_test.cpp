@@ -369,7 +369,14 @@ TEST(ExpressionTyper, EachBadListItemIsItsOwnRootCause) {
     const Typed typed =
         type_expression("[\"a\", 1, \"b\"]", {}, Type::list_of(Type::int_()));
 
-    EXPECT_EQ(typed.diagnostics.size(), 2u) << "items 0 and 2";
+    ASSERT_EQ(typed.diagnostics.size(), 2u) << "items 0 and 2";
+    // Assert the actual two messages, not just a count of 2 -- an
+    // implementation that reported item 0 twice (and skipped item 2 entirely)
+    // would also satisfy size() == 2.
+    EXPECT_EQ(typed.diagnostics[0].message,
+              "list item 0 has incompatible type \"str\"; expected \"int\"");
+    EXPECT_EQ(typed.diagnostics[1].message,
+              "list item 2 has incompatible type \"str\"; expected \"int\"");
 }
 
 // Type context propagates recursively. Verified both clean.
@@ -378,6 +385,28 @@ TEST(ExpressionTyper, TypeContextPropagatesIntoNestedDisplays) {
         "[[1], [2]]", {}, Type::list_of(Type::list_of(Type::int_())));
     EXPECT_TRUE(nested.diagnostics.empty());
     EXPECT_EQ(type_name(nested.type), "list[list[int]]");
+}
+
+// Negative control for the propagation above: a bad element inside a NESTED
+// display must report exactly once, at the inner arm that actually checked
+// it, and the outer arm must not pile on a second diagnostic. This holds
+// because the inner list arm always returns the DECLARED type (list[int])
+// even when one of its own elements was bad, so from the outer arm's own
+// is_subtype check the child still looks like a perfect match. Without this
+// test, a regression that made the outer arm re-check the inner element
+// against its own actual (joined) type -- or that made the inner arm report
+// twice -- would pass unnoticed.
+TEST(ExpressionTyper, ANestedDisplayMismatchReportsOnceAtTheInnerDepth) {
+    const Typed typed = type_expression(
+        "[[1], [\"s\"]]", {}, Type::list_of(Type::list_of(Type::int_())));
+
+    ASSERT_EQ(typed.diagnostics.size(), 1u)
+        << "the inner mismatch must report once; the outer arm must not add a second";
+    EXPECT_EQ(typed.diagnostics.front().message,
+              "list item 0 has incompatible type \"str\"; expected \"int\"")
+        << "reported by the INNER list, naming the inner index -- not the outer index (1)";
+    EXPECT_EQ(type_name(typed.type), "list[list[int]]")
+        << "the declared type still comes back, even with a nested failure";
 }
 
 // Verified: reveal_type({1: "a", 2: "b"}) is dict[int, str];
@@ -389,11 +418,97 @@ TEST(ExpressionTyper, JoinsDictKeysAndValuesIndependently) {
     EXPECT_EQ(typed_name("{1: \"a\", 2: 3}"), "dict[int, object]");
 }
 
+// The dict-with-context error path (type_of_dict's has_context branch) had
+// NO test at all before this round -- unreachable from the whole suite.
+// Ground truth from real mypy 1.18.1: `x: dict[str,int] = {1: 2}` reports
+// 'Dict entry 0 has incompatible type "int": "int"; expected "str": "int"'
+// -- note the VALUE side ("int": "int") matches perfectly and is still
+// quoted, because mypy (and this project) reports one diagnostic per bad
+// ENTRY, not one per bad half. Here only the key (1, an int) is actually
+// wrong against the declared str key type; the value (2) already satisfies
+// the declared int value type.
+TEST(ExpressionTyper, ReportsADictEntryWithOnlyTheKeyWrong) {
+    const Typed typed = type_expression(
+        "{1: 2}", {}, Type::dict_of(Type::str(), Type::int_()));
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "dict entry 0 has incompatible type \"int\": \"int\"; expected \"str\": \"int\"");
+    EXPECT_EQ(type_name(typed.type), "dict[str, int]") << "the declared type still comes back";
+    // Pin the anchor position too, now that this path finally has coverage:
+    // the diagnostic is reported at the KEY's own span, not the whole entry
+    // or the dict expression. Source is "{1: 2}\n" -- '{' is column 1, the
+    // key '1' is column 2.
+    EXPECT_EQ(error.line, 1);
+    EXPECT_EQ(error.column, 2) << "anchored at the key's span, not the whole entry";
+}
+
+// Mirror case: only the VALUE is wrong (key already satisfies its declared
+// type). Still one diagnostic, still quoting both actual halves together.
+TEST(ExpressionTyper, ReportsADictEntryWithOnlyTheValueWrong) {
+    const Typed typed = type_expression(
+        "{\"a\": \"b\"}", {}, Type::dict_of(Type::str(), Type::int_()));
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "dict entry 0 has incompatible type \"str\": \"str\"; expected \"str\": \"int\"");
+    EXPECT_EQ(type_name(typed.type), "dict[str, int]");
+}
+
+// Both halves wrong at once: still exactly ONE diagnostic for the entry, not
+// two (one per bad half) -- the specific decision Finding 2 calls out as
+// untested.
+TEST(ExpressionTyper, ReportsADictEntryWithBothHalvesWrongAsOneDiagnostic) {
+    const Typed typed = type_expression(
+        "{1: \"x\"}", {}, Type::dict_of(Type::str(), Type::int_()));
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "dict entry 0 has incompatible type \"int\": \"str\"; expected \"str\": \"int\"");
+}
+
 // Verified: reveal_type((1, "s")) keeps positional element types -- tuples
 // are heterogeneous and there is NO join.
 TEST(ExpressionTyper, TuplesKeepTheirPositionalElementTypes) {
     EXPECT_EQ(typed_name("(1, \"s\")"), "tuple[int, str]");
     EXPECT_EQ(typed_name("(1, 1.5)"), "tuple[int, float]");
+}
+
+// Ground truth from real mypy 1.18.1: mypy has NO per-item tuple diagnostic.
+// `x: tuple[int, str] = (1, 2)` reports ONE `assignment` error naming the two
+// whole tuple types ("expression has type \"tuple[int, int]\", variable has
+// type \"tuple[int, str]\""), not a per-element TypeError. So, unlike
+// List/Dict, TupleExpr's context branch never reports here -- it stays
+// silent even on a genuine element mismatch, and returns the POSITIONAL
+// types actually present (tuple[int, int], NOT the declared tuple[int, str])
+// so the later assignment check is the one place the mismatch surfaces.
+TEST(ExpressionTyper, AContextMismatchedTupleElementIsSilentAndReturnsPositionalTypes) {
+    const Typed typed = type_expression(
+        "(1, 2)", {}, Type::tuple_of({Type::int_(), Type::str()}));
+
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "the assignment check reports the whole-tuple mismatch, not the display";
+    EXPECT_EQ(type_name(typed.type), "tuple[int, int]")
+        << "positional types come back, NOT the declared tuple[int, str]";
+}
+
+// Ground truth from real mypy 1.18.1: a wrong-ARITY tuple context
+// (`x: tuple[int, str] = (1,)`) is ALSO just one `assignment` error naming
+// "tuple[int]" vs "tuple[int, str]" -- the same single-diagnostic shape as
+// the element mismatch above, not a distinct "arity mismatch" report. Since
+// the arity differs, has_context is false here (see type_of_tuple), so this
+// is really the ordinary no-context path, but it is pinned explicitly
+// because it is the other half of the mypy ground truth this task settles.
+TEST(ExpressionTyper, AWrongArityTupleContextIsSilentAndReturnsPositionalTypes) {
+    const Typed typed = type_expression(
+        "(1,)", {}, Type::tuple_of({Type::int_(), Type::str()}));
+
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "the assignment check reports the whole-tuple mismatch, not the display";
+    EXPECT_EQ(type_name(typed.type), "tuple[int]");
 }
 
 // Verified: reveal_type(()) is tuple[()] and it is CLEAN -- the one display
@@ -413,11 +528,17 @@ TEST(ExpressionTyper, TheEmptyTupleNeedsNoAnnotation) {
 // put in the message. So the typer returns Unknown silently and Task 17's
 // Assign arm reports.
 TEST(ExpressionTyper, AnEmptyDisplayWithNoContextIsSilentlyUnknown) {
-    const Typed typed = type_expression("[]");
-
-    EXPECT_TRUE(typed.diagnostics.empty())
+    const Typed list = type_expression("[]");
+    EXPECT_TRUE(list.diagnostics.empty())
         << "the assignment reports, not the display -- mypy types a bare [] as list[Never]";
-    EXPECT_EQ(typed.printed, "Unknown");
+    EXPECT_EQ(list.printed, "Unknown");
+
+    // Same reasoning applies to a bare `{}`: mypy types it as dict[Never,
+    // Never] in expression position and reports nothing, so the same
+    // var-annotated error belongs to the assignment, not the display.
+    const Typed dict = type_expression("{}");
+    EXPECT_TRUE(dict.diagnostics.empty());
+    EXPECT_EQ(dict.printed, "Unknown");
 }
 
 TEST(ExpressionTyper, AnEmptyDisplayWithContextTakesTheContext) {

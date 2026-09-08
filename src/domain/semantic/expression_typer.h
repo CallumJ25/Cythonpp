@@ -68,10 +68,20 @@ private:
     //
     //   WITH a context of the matching kind (and, for TupleExpr, the
     //   matching arity): each element/entry is checked individually against
-    //   the declared element type(s) and the result is the DECLARED type
-    //   (`expected` itself) -- no join is computed. A mismatching element
-    //   reports its own TypeError naming its index/position; every element
-    //   is still visited, so N bad elements are N diagnostics, not one.
+    //   the declared element type(s). For ListExpr/DictExpr, the result is
+    //   the DECLARED type (`expected` itself) -- no join is computed -- and a
+    //   mismatching element reports its own TypeError naming its
+    //   index/position; every element is still visited, so N bad elements are
+    //   N diagnostics, not one. TupleExpr is the ONE exception to "a
+    //   mismatching element reports": it never reports here, even with a
+    //   matching context. mypy has no per-item tuple diagnostic -- both an
+    //   element mismatch (`x: tuple[int, str] = (1, 2)`) and an arity
+    //   mismatch (`x: tuple[int, str] = (1,)`) surface as a single
+    //   `assignment` error naming the two whole tuple types, produced by a
+    //   later task's assignment check from the POSITIONAL type this arm
+    //   returns (see type_of_tuple). `element_expected` still propagates into
+    //   the recursive type_of() call either way, since that context
+    //   propagation is independent of whether anyone reports here.
     //
     //   WITHOUT a usable context (Type::unknown(), the wrong TypeKind, or --
     //   for TupleExpr -- the wrong arity): elements are typed against

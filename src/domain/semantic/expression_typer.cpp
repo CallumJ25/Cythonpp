@@ -264,20 +264,22 @@ Type ExpressionTyper::type_of_tuple(const ast::TupleExpr& tuple, const Type& exp
 
     // No join branch at all: a tuple's elements are positional, not
     // homogeneous, so the result is always built from each element's own
-    // inferred type -- WITH a matching context, that inferred type is simply
-    // checked against the corresponding declared element type on the way,
-    // and a mismatch reports its own TypeError naming its index.
+    // inferred type -- WITH a matching context, `element_expected` still
+    // propagates into the recursive type_of() call (so e.g. a nested `[]`
+    // resolves against its declared element type instead of going Unknown),
+    // but the result is NEVER checked against it here: mypy has no per-item
+    // tuple diagnostic. Both an element mismatch (`x: tuple[int, str] =
+    // (1, 2)`) and an arity mismatch (`x: tuple[int, str] = (1,)`) surface as
+    // ONE `assignment` error naming the two whole tuple types -- which the
+    // later assignment check produces for free from the POSITIONAL type
+    // returned below, since is_subtype's Tuple arm is covariant, elementwise,
+    // and arity-checked. Reporting here too would be a second diagnostic for
+    // the same root cause.
     std::vector<Type> element_types;
     element_types.reserve(elements.size());
     for (std::size_t index = 0; index < elements.size(); ++index) {
         const Type element_expected = has_context ? expected.args[index] : Type::unknown();
-        Type actual = type_of(*elements[index], element_expected);
-        if (has_context && !is_subtype(actual, element_expected, &classes_)) {
-            error(*elements[index], "TypeError",
-                 "tuple item " + std::to_string(index) + " has incompatible type \"" +
-                     type_name(actual) + "\"; expected \"" + type_name(element_expected) + "\"");
-        }
-        element_types.push_back(std::move(actual));
+        element_types.push_back(type_of(*elements[index], element_expected));
     }
     // Not `expected`, even when has_context: unlike List/Dict, Tuple has no
     // single "declared element type" to fall back on for a bad position, so
