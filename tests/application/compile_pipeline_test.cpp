@@ -306,9 +306,12 @@ TEST(CompilePipeline, PopulatesTheTypeMapForACleanFile) {
 
 // Skipped when the sink already has errors: a dropped statement removes a
 // binding, so running the checker would invent a NameError for every later
-// use of it.
+// use of it. The dropped `import os` removes the only binding of `os`, and
+// `y: int = os` reads that exact name -- so with the guard off this would
+// report the SyntaxError plus an invented `NameError: name 'os' is not
+// defined`, and with the guard on it must report only the former.
 TEST(CompilePipeline, SkipsSemanticAnalysisWhenParsingFailed) {
-    FakeSourceReader reader({{"a.py", "x: int = 5\nimport os\ny: int = x\n"}});
+    FakeSourceReader reader({{"a.py", "import os\ny: int = os\n"}});
     FakeSourceLister lister({});
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
@@ -317,7 +320,7 @@ TEST(CompilePipeline, SkipsSemanticAnalysisWhenParsingFailed) {
 
     EXPECT_TRUE(result.has_errors);
     EXPECT_EQ(result.modules.at("a.py").types.size(), 0u) << "the map must be empty";
-    // Exactly the one syntax error, and no invented NameErrors.
+    // Exactly the one syntax error, and no invented NameError for `os`.
     ASSERT_EQ(reporter.entries.size(), 1u);
     EXPECT_EQ(reporter.entries.front().diagnostic.code, "SyntaxError");
 }
@@ -332,6 +335,10 @@ TEST(CompilePipeline, ChecksEveryFileInADirectoryRun) {
 
     EXPECT_TRUE(result.has_errors);
     EXPECT_GT(result.modules.at("a.py").types.size(), 0u);
+    // b.py has no syntax error, so the checker still runs on it despite the
+    // TypeError -- the mismatched value is still typed for the TypeMap (see
+    // TypeChecker::visit(AnnAssign)), so this must be non-empty too.
+    EXPECT_GT(result.modules.at("b.py").types.size(), 0u);
     ASSERT_EQ(reporter.entries.size(), 1u);
     EXPECT_EQ(reporter.entries.front().path, "b.py");
     EXPECT_EQ(reporter.entries.front().diagnostic.code, "TypeError");
