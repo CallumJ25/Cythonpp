@@ -729,7 +729,7 @@ TEST(TypeChecker, AMethodMayReadAClassBodyAttributeDeclaredBelowIt) {
 }
 
 // ---------------------------------------------------------------------------
-// Carried defect N1: the ANNOTATED self.x form.
+// The ANNOTATED self.x form.
 //
 // `self.ys: list[int] = ys` -- close to universal in typed Python -- reached
 // visit(AnnAssign)'s non-Name-target fallback, which resolved the annotation
@@ -766,7 +766,7 @@ TEST(TypeChecker, AnAnnotatedSelfAssignmentDeclaresTheAttribute) {
         << "the ANNOTATION must be the declared type, not an absorbing Unknown";
 }
 
-// Half A on its own: the reader method sits ABOVE the declaring one, so
+// The pre-pass arm on its own: the reader method sits ABOVE the declaring one, so
 // nothing has walked the annotation by the time the read is typed. Only
 // collect_self_attribute_placeholders' AnnAssign arm can make this clean.
 TEST(TypeChecker, AMethodMayReadAnAttributeFirstAnnotatedByALaterMethod) {

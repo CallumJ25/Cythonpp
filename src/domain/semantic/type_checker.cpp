@@ -834,7 +834,7 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
         AnnotationResolver resolver(classes_, sink_);
         info.type = resolver.resolve(node.annotation());
 
-        // N1: `self.x: T = ...` inside a method DECLARES the instance
+        // `self.x: T = ...` inside a method DECLARES the instance
         // attribute, exactly like the plain `self.x = ...` form
         // assign_attribute already handled. Without this branch the
         // annotated form -- close to universal in typed Python -- declared
@@ -842,9 +842,9 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
         // TypeError on mypy-clean code. The guard and the three-way line
         // disambiguation are assign_attribute's own, shared verbatim rather
         // than copied (see self_attribute_receiver_type / self_member_state);
-        // Half B of the fix, pre_collect_class_body's AnnAssign arm being
-        // Half A, which is what makes a reader method sitting ABOVE the
-        // declaring one work too.
+        // This branch is one of two halves: pre_collect_class_body's
+        // own AnnAssign arm is the other, and is what makes a reader
+        // method sitting ABOVE the declaring one work too.
         //
         // Every other non-Name target (`xs[0]: int = 5`, `other.x: int = 5`)
         // is unchanged: annotation resolved for `expected` only, no binding,
@@ -1475,19 +1475,19 @@ void TypeChecker::collect_self_attribute_placeholders(const std::string& qualifi
             declare_self_attribute_placeholder(qualified_name, assign->target(),
                                                assign->span().start_line);
         } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
-            // N1, Half A: the ANNOTATED form, `self.x: T = ...` (and the
+            // The ANNOTATED form, `self.x: T = ...` (and the
             // value-less `self.x: T`), placeholder-declares through the exact
             // same helper as the plain form above -- not a second copy of it,
             // so the two forms cannot drift into recognising different sets
             // of targets. Without this arm a reader method sitting ABOVE the
             // declaring one was still a false attr-defined TypeError even
-            // with visit(AnnAssign)'s own branch (Half B) in place, because
+            // with visit(AnnAssign)'s own branch in place, because
             // nothing had declared the attribute by the time the reader was
             // walked.
             //
             // The annotation is deliberately NOT resolved here, for two
             // reasons: resolving it would double-report a bad annotation
-            // (Half B resolves it again when the real walk reaches this
+            // (visit(AnnAssign) resolves it again when the real walk reaches this
             // statement), and an Unknown placeholder at this statement's own
             // LINE is the disambiguator self_member_state needs to tell "this
             // IS my own placeholder" from "a genuine earlier declaration".

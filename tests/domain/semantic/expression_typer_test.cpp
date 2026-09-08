@@ -150,7 +150,7 @@ TEST(ExpressionTyper, ALocalBindingNamedLikeABuiltinTypeWinsOverTheBuiltinPath) 
     EXPECT_EQ(typed_name("int", {{"int", Type::str()}}), "str");
 }
 
-// Carried defect N2: a USER CLASS name used as a VALUE (`w = Widget`) is
+// A USER CLASS name used as a VALUE (`w = Widget`) is
 // mypy-clean but drew `NameError: name 'Widget' is not defined`, because
 // class names are deliberately never bound into ScopeStack (two precedence
 // checks depend on their absence) so a resolution miss is a class name's

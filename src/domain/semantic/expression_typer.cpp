@@ -154,7 +154,7 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
         if (builtin_type_kind(name.identifier()).has_value()) {
             return Type::class_of("type");
         }
-        // N2: a USER class name used as a VALUE (`w = Widget`) is mypy-clean,
+        // A USER class name used as a VALUE (`w = Widget`) is mypy-clean,
         // while we reported `name 'Widget' is not defined`. Class names are
         // deliberately never bound into ScopeStack -- both
         // type_of_attribute's class-object-receiver check and
