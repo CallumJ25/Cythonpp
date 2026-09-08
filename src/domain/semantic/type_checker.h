@@ -92,22 +92,22 @@ namespace cythonpp::domain::semantic {
 //
 // This is a syntactic approximation of mypy's real reachability analysis, and
 // fix round 1 (Finding 4) corrects a false claim that used to live here: it
-// does NOT err in only one direction. Both are reachable:
-//   - MISSED error (mypy says "definitely returns", we say "maybe not"): the
-//     loop-else case above, before this fix round -- `while True: / for x in
-//     xs: pass / else: break` with no return after it. mypy proves the
-//     `break` (loop-else, so it targets the `while`) makes fall-through
-//     reachable and demands a return; the old code did not look inside a
-//     nested loop's orelse at all, so it silently agreed with neither.
-//   - FALSE POSITIVE (mypy says "maybe not", we say "definitely returns" --
-//     or the reverse, whichever direction the missing return check reads as
-//     an error): `while True: / if False: / break / return 1` (unreachable
-//     code after `if False:` is fine by itself, but syntactically this body
-//     TEXTUALLY contains a `break`, so contains_reachable_break says true and
-//     the enclosing `while True` is judged skippable). mypy prunes the
-//     `if False:` block as unreachable and never counts that break, so it
-//     still judges the loop non-terminating; this checker reports a spurious
-//     "missing return statement" mypy would not.
+// does NOT err in only one direction. Both are reachable, verified against
+// mypy 1.18.1:
+//   - mypy reports "missing return statement"; we do not: `while True: / for
+//     x in xs: pass / else: break` with no return after it. A loop's else
+//     runs outside that loop's own break scope, so mypy sees the `break`
+//     escape the `while True` and demands a return. Before fix round 1 this
+//     checker did not look inside a nested loop's orelse at all, so it
+//     stayed silent.
+//   - we report "missing return statement"; mypy does not: `while True: / if
+//     False: / break / return 1`. mypy prunes the `if False:` block as
+//     unreachable and never counts that break, so it judges the loop
+//     non-terminating and accepts the function. This checker has no
+//     reachability analysis -- contains_reachable_break finds the `break`
+//     textually regardless of the `if False:` guard around it -- so it judges
+//     the `while True` skippable and reports a spurious "missing return
+//     statement" mypy would not.
 // This ships anyway because building real reachability analysis (constant
 // folding, unreachable-code pruning) is out of scope for this task -- the
 // syntactic rule catches the overwhelmingly common shapes correctly and both
