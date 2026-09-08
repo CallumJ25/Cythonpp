@@ -554,6 +554,31 @@ private:
     // one) or a later statement can see a class declared below it (Phase 1
     // already ran) or a name declared below it in source order without a
     // false NameError once Task 18 wires up FunctionDef bodies.
+    //
+    // RECURSED THROUGH CONTROL FLOW for the FunctionDef arm only (see
+    // for_each_flat_statement): Python introduces no scope for an
+    // `if`/`while`/`for` block, so a `def` written there binds its name in
+    // module scope exactly like a flat one -- the same rule collect_classes
+    // already applies to a conditional `class`. Before this recursion, a
+    // conditional def's own name was bound by nobody (its own
+    // visit(FunctionDef) binds it only when the current scope is Function,
+    // which at module level it never is), so every call to one was a false
+    // NameError on code mypy accepts and CPython runs.
+    //
+    // The AnnAssign arm deliberately does NOT get this recursion: a
+    // conditional annotated assignment is already bound correctly by the
+    // ordinary statement walk when it reaches that exact line, and binding it
+    // here too would either double-report a redefinition or bind it ahead of
+    // its own source position.
+    //
+    // A conditional def's FAILED bind is dropped silently rather than
+    // reported: measured against mypy 1.18.1, two defs of one name in an
+    // if/else, and two in the same block, are both `Success` -- mypy allows a
+    // conditional function redefinition, so reporting one here would be a
+    // false TypeError on mypy-clean code. The first binding wins; a second,
+    // genuinely incompatible conditional def is a missed error, the safe
+    // direction, matching the allowance scan_top_level_names already makes
+    // for the identical case.
     void collect_signatures(const ast::Module& module);
 
     // Phase 2.5: every top-level Assign's target name(s) that are not yet

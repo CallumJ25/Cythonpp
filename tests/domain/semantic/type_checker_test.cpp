@@ -2428,5 +2428,143 @@ TEST(TypeChecker, TwoFlatDefsOfOneNameStillCollide) {
     EXPECT_EQ(error.message, "name \"f\" already defined on line 1");
 }
 
+// Python introduces no scope for an `if` block, so a `def` inside one binds
+// its name in MODULE scope -- the exact counterpart of a `class` there.
+// Verified against mypy 1.18.1 (`Success`) and CPython (prints 1). The
+// signature pre-pass walked the module body flat, and a def's own name is
+// bound by its visit only when the current scope is Function, so a
+// conditional def was never bound at all and every call was a false
+// NameError.
+TEST(TypeChecker, ADefDefinedInsideAnIfIsBoundInModuleScope) {
+    expect_clean("FLAG = True\n"
+                 "if FLAG:\n"
+                 "    def f() -> int:\n"
+                 "        return 1\n"
+                 "print(f())\n");
+}
+
+// Its SIGNATURE is bound, not merely its name: a wrong-typed argument at the
+// call site is still caught.
+TEST(TypeChecker, AConditionalDefsSignatureIsCheckedAtItsCallSite) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "if FLAG:\n"
+                                         "    def f(n: int) -> int:\n"
+                                         "        return n\n"
+                                         "print(f(\"s\"))\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "argument 1 to \"f\" has incompatible type \"str\"; expected \"int\"");
+}
+
+// A closure reading a conditional def defined BELOW it resolves outward and is
+// never order-checked, so this is clean. Verified: mypy `Success`.
+TEST(TypeChecker, AFunctionCanCallAConditionalDefDefinedBelowIt) {
+    expect_clean("FLAG = True\n"
+                 "def g() -> int:\n"
+                 "    return f()\n"
+                 "if FLAG:\n"
+                 "    def f() -> int:\n"
+                 "        return 1\n"
+                 "print(g())\n");
+}
+
+// THE HAZARD. Two conditional defs of one name is mypy-CLEAN (measured:
+// `Success`), so the second binding must NOT report a redefinition. The first
+// definition wins and the second is skipped silently -- if their signatures
+// genuinely disagree that is a missed error, which is the safe direction and
+// the same one the top-level name scan already takes for its own
+// conditional-redefinition allowance.
+TEST(TypeChecker, TwoConditionalDefsOfOneNameBindWithoutReporting) {
+    expect_clean("FLAG = True\n"
+                 "if FLAG:\n"
+                 "    def f() -> int:\n"
+                 "        return 1\n"
+                 "else:\n"
+                 "    def f() -> int:\n"
+                 "        return 2\n"
+                 "print(f())\n");
+}
+
+// Same allowance for two conditional defs in the SAME block.
+TEST(TypeChecker, TwoConditionalDefsInOneBlockBindWithoutReporting) {
+    expect_clean("FLAG = True\n"
+                 "if FLAG:\n"
+                 "    def f() -> int:\n"
+                 "        return 1\n"
+                 "    def f() -> int:\n"
+                 "        return 2\n"
+                 "print(f())\n");
+}
+
+// A read ABOVE a conditional def now says "used before definition" rather than
+// "not defined" -- both are errors and mypy reports one too
+// (`Name "f" is used before definition`), so this is a wording improvement
+// that falls out of the def finally having a Binding with its own line.
+TEST(TypeChecker, AReadAboveAConditionalDefIsUsedBeforeDefinition) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "print(f())\n"
+                                         "if FLAG:\n"
+                                         "    def f() -> int:\n"
+                                         "        return 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'f' is used before definition");
+}
+
+// UNCHANGED GUARDS -- each is a row of the measured matrix that already worked,
+// and this task must not disturb any of them.
+
+// Two FLAT defs still collide, reported by the top-level name scan.
+TEST(TypeChecker, TwoFlatDefsStillCollideAfterConditionalBinding) {
+    const Checked checked = check_module("def f() -> int:\n"
+                                         "    return 1\n"
+                                         "def f() -> int:\n"
+                                         "    return 2\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.message, "name \"f\" already defined on line 1");
+}
+
+// A flat AnnAssign followed by a flat def of the same name still collides --
+// this is the ONE collision that reaches the signature pass's own bind check,
+// and gating that report on flatness must not remove it. Confirm the exact
+// wording against the current binary before trusting this expectation.
+TEST(TypeChecker, AnAnnotatedNameFollowedByAFlatDefStillCollides) {
+    const Checked checked = check_module("f: int = 1\n"
+                                         "def f() -> int:\n"
+                                         "    return 2\n");
+    EXPECT_FALSE(checked.diagnostics.empty());
+    EXPECT_EQ(checked.diagnostics.front().code, "TypeError");
+}
+
+// An if/else pair of ANNOTATED assignments still reports, matching mypy's
+// `Name "y" already defined on line 4 [no-redef]`. This is why the signature
+// pass's AnnAssign branch must NOT be recursed.
+TEST(TypeChecker, TwoConditionalAnnotatedAssignmentsStillCollide) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "if FLAG:\n"
+                                         "    y: int = 5\n"
+                                         "else:\n"
+                                         "    y: int = 6\n"
+                                         "print(y)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"y\" already defined on line 3");
+}
+
+// A conditional def inside a `def` already worked and must keep working: the
+// enclosing function's own scope is current, so the ordinary binding path
+// covers it.
+TEST(TypeChecker, AConditionalDefInsideAFunctionStillWorks) {
+    expect_clean("FLAG = True\n"
+                 "def outer() -> int:\n"
+                 "    if FLAG:\n"
+                 "        def inner() -> int:\n"
+                 "            return 1\n"
+                 "        return inner()\n"
+                 "    return 0\n"
+                 "print(outer())\n");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

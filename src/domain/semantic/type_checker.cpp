@@ -349,59 +349,107 @@ void TypeChecker::declare_class_recursive(const ast::ClassDef& class_def,
 }
 
 void TypeChecker::collect_signatures(const ast::Module& module) {
-    for (const ast::StmtPtr& statement : module.body()) {
-        if (const auto* function_def = dynamic_cast<const ast::FunctionDef*>(statement.get())) {
-            if (collided_top_level_.count(function_def) != 0) {
-                continue; // scan_top_level_names already reported this.
+    // Recursed through control flow (see for_each_flat_statement), so a `def`
+    // written inside an `if`/`while`/`for` is bound in module scope exactly
+    // like a flat one -- Python introduces no scope for a control-flow block,
+    // and a conditional def was previously never bound at all (a def's own
+    // name is otherwise bound only by its own visit(FunctionDef), which binds
+    // it only when the current scope is Function -- Module, at this point),
+    // making every call to one a false NameError on code mypy accepts and
+    // CPython runs.
+    //
+    // ONE ORDERED LOOP, not two passes: the bind check below relies on an
+    // AnnAssign having bound first when it textually appears first, and
+    // splitting into a recursed def pass plus a flat AnnAssign pass would
+    // reorder every def ahead of every AnnAssign, breaking that.
+    //
+    // The AnnAssign arm is deliberately NOT affected by the recursion -- see
+    // its own comment below.
+    for_each_flat_statement(
+        module.body(), /*directly_in_body=*/true,
+        [this](const ast::Stmt& statement, bool at_flat_top_level) {
+            if (const auto* function_def = dynamic_cast<const ast::FunctionDef*>(&statement)) {
+                if (collided_top_level_.count(function_def) != 0) {
+                    return; // scan_top_level_names already reported this.
+                }
+                AnnotationResolver resolver(classes_, sink_);
+                std::vector<Type> params;
+                params.reserve(function_def->params().size());
+                for (const ast::Parameter& parameter : function_def->params()) {
+                    params.push_back(parameter.annotation != nullptr
+                                          ? resolver.resolve(*parameter.annotation)
+                                          : Type::unknown());
+                }
+                Type return_type = function_def->has_return_annotation()
+                                        ? resolver.resolve(function_def->return_annotation())
+                                        : Type::unknown();
+                // Cached BEFORE the Binding below moves from it, so Task 18's
+                // visit(FunctionDef) can reuse this exact resolution rather
+                // than calling AnnotationResolver a second time on the same
+                // annotations (see top_level_signatures_'s own comment).
+                // MUST happen even for a conditional def, and BEFORE the
+                // early return below -- otherwise visit(FunctionDef) finds no
+                // cached entry, re-resolves the same annotations itself, and
+                // double-reports a bad one.
+                const Type signature_type = Type::callable(
+                    params, return_type, defaulted_param_count(function_def->params()));
+                top_level_signatures_.emplace(function_def, signature_type);
+                // The bool `bind` returns MUST be
+                // checked -- `bind` itself has no sink and never reported
+                // anything on its own, contrary to what the previous comment
+                // here claimed. A def/def or def/class collision never
+                // reaches this line at all: scan_top_level_names already
+                // caught and reported both (it compares EVERY top-level
+                // ClassDef/FunctionDef name against every other), and the
+                // early return above already skipped the losing def. The ONE
+                // collision that reaches `bind` here is an AnnAssign-then-def
+                // collision -- the AnnAssign bound first, earlier in THIS
+                // same ordered loop, and scan_top_level_names never tracks
+                // AnnAssign names at all -- so this check exists for that
+                // case specifically. The reverse, def-then-AnnAssign, is
+                // instead caught by bind_annotation's own bool check below,
+                // since by the time that AnnAssign runs the def already
+                // occupies the name.
+                const Binding signature{signature_type, function_def->span().start_line,
+                                        /*annotated=*/true};
+                if (!scopes_.bind(function_def->name(), signature)) {
+                    if (!at_flat_top_level) {
+                        // A CONDITIONAL def whose name is already bound.
+                        // Measured against mypy 1.18.1: two defs of one name
+                        // in an if/else, and two in the same block, are BOTH
+                        // `Success` -- mypy allows a conditional function
+                        // redefinition. So reporting here would be a false
+                        // TypeError on code mypy accepts, which is the one
+                        // thing this pass must never do. The first binding
+                        // wins and this one is dropped silently; if the two
+                        // signatures genuinely disagree that is a MISSED
+                        // error, the safe direction, and the same choice the
+                        // top-level name scan already makes for its own
+                        // conditional-redefinition allowance.
+                        return;
+                    }
+                    const Resolution existing = scopes_.resolve(function_def->name());
+                    report(*function_def, "TypeError",
+                          "name \"" + function_def->name() + "\" already defined on line " +
+                              std::to_string(existing.binding->declared_line));
+                }
+            } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(&statement)) {
+                if (!at_flat_top_level) {
+                    // A conditional annotated assignment is already handled
+                    // correctly by the ordinary walk, which binds it when it
+                    // reaches the statement -- verified, `if FLAG: y: int = 5`
+                    // then reading `y` is clean, and an if/else pair of them
+                    // still reports the redefinition mypy reports. Binding one
+                    // here as well would either double-report that
+                    // redefinition or bind it ahead of its own line.
+                    return;
+                }
+                if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
+                    module_level_annotations_[ann_assign] = bind_annotation(
+                        *target_name, ann_assign->annotation(), ann_assign->span().start_line);
+                }
             }
-            AnnotationResolver resolver(classes_, sink_);
-            std::vector<Type> params;
-            params.reserve(function_def->params().size());
-            for (const ast::Parameter& parameter : function_def->params()) {
-                params.push_back(parameter.annotation != nullptr
-                                      ? resolver.resolve(*parameter.annotation)
-                                      : Type::unknown());
-            }
-            Type return_type = function_def->has_return_annotation()
-                                    ? resolver.resolve(function_def->return_annotation())
-                                    : Type::unknown();
-            // Cached BEFORE the Binding below moves from it, so Task 18's
-            // visit(FunctionDef) can reuse this exact resolution rather than
-            // calling AnnotationResolver a second time on the same
-            // annotations (see top_level_signatures_'s own comment).
-            const Type signature_type = Type::callable(params, return_type,
-                                                       defaulted_param_count(function_def->params()));
-            top_level_signatures_.emplace(function_def, signature_type);
-            // The bool `bind` returns MUST be
-            // checked -- `bind` itself has no sink and never reported
-            // anything on its own, contrary to what the previous comment
-            // here claimed. A def/def or def/class collision never reaches
-            // this line at all: scan_top_level_names already caught and
-            // reported both (it compares EVERY top-level ClassDef/FunctionDef
-            // name against every other), and the `continue` above already
-            // skipped the losing def. The ONE collision that reaches `bind`
-            // here is an AnnAssign-then-def collision -- the AnnAssign bound
-            // first, earlier in THIS same ordered loop, and
-            // scan_top_level_names never tracks AnnAssign names at all -- so
-            // this check exists for that case specifically. The reverse,
-            // def-then-AnnAssign, is instead caught by bind_annotation's own
-            // bool check below, since by the time that AnnAssign runs the def
-            // already occupies the name.
-            const Binding signature{signature_type, function_def->span().start_line,
-                                    /*annotated=*/true};
-            if (!scopes_.bind(function_def->name(), signature)) {
-                const Resolution existing = scopes_.resolve(function_def->name());
-                report(*function_def, "TypeError",
-                      "name \"" + function_def->name() + "\" already defined on line " +
-                          std::to_string(existing.binding->declared_line));
-            }
-        } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
-            if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
-                module_level_annotations_[ann_assign] = bind_annotation(
-                    *target_name, ann_assign->annotation(), ann_assign->span().start_line);
-            }
-        }
-    }
+        });
 }
 
 void TypeChecker::pre_bind_assignment_targets(const ast::Module& module) {
