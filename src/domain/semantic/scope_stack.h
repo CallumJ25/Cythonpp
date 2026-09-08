@@ -22,6 +22,24 @@ struct Binding {
     // an annotated name is a redefinition error; re-ASSIGNING it is an
     // ordinary assignment check.
     bool annotated = false;
+
+    // Task 18 fix round 1, Finding 1 (CRITICAL): true only for a function
+    // parameter. A parameter can NEVER be used-before-definition inside its
+    // own body -- by the time the body runs, every parameter is already
+    // bound -- yet a one-line `def f(x: int) -> None: print(x)` binds `x` at
+    // the SAME line the body statement sits on (there is no separate body
+    // line to be strictly greater), so the ordinary ordering check's `>=`
+    // (declared_line >= statement_line_, deliberately `>=` so `x = x + 1`
+    // still trips) would misfire on the read of `x` and on any other
+    // same-line read of a parameter. This flag is the exemption:
+    // ExpressionTyper::type_of_name skips the ordering check entirely when
+    // it is set. It ALSO lets assign_to/assign_name tell a parameter apart
+    // from pre_bind_function_body's own "still-unfilled placeholder" pattern
+    // (same test, declared_line == the current statement's line) -- without
+    // it, `def f(x: int) -> None: x = "s"` would be mistaken for the
+    // placeholder-fill case and silently REBIND over the parameter's
+    // annotation instead of reporting the incompatible assignment.
+    bool order_exempt = false;
 };
 
 // What a lookup found, and WHERE, because the ordering rule (3b) depends on

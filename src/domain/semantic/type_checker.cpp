@@ -293,6 +293,10 @@ void TypeChecker::visit(const ast::Assign& node) {
     assign_to(node.target(), node.value(), line);
 }
 
+bool TypeChecker::is_unfilled_placeholder(const Binding& binding, int line) {
+    return binding.declared_line == line && !binding.order_exempt;
+}
+
 void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int line) {
     if (const auto* tuple = dynamic_cast<const ast::TupleExpr*>(&target)) {
         assign_tuple(*tuple, value, line);
@@ -314,9 +318,10 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
         Type expected = Type::unknown();
         if (scopes_.bound_in_current_scope(name->identifier())) {
             const Resolution existing = scopes_.resolve(name->identifier());
-            if (existing.binding->declared_line != line) {
+            if (!is_unfilled_placeholder(*existing.binding, line)) {
                 // A genuine prior binding (not this exact statement's own
-                // still-unfilled placeholder) -- use its type as
+                // still-unfilled placeholder, and not a same-line parameter
+                // -- see is_unfilled_placeholder) -- use its type as
                 // bidirectional context.
                 expected = existing.binding->type;
             }
@@ -324,8 +329,8 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
         const Type value_type = typer_.type_of(value, expected);
 
         const bool is_new_definition = !scopes_.bound_in_current_scope(name->identifier()) ||
-                                       scopes_.resolve(name->identifier()).binding->declared_line ==
-                                           line;
+                                       is_unfilled_placeholder(
+                                           *scopes_.resolve(name->identifier()).binding, line);
         if (is_new_definition && is_bare_empty_container(value)) {
             report(*name, "TypeError", "need type annotation for \"" + name->identifier() + "\"");
         }
@@ -343,7 +348,7 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
         return;
     }
     const Resolution existing = scopes_.resolve(target.identifier());
-    if (existing.binding->declared_line == line) {
+    if (is_unfilled_placeholder(*existing.binding, line)) {
         // This statement owns a still-unfilled placeholder from
         // pre_bind_assignment_targets (or is re-visiting its own earlier
         // tuple element within the same statement) -- this IS the first
@@ -352,8 +357,14 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
         scopes_.rebind(target.identifier(), Binding{value_type, line, /*annotated=*/false});
         return;
     }
-    // A genuine reassignment: the FIRST assignment's inferred type is
-    // sticky, so this is a compatibility check only, never a rebind.
+    // A genuine reassignment (including a one-line def's parameter, whose
+    // declared_line equals this very statement's line but which is
+    // order_exempt -- see is_unfilled_placeholder -- so it never takes the
+    // branch above): the FIRST assignment's inferred type is sticky, so this
+    // is a compatibility check only, never a rebind. This is what makes
+    // `def f(x: int) -> None: x = "s"` a reported incompatible assignment
+    // instead of a silent rebind that discards the parameter's annotation
+    // (Task 18 fix round 1, Finding 1's second symptom).
     if (value_type.kind != TypeKind::Unknown && existing.binding->type.kind != TypeKind::Unknown &&
         !is_subtype(value_type, existing.binding->type, &classes_)) {
         report_incompatible_assignment(target, value_type, existing.binding->type, "variable");
@@ -474,10 +485,19 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         // Verified against mypy 1.18.1: "Method must have at least one
         // argument. Did you forget the "self" argument?", reported ONCE at
         // the definition (mypy itself repeats it at every call site; we do
-        // not). No parameter/return annotation check makes sense without a
-        // self to exempt, so this is the function's ONLY diagnostic -- the
-        // body is still walked (Fix round 1, Finding 1's own Function scope
-        // still applies) so a read inside it is still checked.
+        // not). There is no self to exempt, so the "missing an annotation"
+        // completeness check makes no sense here and is skipped -- but the
+        // RETURN annotation, if present, is still a real expression naming a
+        // real (possibly bogus) type, and mypy still reports it. Task 18 fix
+        // round 1, Finding 5: this was skipped entirely before, so
+        // `def m() -> Bogus:` inside a class silently swallowed the bad
+        // annotation. Resolved for its diagnostic side effect only -- the
+        // result feeds nothing, since the function's OWN diagnostic above is
+        // already the only thing reported for its (missing) signature.
+        if (node.has_return_annotation()) {
+            AnnotationResolver resolver(classes_, sink_);
+            resolver.resolve(node.return_annotation());
+        }
         report(node, "TypeError", "method must have at least one argument");
         FunctionScopeGuard guard(scopes_);
         pre_bind_function_body(node.body());
@@ -501,7 +521,16 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     bool any_param_annotated = false;
 
     const auto cached = top_level_signatures_.find(&node);
-    if (cached != top_level_signatures_.end()) {
+    if (cached != top_level_signatures_.end() && !cached->second.args.empty()) {
+        // Task 18 fix round 1, Finding 6: `args.end() - 1`/`args.back()` are
+        // safe TODAY -- Type::callable (collect_signatures's own caller)
+        // always pushes the return, so a cached entry's args is never empty
+        // -- but this cache is populated by a DIFFERENT function than the
+        // one reading it, so nothing here proves that invariant holds by
+        // construction the way type_of_positional_call's identical guard
+        // (expression_typer_calls.cpp) does for a Callable built through the
+        // exact same Type::callable call. Guarded rather than trusted, same
+        // rationale as that guard's own comment.
         const Type& signature = cached->second;
         param_types.assign(signature.args.begin(), signature.args.end() - 1);
         return_type = signature.args.back();
@@ -602,11 +631,29 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // the brief -- a parameter's annotation is a declaration for the whole
     // body (`def f(x: int)` then `x = "s"` inside is a TypeError, checked
     // via assign_to/assign_name exactly like any other reassignment).
+    // order_exempt=true (Task 18 fix round 1, Finding 1, CRITICAL): a
+    // parameter is bound before its body runs, so it can NEVER genuinely be
+    // used-before-definition inside that same body -- see Binding::
+    // order_exempt's own comment for why the ordinary `>=` ordering check
+    // would otherwise misfire on a one-line suite, and why
+    // is_unfilled_placeholder needs this same flag to avoid mistaking a
+    // same-line parameter for its own placeholder-fill case.
     FunctionScopeGuard guard(scopes_);
     for (std::size_t i = 0; i < params.size(); ++i) {
         const ast::Parameter& parameter = params[i];
-        scopes_.bind(parameter.name, Binding{param_types[i], def_line,
-                                             /*annotated=*/parameter.annotation != nullptr});
+        // Task 18 fix round 1, Finding 4: the bool `bind` returns MUST be
+        // checked, exactly as Finding 2 of the PRIOR fix round already
+        // established for collect_signatures's own def/def-collision bind
+        // call -- otherwise `def f(x: int, x: str) -> None` silently binds
+        // `x` once (keeping only the FIRST parameter's type) instead of
+        // reporting the duplicate. Verified against mypy 1.18.1: `Duplicate
+        // argument "x" in function definition`.
+        if (!scopes_.bind(parameter.name, Binding{param_types[i], def_line,
+                                                  /*annotated=*/parameter.annotation != nullptr,
+                                                  /*order_exempt=*/true})) {
+            report(node, "TypeError",
+                  "duplicate argument \"" + parameter.name + "\" in function definition");
+        }
     }
     // A nested `def` gets NO collect pass (verified: calling a nested
     // function defined LATER in the same body is used-before-def) -- this

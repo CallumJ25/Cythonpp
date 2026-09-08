@@ -189,6 +189,20 @@ private:
     // placeholder" means and why declared_line == line is the signal for it.
     void assign_name(const ast::Name& target, const Type& value_type, int line);
 
+    // Task 18 fix round 1, Finding 1: true when `binding` is THIS exact
+    // statement's own still-unfilled placeholder (from
+    // pre_bind_assignment_targets / pre_bind_function_body) rather than a
+    // genuine prior binding -- the signal being declared_line == line, AS
+    // LONG AS the binding is not order_exempt. A parameter's declared_line
+    // is the `def` line, which for a one-line suite equals the body
+    // statement's own line too, but a parameter is never a placeholder to
+    // fill in -- it already carries its real (possibly annotated) type --
+    // so order_exempt vetoes the match. Shared by assign_to (for both the
+    // bidirectional `expected` type and the bare-empty-container check) and
+    // assign_name, so the parameter exemption cannot be added to one call
+    // site and missed on another.
+    static bool is_unfilled_placeholder(const Binding& binding, int line);
+
     // True for `[]`, `{}`, or a zero-argument call to
     // list/dict/set/frozenset/tuple -- the five constructs mypy leaves
     // silently un-annotated (ExpressionTyper returns Unknown for them with NO

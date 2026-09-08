@@ -137,7 +137,19 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
     // not yet bound is a violation, because the right-hand side is evaluated
     // before the target is bound, so a read on the SAME line as its own
     // binding is already too late.
-    if (resolution.in_own_scope && resolution.binding->declared_line >= statement_line_) {
+    //
+    // Task 18 fix round 1, Finding 1 (CRITICAL): order_exempt is checked
+    // FIRST, ahead of the `>=`, because a parameter's declared_line is the
+    // `def` line -- which for a one-line suite (`def f(x: int) -> None:
+    // print(x)`) is the SAME line the body statement sits on, so `>=` alone
+    // would misfire a false "used before definition" on every one-line def
+    // that reads a parameter. A parameter can never genuinely be read before
+    // its own definition (it is bound before the body runs, full stop), so
+    // this is a real exemption, not a workaround: changing `>=` to `>`
+    // instead would silently break AReadOnItsOwnBindingLineIsAViolation's
+    // `x = x + 1` case, which relies on `>=` firing at module/local scope.
+    if (resolution.in_own_scope && !resolution.binding->order_exempt &&
+        resolution.binding->declared_line >= statement_line_) {
         return error(name, "NameError",
                      "name '" + name.identifier() + "' is used before definition");
     }

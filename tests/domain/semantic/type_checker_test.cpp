@@ -449,5 +449,111 @@ TEST(TypeChecker, AFunctionLocalUseBeforeDefinitionIsAViolation) {
     EXPECT_EQ(error.message, "name 'x' is used before definition");
 }
 
+// ---------------------------------------------------------------------------
+// Task 18, fix round 1.
+// ---------------------------------------------------------------------------
+
+// Finding 1 (CRITICAL). Reproduced against the built binary before this fix:
+// `def f(x: int) -> None: print(x)` reported a false "used before
+// definition" on `x`, because a one-line suite's body statement sits on the
+// SAME line as the `def` -- exactly the line a parameter is bound at -- so
+// the ordinary ordering check's `>=` misfired. mypy accepts both the
+// one-line and two-line forms; this pins the one-line form, the two-line
+// form already being covered by AFullyAnnotatedFunctionIsClean.
+TEST(TypeChecker, AOneLineDefReadingItsOwnParameterIsClean) {
+    expect_clean("def f(x: int) -> None: print(x)\n");
+}
+
+// Finding 1, second symptom: the SAME root cause, in the opposite direction.
+// `assign_name` mistook a one-line def's parameter (declared_line == the
+// body statement's own line) for pre_bind_function_body's "still-unfilled
+// placeholder" and silently REBOUND over it, discarding the parameter's
+// annotation -- so a wrong-typed assignment to it went unreported. This must
+// report the ordinary incompatible-assignment error, exactly as the
+// two-line form (AParameterAnnotationDeclaresTheNameForTheWholeBody) already
+// does.
+TEST(TypeChecker, AOneLineDefAssigningTheWrongTypeToItsParameterIsAnError) {
+    const Checked checked = check_module("def f(x: int) -> None: x = \"s\"\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"str\", "
+              "variable has type \"int\")");
+}
+
+// Finding 2 (IMPORTANT). Pins top_level_signatures_'s entire reason to
+// exist: without the cache, visit(FunctionDef) would call AnnotationResolver
+// a SECOND time on the same bad annotation collect_signatures's Phase 2
+// already resolved once, double-reporting it. Deleting the cache (and
+// falling through to the `else` branch unconditionally) makes this test
+// fail with 2 diagnostics instead of 1.
+TEST(TypeChecker, ATopLevelDefsBadAnnotationIsReportedExactlyOnce) {
+    const Checked checked = check_module("def f(x: Bogus) -> None:\n    pass\n");
+
+    EXPECT_EQ(only_error(checked).code, "NameError");
+}
+
+// Finding 3 (IMPORTANT). ANestedDefIsNotHoisted only pins the NEGATIVE case
+// (a nested def is not visible before its own line). Nothing previously
+// pinned that a nested def defined EARLIER is actually filled in with its
+// REAL signature -- AClosureMayReadALocalAssignedAfterItsOwnDef's own
+// `print(v)` never calls the nested function at all, so the rebind at
+// visit(FunctionDef)'s "own name is bound before its body is checked" step
+// could be deleted (leaving the Unknown placeholder unfilled, which silently
+// absorbs any call) and every existing test would still pass. Calling
+// `inner` with the wrong number of arguments makes a wrong signature
+// observable: an unfilled Unknown placeholder would report NOTHING here.
+TEST(TypeChecker, ANestedDefDefinedEarlierIsCallableWithItsRealSignature) {
+    const Checked checked = check_module(
+        "def outer() -> None:\n"
+        "    def inner(a: int) -> int:\n"
+        "        return a\n"
+        "    print(inner(1, 2))\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "too many arguments for \"inner\"");
+}
+
+// Finding 4 (Minor). collect_signatures already checked ScopeStack::bind's
+// return value for a top-level def/def collision (prior fix round); the
+// parameter-binding loop below it did not, so `def f(x: int, x: str) ->
+// None` silently kept only the FIRST parameter's binding instead of
+// reporting the duplicate. Verified against mypy 1.18.1: `Duplicate
+// argument "x" in function definition`.
+TEST(TypeChecker, ADuplicateParameterNameIsReported) {
+    const Checked checked = check_module("def f(x: int, x: str) -> None:\n    pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "duplicate argument \"x\" in function definition");
+}
+
+// Finding 5 (Minor). The zero-parameter-method path reported its own
+// "method must have at least one argument" error and returned WITHOUT ever
+// resolving the return annotation, so a bad one went unreported alongside
+// it. Both are real, independent errors on this input; asserting the
+// diagnostic COUNT is what pins that the return annotation is resolved at
+// all (a dropped resolution would silently leave this at one diagnostic).
+TEST(TypeChecker, AZeroParameterMethodsBadReturnAnnotationIsStillReported) {
+    const Checked checked = check_module("class C:\n    def m() -> Bogus:\n        pass\n");
+
+    EXPECT_EQ(checked.diagnostics.size(), 2u);
+    bool saw_missing_self = false;
+    bool saw_bad_annotation = false;
+    for (const diagnostics::Diagnostic& diagnostic : checked.diagnostics) {
+        if (diagnostic.code == "TypeError" &&
+            diagnostic.message == "method must have at least one argument") {
+            saw_missing_self = true;
+        }
+        if (diagnostic.code == "NameError" && diagnostic.message == "name 'Bogus' is not defined") {
+            saw_bad_annotation = true;
+        }
+    }
+    EXPECT_TRUE(saw_missing_self);
+    EXPECT_TRUE(saw_bad_annotation);
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic
