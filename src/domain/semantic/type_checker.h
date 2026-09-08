@@ -1,6 +1,7 @@
 #ifndef CYTHONPP_DOMAIN_SEMANTIC_TYPE_CHECKER_H
 #define CYTHONPP_DOMAIN_SEMANTIC_TYPE_CHECKER_H
 
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -23,6 +24,7 @@
 #include "domain/ast/node.h"
 #include "domain/ast/recursive_visitor.h"
 #include "domain/ast/return.h"
+#include "domain/ast/stmt.h"
 #include "domain/ast/subscript.h"
 #include "domain/ast/tuple_expr.h"
 #include "domain/ast/while.h"
@@ -255,6 +257,38 @@ private:
         bool redefinition = false;
     };
 
+    // The statement lists a MODULE-level or CLASS-level pre-pass must look
+    // inside, beyond the list it was handed. Python introduces no scope for
+    // an `if`/`while`/`for` block, so a `class` or `def` written there binds
+    // its name in the ENCLOSING scope exactly as a flat one does -- verified
+    // against mypy 1.18.1, `if FLAG: class Bag: ...` puts "Bag" in module
+    // scope and every later use of it is clean, with no "possibly undefined"
+    // complaint.
+    //
+    // THE BOUNDARY, and it is the OPPOSITE of
+    // collect_self_attribute_placeholders' one, which is why the two
+    // recursions look alike and must not be merged: that scan must NOT reach
+    // into a nested ClassDef/FunctionDef, because `self` there may be
+    // shadowed or simply absent. This walk must reach a ClassDef/FunctionDef
+    // that SITS inside an `if` (same enclosing scope, so its name really does
+    // bind here), but must still never descend INTO a ClassDef's or
+    // FunctionDef's own body: a class declared in a `def` is function-local,
+    // owned by visit(ClassDef)'s isolated-name and scoped-alias mechanism,
+    // and declaring it from here would leak it to the whole module. A class
+    // body's own nested classes are reached by declare_class_recursive
+    // instead, which calls back into this function per class body.
+    //
+    // `visitor` is invoked for every statement in `body` and in every nested
+    // control-flow block, in source order, INCLUDING the If/While/For
+    // statements themselves. Its second argument is `directly_in_body` --
+    // true only for a statement of the list the OUTERMOST caller passed, and
+    // false for anything found inside a control-flow block. Callers that do
+    // not care take an unnamed parameter; scan_top_level_names does care, and
+    // its comment says why.
+    static void for_each_flat_statement(
+        const std::vector<ast::StmtPtr>& body, bool directly_in_body,
+        const std::function<void(const ast::Stmt&, bool)>& visitor);
+
     // PRE-PASS, in source order: every top-level ClassDef/FunctionDef name,
     // recording the FIRST line it was declared at. A SECOND top-level
     // ClassDef/FunctionDef under an already-recorded name is a redefinition,
@@ -269,6 +303,22 @@ private:
     // built-in collision detection -- which Phase 2 relies on for a pure
     // def/def or def/AnnAssign collision -- can never see a class name to
     // compare against.
+    //
+    // RECURSED THROUGH CONTROL FLOW (see for_each_flat_statement) -- BUT ONLY
+    // A CLASS ON EITHER SIDE COLLIDES WITH A CONDITIONAL DEFINITION. Measured
+    // against mypy 1.18.1, all six arrangements:
+    //   flat def    + flat def           -> `Name "f" already defined` [no-redef]
+    //   flat def    + def inside an if   -> Success
+    //   def in if   + def in same if     -> Success
+    //   flat class  + class inside an if -> `Name "Bag" already defined`
+    //   class in if + class in else      -> `Name "Bag" already defined`
+    //   flat def    + class inside an if -> `Name "Bag" already defined`
+    // mypy allows a CONDITIONAL FUNCTION redefinition and allows no
+    // conditional class redefinition at all. So the collision fires when
+    // either definition is a class, or when both sit flat in the module (or
+    // class) body -- see TopLevelDefinition and the function's own body for
+    // why the kind and the flatness are both recorded rather than just the
+    // line.
     void scan_top_level_names(const ast::Module& module);
 
     // Phase 1: declare every top-level ClassDef's name and bases into
@@ -426,6 +476,14 @@ private:
     // order with methods below because it genuinely depends on a
     // (possibly order-sensitive) VALUE expression Phase 3 alone can safely
     // resolve.
+    //
+    // Both sub-passes are recursed through control flow (see
+    // for_each_flat_statement): Python introduces no scope for an `if` inside
+    // a class body, so a method or an annotation written there is a member of
+    // the class exactly as a flat one is. visit(AnnAssign)'s own class-body
+    // arm already behaved this way (it gates on the CURRENT scope being
+    // Class, which an `if` does not change); this makes the pre-pass agree
+    // with it instead of missing the nested case.
     void pre_collect_class_body(const ast::ClassDef& node, const std::string& qualified_name);
 
     // The method-signature half of pre_collect_class_body's per-FunctionDef
@@ -705,8 +763,18 @@ private:
     TypeMap types_;
     ExpressionTyper typer_;
 
+    // One recorded module-scope definition, for the collision rule
+    // scan_top_level_names implements. `at_flat_top_level` is false for a
+    // definition found inside an `if`/`while`/`for` block, which is the ONE
+    // fact the rule needs beyond the line and the kind -- see that function.
+    struct TopLevelDefinition {
+        int line = 0;
+        bool is_class = false;
+        bool at_flat_top_level = false;
+    };
+
     // Populated by scan_top_level_names; see its comment.
-    std::map<std::string, int> top_level_lines_;
+    std::map<std::string, TopLevelDefinition> top_level_definitions_;
     std::set<const ast::Node*> collided_top_level_;
 
     // Phase 2's resolution for every module-level AnnAssign, keyed by node

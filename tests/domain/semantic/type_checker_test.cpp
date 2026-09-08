@@ -2338,5 +2338,95 @@ TEST(TypeChecker, ASyntheticIsolationPrefixDoesNotLeakIntoAnAttrDefinedMessage) 
     EXPECT_EQ(checked.diagnostics[1].message, "\"C\" has no attribute \"missing\"");
 }
 
+// Python introduces no scope for an `if` block, so a class defined inside one
+// binds its name in MODULE scope. Verified against mypy 1.18.1: clean, with no
+// "possibly undefined" complaint, and `reveal_type(Bag)` is `def () -> Bag`.
+TEST(TypeChecker, AClassDefinedInsideAnIfIsDeclaredInModuleScope) {
+    expect_clean("FLAG = True\n"
+                 "if FLAG:\n"
+                 "    class Bag:\n"
+                 "        def __init__(self) -> None:\n"
+                 "            self.n = 0\n"
+                 "def f() -> None:\n"
+                 "    b = Bag()\n"
+                 "    print(b.n)\n");
+}
+
+// A class nested in an `if` inside a CLASS body is declared under its
+// qualified name too -- same rule, one level down.
+TEST(TypeChecker, AClassInsideAnIfInAClassBodyIsDeclaredQualified) {
+    expect_clean("FLAG = True\n"
+                 "class Outer:\n"
+                 "    if FLAG:\n"
+                 "        class Inner:\n"
+                 "            pass\n"
+                 "x: Outer.Inner = Outer.Inner()\n"
+                 "print(x)\n");
+}
+
+// Verified against mypy 1.18.1: `Name "Bag" already defined on line 3
+// [no-redef]` on the `else` branch, and the FIRST definition wins wholesale
+// -- no union.
+TEST(TypeChecker, TwoSameNamedClassesInIfElseAreARedefinition) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "if FLAG:\n"
+                                         "    class Bag:\n"
+                                         "        pass\n"
+                                         "else:\n"
+                                         "    class Bag:\n"
+                                         "        pass\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"Bag\" already defined on line 3");
+    EXPECT_EQ(error.line, 6);
+}
+
+// A CLASS gets no conditional-definition allowance even against a flat `def`.
+// Verified: mypy reports `Name "Bag" already defined on line 3 [no-redef]`.
+TEST(TypeChecker, AClassInsideAnIfCollidesWithAFlatDef) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "def Bag() -> int:\n"
+                                         "    return 1\n"
+                                         "if FLAG:\n"
+                                         "    class Bag:\n"
+                                         "        pass\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"Bag\" already defined on line 2");
+}
+
+// THE COUNTERPART, and the reason the collision rule is not simply "any two
+// definitions of one name". Verified against mypy 1.18.1: BOTH of these are
+// `Success` -- mypy allows a conditional FUNCTION redefinition. Reporting
+// either would be a false TypeError on mypy-clean code.
+TEST(TypeChecker, AConditionalDefDoesNotCollideWithAFlatDef) {
+    expect_clean("FLAG = True\n"
+                 "def f() -> int:\n"
+                 "    return 1\n"
+                 "if FLAG:\n"
+                 "    def f() -> int:\n"
+                 "        return 2\n");
+}
+
+TEST(TypeChecker, TwoConditionalDefsOfOneNameDoNotCollide) {
+    expect_clean("FLAG = True\n"
+                 "if FLAG:\n"
+                 "    def f() -> int:\n"
+                 "        return 1\n"
+                 "    def f() -> int:\n"
+                 "        return 2\n");
+}
+
+// Unchanged by the new recursion: two FLAT defs still collide. Verified:
+// `Name "f" already defined on line 1 [no-redef]`.
+TEST(TypeChecker, TwoFlatDefsOfOneNameStillCollide) {
+    const Checked checked = check_module("def f() -> int:\n"
+                                         "    return 1\n"
+                                         "def f() -> int:\n"
+                                         "    return 2\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.message, "name \"f\" already defined on line 1");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

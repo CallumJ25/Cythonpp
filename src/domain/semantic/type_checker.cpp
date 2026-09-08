@@ -157,33 +157,84 @@ void TypeChecker::visit(const ast::Module& node) {
     }
 }
 
-void TypeChecker::scan_top_level_names(const ast::Module& module) {
-    for (const ast::StmtPtr& statement : module.body()) {
-        const ast::Node* node = nullptr;
-        std::string name;
-        int line = 0;
-        if (const auto* class_def = dynamic_cast<const ast::ClassDef*>(statement.get())) {
-            node = class_def;
-            name = class_def->name();
-            line = class_def->span().start_line;
-        } else if (const auto* function_def = dynamic_cast<const ast::FunctionDef*>(statement.get())) {
-            node = function_def;
-            name = function_def->name();
-            line = function_def->span().start_line;
-        } else {
-            continue;
+void TypeChecker::for_each_flat_statement(
+    const std::vector<ast::StmtPtr>& body, bool directly_in_body,
+    const std::function<void(const ast::Stmt&, bool)>& visitor) {
+    for (const ast::StmtPtr& statement : body) {
+        visitor(*statement, directly_in_body);
+        if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
+            for_each_flat_statement(if_stmt->body(), false, visitor);
+            for_each_flat_statement(if_stmt->orelse(), false, visitor);
+        } else if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
+            for_each_flat_statement(while_stmt->body(), false, visitor);
+            for_each_flat_statement(while_stmt->orelse(), false, visitor);
+        } else if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
+            for_each_flat_statement(for_stmt->body(), false, visitor);
+            for_each_flat_statement(for_stmt->orelse(), false, visitor);
         }
-
-        const auto existing = top_level_lines_.find(name);
-        if (existing != top_level_lines_.end()) {
-            report(*node, "TypeError",
-                  "name \"" + name + "\" already defined on line " +
-                      std::to_string(existing->second));
-            collided_top_level_.insert(node);
-        } else {
-            top_level_lines_.emplace(name, line);
-        }
+        // A FunctionDef's or ClassDef's own body is a DIFFERENT scope and is
+        // deliberately not descended into -- see the header.
     }
+}
+
+void TypeChecker::scan_top_level_names(const ast::Module& module) {
+    // Recursed through control flow (see for_each_flat_statement): a class or
+    // def inside an `if` binds its name in module scope, so a same-named
+    // definition there collides with a flat one exactly as two flat ones do.
+    //
+    // BUT ONLY WHEN A CLASS IS INVOLVED. Measured against mypy 1.18.1, all
+    // six arrangements:
+    //   flat def    + flat def           -> `Name "f" already defined` [no-redef]
+    //   flat def    + def inside an if   -> Success
+    //   def in if   + def in same if     -> Success
+    //   flat class  + class inside an if -> `Name "Bag" already defined`
+    //   class in if + class in else      -> `Name "Bag" already defined`
+    //   flat def    + class inside an if -> `Name "Bag" already defined`
+    // mypy allows a CONDITIONAL FUNCTION redefinition and allows no
+    // conditional class redefinition at all. So the collision fires when
+    // either definition is a class, or when both sit flat in the module body.
+    // Reporting every def/def pair this recursion now reaches would be a
+    // false TypeError on mypy-clean code -- the exact invariant this pass
+    // exists to protect -- which is why the kind and the flatness are both
+    // recorded rather than just the line.
+    for_each_flat_statement(
+        module.body(), /*directly_in_body=*/true,
+        [this](const ast::Stmt& statement, bool at_flat_top_level) {
+            const ast::Node* node = nullptr;
+            std::string name;
+            int line = 0;
+            bool is_class = false;
+            if (const auto* class_def = dynamic_cast<const ast::ClassDef*>(&statement)) {
+                node = class_def;
+                name = class_def->name();
+                line = class_def->span().start_line;
+                is_class = true;
+            } else if (const auto* function_def =
+                           dynamic_cast<const ast::FunctionDef*>(&statement)) {
+                node = function_def;
+                name = function_def->name();
+                line = function_def->span().start_line;
+            } else {
+                return;
+            }
+
+            const auto existing = top_level_definitions_.find(name);
+            if (existing == top_level_definitions_.end()) {
+                top_level_definitions_.emplace(
+                    name, TopLevelDefinition{line, is_class, at_flat_top_level});
+                return;
+            }
+            if (!is_class && !existing->second.is_class &&
+                !(at_flat_top_level && existing->second.at_flat_top_level)) {
+                // Two functions, at least one of them conditional: mypy's
+                // conditional-function-definition allowance, measured above.
+                return;
+            }
+            report(*node, "TypeError",
+                   "name \"" + name + "\" already defined on line " +
+                       std::to_string(existing->second.line));
+            collided_top_level_.insert(node);
+        });
 }
 
 std::vector<std::string> TypeChecker::base_names(const std::vector<ast::ExprPtr>& bases) {
@@ -212,22 +263,19 @@ std::size_t TypeChecker::defaulted_param_count(const std::vector<ast::Parameter>
 
 void TypeChecker::collect_classes(const ast::Module& module) {
     std::vector<const ast::ClassDef*> all_classes;
-    for (const ast::StmtPtr& statement : module.body()) {
-        if (const auto* class_def = dynamic_cast<const ast::ClassDef*>(statement.get())) {
+    for_each_flat_statement(module.body(), /*directly_in_body=*/true,
+                            [&](const ast::Stmt& statement, bool) {
+        if (const auto* class_def = dynamic_cast<const ast::ClassDef*>(&statement)) {
             if (collided_top_level_.count(class_def) != 0) {
-                // scan_top_level_names already reported this
-                // ClassDef as a redefinition. Declaring it anyway used to
-                // silently OVERWRITE the winning same-named class's
-                // ClassTable entry (declare() has no collision detection of
-                // its own), so a later use (a member lookup, a constructor
-                // call) resolved against the LOSING class's bases/members --
-                // collect_signatures already skips a collided FunctionDef
-                // for the identical reason.
-                continue;
+                // scan_top_level_names already reported this ClassDef as a
+                // redefinition; declaring it anyway would silently overwrite
+                // the WINNING same-named class's ClassTable entry, since
+                // declare() has no collision detection of its own.
+                return;
             }
             declare_class_recursive(*class_def, "", all_classes);
         }
-    }
+    });
 
     // THEN -- once every class at every nesting depth is declared -- validate
     // that each bare-Name base actually resolves, reporting NameError for one
@@ -257,11 +305,12 @@ std::string TypeChecker::declare_isolated_class(const ast::ClassDef& node,
                                                 const std::string& qualified_name) {
     classes_.declare(qualified_name, base_names(node.bases()));
     std::vector<const ast::ClassDef*> all_classes{&node};
-    for (const ast::StmtPtr& statement : node.body()) {
-        if (const auto* nested = dynamic_cast<const ast::ClassDef*>(statement.get())) {
+    for_each_flat_statement(node.body(), /*directly_in_body=*/true,
+                            [&](const ast::Stmt& statement, bool) {
+        if (const auto* nested = dynamic_cast<const ast::ClassDef*>(&statement)) {
             declare_class_recursive(*nested, qualified_name, all_classes);
         }
-    }
+    });
     validate_class_bases(all_classes);
     return qualified_name;
 }
@@ -281,11 +330,12 @@ void TypeChecker::declare_class_recursive(const ast::ClassDef& class_def,
     // Outer's ClassDef node, so without this recursion "Outer.Inner" would
     // not exist in ClassTable yet and the annotation would report a false
     // NameError.
-    for (const ast::StmtPtr& statement : class_def.body()) {
-        if (const auto* nested = dynamic_cast<const ast::ClassDef*>(statement.get())) {
+    for_each_flat_statement(class_def.body(), /*directly_in_body=*/true,
+                            [&](const ast::Stmt& statement, bool) {
+        if (const auto* nested = dynamic_cast<const ast::ClassDef*>(&statement)) {
             declare_class_recursive(*nested, qualified_name, all_classes);
         }
-    }
+    });
 }
 
 void TypeChecker::collect_signatures(const ast::Module& module) {
@@ -1538,8 +1588,9 @@ void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
     // ClassTable, already fully populated by Phase 1), never from a VALUE
     // expression that could itself forward-reference another not-yet-bound
     // class-body name.
-    for (const ast::StmtPtr& statement : node.body()) {
-        if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
+    for_each_flat_statement(node.body(), /*directly_in_body=*/true,
+                            [&](const ast::Stmt& statement, bool) {
+        if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(&statement)) {
             if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
                 AnnotationResolver resolver(classes_, sink_);
                 const Type type = resolver.resolve(ann_assign->annotation());
@@ -1559,23 +1610,24 @@ void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
                 }
             }
         }
-    }
+    });
 
-    for (const ast::StmtPtr& statement : node.body()) {
-        if (const auto* function_def = dynamic_cast<const ast::FunctionDef*>(statement.get())) {
+    for_each_flat_statement(node.body(), /*directly_in_body=*/true,
+                            [&](const ast::Stmt& statement, bool) {
+        if (const auto* function_def = dynamic_cast<const ast::FunctionDef*>(&statement)) {
             if (function_def->params().empty()) {
                 // A method with no parameters at all (missing self) is
                 // reported by visit(FunctionDef) itself, which never
                 // registers it in ClassTable either -- this pre-pass must
                 // not add signature information for a method that will
                 // never really have one.
-                continue;
+                return;
             }
             const Type signature = resolve_method_signature(*function_def, qualified_name);
             class_method_signatures_.emplace(function_def, signature);
             classes_.declare_method(qualified_name, function_def->name(), signature);
             collect_self_attribute_placeholders(qualified_name, function_def->body());
-        } else if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
+        } else if (const auto* assign = dynamic_cast<const ast::Assign*>(&statement)) {
             if (const auto* target_name = dynamic_cast<const ast::Name*>(&assign->target())) {
                 // A plain class-body Assign
                 // placeholder-declares the SAME way self.x = ... does (real
@@ -1595,7 +1647,7 @@ void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
         // A nested ClassDef is handled entirely by its OWN visit(ClassDef)
         // call, when Phase 3's real walk reaches it -- nothing to pre-collect
         // for one here.
-    }
+    });
 }
 
 Type TypeChecker::resolve_method_signature(const ast::FunctionDef& method,
