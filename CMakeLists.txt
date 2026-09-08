@@ -30,6 +30,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/semantic/annotation_resolver.cpp
     src/domain/semantic/scope_stack.cpp
     src/domain/semantic/expression_typer.cpp
+    src/domain/semantic/expression_typer_calls.cpp
     src/domain/semantic/builtin_call_table.cpp
     src/application/compile_pipeline.cpp
     src/adapters/filesystem/filesystem_source_reader.cpp

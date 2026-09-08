@@ -870,9 +870,16 @@ TEST(ExpressionTyper, CallsAUserFunction) {
 }
 
 TEST(ExpressionTyper, ReportsCallArityBothWays) {
+    // Fix round 1, Finding 2: verified against real mypy 1.18.1 that a
+    // callee with no recoverable parameter names gets mypy's actual
+    // name-free spelling, "Too few arguments for \"f\"" -- never an invented
+    // count form. Type::callable carries no parameter names, so this is the
+    // truthful substitute, lower-cased to match "too many arguments for"'s
+    // own convention one branch below.
     const Typed missing =
         type_expression("f()", {{"f", Type::callable({Type::int_()}, Type::str())}});
     EXPECT_EQ(only_error(missing).code, "TypeError");
+    EXPECT_EQ(only_error(missing).message, "too few arguments for \"f\"");
 
     const Typed extra = type_expression(
         "f(1, 2)", {{"f", Type::callable({Type::int_()}, Type::str())}});
@@ -967,6 +974,33 @@ TEST(ExpressionTyper, BareContainerConstructorsFollowTheEmptyDisplayRule) {
     const Typed without = type_expression("list()");
     EXPECT_TRUE(without.diagnostics.empty());
     EXPECT_EQ(without.printed, "Unknown");
+}
+
+// Fix round 1, Finding 1 (CRITICAL): a nullopt from builtin_call_result for
+// a SUPPORTED name means "this shape is not modelled", never "mypy rejects
+// this" -- so it must be NotImplementedError, not a false TypeError.
+// `list(range(3))` is mypy-clean and about as common as Python gets;
+// `round(x, 2)` is a mypy-clean two-argument overload this table does not
+// model; `len(w)` on a user class defining `__len__` is mypy-clean but
+// invisible to this model, which has no typeshed. All three used to draw a
+// false TypeError.
+TEST(ExpressionTyper, ReportsAnUnmodelledSupportedBuiltinShapeAsUnsupportedNotAFalseTypeError) {
+    const Typed list_call = type_expression("list(range(3))");
+    const diagnostics::Diagnostic list_error = only_error(list_call);
+    EXPECT_EQ(list_error.code, "NotImplementedError");
+    EXPECT_EQ(list_error.message,
+              "calls to builtin 'list' with these argument types are not supported");
+
+    const Typed round_call = type_expression("round(1.5, 2)");
+    EXPECT_EQ(only_error(round_call).code, "NotImplementedError");
+
+    ClassTable table;
+    table.declare("Widget", {});
+    table.declare_method("Widget", "__len__",
+                         Type::callable({Type::class_of("Widget")}, Type::int_()));
+    const Typed len_call =
+        type_expression("len(w)", {{"w", Type::class_of("Widget")}}, Type::unknown(), &table);
+    EXPECT_EQ(only_error(len_call).code, "NotImplementedError");
 }
 
 TEST(ExpressionTyper, ReportsCallingANonCallable) {
