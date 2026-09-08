@@ -48,6 +48,42 @@ Type ExpressionTyper::type_of_call(const ast::Call& call, const Type& expected) 
         return type_of_name_call(*callee_name, call, expected);
     }
 
+    // NESTED-CLASS CONSTRUCTOR (Task 19): `Outer.Inner()`. Checked
+    // syntactically, BEFORE the callee is typed at all -- mirroring
+    // type_of_name_call's own is_class(identifier) branch for a bare `C()`,
+    // which exists for the identical reason: Type has no way to distinguish
+    // "a Class-kind VALUE" (an instance, which type_of_call_result's Class
+    // branch correctly treats as an unmodelled __call__) from "a class
+    // OBJECT reference" (which must construct). type_of_attribute's own
+    // class-object-receiver check (see its declaration comment) only
+    // recognises a bare-Name receiver, so a two-segment chain like this one
+    // is never routed there; going through the ordinary type_of(call.
+    // callee(), ...) dispatch below would fall into type_of_attribute's
+    // general Class-receiver arm instead, which looks ONLY at members and
+    // methods and has no notion of a nested class -- a false attr-defined
+    // TypeError on mypy-clean code. `root`'s own scope binding must still
+    // win, matching the precedence hazard documented on
+    // type_of_attribute's class-object check.
+    if (const auto* attribute = dynamic_cast<const ast::Attribute*>(&call.callee())) {
+        if (const auto* root = dynamic_cast<const ast::Name*>(&attribute->value())) {
+            const std::string dotted = root->identifier() + "." + attribute->attribute();
+            if (classes_.is_class(dotted) && scopes_.resolve(root->identifier()).binding == nullptr) {
+                // Recorded by hand, not through type_of(): typing `root`
+                // through the ordinary type_of_name() path would report a
+                // false NameError, exactly as every other class-object
+                // reference in this file explains.
+                types_.insert(root, Type::class_of(root->identifier()));
+                const Type constructor = classes_.constructor_type(dotted);
+                // The Attribute node itself gets the CONSTRUCTOR's type, not
+                // Class(dotted) -- matching type_of_name_call's identical
+                // choice for a bare `C` used as a callee (reveal_type(C) is
+                // `def (...) -> C`, not `type[C]`).
+                types_.insert(attribute, constructor);
+                return type_of_positional_call(constructor, call, "\"" + dotted + "\"");
+            }
+        }
+    }
+
     // Attribute and every other callee shape: type the callee through the
     // ordinary dispatcher (for an Attribute this runs type_of_attribute,
     // which already applies THE self CONTRACT -- an instance method arrives

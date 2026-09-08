@@ -555,5 +555,152 @@ TEST(TypeChecker, AZeroParameterMethodsBadReturnAnnotationIsStillReported) {
     EXPECT_TRUE(saw_bad_annotation);
 }
 
+// ---------------------------------------------------------------------------
+// Task 19: ClassDef and attribute collection.
+// ---------------------------------------------------------------------------
+
+TEST(TypeChecker, CollectsClassBodyAnnotations) {
+    expect_clean("class C:\n    x: int = 5\nc = C()\ny: int = c.x\n");
+}
+
+TEST(TypeChecker, AValuelessClassBodyAnnotationIsStillAnAttribute) {
+    expect_clean("class C:\n    x: int\nc = C()\ny: int = c.x\n");
+}
+
+// Verified: mypy does NOT privilege __init__. Any self.x = ... in any method
+// declares the attribute.
+TEST(TypeChecker, CollectsSelfAssignmentsFromAnyMethod) {
+    expect_clean(
+        "class C:\n"
+        "    def setup(self) -> None:\n"
+        "        self.x = 5\n"
+        "c = C()\n"
+        "y: int = c.x\n");
+}
+
+// Verified: the FIRST self.x assignment declares the type; a later
+// conflicting one is an assignment error. No join, no union.
+TEST(TypeChecker, TheFirstSelfAssignmentDeclaresTheAttributeType) {
+    const Checked checked = check_module(
+        "class C:\n"
+        "    def a(self) -> None:\n"
+        "        self.x = 5\n"
+        "    def b(self) -> None:\n"
+        "        self.x = \"s\"\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 5);
+}
+
+// Verified: the class body is NOT in the method's lexical scope.
+//
+// PLAN DEFECT (reported, not silently patched): the brief's own version of
+// this test used `return x`, which is VACUOUS for the exact reason recorded
+// on DirectRecursionIsClean and AClosureMayReadALocalAssignedAfterItsOwnDef
+// above -- Return is not yet overridden (Task 20), so RecursiveVisitor's
+// default just walks to the Name `x` via accept(), whose own visit() is
+// RecursiveVisitor's no-op default; `x` never reaches ExpressionTyper and the
+// test could not fail regardless of whether a method body actually skips the
+// class scope. Rewritten to `print(x)`, the same established fix.
+TEST(TypeChecker, AMethodBodyDoesNotSeeClassBodyNames) {
+    const Checked checked = check_module(
+        "class C:\n"
+        "    x: int = 1\n"
+        "    def m(self) -> None:\n"
+        "        print(x)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    // mypy emits TWO here -- name-defined plus a cascading no-any-return from
+    // the poisoned Any. We emit ONE, because Unknown is absorbing. That is a
+    // deliberate difference, not a gap in either compliance direction.
+}
+
+// Verified: a class body IS order-sensitive, and mypy uses name-defined here
+// rather than used-before-def for the structurally identical mistake.
+TEST(TypeChecker, AClassBodyIsOrderSensitive) {
+    const Checked checked = check_module("class C:\n    a: int = b\n    b: int = 2\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'b' is not defined");
+}
+
+TEST(TypeChecker, ResolvesInheritedAttributes) {
+    expect_clean("class B:\n    x: int\nclass D(B):\n    pass\nd = D()\ny: int = d.x\n");
+}
+
+// THE INVARIANT-(a) CLOSURE, end to end. Verified mypy-clean.
+TEST(TypeChecker, AUserClassInheritingABuiltinIsAssignableToIt) {
+    expect_clean("class Sub(int):\n    pass\nx: int = Sub()\n");
+}
+
+// Verified: e: Exception = ValueError() is mypy-clean -- the seeded bases at
+// work.
+TEST(TypeChecker, SeededBuiltinClassesAndTheirHierarchyResolve) {
+    expect_clean("x: type\n");
+    expect_clean("e: Exception = ValueError()\n");
+    expect_clean("b: BaseException = ValueError()\n");
+}
+
+TEST(TypeChecker, DeclaresNestedClassesByQualifiedName) {
+    expect_clean("class Outer:\n    class Inner:\n        pass\nx: Outer.Inner = Outer.Inner()\n");
+}
+
+// Verified: c.x = 5 from OUTSIDE the class is attr-defined. The attribute set
+// is closed at the class definition.
+TEST(TypeChecker, ReportsAssigningANewAttributeFromOutside) {
+    const Checked checked = check_module("class C:\n    pass\nc = C()\nc.x = 5\n");
+
+    EXPECT_EQ(only_error(checked).code, "TypeError");
+}
+
+TEST(TypeChecker, ChecksMethodCallArgumentsWithSelfDropped) {
+    expect_clean(
+        "class C:\n"
+        "    def m(self, a: int) -> int:\n"
+        "        return a\n"
+        "c = C()\n"
+        "y: int = c.m(1)\n");
+
+    const Checked checked = check_module(
+        "class C:\n"
+        "    def m(self, a: int) -> int:\n"
+        "        return a\n"
+        "c = C()\n"
+        "c.m(1, 2)\n");
+    EXPECT_EQ(only_error(checked).code, "TypeError");
+}
+
+// Task 19 gap 1 (recorded as pre-existing, closed by this task): a class-body
+// AnnAssign used to bind into MODULE scope (there was no real Class scope to
+// bind into instead), so a module-level name reused after the class reported
+// a false "already defined" redefinition against it. A real Class scope
+// isolates the two.
+TEST(TypeChecker, AClassBodyAnnotationDoesNotLeakIntoModuleScope) {
+    expect_clean("class A:\n    x: int\nx: str = \"s\"\n");
+}
+
+// Task 19 gap 2 (recorded as pre-existing, closed by this task): collect_
+// classes used to declare EVERY top-level ClassDef, even one scan_top_level_
+// names had already reported as a losing same-name collision -- silently
+// overwriting the winning class's ClassTable entry, so a later member lookup
+// resolved against the wrong (erroneous) class. The winning class's own
+// member must survive the collision.
+TEST(TypeChecker, ALosingClassRedefinitionDoesNotClobberTheWinningOnesMembers) {
+    const Checked checked = check_module(
+        "class C:\n"
+        "    x: int\n"
+        "class C:\n"
+        "    y: str\n"
+        "c = C()\n"
+        "z: int = c.x\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"C\" already defined on line 1");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

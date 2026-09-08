@@ -37,26 +37,34 @@ private:
     ScopeStack& scopes_;
 };
 
-// RAII guard for in_class_body_: sets it to `new_value`, restores whatever
-// it was on destruction. Used both ways round -- visit(ClassDef) sets it
-// TRUE around walking a class's own body, visit(FunctionDef) sets it FALSE
-// around walking a def's own body (a method's nested def is not itself a
-// method) -- so one guard covers both, and neither an early report-and-
-// return nor an exception between construction and the matching restore can
-// leave the flag stuck.
-class ClassBodyGuard {
+// RAII guard for visit(ClassDef)'s class body: pushes a REAL ScopeKind::Class
+// (Task 19 -- a prior, minimal ClassDef override pushed nothing at all, just
+// a bool; see type_checker.h's class-level comment for why that was enough
+// before this task and is not now) and sets current_class_qualified_name_ to
+// `qualified_name`, restoring both on destruction -- so nested classes
+// compose correctly by simple stack discipline: Inner's own guard, built
+// while Outer's is still live, saves "Outer" as `previous_` and restores it
+// once Inner's body is done, with no explicit nesting-depth bookkeeping
+// anywhere.
+class ClassContextGuard {
 public:
-    ClassBodyGuard(bool& flag, bool new_value) : flag_(flag), previous_(flag) {
-        flag_ = new_value;
+    ClassContextGuard(ScopeStack& scopes, std::string& current_name, std::string qualified_name)
+        : scopes_(scopes), current_name_(current_name), previous_(current_name) {
+        scopes_.push(ScopeKind::Class);
+        current_name_ = std::move(qualified_name);
     }
-    ~ClassBodyGuard() { flag_ = previous_; }
+    ~ClassContextGuard() {
+        scopes_.pop();
+        current_name_ = std::move(previous_);
+    }
 
-    ClassBodyGuard(const ClassBodyGuard&) = delete;
-    ClassBodyGuard& operator=(const ClassBodyGuard&) = delete;
+    ClassContextGuard(const ClassContextGuard&) = delete;
+    ClassContextGuard& operator=(const ClassContextGuard&) = delete;
 
 private:
-    bool& flag_;
-    bool previous_;
+    ScopeStack& scopes_;
+    std::string& current_name_;
+    std::string previous_;
 };
 
 } // namespace
@@ -123,20 +131,31 @@ std::vector<std::string> TypeChecker::base_names(const std::vector<ast::ExprPtr>
 }
 
 void TypeChecker::collect_classes(const ast::Module& module) {
-    std::vector<const ast::ClassDef*> class_defs;
+    std::vector<const ast::ClassDef*> all_classes;
     for (const ast::StmtPtr& statement : module.body()) {
         if (const auto* class_def = dynamic_cast<const ast::ClassDef*>(statement.get())) {
-            class_defs.push_back(class_def);
+            if (collided_top_level_.count(class_def) != 0) {
+                // Task 19 fix: scan_top_level_names already reported this
+                // ClassDef as a redefinition. Declaring it anyway used to
+                // silently OVERWRITE the winning same-named class's
+                // ClassTable entry (declare() has no collision detection of
+                // its own), so a later use (a member lookup, a constructor
+                // call) resolved against the LOSING class's bases/members --
+                // collect_signatures already skips a collided FunctionDef
+                // for the identical reason.
+                continue;
+            }
+            declare_class_recursive(*class_def, "", all_classes);
         }
     }
 
-    // Declare every top-level class BEFORE resolving any base, so a base
-    // naming a class declared later in the same module already resolves.
-    for (const ast::ClassDef* class_def : class_defs) {
-        classes_.declare(class_def->name(), base_names(class_def->bases()));
-    }
-
-    for (const ast::ClassDef* class_def : class_defs) {
+    // THEN -- once every class at every nesting depth is declared -- validate
+    // that each bare-Name base actually resolves, reporting NameError for one
+    // that does not (e.g. `class C(Generic):`, since Generic cannot be
+    // imported in this subset). Deferred until here (rather than folded into
+    // declare_class_recursive) so a base naming a class declared LATER in the
+    // same module, or in a different class's body, already resolves.
+    for (const ast::ClassDef* class_def : all_classes) {
         for (const ast::ExprPtr& base : class_def->bases()) {
             if (const auto* name = dynamic_cast<const ast::Name*>(base.get())) {
                 if (!classes_.is_class(name->identifier())) {
@@ -146,6 +165,28 @@ void TypeChecker::collect_classes(const ast::Module& module) {
                     report(*name, "NameError", "name '" + name->identifier() + "' is not defined");
                 }
             }
+        }
+    }
+}
+
+void TypeChecker::declare_class_recursive(const ast::ClassDef& class_def,
+                                          const std::string& qualified_prefix,
+                                          std::vector<const ast::ClassDef*>& all_classes) {
+    const std::string qualified_name =
+        qualified_prefix.empty() ? class_def.name() : qualified_prefix + "." + class_def.name();
+    classes_.declare(qualified_name, base_names(class_def.bases()));
+    all_classes.push_back(&class_def);
+
+    // A NESTED ClassDef (e.g. Inner inside Outer's body) is declared right
+    // here, under ITS OWN qualified name -- "Outer.Inner" -- rather than
+    // waiting for Phase 3's ordinary walk to reach it: an annotation
+    // resolved in Phase 2 (`x: Outer.Inner`) runs BEFORE Phase 3 ever visits
+    // Outer's ClassDef node, so without this recursion "Outer.Inner" would
+    // not exist in ClassTable yet and the annotation would report a false
+    // NameError.
+    for (const ast::StmtPtr& statement : class_def.body()) {
+        if (const auto* nested = dynamic_cast<const ast::ClassDef*>(statement.get())) {
+            declare_class_recursive(*nested, qualified_name, all_classes);
         }
     }
 }
@@ -411,11 +452,56 @@ void TypeChecker::assign_subscript(const ast::Subscript& target, const ast::Expr
 }
 
 void TypeChecker::assign_attribute(const ast::Attribute& target, const ast::Expr& value) {
+    // THE TRAP's escape hatch (Task 19): `self.x = ...` inside a method
+    // declares a NEW instance attribute the first time it is seen, checked
+    // BEFORE the ordinary read-then-compare path below -- which would
+    // otherwise call type_of_attribute on a member that does not exist YET
+    // and report a false attr-defined TypeError. Purely syntactic plus one
+    // ScopeStack::resolve (never itself typed, so this check alone can never
+    // report anything): the receiver must be a bare Name spelled "self" that
+    // currently resolves to Class(current_class_qualified_name_) -- i.e. we
+    // are really inside one of that class's own methods, not merely inside
+    // some unrelated nested function that happens to have a parameter also
+    // named "self".
+    if (const auto* receiver = dynamic_cast<const ast::Name*>(&target.value())) {
+        if (receiver->identifier() == "self" && !current_class_qualified_name_.empty()) {
+            const Resolution self_resolution = scopes_.resolve("self");
+            if (self_resolution.binding != nullptr &&
+                self_resolution.binding->type.kind == TypeKind::Class &&
+                self_resolution.binding->type.name == current_class_qualified_name_ &&
+                !classes_.member_type(current_class_qualified_name_, target.attribute()).has_value() &&
+                !classes_.method_type(current_class_qualified_name_, target.attribute()).has_value()) {
+                // First self.x = ... TypeChecker's own visitation has reached
+                // for this name (in THIS class; a base's member/method of the
+                // same name already failed one of the two has_value() checks
+                // above and falls through to the ordinary path instead) --
+                // infer the type from the value, exactly like an ordinary
+                // Name assignment, and declare it. No comparison: there is
+                // nothing yet to compare against.
+                const Type value_type = typer_.type_of(value, Type::unknown());
+                classes_.declare_member(current_class_qualified_name_, target.attribute(), value_type,
+                                        target.span().start_line);
+                // type_of_attribute never ran for `target`, so its TypeMap
+                // entries would otherwise be missing -- recorded by hand,
+                // matching type_of_attribute's own class-object-receiver
+                // branch (expression_typer.cpp), which does the same for the
+                // same reason.
+                types_.insert(&target, value_type);
+                types_.insert(receiver, self_resolution.binding->type);
+                return;
+            }
+        }
+    }
+
     const Type value_type = typer_.type_of(value, Type::unknown());
     // Reuses type_of_attribute entirely, which already reports attr-defined
     // ("\"C\" has no attribute \"x\"") for a name the class never declares --
     // the attribute set is closed at the class definition, so assigning a
-    // NEW attribute from outside the class is exactly that error.
+    // NEW attribute from outside the class is exactly that error. Also the
+    // path a SECOND, conflicting self.x assignment falls through to (the
+    // member now exists, from the first assignment above), matching
+    // assign_name's own "first assignment's type is sticky" rule -- no join,
+    // no union, just a compatibility check against the already-declared type.
     const Type member_type = typer_.type_of(target, Type::unknown());
     if (value_type.kind != TypeKind::Unknown && member_type.kind != TypeKind::Unknown &&
         !is_subtype(value_type, member_type, &classes_)) {
@@ -439,6 +525,18 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
         // reference to a class still works: Phase 1 already declared every
         // top-level class before Phase 3 (this walk) ever started.
         info = bind_annotation(*target_name, node.annotation(), node.span().start_line);
+        if (!info.redefinition && scopes_.current_kind() == ScopeKind::Class) {
+            // Task 19: a class-body AnnAssign ALSO declares an instance
+            // attribute, in addition to the ordinary scope-bind above --
+            // verified mypy accepts BOTH `C.x` and `c.x` for a bare `x: int`
+            // class-body annotation with no value, so this runs regardless
+            // of node.has_value() below. `current_kind() == Class` is true
+            // for one directly in the body AND for one nested in an if/for
+            // inside it (Python itself does not scope those), which is
+            // exactly the set of positions mypy treats as class-body level.
+            classes_.declare_member(current_class_qualified_name_, target_name->identifier(),
+                                    info.type, node.span().start_line);
+        }
     } else {
         // A non-Name target (outside this task's tested scope): resolve the
         // annotation for `expected` only, no binding.
@@ -469,14 +567,16 @@ void TypeChecker::visit(const ast::ExprStmt& node) {
 }
 
 void TypeChecker::visit(const ast::FunctionDef& node) {
-    // is_method is captured BEFORE in_class_body_guard resets the flag, so
-    // it doubles as "the value to restore when this FunctionDef is done" --
-    // ClassBodyGuard's own previous_ field mirrors this exact trick. A
-    // method's own nested def is not itself a method (in_class_body_ is
-    // false for the whole of this function's body), which is why the reset
-    // happens unconditionally rather than only when is_method is true.
-    const bool is_method = in_class_body_;
-    ClassBodyGuard in_class_body_guard(in_class_body_, false);
+    // Task 19: "is this a method" collapsed into a single scope-kind check,
+    // read BEFORE FunctionScopeGuard (below) pushes this def's OWN Function
+    // scope -- so the CURRENT scope is still whatever this def is lexically
+    // inside. True only when that is a Class scope: a method's own nested
+    // def sees ScopeKind::Function instead (its enclosing method's
+    // FunctionScopeGuard already pushed one), so it is correctly never a
+    // method itself, with no separate reset needed (a prior, minimal
+    // ClassDef override tracked a bool for exactly this and had to reset it
+    // by hand for that same case; see type_checker.h's class-level comment).
+    const bool is_method = scopes_.current_kind() == ScopeKind::Class;
 
     const int def_line = node.span().start_line;
     const std::vector<ast::Parameter>& params = node.params();
@@ -553,7 +653,16 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
                 param_types.push_back(resolver.resolve(*parameter.annotation));
                 any_param_annotated = true;
             } else if (is_self_param) {
-                param_types.push_back(Type::unknown());
+                // Task 19: self is bound to the ENCLOSING class, not Unknown
+                // -- this is THE TRAP the brief warns about. Unknown is
+                // absorbing, so before this change `self.a`/`self.m()` were
+                // silently accepted no matter what; landing this alone (with
+                // no attribute collection alongside it) would flip
+                // InitNeedsNoReturnAnnotationWhenAParameterIsAnnotated's
+                // `self.a = a` into a false attr-defined TypeError, which is
+                // exactly why assign_attribute's new declare-on-first-
+                // assignment path had to land in this SAME change.
+                param_types.push_back(Type::class_of(current_class_qualified_name_));
             } else {
                 param_types.push_back(Type::unknown());
                 any_param_missing = true;
@@ -561,6 +670,18 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         }
         return_type = node.has_return_annotation() ? resolver.resolve(node.return_annotation())
                                                     : Type::unknown();
+    }
+
+    if (is_method) {
+        // Task 19: a method's signature -- self INCLUDED, per
+        // ClassTable::method_type's own contract -- is declared into
+        // ClassTable as soon as it is known, which is also what makes
+        // __init__ discoverable as a constructor (ClassTable::constructor_
+        // type looks for a method literally named "__init__"). Never bound
+        // into ScopeStack: see the class-level comment on why a class's (and
+        // now a method's) own name must not be.
+        classes_.declare_method(current_class_qualified_name_, node.name(),
+                                Type::callable(param_types, return_type));
     }
 
     // Verified against mypy 1.18.1, and contradicting Spec 5a: __init__ does
@@ -667,17 +788,35 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
 }
 
 void TypeChecker::visit(const ast::ClassDef& node) {
-    // ONLY tracks whether a FunctionDef sits directly in a class body, for
-    // self-exemption and the __init__ carve-out above -- see the class-level
-    // comment for why this is a plain bool rather than a ScopeKind::Class
-    // push. Delegating to the base implementation reuses the exact
-    // bases-then-body walk RecursiveVisitor::visit(ClassDef) already
-    // performs, unchanged, so a class body statement is still checked in
-    // whatever scope was already current (Module, until Task 19 pushes a
-    // real Class scope) -- this override changes NO existing behaviour
-    // besides setting/restoring the flag.
-    ClassBodyGuard in_class_body_guard(in_class_body_, true);
-    ast::RecursiveVisitor::visit(node);
+    // Task 19: a class body is a REAL, order-sensitive ScopeKind::Class push
+    // -- a forward reference within it (`a: int = b` before `b` is declared)
+    // resolves to NOTHING (no placeholder is ever pre-bound for a class-body
+    // name, unlike module/function scope's own pre-bind passes), so it falls
+    // straight through to type_of_name's ordinary not-found path and reports
+    // plain NameError, matching mypy's own name-defined wording for this
+    // exact mistake rather than the used-before-def wording module scope
+    // gets for the structurally identical case.
+    //
+    // Bases are still walked first (matching RecursiveVisitor::visit's own
+    // bases-then-body order, no longer delegated to since only the body half
+    // needs the new scope): TypeChecker overrides no Name/Attribute visit,
+    // so this remains inert today, exactly as before this task.
+    for (const ast::ExprPtr& base : node.bases()) {
+        base->accept(*this);
+    }
+
+    const std::string qualified_name = current_class_qualified_name_.empty()
+                                           ? node.name()
+                                           : current_class_qualified_name_ + "." + node.name();
+    // Bases and the class itself were already declared, under this SAME
+    // qualified name, by collect_classes's declare_class_recursive (Phase
+    // 1) -- so member/method declaration below has an Entry to write into,
+    // and a forward reference to a class declared later in the same module
+    // (or a differently-nested one) already resolves.
+    ClassContextGuard guard(scopes_, current_class_qualified_name_, qualified_name);
+    for (const ast::StmtPtr& statement : node.body()) {
+        statement->accept(*this);
+    }
 }
 
 bool TypeChecker::is_bare_empty_container(const ast::Expr& value) {

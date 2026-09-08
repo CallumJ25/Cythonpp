@@ -39,12 +39,12 @@ namespace cythonpp::domain::semantic {
 // SCOPE (Task 17): Module, Assign, AnnAssign, ExprStmt, and the two-phase
 // module-scope collection. Pass/Break/Continue carry nothing to check and are
 // deliberately left un-overridden -- RecursiveVisitor's empty default is
-// already correct for all three. ClassDef (Task 19) and control flow / Return
-// (Task 20) are also left un-overridden for now, which is exactly the right
-// intermediate behaviour: their children still get walked (and, for a body
-// statement this task DOES handle, still checked), so the worst case is that
-// a construct only Task 19-20 will add real rules for is silently
-// under-checked rather than wrongly flagged.
+// already correct for all three. Control flow / Return (Task 20) are also
+// left un-overridden for now, which is exactly the right intermediate
+// behaviour: their children still get walked (and, for a body statement this
+// task DOES handle, still checked), so the worst case is that a construct
+// only Task 20 will add real rules for is silently under-checked rather than
+// wrongly flagged.
 //
 // FunctionDef (Task 18) is now fully checked: every parameter (except a
 // method's `self`) and the return both need an annotation, a wrong-typed
@@ -56,15 +56,63 @@ namespace cythonpp::domain::semantic {
 // nested def's own name and a nested AnnAssign target (bind_annotation grew
 // the matching "own still-unfilled placeholder" case to support it).
 //
-// ClassDef is overridden ONLY to track whether a FunctionDef sits directly
-// in a class body -- self-exemption and the __init__ carve-out both need
-// that, and nothing else currently does -- via in_class_body_, a plain bool
-// rather than a ScopeKind::Class push. Task 19 owns the real Class scope,
-// the order-sensitive class body, and attribute collection; this override
-// pushes NOTHING onto ScopeStack and declares NOTHING into ClassTable, so
-// it changes no existing behaviour of its own. A method's name is never
-// bound into ScopeStack (ClassTable is Task 19's sole source of truth for
-// method names, exactly like a class's own name).
+// ClassDef (Task 19) is now fully checked: a class body is a REAL
+// ScopeKind::Class push (current_class_qualified_name_ tracks the qualified
+// name for the DURATION of that push, restored by ClassContextGuard, so
+// nested classes declare under "Outer.Inner" and self inside one of Inner's
+// methods binds to Class("Outer.Inner"), never to Outer's). "Is this
+// FunctionDef a method" collapsed entirely into
+// `scopes_.current_kind() == ScopeKind::Class`, checked BEFORE
+// FunctionScopeGuard pushes the Function scope -- no separate bool needed
+// (a prior, minimal ClassDef override tracked one, in_class_body_, purely for
+// this question; Task 19 replaces it outright). A method's name is never
+// bound into ScopeStack (ClassTable is the sole source of truth for both
+// method and class names -- see the class-object-receiver precedence hazard
+// documented on ExpressionTyper::type_of_attribute); its SIGNATURE (self
+// included, per ClassTable::method_type's own contract) is declared into
+// ClassTable via declare_method as soon as it is known, which is also what
+// makes __init__ discoverable as a constructor. self itself is bound to
+// Class(current_class_qualified_name_) instead of Unknown -- see
+// assign_attribute for why this cannot land without ALSO collecting
+// attributes in the same change (self.x would otherwise become a false
+// attr-defined TypeError the moment self stops being the absorbing Unknown).
+//
+// Attributes come from two places, both closing the attribute set at
+// declaration time (an assignment to an attribute the class never declared,
+// from OUTSIDE the class, is attr-defined -- see assign_attribute's ordinary
+// path, unchanged from Task 17):
+//   - A class-body AnnAssign (visit(AnnAssign), when the CURRENT scope is
+//     Class at the time it runs -- true for one directly in the body, and
+//     for one nested in an if/for inside it too, since Python itself does
+//     not scope those) also calls ClassTable::declare_member, in addition to
+//     the ordinary scope-bind bind_annotation already performs. Declared
+//     whether or not the AnnAssign carries a value -- verified mypy accepts
+//     `C.x` for a bare `x: int` class-body annotation.
+//   - `self.x = ...` inside ANY method (not just __init__) -- handled in
+//     assign_attribute, checked BEFORE the ordinary read path so a brand-new
+//     attribute is not a false attr-defined miss. The FIRST such assignment
+//     TypeChecker's own visitation order encounters declares the member (its
+//     type inferred from the value, exactly like an ordinary Name
+//     assignment); this is single-pass, not a separate collect phase, so it
+//     matches every VERIFIED test in the corpus (every one either declares
+//     from a single method or declares-then-conflicts in textual method
+//     order) but does NOT handle a method appearing BEFORE the one that
+//     first assigns an attribute it reads via self -- an out-of-order
+//     forward reference across two methods' bodies, untested here and left
+//     for a future task if it turns out to matter.
+//
+// collect_classes (Phase 1) now RECURSES into every class body to declare a
+// NESTED ClassDef under its qualified name too, before Phase 2 resolves any
+// annotation -- `x: Outer.Inner` needs "Outer.Inner" declared in ClassTable
+// by the time collect_signatures reaches it, and Phase 3 (the ordinary
+// per-statement walk, which is what would otherwise declare Inner) does not
+// run until after Phase 2 finishes. It also now SKIPS a collided top-level
+// ClassDef (scan_top_level_names already reported it) instead of declaring
+// it anyway -- previously the LOSING class's declare() call silently
+// overwrote the winning one in ClassTable, so a later use resolved against
+// the wrong (reported-as-erroneous) class's bases/members; collect_signatures
+// already had the matching skip for a colliding FunctionDef, so this was an
+// asymmetry, not a deliberate choice.
 class TypeChecker : public ast::RecursiveVisitor {
 public:
     explicit TypeChecker(diagnostics::DiagnosticSink& sink);
@@ -114,11 +162,28 @@ private:
 
     // Phase 1: declare every top-level ClassDef's name and bases into
     // ClassTable (no annotation resolution yet -- a base may name a class
-    // declared later in the same module), THEN -- once every class is
+    // declared later in the same module), RECURSING into each class's own
+    // body to declare a NESTED ClassDef too, under its qualified name (see
+    // declare_class_recursive) -- so `x: Outer.Inner` resolves in Phase 2,
+    // which runs before Phase 3 (the ordinary walk) ever reaches Inner's own
+    // ClassDef node. A top-level ClassDef scan_top_level_names already
+    // reported as a collided redefinition is SKIPPED here (Task 19 fix: it
+    // used to be declared anyway, silently overwriting the winning
+    // same-named class's ClassTable entry). THEN -- once every class is
     // declared -- validate that each bare-Name base actually resolves,
     // reporting NameError for one that does not (e.g. `class C(Generic):`,
     // since Generic cannot be imported in this subset).
     void collect_classes(const ast::Module& module);
+
+    // The recursive half of collect_classes: declares `class_def` under
+    // `qualified_prefix + "." + class_def.name()` (or just its own name, at
+    // the top level, where `qualified_prefix` is empty), appends it to
+    // `all_classes` for the base-validation loop collect_classes runs once
+    // every class -- at every nesting depth -- is declared, then recurses
+    // into `class_def`'s own body for a nested ClassDef, passing ITS OWN
+    // qualified name down as the next prefix.
+    void declare_class_recursive(const ast::ClassDef& class_def, const std::string& qualified_prefix,
+                                 std::vector<const ast::ClassDef*>& all_classes);
 
     // Phase 2: resolve every top-level FunctionDef signature and every
     // module-level AnnAssign's annotation, binding each name into ScopeStack
@@ -181,6 +246,26 @@ private:
     void assign_to(const ast::Expr& target, const ast::Expr& value, int line);
     void assign_tuple(const ast::TupleExpr& target, const ast::Expr& value, int line);
     void assign_subscript(const ast::Subscript& target, const ast::Expr& value);
+
+    // Task 19: `self.x = ...` inside a method DECLARES a new instance
+    // attribute the first time TypeChecker's own single-pass visitation
+    // encounters it for a given name -- checked FIRST, syntactically plus one
+    // ScopeStack::resolve (never typed, so this check alone cannot itself
+    // report anything): the receiver is a bare Name spelled "self" AND it
+    // currently resolves to Class(current_class_qualified_name_). Only once
+    // ClassTable confirms the member/method does not already exist (from an
+    // earlier assignment in THIS class, or inherited from a base) does this
+    // take the declare-a-new-member path, inferring the type from the value
+    // exactly like an ordinary Name assignment and calling
+    // ClassTable::declare_member with the ASSIGNMENT's own line. Every other
+    // shape -- an attribute store from outside the class, a conflicting
+    // SECOND self.x assignment once the member already exists, a `self` that
+    // is not really bound to the enclosing class (shadowed, or outside any
+    // method) -- falls through to the ordinary read-then-compare path
+    // unchanged from Task 17, which is what makes a later conflicting
+    // self.x assignment a TypeError (first assignment's type is sticky, same
+    // rule as assign_name) and an attribute store from OUTSIDE the class a
+    // genuine attr-defined TypeError (the set is closed there).
     void assign_attribute(const ast::Attribute& target, const ast::Expr& value);
 
     // The one place a Name target is bound or checked, for both a plain
@@ -249,12 +334,18 @@ private:
     // directly in visit(FunctionDef), the only time it is ever resolved.
     std::map<const ast::FunctionDef*, Type> top_level_signatures_;
 
-    // Set only by visit(ClassDef) around walking that class's OWN body list,
-    // and reset to false for the duration of a FunctionDef's own body (a
-    // method's nested def is not itself a method) -- see the class-level
-    // comment. False at every point outside a class body statement list,
-    // including the outermost module scope.
-    bool in_class_body_ = false;
+    // The QUALIFIED name of the class whose body is currently being walked --
+    // "Outer.Inner" while inside Inner's own body, restored to whatever it
+    // was (by ClassContextGuard, in the .cpp) once that body's walk is done.
+    // Empty at every point outside a class body statement list, including
+    // the outermost module scope -- which is also what
+    // `scopes_.current_kind() == ScopeKind::Class` means now, replacing the
+    // old in_class_body_ bool entirely (see the class-level comment): a
+    // FunctionDef checks that scope-kind test, BEFORE its own Function scope
+    // is pushed, to decide "is this a method", and a method's nested def
+    // sees ScopeKind::Function instead (already pushed by its own enclosing
+    // method's FunctionScopeGuard) with no separate reset ever needed.
+    std::string current_class_qualified_name_;
 };
 
 } // namespace cythonpp::domain::semantic
