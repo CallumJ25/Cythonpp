@@ -185,6 +185,20 @@ def corpus_dir() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent.parent / "test_files" / "semantic"
 
 
+def _is_mypy_error_line(line: str) -> bool:
+    """True for exactly '# mypy: error' or '# mypy: error ' + freeform detail.
+
+    Mirrors semantic_corpus_test.cpp's is_mypy_error_line. A bare prefix
+    match (`startswith("# mypy: error")` with no trailing-space requirement)
+    would also accept a typo like '# mypy: errorX' -- and 'error' is the
+    label that disables the C++ harness's invariant guard, so a lenient
+    match there would sit on exactly the wrong side. Kept in lockstep with
+    the C++ version even though this script only branches on clean-vs-not,
+    same as that one does.
+    """
+    return line == "# mypy: error" or line.startswith("# mypy: error ")
+
+
 def parse_header(lines):
     """Returns (mypy_clean, header_line_count) for a sample's leading lines.
 
@@ -200,11 +214,12 @@ def parse_header(lines):
     first = lines[0].rstrip("\r\n")
     if first == "# mypy: clean":
         mypy_clean = True
-    elif first.startswith("# mypy: error"):
+    elif _is_mypy_error_line(first):
         mypy_clean = False
     else:
         raise ValueError(
-            f"first line must be '# mypy: clean' or '# mypy: error ...', got: {first!r}"
+            f"first line must be '# mypy: clean' or '# mypy: error ...', got: {first!r} "
+            "(if this looks identical to a valid header, check for trailing whitespace)"
         )
 
     header_count = 1
@@ -273,6 +288,25 @@ def check_corpus() -> int:
                 print("mypy not found on PATH", file=sys.stderr)
                 return 1
 
+            # mypy's exit codes are 0 (clean), 1 (type errors found), and 2
+            # (crash or fatal error -- bad flags, an internal exception,
+            # etc). Only 0 and 1 are a real clean/error signal about the
+            # SAMPLE. Treating >=2 as "error" (as `returncode == 0` alone
+            # implicitly does) would let a crashed mypy invocation happily
+            # "validate" every '# mypy: error' label without ever having
+            # checked the code -- so it is scored as a hard failure instead,
+            # distinct from a genuine label mismatch.
+            if result.returncode >= 2:
+                print(
+                    f"CRASHED    {sample.name}: mypy --strict exited {result.returncode} "
+                    "(crash or fatal error, not a clean/error verdict)"
+                )
+                failures.append(
+                    f"{sample}: mypy --strict crashed (exit {result.returncode}), this is not "
+                    f"a clean/error signal:\n{result.stdout}{result.stderr}"
+                )
+                continue
+
             mypy_actually_clean = result.returncode == 0
             label = "clean" if mypy_clean else "error"
             actual = "clean" if mypy_actually_clean else "error"
@@ -297,8 +331,13 @@ def check_corpus() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--generate-class-table", action="store_true")
-    parser.add_argument(
+    # Mutually exclusive: passing both used to silently run only
+    # --generate-class-table and ignore --check-corpus entirely (argparse
+    # just keeps the last-set store_true flags, it does not warn), which
+    # would look like a corpus check ran when it never did.
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--generate-class-table", action="store_true")
+    group.add_argument(
         "--check-corpus",
         action="store_true",
         help="Run mypy --strict on every test_files/semantic sample and confirm its "
