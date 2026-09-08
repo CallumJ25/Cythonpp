@@ -855,7 +855,17 @@ TEST(TypeChecker, AnAnnotationConflictingWithAnEarlierSelfAssignmentIsReported) 
 // has been written backwards before, but it is not coverage of the
 // annotated form's own rules -- AClassBodyAnnotationSurvivesAMethod
 // Annotation and its neighbours below are.
-TEST(TypeChecker, APlainSelfAssignmentOfASubtypeAfterAnAnnotationIsClean) {
+//
+// The clean half ALONE proved nothing, and this is what the second half is
+// for: with the annotated `self.x` branch absent altogether (its state at
+// 6192fab, before this work), the annotation declared NOTHING, "n" became
+// plain int from the line-5 assignment, and `f: float = b.n` was clean for
+// an unrelated reason. `i: int = b.n` discriminates -- it is SILENT against
+// the 6192fab binary and reports `expression has type "float"` now, mypy's
+// own message for the same program (`error: Incompatible types in assignment
+// (expression has type "float", variable has type "int")`, line 8), which is
+// only possible once the ANNOTATED type is what the attribute carries.
+TEST(TypeChecker, APlainSelfAssignmentOfASubtypeAfterAnAnnotationKeepsTheAnnotatedType) {
     expect_clean(
         "class Bag:\n"
         "    def a(self) -> None:\n"
@@ -864,6 +874,24 @@ TEST(TypeChecker, APlainSelfAssignmentOfASubtypeAfterAnAnnotationIsClean) {
         "        self.n = 5\n"
         "b = Bag()\n"
         "f: float = b.n\n");
+
+    const Checked checked = check_module(
+        "class Bag:\n"
+        "    def a(self) -> None:\n"
+        "        self.n: float = 1.5\n"
+        "    def b(self) -> None:\n"
+        "        self.n = 5\n"
+        "b = Bag()\n"
+        "f: float = b.n\n"
+        "i: int = b.n\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"float\", "
+              "variable has type \"int\")")
+        << "the attribute carries the ANNOTATED float, not the assignment's int";
+    EXPECT_EQ(error.line, 8);
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,6 +1166,173 @@ TEST(TypeChecker, AClassBodyAnnotationNestedInAnIfWideningAnEarlierSelfAssignmen
         "        self.x = True\n"
         "    if FLAG:\n"
         "        x: int\n");
+}
+
+// ---------------------------------------------------------------------------
+// THE OTHER HALF of the same two-rule split, at the two CLASS-BODY sites.
+// The four tests above cover the SAME-CLASS rule (an earlier declaration on
+// this very class); these cover the INHERITED one, which the two class-body
+// sites got wrong in both directions until they stopped gating on the
+// chain-walking member_type and started gating on own_member_type. Every
+// program below was run through mypy 1.18.1, and every clean one reported a
+// false TypeError against the built binary before the fix (identical output
+// at 6192fab, so a pre-existing defect rather than a regression).
+//
+// Note the same-class and inherited rules point in OPPOSITE directions here,
+// which is exactly why one comparison could not serve both: same-class, the
+// class-body statement wins and the earlier declaration is the expression
+// checked against it; inherited, the class-body statement is still what wins
+// but it is the EXPRESSION checked against the base's declaration.
+// ---------------------------------------------------------------------------
+
+// INHERITED, narrowing, the ANNOTATION form. mypy: `Success: no issues
+// found`, with `reveal_type(self.v)` "builtins.int" in Child and
+// "builtins.object" in Base. `self.v + 1` pins the install onto Child:
+// leaving the base's `object` in place makes that mypy-clean line a false
+// "unsupported operand types". The three-level chain pins that each class
+// reads as its OWN declaration (bool / int / object, per mypy).
+TEST(TypeChecker, AClassBodyAnnotationMayNarrowAnInheritedAttribute) {
+    expect_clean(
+        "class Base:\n"
+        "    v: object\n"
+        "class Child(Base):\n"
+        "    v: int\n"
+        "    def use(self) -> int:\n"
+        "        return self.v + 1\n");
+
+    expect_clean(
+        "class Base:\n"
+        "    v: object\n"
+        "class Mid(Base):\n"
+        "    v: int\n"
+        "class Leaf(Mid):\n"
+        "    v: bool\n"
+        "    def use(self) -> int:\n"
+        "        return self.v + 1\n");
+
+    // A user-class hierarchy, not just the numeric tower and `object`.
+    expect_clean(
+        "class Animal:\n"
+        "    pass\n"
+        "class Dog(Animal):\n"
+        "    pass\n"
+        "class Base:\n"
+        "    pet: Animal\n"
+        "class Child(Base):\n"
+        "    pet: Dog\n");
+}
+
+// INHERITED, narrowing, and CONFINED to the subclass -- the install must land
+// on the current class and leave the base's own declaration alone. mypy
+// accepts `self.v = "s"` in Base on this very program (v is object there) and
+// reports it in Child (v is int there).
+TEST(TypeChecker, AClassBodyNarrowingDoesNotChangeTheBaseClassDeclaration) {
+    expect_clean(
+        "class Base:\n"
+        "    v: object\n"
+        "    def w(self) -> None:\n"
+        "        self.v = \"s\"\n"
+        "class Child(Base):\n"
+        "    v: int\n");
+
+    const Checked checked = check_module(
+        "class Base:\n"
+        "    v: object\n"
+        "class Child(Base):\n"
+        "    v: int\n"
+        "    def w(self) -> None:\n"
+        "        self.v = \"s\"\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 6) << "the narrowed int is Child's declared type for writes too";
+}
+
+// INHERITED, WIDENING, the ANNOTATION form -- the direction mypy DOES reject:
+// `error: Incompatible types in assignment (expression has type "object",
+// base class "Base" defined the type as "int")`. This one was SILENT before
+// the fix (the same-class direction happens to hold for it, so nothing
+// reported), which is why the clean tests above alone would not have pinned
+// the split. The arguments are the way round mypy prints them: the
+// annotation is the expression, the inherited declaration the variable.
+TEST(TypeChecker, AClassBodyAnnotationWideningAnInheritedAttributeIsReported) {
+    const Checked checked = check_module(
+        "class Base:\n"
+        "    v: int\n"
+        "class Child(Base):\n"
+        "    v: object\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"object\", "
+              "variable has type \"int\")");
+    EXPECT_EQ(error.line, 4);
+}
+
+// INHERITED, narrowing, the PLAIN ASSIGN form. mypy: `Success`, with
+// `reveal_type(self.v)` "builtins.int" in Child -- so the INFERRED type of a
+// class-body assignment overrides an inherited annotation just as an explicit
+// one does. Both the arithmetic and the later `self.v = 7` pin the install:
+// with the base's `object` left in place the first is a false "unsupported
+// operand types" and the second a false incompatible assignment.
+TEST(TypeChecker, AClassBodyAssignmentMayNarrowAnInheritedAttribute) {
+    expect_clean(
+        "class Base:\n"
+        "    v: object\n"
+        "class Child(Base):\n"
+        "    v = 1\n"
+        "    def use(self) -> int:\n"
+        "        return self.v + 1\n"
+        "    def w(self) -> None:\n"
+        "        self.v = 7\n");
+}
+
+// INHERITED, WIDENING, the PLAIN ASSIGN form. mypy: `error: Incompatible
+// types in assignment (expression has type "str", base class "Base" defined
+// the type as "int")`. This one DID report before the fix, but with the two
+// arguments the wrong way round (`expression has type "int", variable has
+// type "str"`) -- so what this pins is the direction, not merely that
+// something is reported.
+TEST(TypeChecker, AClassBodyAssignmentWideningAnInheritedAttributeIsReported) {
+    const Checked checked = check_module(
+        "class Base:\n"
+        "    v: int\n"
+        "class Child(Base):\n"
+        "    v = \"s\"\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"str\", "
+              "variable has type \"int\")");
+    EXPECT_EQ(error.line, 4);
+}
+
+// own_member_type does no canonicalisation, and a nested and a function-local
+// class are keyed differently from a module-level one ("Outer.Inner" and a
+// synthetic isolated name respectively) -- so the narrowing must be probed
+// under both keyings, not just the flat one. Both mypy-clean, both a false
+// TypeError before the fix.
+TEST(TypeChecker, AClassBodyNarrowingWorksForNestedAndFunctionLocalClasses) {
+    expect_clean(
+        "class Base:\n"
+        "    v: object\n"
+        "class Outer:\n"
+        "    class Inner(Base):\n"
+        "        v: int\n"
+        "        def use(self) -> int:\n"
+        "            return self.v + 1\n");
+
+    expect_clean(
+        "class Base:\n"
+        "    v: object\n"
+        "def f() -> int:\n"
+        "    class Local(Base):\n"
+        "        v = 1\n"
+        "        def use(self) -> int:\n"
+        "            return self.v + 1\n"
+        "    return Local().use()\n");
 }
 
 // A ClassDef lexically inside a `def` is never seen

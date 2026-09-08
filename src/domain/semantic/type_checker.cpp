@@ -513,39 +513,70 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
             // against yet); anything else is a genuine earlier declaration,
             // compared rather than silently overwritten.
             //
-            // The comparison must run in THIS direction and not the
-            // reverse, which alone made two mypy-clean programs false
-            // TypeErrors. mypy's precedence here (verified against mypy
-            // 1.18.1, including reveal_type on the resulting attribute) is
-            // that a class-body assignment's inferred type is the DECLARED
-            // type of the attribute for the whole class body, and the
-            // earlier `self.x = ...` value is what gets checked AGAINST it
-            // -- exactly the rule already established for a class-body
-            // ANNOTATION. So `self.x = True`
-            // above `x = 5` is clean (bool widens into the declared int),
-            // `self.x = 5` above `x = 1.5` is clean (int widens into float),
-            // and only a genuine mismatch such as `self.x = 5` above
-            // `x = "s"` reports -- with mypy's own exact wording,
-            // `expression has type "int", variable has type "str"`. The LINE
-            // still differs from mypy's (we report at this class-body
-            // statement, mypy at the self.x assignment), a recorded
-            // residual this does not close.
+            // WHICH CLASS the earlier declaration lives on decides the rule
+            // -- the same two-rule split as the class-body AnnAssign sibling
+            // and the `self.x: T = ...` branch, gated the same way, on
+            // own_member_type rather than the chain-walking member_type.
+            // Both rules verified against mypy 1.18.1, including reveal_type
+            // on the resulting attribute:
+            //
+            //   SAME CLASS (own_member_type finds it, at a line other than
+            //     this statement's): this class-body assignment's inferred
+            //     type is the DECLARED type of the attribute for the whole
+            //     class body, and the earlier `self.x = ...` value is what
+            //     gets checked AGAINST it -- exactly the rule the class-body
+            //     ANNOTATION follows. So `self.x = True` above `x = 5` is
+            //     clean (bool widens into the declared int), `self.x = 5`
+            //     above `x = 1.5` is clean (int widens into float), and only
+            //     a genuine mismatch such as `self.x = 5` above `x = "s"`
+            //     reports -- with mypy's own exact wording, `expression has
+            //     type "int", variable has type "str"`. The LINE still
+            //     differs from mypy's (we report at this class-body
+            //     statement, mypy at the self.x assignment), a recorded
+            //     residual this does not close. Running that comparison the
+            //     other way round alone made two mypy-clean programs false
+            //     TypeErrors. An earlier CLASS-BODY declaration of the same
+            //     name never reaches here at all: it binds the name in the
+            //     class SCOPE, so is_new_definition above is false and this
+            //     whole arm is skipped in favour of assign_name's ordinary
+            //     compare -- which is what keeps `x: float` above `x = 5`
+            //     (mypy-clean, and float stays the attribute's type) clean.
+            //
+            //   INHERITED (a base declares it, own_member_type does not): a
+            //     narrowing override, accepted, and it becomes THIS class's
+            //     own declared type -- `class Base: v: object` / `class
+            //     Child(Base): v = 1` is mypy-clean with reveal_type(self.v)
+            //     "builtins.int" in Child, so the inferred type must be
+            //     INSTALLED here or Child's own `self.v + 1` is a false
+            //     TypeError. Widening is the error, with the arguments the
+            //     other way round from the same-class rule: mypy says
+            //     `expression has type "str", base class "Base" defined the
+            //     type as "int"`, so the VALUE is the expression and the
+            //     inherited declaration is the variable.
             const bool already_method =
                 classes_.method_type(current_class_qualified_name_, name->identifier()).has_value();
+            const std::optional<Type> own_existing =
+                classes_.own_member_type(current_class_qualified_name_, name->identifier());
             const std::optional<int> existing_line =
                 classes_.member_declared_line(current_class_qualified_name_, name->identifier());
             const bool is_brand_new = !already_method && !existing_line.has_value();
-            const bool is_own_placeholder =
-                !already_method && existing_line.has_value() && *existing_line == line;
+            // A placeholder is by construction one this class declared on
+            // ITSELF, so this asks own_member_type as well as the line: an
+            // inherited declaration must never be mistaken for this
+            // statement's own placeholder, however the lines fall.
+            const bool is_own_placeholder = !already_method && own_existing.has_value() &&
+                                            existing_line.has_value() && *existing_line == line;
             if (is_brand_new || is_own_placeholder) {
                 classes_.declare_member(current_class_qualified_name_, name->identifier(), value_type,
                                         line);
-            } else if (!already_method) {
-                const Type existing_type =
-                    *classes_.member_type(current_class_qualified_name_, name->identifier());
-                if (value_type.kind != TypeKind::Unknown && existing_type.kind != TypeKind::Unknown &&
-                    !is_subtype(existing_type, value_type, &classes_)) {
-                    report_incompatible_assignment(*name, existing_type, value_type, "variable");
+            } else if (!already_method && own_existing.has_value()) {
+                // Unknown on either side leaves nothing to compare: silent,
+                // and the value's type still installs below (Unknown is
+                // absorbing, so the worst case is a later missed error).
+                if (value_type.kind != TypeKind::Unknown &&
+                    own_existing->kind != TypeKind::Unknown &&
+                    !is_subtype(*own_existing, value_type, &classes_)) {
+                    report_incompatible_assignment(*name, *own_existing, value_type, "variable");
                 }
                 // The class-body assignment's type WINS, reported or not:
                 // mypy treats it as the attribute's declared type for the
@@ -557,6 +588,23 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
                 // subsequent statement's own placeholder disambiguation
                 // still compares against this declaration rather than
                 // mistaking it for its own.
+                classes_.declare_member(current_class_qualified_name_, name->identifier(),
+                                        value_type, line);
+            } else if (!already_method && existing_line.has_value()) {
+                // Inherited only: own_member_type missed and the chain walk
+                // hit. Unknown on either side is silent for the same reason
+                // as above, and the value's type is installed over the
+                // inherited one regardless -- mypy treats this class's own
+                // declaration as authoritative, so checking a later write
+                // against the base's type instead is how a false TypeError
+                // gets made.
+                const Type inherited_type =
+                    *classes_.member_type(current_class_qualified_name_, name->identifier());
+                if (value_type.kind != TypeKind::Unknown &&
+                    inherited_type.kind != TypeKind::Unknown &&
+                    !is_subtype(value_type, inherited_type, &classes_)) {
+                    report_incompatible_assignment(*name, value_type, inherited_type, "variable");
+                }
                 classes_.declare_member(current_class_qualified_name_, name->identifier(),
                                         value_type, line);
             }
@@ -770,56 +818,113 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
             // inside it (Python itself does not scope those), which is
             // exactly the set of positions mypy treats as class-body level.
             //
-            // Guarded by has_value() exactly like
-            // assign_attribute's own check -- without it, an EARLIER self.x
-            // = ... assignment (in a method occurring ABOVE this annotation
-            // in the class body) is silently re-typed with zero diagnostics,
-            // since declare_member has no collision detection of its own.
-            // (For a DIRECT class-body annotation -- the case reaching this
-            // branch via the cache above -- pre_collect_class_body's own
-            // identical guard already declared this exact member, so the
-            // has_value() check below is true for THIS statement's own
-            // declaration too; comparing info.type against itself is always
-            // a clean no-op subtype check, so nothing is lost.)
-            const bool already_member =
-                classes_.member_type(current_class_qualified_name_, target_name->identifier())
-                    .has_value();
+            // Guarded rather than declared unconditionally -- without a
+            // guard, an EARLIER self.x = ... assignment (in a method
+            // occurring ABOVE this annotation in the class body) is silently
+            // re-typed with zero diagnostics, since declare_member has no
+            // collision detection of its own.
+            //
+            // WHICH CLASS the earlier declaration lives on decides the rule,
+            // exactly as it does in the `self.x: T = ...` branch further
+            // down -- so the gate is own_member_type (a direct-entry lookup,
+            // keyed exactly as declare_member keys it) and NOT the
+            // chain-walking member_type, which reports a hit for an
+            // inherited declaration and an own one alike. A single
+            // comparison covering both was a false TypeError on one of them
+            // whichever way round it was written: with the same-class
+            // direction below, `class Base: v: object` / `class Child(Base):
+            // v: int` -- mypy-clean narrowing -- was reported, while the
+            // widening mypy DOES reject passed silently.
+            //
+            // The two rules, both measured against mypy 1.18.1, and NOT the
+            // two rules the `self.x: T` branch uses -- its same-class half is
+            // the OPPOSITE of this one, because a class-body declaration
+            // outranks a method-level one whatever the textual order, and
+            // here the class-body statement IS the declaration:
+            //
+            //   SAME CLASS (own_member_type finds it): this annotation is the
+            //     declared type and the earlier declaration's type is the
+            //     expression checked AGAINST it. `FLAG = True / class C: def
+            //     m(self): self.x = True / if FLAG: x: int` is clean and
+            //     reveal_type(self.x) is "builtins.int" in every method,
+            //     while the same pair with `self.x = 5` above `if FLAG:
+            //     x: str` reports `expression has type "int", variable has
+            //     type "str"` -- mypy's exact wording, at our own line rather
+            //     than mypy's self.x line (a recorded residual). That is why
+            //     the comparison keeps the existing declaration as the
+            //     expression and installs the annotation below.
+            //
+            //   INHERITED (a base declares it, own_member_type does not): a
+            //     narrowing override, accepted, and it really does become
+            //     THIS class's own declared type -- `class Base: v: object` /
+            //     `class Child(Base): v: int` reveals "builtins.int" in every
+            //     Child method and "builtins.object" in Base, and a third
+            //     level (`class Leaf(Mid): v: bool`) reads as bool/int/object
+            //     per class. So the annotation must be INSTALLED on the
+            //     current class, or Child's own mypy-clean `self.v + 1` is a
+            //     false TypeError. Widening is the error, with the arguments
+            //     the other way round: mypy says `expression has type
+            //     "object", base class "Base" defined the type as "int"`, so
+            //     the ANNOTATION is the expression and the inherited
+            //     declaration is the variable. (Same for a nested and for a
+            //     function-local class -- own_member_type does no
+            //     canonicalisation, and both are declared under the exact
+            //     qualified name this call passes it.)
+            const std::optional<Type> own_existing = classes_.own_member_type(
+                current_class_qualified_name_, target_name->identifier());
+            // Only consulted when the member is NOT this class's own, so a
+            // hit here is by construction an inherited one.
+            const std::optional<Type> inherited_existing =
+                own_existing.has_value()
+                    ? std::nullopt
+                    : classes_.member_type(current_class_qualified_name_,
+                                           target_name->identifier());
             const bool already_method =
                 classes_.method_type(current_class_qualified_name_, target_name->identifier())
                     .has_value();
-            if (!already_member && !already_method) {
+            if (own_existing.has_value()) {
+                // For a DIRECT class-body AnnAssign this is a no-op:
+                // pre_collect_class_body's annotation sub-pass already
+                // declared this exact member with this exact type at this
+                // exact line (the case reaching this branch via the cache
+                // above), so both the comparison and the re-declaration are
+                // against themselves. The sub-pass handles only DIRECT
+                // class-body annotations, so the shape with something real to
+                // compare against is one NESTED inside an `if` within the
+                // class body, arriving here with an earlier `self.x = ...`
+                // already declared on this same class.
+                //
+                // Unknown on either side means there is nothing to compare:
+                // no report, and the annotation still installs below -- an
+                // Unknown existing declaration (an earlier
+                // `self.x = <unmodellable>`) is not a declaration worth
+                // keeping, and an Unknown annotation replacing a known one
+                // only silences later reads, a missed error rather than a
+                // false one.
+                if (info.type.kind != TypeKind::Unknown &&
+                    own_existing->kind != TypeKind::Unknown &&
+                    !is_subtype(*own_existing, info.type, &classes_)) {
+                    report_incompatible_assignment(node, *own_existing, info.type, "variable");
+                }
                 classes_.declare_member(current_class_qualified_name_, target_name->identifier(),
                                         info.type, node.span().start_line);
-            } else if (already_member) {
-                // The comparison here once ran the WRONG WAY ROUND for
-                // exactly the same reason assign_to's plain-Assign sibling
-                // did, and it is still reachable: pre_collect_class_body's
-                // annotation
-                // sub-pass only handles a DIRECT class-body AnnAssign, so
-                // one NESTED inside an `if` within the class body arrives
-                // here with an earlier `self.x = ...` already declared.
-                // `FLAG = True / class C: def m(self): self.x = True /
-                // if FLAG: x: int` is mypy-clean (verified against mypy
-                // 1.18.1) and was a false TypeError. The ANNOTATION is the
-                // declared type; the earlier self.x's inferred type is the
-                // expression checked against it.
-                //
-                // For a DIRECT class-body AnnAssign this branch is a no-op
-                // either way -- the sub-pass already declared this exact
-                // member with this exact type at this exact line, so the
-                // comparison and the re-declaration below are both against
-                // themselves.
-                const Type existing_type =
-                    *classes_.member_type(current_class_qualified_name_, target_name->identifier());
-                if (info.type.kind != TypeKind::Unknown && existing_type.kind != TypeKind::Unknown &&
-                    !is_subtype(existing_type, info.type, &classes_)) {
-                    report_incompatible_assignment(node, existing_type, info.type, "variable");
+            } else if (inherited_existing.has_value()) {
+                // Unknown on either side, same handling and same reasoning as
+                // the same-class arm above, with one extra consequence worth
+                // naming: an Unknown annotation is installed OVER a known
+                // inherited type rather than leaving the base's in place,
+                // because mypy treats this class's own declaration as
+                // authoritative -- keeping the base's type would check a
+                // later write against a type the attribute no longer has,
+                // which is how a false TypeError gets made.
+                if (info.type.kind != TypeKind::Unknown &&
+                    inherited_existing->kind != TypeKind::Unknown &&
+                    !is_subtype(info.type, *inherited_existing, &classes_)) {
+                    report_incompatible_assignment(node, info.type, *inherited_existing, "variable");
                 }
-                // The annotation's declared type wins, reported or not --
-                // same rule, and same reason, as assign_to's sibling: mypy's
-                // reveal_type of the attribute is the ANNOTATED type, so a
-                // later read must see that and not the earlier self.x's
-                // inferred one.
+                classes_.declare_member(current_class_qualified_name_, target_name->identifier(),
+                                        info.type, node.span().start_line);
+            } else if (!already_method) {
                 classes_.declare_member(current_class_qualified_name_, target_name->identifier(),
                                         info.type, node.span().start_line);
             }
@@ -913,13 +1018,29 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
                 existing.has_value() ? classes_.own_member_type(current_class_qualified_name_,
                                                                 target_attribute->attribute())
                                      : std::nullopt;
-            // An Unknown own declaration is not a real one to keep: it is
-            // either a class-body plain Assign's placeholder that Phase 3 has
-            // not reached yet (the assignment sits BELOW this method, a shape
-            // mypy rejects outright as a re-definition) or an earlier
-            // `self.x = <unmodellable>`. Nothing can be checked against
-            // Unknown and nothing is lost by installing over it, so it falls
-            // through to the install path with BrandNew and OwnPlaceholder.
+            // An Unknown own declaration is not a real one to keep. Nothing
+            // can be checked against Unknown and nothing is lost by
+            // installing over it, so it falls through to the install path
+            // with BrandNew and OwnPlaceholder.
+            //
+            // The reachable shape is an earlier `self.x = <value this model
+            // cannot type>` in a method ABOVE this one -- e.g. a call to a
+            // function with no return annotation, verified against the built
+            // binary: the attribute reads as the ANNOTATED type in every
+            // later method, which is only true because of this
+            // fall-through. (An earlier version of this comment also cited "a
+            // class-body plain Assign's placeholder Phase 3 has not reached
+            // yet, the assignment sitting BELOW this method". That shape is
+            // UNREACHABLE, traced and probed: pre_collect_class_body's second
+            // loop walks FunctionDefs and class-body Assigns in ONE
+            // source-order pass and each declaration is guarded on the member
+            // not existing yet, so for the ASSIGN to own the placeholder it
+            // must sit ABOVE the method -- and then Phase 3, which is also
+            // source-ordered, has already filled in its real type by the time
+            // this statement is walked. A placeholder belonging to a method
+            // below is at that method's own line, not the assignment's, so it
+            // is OwnPlaceholder for its own statement and never
+            // ExistingDeclaration here.)
             const bool keep_earlier_declaration =
                 own_existing.has_value() && own_existing->kind != TypeKind::Unknown;
             if (keep_earlier_declaration) {

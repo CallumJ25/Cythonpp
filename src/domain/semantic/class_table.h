@@ -110,13 +110,25 @@ public:
     // answer, since it walks the chain and reports a hit either way.
     //
     // Exists because mypy's rule for RE-DECLARING an attribute is two
-    // different rules depending on the answer (verified against mypy 1.18.1;
-    // see visit(AnnAssign)'s self.x branch for the probe output): a
-    // re-declaration in the SAME class is ignored -- the first declaration
-    // stays the attribute's type -- while one in a SUBCLASS installs a real,
-    // narrower per-class type, and is an error unless it is a subtype of the
-    // inherited one. Conflating the two costs a false TypeError in one
-    // direction or the other, whichever way round the comparison is written.
+    // different rules depending on the answer (verified against mypy 1.18.1),
+    // and that is true at all THREE re-declaration sites in type_checker.cpp
+    // -- visit(AnnAssign)'s self.x branch, visit(AnnAssign)'s class-body arm,
+    // and assign_to's class-body plain-Assign arm. What the two rules ARE is
+    // NOT uniform across the three, so each site states and justifies its own
+    // pair; only the INHERITED half is shared:
+    //
+    //  - INHERITED, at every site: the re-declaration installs a real,
+    //    narrower per-class type, and is an error unless it is a subtype of
+    //    the inherited one.
+    //  - SAME CLASS: site-dependent. A METHOD-level annotation under an
+    //    existing declaration is IGNORED (the earlier declaration stays the
+    //    attribute's type), while a CLASS-BODY statement is itself the
+    //    declaration and WINS, with the earlier declaration checked against
+    //    it -- because a class-body declaration outranks a method-level one
+    //    whatever the textual order.
+    //
+    // Conflating own with inherited costs a false TypeError in one direction
+    // or the other, whichever way round that site's comparison is written.
     //
     // Deliberately does NOT canonicalise through canonical_name and does NOT
     // fall back to a shadowed class the way member_type's query_chain does:
