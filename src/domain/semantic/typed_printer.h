@@ -31,12 +31,21 @@ namespace cythonpp::domain::semantic {
 // private with no protected accessor, so a derived class has no way to
 // write a suffix into the buffer a base-class `visit` call just populated.
 // The duplication this causes is real -- every statement-shaped `visit` here
-// is a verbatim copy of AstPrinter's -- and a shared helper (e.g. AstPrinter
-// exposing a protected `out_`/`depth_` or a `render(Node, Visitor&)`
-// building block both renderers call through) would remove it cheaply if
-// AstPrinter is ever revisited. Only the thirteen expression-node overloads
-// differ from AstPrinter's, each by exactly one trailing call that appends
-// the type suffix when TypeMap has an entry for that node.
+// is a verbatim copy of AstPrinter's. A protected-accessor refactor of
+// AstPrinter (e.g. exposing `out_`/`depth_`, or a `render(Node, Visitor&)`
+// building block both renderers call through) would likely have been LESS
+// work than this ~200-line mirror, not more; it was left undone because
+// touching ast_printer.{h,cpp} was out of this task's file scope, not
+// because duplication was judged cheaper. Only the thirteen expression-node
+// overloads differ from AstPrinter's, each by exactly one trailing call that
+// appends the type suffix when TypeMap has an entry for that node.
+//
+// Because that duplication can silently DRIFT -- AstPrinter changing how an
+// existing node renders would not force a matching edit here, since adding a
+// node is the only kind of change ast::Visitor's pure virtuals catch at
+// compile time -- typed_printer_test.cpp also asserts, over a broad fixture
+// set, that TypedPrinter fed an EMPTY TypeMap renders byte-identical output
+// to AstPrinter for the same tree.
 class TypedPrinter {
 public:
     std::string print(const ast::Module& module, const TypeMap& types);
