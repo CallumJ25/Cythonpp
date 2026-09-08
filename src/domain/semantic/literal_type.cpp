@@ -33,9 +33,11 @@ Type literal_type(lexer::token_type type) {
     }
 }
 
-bool integer_literal_fits_64_bits(const std::string& lexeme) {
-    // 2^63. See the header for why this is the bound and not 2^63 - 1.
-    constexpr unsigned long long LIMIT = 9223372036854775808ULL;
+bool integer_literal_fits_64_bits(const std::string& lexeme, bool allow_two_to_63) {
+    // 2^63. See the header for why this is the bound and not 2^63 - 1, and for
+    // when a caller passes allow_two_to_63 = false to tighten it by one.
+    constexpr unsigned long long LIMIT_INCLUSIVE = 9223372036854775808ULL;
+    const unsigned long long LIMIT = allow_two_to_63 ? LIMIT_INCLUSIVE : LIMIT_INCLUSIVE - 1;
 
     std::string digits;
     for (const char character : lexeme) {
