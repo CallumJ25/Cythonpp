@@ -2414,7 +2414,8 @@ TEST(TypeChecker, TwoConditionalDefsOfOneNameDoNotCollide) {
                  "    def f() -> int:\n"
                  "        return 1\n"
                  "    def f() -> int:\n"
-                 "        return 2\n");
+                 "        return 2\n"
+                 "print(f())\n");
 }
 
 // Unchanged by the new recursion: two FLAT defs still collide. Verified:
@@ -2486,17 +2487,6 @@ TEST(TypeChecker, TwoConditionalDefsOfOneNameBindWithoutReporting) {
                  "print(f())\n");
 }
 
-// Same allowance for two conditional defs in the SAME block.
-TEST(TypeChecker, TwoConditionalDefsInOneBlockBindWithoutReporting) {
-    expect_clean("FLAG = True\n"
-                 "if FLAG:\n"
-                 "    def f() -> int:\n"
-                 "        return 1\n"
-                 "    def f() -> int:\n"
-                 "        return 2\n"
-                 "print(f())\n");
-}
-
 // A read ABOVE a conditional def now says "used before definition" rather than
 // "not defined" -- both are errors and mypy reports one too
 // (`Name "f" is used before definition`), so this is a wording improvement
@@ -2512,18 +2502,43 @@ TEST(TypeChecker, AReadAboveAConditionalDefIsUsedBeforeDefinition) {
     EXPECT_EQ(error.message, "name 'f' is used before definition");
 }
 
+// A conditional annotated assignment is bound by the signature pre-pass
+// exactly like a flat one, so a read above it is a same-scope, order-checked
+// read against a real Binding -- "used before definition", not "not defined".
+// Verified against mypy 1.18.1: `Name "y" is used before definition
+// [used-before-def]`. Both tools error; this is a wording match, and both
+// reject the program mypy does, so nothing mypy accepts starts failing.
+TEST(TypeChecker, ReadAboveAConditionalAnnAssignIsUsedBeforeDefinition) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "print(y)\n"
+                                         "if FLAG:\n"
+                                         "    y: int = 5\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'y' is used before definition");
+}
+
+// A conditional annotated assignment now collides with a LATER flat def of the
+// same name, reported at the def and pointing back to the annotation's own
+// line -- because the annotation binds during this same pre-pass, before the
+// def's own bind is attempted, exactly like two flat statements would.
+// Verified against mypy 1.18.1: `Name "y" already defined on line 3
+// [no-redef]`, reported on the def's own line (4), matching both the code and
+// the line this test expects.
+TEST(TypeChecker, ConditionalAnnAssignCollidesWithLaterFlatDef) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "if FLAG:\n"
+                                         "    y: int = 5\n"
+                                         "def y() -> int:\n"
+                                         "    return 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"y\" already defined on line 3");
+    EXPECT_EQ(error.line, 4);
+}
+
 // UNCHANGED GUARDS -- each is a row of the measured matrix that already worked,
 // and this task must not disturb any of them.
-
-// Two FLAT defs still collide, reported by the top-level name scan.
-TEST(TypeChecker, TwoFlatDefsStillCollideAfterConditionalBinding) {
-    const Checked checked = check_module("def f() -> int:\n"
-                                         "    return 1\n"
-                                         "def f() -> int:\n"
-                                         "    return 2\n");
-    const diagnostics::Diagnostic error = only_error(checked);
-    EXPECT_EQ(error.message, "name \"f\" already defined on line 1");
-}
 
 // A flat AnnAssign followed by a flat def of the same name still collides --
 // this is the ONE collision that reaches the signature pass's own bind check,
@@ -2538,8 +2553,10 @@ TEST(TypeChecker, AnAnnotatedNameFollowedByAFlatDefStillCollides) {
 }
 
 // An if/else pair of ANNOTATED assignments still reports, matching mypy's
-// `Name "y" already defined on line 4 [no-redef]`. This is why the signature
-// pass's AnnAssign branch must NOT be recursed.
+// `Name "y" already defined on line 3 [no-redef]` (verified against mypy
+// 1.18.1). The signature pass's AnnAssign branch binds a conditional
+// annotation exactly like a flat one, so the second one still collides with
+// the first.
 TEST(TypeChecker, TwoConditionalAnnotatedAssignmentsStillCollide) {
     const Checked checked = check_module("FLAG = True\n"
                                          "if FLAG:\n"

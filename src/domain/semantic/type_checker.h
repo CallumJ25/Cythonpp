@@ -565,11 +565,11 @@ private:
     // which at module level it never is), so every call to one was a false
     // NameError on code mypy accepts and CPython runs.
     //
-    // The AnnAssign arm deliberately does NOT get this recursion: a
-    // conditional annotated assignment is already bound correctly by the
-    // ordinary statement walk when it reaches that exact line, and binding it
-    // here too would either double-report a redefinition or bind it ahead of
-    // its own source position.
+    // The AnnAssign arm gets this recursion too, unconditionally: a
+    // conditional annotated assignment is bound here exactly like a flat one,
+    // at its own line -- which is what makes a read above it say "used before
+    // definition" instead of "not defined" (matching mypy), and what makes a
+    // later same-name definition report against the right statement.
     //
     // A conditional def's FAILED bind is dropped silently rather than
     // reported: measured against mypy 1.18.1, two defs of one name in an
@@ -828,6 +828,13 @@ private:
     // collect_signatures skipped (collided_top_level_) or never saw at all
     // (a NESTED def, or a method) has no entry here and is resolved fresh,
     // directly in visit(FunctionDef), the only time it is ever resolved.
+    // NOTE: "has an entry here" no longer implies "sits flat in the module
+    // body" -- collect_signatures now recurses through control flow, so a def
+    // under an `if`/`while`/`for` gets an entry too. Do not add a rule that
+    // keys off this map's presence to mean "flat"; it would get the wrong
+    // answer for a conditional def. (This is the same trap that forced
+    // class_method_signatures_ below to be a separate map rather than folded
+    // into this one -- see its own comment.)
     std::map<const ast::FunctionDef*, Type> top_level_signatures_;
 
     // Pre_collect_class_body's own resolved-signature cache, one

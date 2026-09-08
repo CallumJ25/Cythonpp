@@ -363,8 +363,12 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
     // splitting into a recursed def pass plus a flat AnnAssign pass would
     // reorder every def ahead of every AnnAssign, breaking that.
     //
-    // The AnnAssign arm is deliberately NOT affected by the recursion -- see
-    // its own comment below.
+    // The AnnAssign arm is recursed too, and unconditionally: a conditional
+    // annotated assignment (`if FLAG: y: int = 5`) is bound here exactly like
+    // a flat one, at its own line, so a read above it says "used before
+    // definition" instead of falling through to "not defined" (matching mypy),
+    // and a later same-name definition still reports against the right
+    // statement.
     for_each_flat_statement(
         module.body(), /*directly_in_body=*/true,
         [this](const ast::Stmt& statement, bool at_flat_top_level) {
@@ -434,16 +438,6 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
                               std::to_string(existing.binding->declared_line));
                 }
             } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(&statement)) {
-                if (!at_flat_top_level) {
-                    // A conditional annotated assignment is already handled
-                    // correctly by the ordinary walk, which binds it when it
-                    // reaches the statement -- verified, `if FLAG: y: int = 5`
-                    // then reading `y` is clean, and an if/else pair of them
-                    // still reports the redefinition mypy reports. Binding one
-                    // here as well would either double-report that
-                    // redefinition or bind it ahead of its own line.
-                    return;
-                }
                 if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
                     module_level_annotations_[ann_assign] = bind_annotation(
                         *target_name, ann_assign->annotation(), ann_assign->span().start_line);
