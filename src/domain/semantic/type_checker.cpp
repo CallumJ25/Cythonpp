@@ -7,12 +7,15 @@
 
 #include "annotation_resolver.h"
 #include "builtin_call_table.h"
+#include "domain/ast/break.h"
 #include "domain/ast/call.h"
+#include "domain/ast/constant.h"
 #include "domain/ast/dict_expr.h"
 #include "domain/ast/function_def.h"
 #include "domain/ast/list_expr.h"
 #include "domain/ast/parameter.h"
 #include "domain/ast/source_span.h"
+#include "domain/lexer/token_type.h"
 #include "type_compatibility.h"
 #include "type_name.h"
 
@@ -66,6 +69,37 @@ private:
     std::string& current_name_;
     std::string previous_;
 };
+
+// RAII guard for the declared return type Return's own checks (Task 20) read
+// -- current_return_type_ -- saved and restored exactly like
+// ClassContextGuard restores current_class_qualified_name_, so a nested def's
+// own Return statements are checked against ITS OWN return type rather than
+// the enclosing function's.
+class ReturnContextGuard {
+public:
+    ReturnContextGuard(Type& current, Type new_type)
+        : current_(current), previous_(current) {
+        current_ = std::move(new_type);
+    }
+    ~ReturnContextGuard() { current_ = std::move(previous_); }
+
+    ReturnContextGuard(const ReturnContextGuard&) = delete;
+    ReturnContextGuard& operator=(const ReturnContextGuard&) = delete;
+
+private:
+    Type& current_;
+    Type previous_;
+};
+
+// The `while True` half of always_returns' While arm: true only for a
+// Constant whose token type is BOOL_TRUE, per the brief's own precise
+// definition -- NOT any expression ExpressionTyper would type as `bool`
+// (e.g. a bare `1` is truthy but not this), because always_returns is a
+// SYNTACTIC approximation with no typing pass of its own.
+bool is_literal_true(const ast::Expr& condition) {
+    const auto* constant = dynamic_cast<const ast::Constant*>(&condition);
+    return constant != nullptr && constant->type() == lexer::token_type::BOOL_TRUE;
+}
 
 } // namespace
 
@@ -609,6 +643,15 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         }
         report(node, "TypeError", "method must have at least one argument");
         FunctionScopeGuard guard(scopes_);
+        // No real return type was ever computed for this broken signature
+        // (there is no self to build param_types from, so this whole
+        // branch skips that machinery), so Return checks inside it get
+        // Unknown -- absorbing, so a return statement here is never
+        // (falsely) flagged on top of the signature error already reported
+        // above. Task 20: the missing-return-statement check is also
+        // skipped entirely for this branch, matching how it already skips
+        // the "missing an annotation" completeness check just above.
+        ReturnContextGuard return_guard(current_return_type_, Type::unknown());
         pre_bind_function_body(node.body());
         for (const ast::StmtPtr& statement : node.body()) {
             statement->accept(*this);
@@ -779,6 +822,13 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // is_unfilled_placeholder needs this same flag to avoid mistaking a
     // same-line parameter for its own placeholder-fill case.
     FunctionScopeGuard guard(scopes_);
+    // Task 20: `return_type` (resolved above, either freshly or from
+    // top_level_signatures_'s cache) becomes the declared type Return's own
+    // checks read for the DURATION of this body walk -- restored by
+    // ReturnContextGuard's destructor to whatever the ENCLOSING function's
+    // (if any) was, so a nested def checks its own returns against its own
+    // signature.
+    ReturnContextGuard return_guard(current_return_type_, return_type);
     for (std::size_t i = 0; i < params.size(); ++i) {
         const ast::Parameter& parameter = params[i];
         // Task 18 fix round 1, Finding 4: the bool `bind` returns MUST be
@@ -803,6 +853,18 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     pre_bind_function_body(node.body());
     for (const ast::StmtPtr& statement : node.body()) {
         statement->accept(*this);
+    }
+
+    // Task 20's return-path check, run once per FunctionDef at the very end
+    // of its own body walk -- ONLY when the declared return type is neither
+    // None (nothing to return, so fall-through is fine) nor Unknown (no
+    // reliable annotation to enforce; the earlier any_param_missing/
+    // return_missing check already flags a genuinely missing one). Reported
+    // at the `def` line, matching mypy, which reports this at the function's
+    // own definition rather than at the fall-through point.
+    if (node.has_return_annotation() && return_type.kind != TypeKind::NoneType &&
+        return_type.kind != TypeKind::Unknown && !always_returns(node.body())) {
+        report(node, "TypeError", "missing return statement");
     }
 }
 
@@ -836,6 +898,163 @@ void TypeChecker::visit(const ast::ClassDef& node) {
     for (const ast::StmtPtr& statement : node.body()) {
         statement->accept(*this);
     }
+}
+
+void TypeChecker::visit(const ast::If& node) {
+    // Truthiness is universal -- ANY condition type is acceptable, so unlike
+    // every other typed subexpression in this checker there is no
+    // compatibility check to run against the result at all; it is typed
+    // purely so the TypeMap stays complete and any error INSIDE the
+    // condition (an unbound name, say) still reports.
+    typer_.set_statement_line(node.span().start_line);
+    typer_.type_of(node.condition(), Type::unknown());
+    for (const ast::StmtPtr& statement : node.body()) {
+        statement->accept(*this);
+    }
+    for (const ast::StmtPtr& statement : node.orelse()) {
+        statement->accept(*this);
+    }
+}
+
+void TypeChecker::visit(const ast::While& node) {
+    // Same reasoning as If: truthiness is universal, so the condition is
+    // typed and never checked against anything.
+    typer_.set_statement_line(node.span().start_line);
+    typer_.type_of(node.condition(), Type::unknown());
+    for (const ast::StmtPtr& statement : node.body()) {
+        statement->accept(*this);
+    }
+    for (const ast::StmtPtr& statement : node.orelse()) {
+        statement->accept(*this);
+    }
+}
+
+void TypeChecker::visit(const ast::For& node) {
+    const int line = node.span().start_line;
+    typer_.set_statement_line(line);
+    const Type iterable_type = typer_.type_of(node.iterable(), Type::unknown());
+    // Routed through ExpressionTyper::element_type_of -- the SAME apply()
+    // switch type_of_list_comp uses for its own, identical need -- rather
+    // than a second copy of the three-way RuleResult handling here.
+    const Type element = typer_.element_type_of(node.iterable(), iterable_type);
+
+    if (const auto* tuple_target = dynamic_cast<const ast::TupleExpr*>(&node.target())) {
+        // mypy ACCEPTS a tuple target (`for a, b in pairs:` is mypy-clean),
+        // so this must be NotImplementedError, not TypeError -- element_type
+        // of a tuple[K, V] is the UNION K | V, not a positional pair, so
+        // there is nothing correct to bind a/b to element-wise. Mirrors
+        // type_of_list_comp's identical tuple-target arm.
+        report(*tuple_target, "NotImplementedError",
+              "tuple targets in for loops are not supported");
+    } else if (const auto* name_target = dynamic_cast<const ast::Name*>(&node.target())) {
+        // A for target does NOT get its own scope (unlike a comprehension's
+        // Comprehension scope) -- bound via assign_name, exactly like an
+        // ordinary Name assignment, into the CURRENT scope, so it survives
+        // the loop and a reassignment through a second loop is checked for
+        // compatibility rather than silently rebound.
+        assign_name(*name_target, element, line);
+    }
+    // Any other target shape (Attribute, Subscript) is outside this task's
+    // tested scope; nothing to bind.
+
+    for (const ast::StmtPtr& statement : node.body()) {
+        statement->accept(*this);
+    }
+    for (const ast::StmtPtr& statement : node.orelse()) {
+        statement->accept(*this);
+    }
+}
+
+void TypeChecker::visit(const ast::Return& node) {
+    const int line = node.span().start_line;
+    typer_.set_statement_line(line);
+
+    if (!node.has_value()) {
+        // A bare `return` is only wrong when the function's declared return
+        // type demands a value -- i.e. it is neither None (nothing expected)
+        // nor Unknown (no reliable declared type to enforce at all).
+        if (current_return_type_.kind != TypeKind::Unknown &&
+            current_return_type_.kind != TypeKind::NoneType) {
+            report(node, "TypeError", "return value expected");
+        }
+        return;
+    }
+
+    // The declared return type is the value's EXPECTED CONTEXT, exactly like
+    // an AnnAssign's declared type -- `def f() -> list[int]: return []`
+    // types the bare `[]` against list[int] rather than Unknown.
+    const Type value_type = typer_.type_of(node.value(), current_return_type_);
+    if (current_return_type_.kind == TypeKind::Unknown) {
+        // No reliable declared type to check the value against.
+        return;
+    }
+    if (current_return_type_.kind == TypeKind::NoneType) {
+        report(node, "TypeError", "no return value expected");
+        return;
+    }
+    if (value_type.kind != TypeKind::Unknown &&
+        !is_subtype(value_type, current_return_type_, &classes_)) {
+        // New wording, not in the corpus's pre-existing settled set --
+        // verified against mypy 1.18.1's own "Incompatible return value type
+        // (got \"str\", expected \"int\")", lower-cased to match this
+        // codebase's existing message-casing convention (every other message
+        // here starts lower-case despite mypy's own title case).
+        report(node, "TypeError",
+              "incompatible return value type (got \"" + type_name(value_type) +
+                  "\", expected \"" + type_name(current_return_type_) + "\")");
+    }
+}
+
+bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body) {
+    for (const ast::StmtPtr& statement : body) {
+        if (dynamic_cast<const ast::Break*>(statement.get()) != nullptr) {
+            return true;
+        }
+        if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
+            // An `if` is not a loop, so a break inside one still belongs to
+            // THIS enclosing loop -- look through it.
+            if (contains_reachable_break(if_stmt->body()) ||
+                contains_reachable_break(if_stmt->orelse())) {
+                return true;
+            }
+            continue;
+        }
+        // A nested For/While's own body/orelse is deliberately NOT
+        // recursed into: a break there can only ever escape THAT loop, never
+        // this one, so counting it here would over-count and turn a
+        // genuinely fall-through-reachable `while True` into a false-clean
+        // one. FunctionDef/ClassDef bodies are new scopes a `break` cannot
+        // reach out of at all (and could not legally appear there either),
+        // so they are skipped for the same reason.
+    }
+    return false;
+}
+
+bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) const {
+    for (const ast::StmtPtr& statement : body) {
+        if (dynamic_cast<const ast::Return*>(statement.get()) != nullptr) {
+            return true;
+        }
+        if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
+            if (!if_stmt->orelse().empty() && always_returns(if_stmt->body()) &&
+                always_returns(if_stmt->orelse())) {
+                return true;
+            }
+            continue;
+        }
+        if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
+            if (is_literal_true(while_stmt->condition()) &&
+                !contains_reachable_break(while_stmt->body())) {
+                return true;
+            }
+            continue;
+        }
+        // A For, or a While with any other condition, is assumed skippable
+        // (false) -- the syntactic approximation the brief settles on. This
+        // can only ever answer false where mypy answers true (a missed
+        // error), never the reverse.
+    }
+    return false;
 }
 
 bool TypeChecker::is_bare_empty_container(const ast::Expr& value) {

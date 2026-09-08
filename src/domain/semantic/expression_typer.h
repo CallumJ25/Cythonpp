@@ -62,6 +62,15 @@ public:
     // opts in.
     void set_statement_line(int line);
 
+    // What iterating `iterable_type` (the ALREADY-typed iterable expression
+    // `iterable_expr`) yields, reported through the SAME apply() switch
+    // type_of_list_comp uses for its identical need (Task 16) -- so a `for`
+    // loop's target (Task 20, TypeChecker) never carries a second, drifting
+    // copy of the three-way RuleResult switch. Public (unlike apply itself)
+    // because TypeChecker is not an ExpressionTyper and has no other way to
+    // reach the shared rule table's Ok/NotApplicable/Unsupported handling.
+    Type element_type_of(const ast::Expr& iterable_expr, const Type& iterable_type);
+
 private:
     // The sign lives in the UnaryOp, not the lexeme -- `negated` is true only
     // when this Constant is the LITERAL_INT operand of a UnaryOp(-), the one

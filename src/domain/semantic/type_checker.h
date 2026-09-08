@@ -13,13 +13,17 @@
 #include "domain/ast/class_def.h"
 #include "domain/ast/expr.h"
 #include "domain/ast/expr_stmt.h"
+#include "domain/ast/for.h"
 #include "domain/ast/function_def.h"
+#include "domain/ast/if.h"
 #include "domain/ast/module.h"
 #include "domain/ast/name.h"
 #include "domain/ast/node.h"
 #include "domain/ast/recursive_visitor.h"
+#include "domain/ast/return.h"
 #include "domain/ast/subscript.h"
 #include "domain/ast/tuple_expr.h"
+#include "domain/ast/while.h"
 #include "domain/diagnostics/diagnostic_sink.h"
 #include "expression_typer.h"
 #include "scope_stack.h"
@@ -39,12 +43,58 @@ namespace cythonpp::domain::semantic {
 // SCOPE (Task 17): Module, Assign, AnnAssign, ExprStmt, and the two-phase
 // module-scope collection. Pass/Break/Continue carry nothing to check and are
 // deliberately left un-overridden -- RecursiveVisitor's empty default is
-// already correct for all three. Control flow / Return (Task 20) are also
-// left un-overridden for now, which is exactly the right intermediate
-// behaviour: their children still get walked (and, for a body statement this
-// task DOES handle, still checked), so the worst case is that a construct
-// only Task 20 will add real rules for is silently under-checked rather than
-// wrongly flagged.
+// already correct for all three.
+//
+// Control flow and Return (Task 20) are now real. If/While type their
+// condition (ANY type is fine -- truthiness is universal) then walk body()
+// and orelse() in that order; neither pushes a scope, matching Python's own
+// lack of block scoping. For types iterable() and takes its element type
+// through ExpressionTyper::element_type_of (the SAME apply() switch
+// type_of_list_comp already uses -- see that method's own comment -- so this
+// is not a second, drifting copy of the three-way RuleResult handling), then
+// binds target() via assign_name in the CURRENT scope (a for target does NOT
+// get its own scope, unlike a comprehension -- the target survives the loop),
+// then walks body()/orelse() the same way. A TupleExpr target reports
+// NotImplementedError ("tuple targets in for loops are not supported")
+// rather than TypeError: mypy accepts one, and element_type of a tuple[K, V]
+// is the union K | V, not a positional pair, so there is nothing correct to
+// bind element-wise.
+//
+// Return's value (if any) is typed with the ENCLOSING function's declared
+// return type as expected context -- current_return_type_, pushed by a small
+// RAII guard around FunctionDef's own body walk (see visit(FunctionDef)) and
+// restored on the way out, exactly like ClassContextGuard restores
+// current_class_qualified_name_ -- so `def f() -> list[int]: return []`
+// checks the bare `[]` against list[int] instead of Unknown. Unknown here
+// means "no reliable declared type" (either no return annotation at all, or
+// one that failed to resolve) and is treated as absorbing throughout: a bare
+// return or a value return under it is never flagged, matching mypy's own
+// silence on an untyped def's return statements (the SEPARATE "function is
+// missing a type annotation" diagnostic already covers that def). A bare
+// `return` in a function whose declared return type is neither None nor
+// Unknown is "return value expected"; a value `return` where the declared
+// type IS None is "no return value expected"; an incompatible value is
+// "incompatible return value type (got \"...\", expected \"...\")" -- all
+// three verified against mypy 1.18.1's own (title-cased) wording, lower-cased
+// to match this codebase's existing message casing convention.
+//
+// RETURN-PATH CHECKING, the sole flow-sensitive check (mypy runs it despite
+// declining definite-assignment analysis generally): `always_returns` is a
+// purely syntactic, non-recursive-into-nested-scopes walk over a statement
+// list -- a Return is a hit; an If counts only when orelse() is NON-EMPTY and
+// BOTH branches always return; a While counts only when its condition is the
+// literal `True` (a Constant whose token type is BOOL_TRUE) AND its body has
+// no reachable break (see contains_reachable_break -- a break belonging to a
+// NESTED For/While does not count, since it can never escape THIS loop); a
+// For, or a While with any other condition, is always assumed skippable
+// (false) -- both directions verified against mypy, and the only possible
+// error from the approximation is a MISSED one (mypy says "definitely
+// returns", this checker says "maybe not"), never a false positive. Checked
+// once per FunctionDef, at the very end of its body walk, ONLY when the
+// function has a return annotation that is neither None nor Unknown --
+// reported at the `def` line as TypeError "missing return statement" (mypy
+// splits this one message across two codes, empty-body and return; this
+// checker does not distinguish them).
 //
 // FunctionDef (Task 18) is now fully checked: every parameter (except a
 // method's `self`) and the return both need an annotation, a wrong-typed
@@ -128,6 +178,10 @@ public:
     void visit(const ast::ExprStmt& node) override;
     void visit(const ast::FunctionDef& node) override;
     void visit(const ast::ClassDef& node) override;
+    void visit(const ast::If& node) override;
+    void visit(const ast::While& node) override;
+    void visit(const ast::For& node) override;
+    void visit(const ast::Return& node) override;
 
 private:
     // What resolving (and possibly binding) an AnnAssign's annotation
@@ -301,6 +355,24 @@ private:
     // `tuple()`, which mypy leaves just as unannotated as `[]`.
     static bool is_bare_empty_container(const ast::Expr& value);
 
+    // Task 20's return-path check. Purely syntactic and const -- it touches
+    // no scope, no ClassTable, nothing but the AST shape -- so it can be
+    // (and is) called after the function's own body has already been
+    // visited, with no ordering hazard either way. See the class-level
+    // comment for the exact per-statement rule; "a body always returns if
+    // ANY of its statements does" is the fold this recursion performs at
+    // every level, mirroring collect_classes' own recursive-then-fold shape.
+    bool always_returns(const std::vector<ast::StmtPtr>& body) const;
+
+    // The `while True` arm's "no reachable break" half: true when `body`
+    // contains a `break` at any depth EXCEPT inside a nested For/While's own
+    // body/orelse -- a break belonging to a nested loop can only ever escape
+    // THAT loop, never this one, so recursing into one would over-count.
+    // Recurses into If's body/orelse (an `if` is not a loop, so a break
+    // inside one still belongs to the enclosing loop), which is the one
+    // compound statement this helper DOES look through.
+    static bool contains_reachable_break(const std::vector<ast::StmtPtr>& body);
+
     void report(const ast::Node& at, std::string code, std::string message);
     void report_incompatible_assignment(const ast::Node& at, const Type& value_type,
                                         const Type& target_type, const char* target_label);
@@ -346,6 +418,18 @@ private:
     // sees ScopeKind::Function instead (already pushed by its own enclosing
     // method's FunctionScopeGuard) with no separate reset ever needed.
     std::string current_class_qualified_name_;
+
+    // The CURRENT function's declared return type, for Return's own checks --
+    // Type::unknown() outside any function, and restored to whatever it was
+    // (by ReturnContextGuard, in the .cpp) once that function's body walk is
+    // done, so a nested def's own return statements are checked against ITS
+    // OWN return type, never the enclosing one's. Unknown means "no reliable
+    // declared type" (no annotation at all, or one that failed to resolve),
+    // which Return treats as absorbing -- consistent with every other Unknown
+    // in this checker, and matching mypy's own silence on an untyped def's
+    // return statements (a SEPARATE diagnostic already flags the missing
+    // annotation itself).
+    Type current_return_type_ = Type::unknown();
 };
 
 } // namespace cythonpp::domain::semantic

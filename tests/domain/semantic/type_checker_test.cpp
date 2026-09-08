@@ -385,15 +385,17 @@ TEST(TypeChecker, ACompatibleDefaultIsClean) {
 // inside function bodies, and the function's own name is one of them.
 //
 // PLAN DEFECT (reported, not silently patched): the brief's own version of
-// this test used `return f(n)`, which is VACUOUS -- Return is not yet
-// overridden (Task 20) and RecursiveVisitor's default just walks to the
-// Name "f", whose own visit() is RecursiveVisitor's no-op default, so
-// nothing is ever typed through ExpressionTyper and the test would pass
-// regardless of whether recursion resolution works at all. This is the
-// exact same class of defect Task 17's fix round 1 found and fixed for
-// `return g` (rewritten to `print(g)`). Rewritten the same way here, inside
-// the `if`, so the call genuinely reaches ExpressionTyper via the
-// TypeChecker-overridden ExprStmt arm.
+// this test used `return f(n)`, which was VACUOUS AT THE TIME -- Return was
+// not yet overridden (that landed in Task 20) and RecursiveVisitor's default
+// just walked to the Name "f", whose own visit() is RecursiveVisitor's no-op
+// default, so nothing was ever typed through ExpressionTyper and the test
+// would have passed regardless of whether recursion resolution worked at
+// all. This is the exact same class of defect Task 17's fix round 1 found
+// and fixed for `return g` (rewritten to `print(g)`). Rewritten the same way
+// here, inside the `if`, so the call genuinely reaches ExpressionTyper via
+// the TypeChecker-overridden ExprStmt arm -- left as-is now that Return IS
+// real, since `return 0` right below already exercises a genuine typed
+// Return, and this test's own point is recursion, not Return.
 TEST(TypeChecker, DirectRecursionIsClean) {
     expect_clean("def f(n: int) -> int:\n    if n:\n        print(f(n))\n    return 0\n");
 }
@@ -418,16 +420,23 @@ TEST(TypeChecker, ANestedDefIsNotHoisted) {
 // happens now, a closure READ happens at call time. The unifying rule is
 // that only same-scope reads are order-checked.
 //
-// PLAN DEFECT (reported, not silently patched): the brief's own version used
-// `return v` inside `i`, which is the SAME vacuous-Return shape as
-// DirectRecursionIsClean above -- `v` is never typed through ExpressionTyper
-// either way, so the test cannot fail regardless of the implementation.
-// Rewritten to `print(v)`, matching the same established fix pattern.
+// Task 18 rewrote the brief's own `return v` to `print(v)` here, since
+// Return was not yet overridden then and `return v` was the SAME vacuous
+// shape as DirectRecursionIsClean above -- `v` was never typed through
+// ExpressionTyper either way. Task 20 makes Return real, which flips this
+// fixture over to a NEW failure: `i` declares `-> int` but (with `print(v)`
+// as its only statement) never returns at all, which is a genuine missing
+// return statement -- verified against mypy 1.18.1, which reports exactly
+// that (`error: Missing return statement  [return]`) on this fixture
+// unmodified. Restored to the brief's original `return v`, which both
+// supplies the now-required return AND exercises the exact same closure
+// read this test is named for (typed via ExpressionTyper same as `print(v)`
+// would have been, now that Return is no longer inert).
 TEST(TypeChecker, AClosureMayReadALocalAssignedAfterItsOwnDef) {
     expect_clean(
         "def o() -> int:\n"
         "    def i() -> int:\n"
-        "        print(v)\n"
+        "        return v\n"
         "    v: int = 1\n"
         "    return i()\n");
 }
@@ -596,13 +605,18 @@ TEST(TypeChecker, TheFirstSelfAssignmentDeclaresTheAttributeType) {
 // Verified: the class body is NOT in the method's lexical scope.
 //
 // PLAN DEFECT (reported, not silently patched): the brief's own version of
-// this test used `return x`, which is VACUOUS for the exact reason recorded
-// on DirectRecursionIsClean and AClosureMayReadALocalAssignedAfterItsOwnDef
-// above -- Return is not yet overridden (Task 20), so RecursiveVisitor's
-// default just walks to the Name `x` via accept(), whose own visit() is
-// RecursiveVisitor's no-op default; `x` never reaches ExpressionTyper and the
-// test could not fail regardless of whether a method body actually skips the
-// class scope. Rewritten to `print(x)`, the same established fix.
+// this test used `return x`, which was VACUOUS AT THE TIME for the exact
+// reason recorded on DirectRecursionIsClean and
+// AClosureMayReadALocalAssignedAfterItsOwnDef above -- Return was not yet
+// overridden (that landed in Task 20), so RecursiveVisitor's default just
+// walked to the Name `x` via accept(), whose own visit() is RecursiveVisitor's
+// no-op default; `x` never reached ExpressionTyper and the test could not
+// have failed regardless of whether a method body actually skips the class
+// scope. Rewritten to `print(x)`, the same established fix -- kept as-is now
+// that Return IS real, since `m`'s `-> None` means restoring `return x` would
+// ALSO report "no return value expected" alongside the NameError this test
+// pins, breaking the single-diagnostic assertion below for a reason unrelated
+// to what this test is actually about.
 TEST(TypeChecker, AMethodBodyDoesNotSeeClassBodyNames) {
     const Checked checked = check_module(
         "class C:\n"
@@ -734,6 +748,164 @@ TEST(TypeChecker, AMultiLineDefReannotatingItsOwnParameterIsARedefinition) {
     const diagnostics::Diagnostic error = only_error(checked);
     EXPECT_EQ(error.code, "TypeError");
     EXPECT_EQ(error.message, "name \"x\" already defined on line 1");
+}
+
+// ---------------------------------------------------------------------------
+// Task 20: control flow, Return, and return-path checking.
+// ---------------------------------------------------------------------------
+
+TEST(TypeChecker, ChecksControlFlowBodies) {
+    expect_clean("c: bool = True\nif c:\n    x: int = 1\nelse:\n    y: int = 2\n");
+    expect_clean("c: bool = True\nwhile c:\n    x: int = 1\n");
+    expect_clean("for i in range(3):\n    x: int = i\n");
+    expect_clean("for i in range(3):\n    break\nelse:\n    pass\n");
+}
+
+// Truthiness is universal -- verified `if w:` clean on a plain user class.
+TEST(TypeChecker, AnyConditionTypeIsAcceptable) {
+    expect_clean("xs: list[int] = []\nif xs:\n    pass\n");
+    expect_clean("class C:\n    pass\nc = C()\nif c:\n    pass\n");
+}
+
+TEST(TypeChecker, BindsTheForTargetToTheElementType) {
+    expect_clean("for s in \"abc\":\n    t: str = s\n");
+    expect_clean("d: dict[str, int] = {}\nfor k in d:\n    s: str = k\n");
+}
+
+// A for target does NOT get its own scope -- verified: reading it after the
+// loop is clean under --strict.
+TEST(TypeChecker, TheForTargetSurvivesTheLoop) {
+    expect_clean("for i in range(3):\n    pass\nx: int = i\n");
+}
+
+TEST(TypeChecker, ReportsIteratingANonIterable) {
+    const Checked checked = check_module("for i in 1:\n    pass\n");
+    EXPECT_EQ(only_error(checked).code, "TypeError");
+}
+
+// mypy ACCEPTS tuple targets, so this must be NotImplementedError.
+TEST(TypeChecker, ReportsATupleForTargetAsUnsupported) {
+    const Checked checked = check_module("for a, b in [(1, 2)]:\n    pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "tuple targets in for loops are not supported");
+}
+
+// Verified: reported at the DEF line. mypy's code is empty-body for a
+// pass-only body and `return` for a fall-through; we use TypeError for both.
+TEST(TypeChecker, ReportsAMissingReturnStatement) {
+    const Checked checked = check_module("def f() -> int:\n    pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "missing return statement");
+    EXPECT_EQ(error.line, 1) << "reported at the def line, matching mypy";
+}
+
+TEST(TypeChecker, BothBranchesReturningIsExhaustive) {
+    expect_clean("def f(c: bool) -> int:\n    if c:\n        return 1\n    else:\n        return 2\n");
+}
+
+TEST(TypeChecker, AnIfWithoutAnElseIsNotExhaustive) {
+    const Checked checked =
+        check_module("def f(c: bool) -> int:\n    if c:\n        return 1\n");
+    EXPECT_EQ(only_error(checked).code, "TypeError");
+}
+
+// Verified CLEAN: `while True` with no reachable break is treated as
+// non-terminating, so fall-through is unreachable -- even when the loop might
+// spin forever without returning.
+TEST(TypeChecker, WhileTrueSatisfiesTheReturnCheck) {
+    expect_clean("def f() -> int:\n    while True:\n        return 1\n");
+    expect_clean("def f(c: bool) -> int:\n    while True:\n        if c:\n            return 1\n");
+}
+
+// The syntactic approximation. A break makes the loop escapable, so
+// fall-through is reachable and the function needs a return after it.
+TEST(TypeChecker, WhileTrueWithABreakDoesNotSatisfyTheReturnCheck) {
+    const Checked checked = check_module(
+        "def f(c: bool) -> int:\n"
+        "    while True:\n"
+        "        if c:\n"
+        "            break\n"
+        "        return 1\n");
+    EXPECT_EQ(only_error(checked).code, "TypeError");
+}
+
+// Verified: a conditional while and a for are both assumed skippable.
+TEST(TypeChecker, ASkippableLoopDoesNotSatisfyTheReturnCheck) {
+    const Checked conditional =
+        check_module("def f(c: bool) -> int:\n    while c:\n        return 1\n");
+    EXPECT_EQ(only_error(conditional).code, "TypeError");
+
+    const Checked loop = check_module(
+        "def f(xs: list[int]) -> int:\n    for x in xs:\n        return 1\n");
+    EXPECT_EQ(only_error(loop).code, "TypeError");
+}
+
+TEST(TypeChecker, ANoneReturningFunctionNeedsNoReturn) {
+    expect_clean("def f() -> None:\n    pass\n");
+}
+
+TEST(TypeChecker, ReportsABareReturnInANonNoneFunction) {
+    const Checked checked = check_module("def f() -> int:\n    return\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "return value expected");
+}
+
+TEST(TypeChecker, ReportsAValueReturnedFromANoneFunction) {
+    const Checked checked = check_module("def f() -> None:\n    return 5\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "no return value expected");
+}
+
+TEST(TypeChecker, ReportsAnIncompatibleReturnValue) {
+    const Checked checked = check_module("def f() -> int:\n    return \"s\"\n");
+    EXPECT_EQ(only_error(checked).code, "TypeError");
+}
+
+// The declared return type is the value's expected context.
+TEST(TypeChecker, TheDeclaredReturnTypeIsTheValuesContext) {
+    expect_clean("def f() -> list[int]:\n    return []\n");
+}
+
+// Verified: x: float = f() where f() -> int is clean -- the numeric tower
+// applies to returns too.
+TEST(TypeChecker, ReturnValuesFollowTheNumericTower) {
+    expect_clean("def f() -> float:\n    return 1\n");
+}
+
+// Not exercised by the brief's own test list above: a break belonging to a
+// NESTED loop must not count as a reachable break for the OUTER `while
+// True`, per contains_reachable_break's own contract. Verified against mypy
+// 1.18.1: this exact fixture is --strict clean.
+TEST(TypeChecker, ABreakInANestedLoopDoesNotEscapeTheOuterWhileTrue) {
+    expect_clean(
+        "def f(xs: list[int]) -> int:\n"
+        "    while True:\n"
+        "        for x in xs:\n"
+        "            break\n"
+        "        return 1\n");
+}
+
+// current_return_type_ is a single member restored by ReturnContextGuard, not
+// a stack a naive reader might assume is unnecessary for a single level of
+// nesting -- this pins that a nested def's return type does not leak back
+// out to the ENCLOSING function once the nested def's own body walk is done:
+// `outer`'s trailing bare `return` must be checked against None (outer's own
+// declared type), not int (inner's).
+TEST(TypeChecker, ANestedDefsReturnTypeDoesNotLeakToTheEnclosingFunction) {
+    expect_clean(
+        "def outer() -> None:\n"
+        "    def inner() -> int:\n"
+        "        return 1\n"
+        "    inner()\n"
+        "    return\n");
 }
 
 } // namespace

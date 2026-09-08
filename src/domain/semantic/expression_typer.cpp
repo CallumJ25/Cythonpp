@@ -584,6 +584,11 @@ Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
     return Type::list_of(element);
 }
 
+Type ExpressionTyper::element_type_of(const ast::Expr& iterable_expr, const Type& iterable_type) {
+    const RuleResult result = element_type(iterable_type);
+    return apply(result, iterable_expr, "\"" + type_name(iterable_type) + "\" is not iterable");
+}
+
 Type ExpressionTyper::apply(const RuleResult& result, const ast::Expr& at,
                             std::string type_error_message) {
     switch (result.status) {
