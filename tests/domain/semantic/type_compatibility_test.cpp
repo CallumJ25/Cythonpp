@@ -228,6 +228,33 @@ TEST(IsSubtype, CallableArityMustMatch) {
     expect_subtype(Type::callable({}, Type::int_()), Type::callable({}, Type::int_()));
 }
 
+// This model represents a class OBJECT as its constructor Callable (three
+// sites do so: type_of_name for `w = Widget`, type_of_attribute's
+// nested-class branch for `Outer.Inner`, type_of_name_call's bare-`C()`
+// callee), and `type` is the annotation spelling for "some class object".
+// Without this arm the model contradicts itself: `x: type = Widget` and
+// `x: type = Outer.Inner` are both mypy-clean (measured, mypy 1.18.1) yet
+// drew a false "incompatible types in assignment" -- and the second of
+// those was already broken before a class name typed as its constructor at
+// all, because the nested-class branch already returned one.
+TEST(IsSubtype, AConstructorCallableSatisfiesATypeAnnotation) {
+    expect_subtype(Type::callable({}, Type::class_of("Widget")), Type::class_of("type"));
+    expect_subtype(Type::callable({Type::int_()}, Type::class_of("Widget")),
+                   Type::class_of("type"));
+    expect_subtype(Type::callable({}, Type::class_of("Outer.Inner")), Type::class_of("type"));
+}
+
+// NARROW on purpose, in both directions. A Callable satisfies `type` and
+// nothing else Class-shaped, and `type` itself is not a Callable -- an arm
+// keyed on any Class target would make `x: Widget = Widget` clean, which
+// mypy rejects.
+TEST(IsSubtype, TheTypeArmDoesNotAdmitOtherClassTargetsOrRunBackwards) {
+    expect_not_subtype(Type::callable({}, Type::class_of("Widget")),
+                       Type::class_of("Widget"));
+    expect_not_subtype(Type::callable({}, Type::int_()), Type::class_of("Gadget"));
+    expect_not_subtype(Type::class_of("type"), Type::callable({}, Type::class_of("Widget")));
+}
+
 TEST(IsSubtype, AClassIsAssignableToItsDirectBase) {
     const semantic_test_support::FakeClassLookup classes({{"Base", {}}, {"Sub", {"Base"}}});
 

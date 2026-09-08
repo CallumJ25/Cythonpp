@@ -1370,11 +1370,12 @@ TEST(TypeChecker, DeclaresNestedClassesByQualifiedName) {
     expect_clean("class Outer:\n    class Inner:\n        pass\nx: Outer.Inner = Outer.Inner()\n");
 }
 
-// A nested class named but NOT called. Verified mypy-clean (`reveal_type` is
-// `type[Outer.Inner]`). This used to be `TypeError: "Outer" has no attribute
-// "Inner"`: only the CALL shape `Outer.Inner()` was special-cased, so a bare
-// reference fell into the member/method lookup, which has no notion of a
-// nested class.
+// A nested class named but NOT called. Verified mypy-clean; measured with
+// mypy 1.18.1, `reveal_type(Outer.Inner)` is `def () -> Outer.Inner`, the
+// constructor signature, which is what this branch returns. This used to be
+// `TypeError: "Outer" has no attribute "Inner"`: only the CALL shape
+// `Outer.Inner()` was special-cased, so a bare reference fell into the
+// member/method lookup, which has no notion of a nested class.
 TEST(TypeChecker, ReferencingANestedClassWithoutCallingItIsClean) {
     expect_clean("class Outer:\n"
                  "    class Inner:\n"
@@ -1384,6 +1385,83 @@ TEST(TypeChecker, ReferencingANestedClassWithoutCallingItIsClean) {
                  "\n"
                  "x = Outer.Inner\n"
                  "print(x)\n");
+}
+
+// A class OBJECT against the annotation `type`, in both spellings that
+// produce one: a bare class name (type_of_name's carve-out) and a nested
+// class (type_of_attribute's branch). Both are mypy-clean -- measured, mypy
+// 1.18.1: `Success` for each -- and both are a Callable source against a
+// Class("type") target, a pair is_subtype had NO arm for. So each drew a
+// false "incompatible types in assignment (expression has type
+// "Callable[[], Widget]", variable has type "type")". The nested-class one
+// was broken BEFORE a bare class name typed as its constructor at all,
+// since that branch already returned one; the bare one only became
+// reachable once it did.
+TEST(TypeChecker, AClassObjectSatisfiesATypeAnnotation) {
+    expect_clean("class Widget:\n"
+                 "    pass\n"
+                 "\n"
+                 "\n"
+                 "x: type = Widget\n");
+    expect_clean("class Outer:\n"
+                 "    class Inner:\n"
+                 "        pass\n"
+                 "\n"
+                 "\n"
+                 "x: type = Outer.Inner\n");
+}
+
+// Calling through a class VALUE. mypy 1.18.1 reveals `w = Widget` as
+// `def (n: int) -> Widget` and `w(1)` as `Widget`, so this must construct
+// exactly as `Widget(1)` does -- arguments checked, instance returned, its
+// attributes reachable. Before the constructor answer replaced
+// Class("type"), `w(1)` reported `NotImplementedError: calling an instance
+// of a user-defined class is not supported` (a missed error, so safe) and
+// `w.n` reported a false `"type" has no attribute "n"` (a hard-invariant
+// violation, so not).
+TEST(TypeChecker, ACallThroughAClassValueConstructsTheInstance) {
+    expect_clean("class Widget:\n"
+                 "    def __init__(self, n: int) -> None:\n"
+                 "        self.n = n\n"
+                 "\n"
+                 "\n"
+                 "w = Widget\n"
+                 "y: int = w(1).n\n");
+}
+
+// The arity check survives the indirection, which is what proves the
+// constructor is carried through rather than replaced by a nullary or
+// Unknown stand-in. mypy reports `Missing positional argument "n" in call to
+// "Widget"` here; we name the CALLEE as the user spelled it (`w`), since a
+// Callable value has no class name of its own to report.
+TEST(TypeChecker, AnArityErrorThroughAClassValueIsStillReported) {
+    const Checked checked = check_module("class Widget:\n"
+                                         "    def __init__(self, n: int) -> None:\n"
+                                         "        self.n = n\n"
+                                         "\n"
+                                         "\n"
+                                         "w = Widget\n"
+                                         "b = w()\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "too few arguments for \"w\"");
+    EXPECT_EQ(error.line, 7);
+}
+
+// A FUNCTION-LOCAL class used as a value. Declared under a synthetic
+// isolated ClassTable name and reached only through the scope-limited alias
+// TypeChecker installs, so this pins that the carve-out passes the BARE
+// identifier (which ClassTable::canonical_name re-routes) and not an
+// already-resolved one. Verified mypy-clean; `reveal_type` is
+// `def () -> Local@2`.
+TEST(TypeChecker, AFunctionLocalClassNameUsedAsAValueIsClean) {
+    expect_clean("def outer() -> None:\n"
+                 "    class Local:\n"
+                 "        pass\n"
+                 "\n"
+                 "    w = Local\n"
+                 "    print(w())\n");
 }
 
 // Arbitrary nesting depth, both named and called: the class-object receiver

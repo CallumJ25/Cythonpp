@@ -131,17 +131,19 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
     const Resolution resolution = scopes_.resolve(name.identifier());
     if (resolution.binding == nullptr) {
         // Defect 2: a bare BUILTIN TYPE NAME used as a VALUE (`x: type = int`)
-        // is mypy-clean -- reveal_type(int) is `type[int]`. ScopeStack never
+        // is mypy-clean (measured, mypy 1.18.1: `Success`). ScopeStack never
         // holds these names (nothing binds `int` itself), so a plain
         // resolution miss would otherwise fall straight into the NameError
-        // below on some of the most ordinary code there is. The model has no
-        // `type[...]` to reach for, so this resolves to the metaclass itself,
-        // Class("type") -- a seeded builtin class (builtin_class_table.h) --
-        // which is the closest representable answer: `x: type = int`
-        // type-checks cleanly against it, and calling the result through
-        // (`y = int` then `y(5)`) lands on type_of_call_result's Class arm and
-        // reports NotImplementedError, a missed error rather than a false
-        // one, preserving the hard invariant.
+        // below on some of the most ordinary code there is. mypy's own answer
+        // here is unrepresentable in this model -- reveal_type(int) is the
+        // OVERLOADED constructor, `Overload(def (str | Buffer | ... = ) ->
+        // int, def (str | bytes | bytearray, base: SupportsIndex) -> int)` --
+        // so this resolves to the metaclass itself, Class("type"), a seeded
+        // builtin class (builtin_class_table.h), which is the closest
+        // representable answer: `x: type = int` type-checks cleanly against
+        // it, and calling the result through (`y = int` then `y(5)`) lands on
+        // type_of_call_result's Class arm and reports NotImplementedError, a
+        // missed error rather than a false one, preserving the hard invariant.
         //
         // Checked ONLY inside this `resolution.binding == nullptr` branch: a
         // live SCOPE BINDING of the same spelling (`def f(int: str) -> None:
@@ -152,10 +154,9 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
         if (builtin_type_kind(name.identifier()).has_value()) {
             return Type::class_of("type");
         }
-        // N2, the exact mirror of the carve-out above for a USER class name
-        // used as a VALUE (`w = Widget`): mypy types that `type[Widget]` and
-        // says nothing, while we reported `name 'Widget' is not defined`.
-        // Class names are deliberately never bound into ScopeStack -- both
+        // N2: a USER class name used as a VALUE (`w = Widget`) is mypy-clean,
+        // while we reported `name 'Widget' is not defined`. Class names are
+        // deliberately never bound into ScopeStack -- both
         // type_of_attribute's class-object-receiver check and
         // type_of_name_call's bare-`C()` constructor branch depend on a bare
         // class name being ABSENT from it -- so a resolution miss is the
@@ -164,11 +165,29 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
         // ClassTable::canonical_name, so a function-local class reached by
         // its scope-limited alias resolves here too.
         //
-        // Class("type") for the same reason as the builtin case: this model
-        // has no `type[...]`, so the metaclass itself is the closest
-        // representable answer. `w = Widget` then `w()` lands on
-        // type_of_call_result's Class arm and reports NotImplementedError --
-        // a missed error, not a false one.
+        // The CONSTRUCTOR is the measured-correct answer, not Class("type").
+        // mypy 1.18.1 reveals a bare class name as its constructor signature:
+        // `def () -> Widget` for a module-level class, `def () ->
+        // Outer.Inner` for a nested one, `def () -> Local@6` for a
+        // function-local one. Two sibling sites in this file already chose
+        // exactly this, both saying the constructor is the closest
+        // representable reading because the model has no `type[...]`:
+        // type_of_attribute's nested-class branch
+        // (`return classes_.constructor_type(qualified);`) and
+        // type_of_name_call's bare-`C()` callee branch. This is that same
+        // is_class/constructor_type pairing, passing the same BARE
+        // identifier -- constructor_type canonicalises internally, so the
+        // scope-limited alias of a function-local class is honoured here as
+        // it is there. The payoff is that `w = Widget` then `w()` now types
+        // as `Widget` and is clean, matching mypy, and that `w.x` no longer
+        // draws a false `"type" has no attribute "x"` -- which Class("type")
+        // did, because the seeded builtin class `type` carries bases but no
+        // members.
+        //
+        // NOT unified with the builtin carve-out above, deliberately: `int`
+        // is a model KIND, not a Class, so there is no ClassTable entry to
+        // take a constructor from and Class("type") stays the answer there.
+        // The asymmetry is the point, not an oversight.
         //
         // Two things this deliberately does NOT do. It does not fire when a
         // live scope binding of the same spelling exists (`def f(Widget: int)
@@ -179,7 +198,7 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
         // declared by a whole-module pre-pass with no line information here
         // to order-check against. A missed error, accepted.
         if (classes_.is_class(name.identifier())) {
-            return Type::class_of("type");
+            return classes_.constructor_type(name.identifier());
         }
         return error(name, "NameError", "name '" + name.identifier() + "' is not defined");
     }

@@ -395,6 +395,31 @@ bool is_subtype(const Type& source, const Type& target, const ClassLookup* class
         // Covariant in the return type.
         return is_subtype(source.args.back(), target.args.back(), classes);
     }
+    if (source.kind == TypeKind::Callable && target.kind == TypeKind::Class &&
+        target.name == "type") {
+        // This model represents a class OBJECT as its constructor Callable --
+        // three sites do so: ExpressionTyper's type_of_name (`w = Widget`),
+        // type_of_attribute's nested-class branch (`Outer.Inner`) and
+        // type_of_name_call's bare-`C()` callee -- and `type` is the
+        // annotation spelling for "some class object". Without this arm the
+        // model contradicts itself: `x: type = Widget` and
+        // `x: type = Outer.Inner` are both mypy-clean (measured, mypy 1.18.1)
+        // yet would draw a false "incompatible types in assignment", which
+        // breaks the hard invariant. The Callable/Callable arm above cannot
+        // cover it (it requires the target to be a Callable too) and the
+        // source.kind == Class arm below does not apply.
+        //
+        // Deliberately narrow: `target.name == "type"` exactly, not any
+        // Class target, so a Callable still does not satisfy `x: Widget`.
+        //
+        // It does admit a plain function where `x: type` is wanted
+        // (`def f() -> None: ...` then `x: type = f`, which mypy rejects with
+        // `expression has type "Callable[[], None]"`). A deliberate MISSED
+        // error, which is always safe; nothing here can tell a constructor
+        // Callable apart from an ordinary function's, because the model has
+        // no `type[...]` to mark one with.
+        return true;
+    }
     if (source.kind == TypeKind::Class) {
         // Broader than "target is also Class": a user class's base chain can
         // reach a builtin KIND, not just another class -- `class Sub(int)`

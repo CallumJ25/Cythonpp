@@ -1,5 +1,6 @@
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -121,13 +122,16 @@ TEST(ExpressionTyper, ReportsAnUnboundName) {
     EXPECT_EQ(typed.printed, "Unknown") << "a failed lookup must yield Unknown";
 }
 
-// Corpus defect 2 (2026-09-07): `x: type = int` is mypy-clean
-// (reveal_type(int) is `type[int]`), but a bare builtin type name used as a
-// VALUE (not an annotation, not a call) resolved through nothing but
-// ScopeStack, which never holds these names, so this drew a false
-// `NameError: name 'int' is not defined`. Option (a) from the fix brief:
-// resolved to Class("type") instead, the closest representable stand-in
-// since this model has no type[...].
+// Corpus defect 2 (2026-09-07): `x: type = int` is mypy-clean (measured,
+// mypy 1.18.1: `Success`), but a bare builtin type name used as a VALUE (not
+// an annotation, not a call) resolved through nothing but ScopeStack, which
+// never holds these names, so this drew a false `NameError: name 'int' is
+// not defined`. Resolved to Class("type") instead, the closest representable
+// stand-in: mypy's own answer for `reveal_type(int)` is the OVERLOADED
+// constructor (`Overload(def (str | Buffer | ... = ) -> int, ...)`), which
+// this model cannot represent at all. Deliberately NOT the constructor
+// treatment the user-class case below gets -- `int` is a model KIND, so
+// there is no ClassTable entry to take a constructor from.
 TEST(ExpressionTyper, ResolvesABareBuiltinTypeNameAsAValue) {
     const Typed typed = type_expression("int");
 
@@ -147,12 +151,15 @@ TEST(ExpressionTyper, ALocalBindingNamedLikeABuiltinTypeWinsOverTheBuiltinPath) 
 }
 
 // Carried defect N2: a USER CLASS name used as a VALUE (`w = Widget`) is
-// mypy-clean -- reveal_type(Widget) is `type[Widget]` -- but drew
-// `NameError: name 'Widget' is not defined`, because class names are
-// deliberately never bound into ScopeStack (two precedence checks depend on
-// their absence) so a resolution miss is a class name's NORMAL state.
-// Resolved through ClassTable to Class("type"), the exact mirror of the
-// builtin-type-name carve-out above.
+// mypy-clean but drew `NameError: name 'Widget' is not defined`, because
+// class names are deliberately never bound into ScopeStack (two precedence
+// checks depend on their absence) so a resolution miss is a class name's
+// NORMAL state. Resolved through ClassTable to the class's CONSTRUCTOR --
+// measured, mypy 1.18.1: `reveal_type(Widget)` is `def () -> Widget`, NOT
+// `type[Widget]`, and the same for a nested (`def () -> Outer.Inner`) or
+// function-local (`def () -> Local@6`) class. Two sibling sites already
+// chose the constructor for the same reason (type_of_attribute's
+// nested-class branch, type_of_name_call's bare-`C()` callee).
 TEST(ExpressionTyper, ResolvesAUserClassNameUsedAsAValue) {
     ClassTable table;
     table.declare("Widget", {});
@@ -162,7 +169,48 @@ TEST(ExpressionTyper, ResolvesAUserClassNameUsedAsAValue) {
     EXPECT_TRUE(typed.diagnostics.empty())
         << "expected no diagnostics, got "
         << (typed.diagnostics.empty() ? "" : typed.diagnostics.front().message);
-    EXPECT_EQ(typed.printed, "type");
+    EXPECT_EQ(typed.printed, "Callable[[], Widget]");
+}
+
+// The constructor is the REAL one, parameters and all, not a nullary
+// stand-in: this is what makes `w = Widget` then `w(1)` check its arguments
+// (and `w()` report arity) exactly as `Widget(1)` does. A test asserting
+// only `Callable[[], Widget]` above would pass just as well against a
+// hard-coded `Type::callable({Type::class_of(name)})`.
+TEST(ExpressionTyper, AUserClassValueCarriesItsConstructorParameters) {
+    ClassTable table;
+    table.declare("Widget", {});
+    table.declare_method("Widget", "__init__",
+                         Type::callable({Type::class_of("Widget"), Type::int_()},
+                                        Type::none()));
+
+    const Typed typed = type_expression("Widget", {}, Type::unknown(), &table);
+
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "expected no diagnostics, got "
+        << (typed.diagnostics.empty() ? "" : typed.diagnostics.front().message);
+    EXPECT_EQ(typed.printed, "Callable[[int], Widget]")
+        << "self stripped, the return replaced by the instance type";
+}
+
+// A FUNCTION-LOCAL class is declared under a synthetic isolated name and
+// reached by a scope-limited alias, so the bare spelling only resolves
+// through ClassTable::canonical_name. Passing the bare identifier (which is
+// what type_of_name_call passes too, and what constructor_type
+// canonicalises internally) is what makes this work; passing an
+// already-canonical name would not have this case to get wrong.
+TEST(ExpressionTyper, ResolvesAFunctionLocalClassNameUsedAsAValue) {
+    ClassTable table;
+    table.declare("outer#Local", {});
+    const std::optional<std::string> saved = table.declare_scoped_alias("Local", "outer#Local");
+    EXPECT_FALSE(saved.has_value()) << "no prior alias of this spelling";
+
+    const Typed typed = type_expression("Local", {}, Type::unknown(), &table);
+
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "expected no diagnostics, got "
+        << (typed.diagnostics.empty() ? "" : typed.diagnostics.front().message);
+    EXPECT_EQ(typed.printed, "Callable[[], outer#Local]");
 }
 
 // PRECEDENCE HAZARD, pinned: a live SCOPE BINDING of the same spelling as a
