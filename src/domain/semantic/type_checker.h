@@ -176,7 +176,11 @@ namespace cythonpp::domain::semantic {
 //     member the same way from visit(AnnAssign)'s Attribute-target branch,
 //     sharing assign_attribute's guard and line disambiguation verbatim; the
 //     annotation is the declared type there, where the plain form infers one
-//     from the value.
+//     from the value -- EXCEPT when this class already declares that
+//     attribute itself, in which case mypy ignores the annotation outright
+//     and the first declaration stays. See that branch for the two measured
+//     rules (same class vs. inherited) and why conflating them costs a false
+//     TypeError either way round.
 //
 // ALL THREE of the above were once purely single-pass -- declared only when
 // TypeChecker's own visitation actually reached the declaring statement, in
@@ -590,11 +594,22 @@ private:
     // Purely syntactic plus one ScopeStack::resolve (the receiver is never
     // itself typed here, so this check alone can never report anything): the
     // receiver must be a bare Name spelled "self" that currently resolves to
-    // Class(current_class_qualified_name_) -- i.e. we are really inside one
-    // of that class's own methods, not merely inside some unrelated nested
-    // function that happens to have a parameter also named "self" (`def
-    // inner(self: int) -> None: self.q = 1` must not declare "q" on the
-    // enclosing class; mypy reports its own attr-defined error there).
+    // Class(current_class_qualified_name_).
+    //
+    // What that DOES stop is a nested function whose own `self` is bound to a
+    // DIFFERENT type -- `def inner(self: int) -> None: self.q = 1` inside a
+    // Bag method must not declare "q" on Bag, and mypy reports its own
+    // attr-defined error there. What it does NOT stop, measured against the
+    // built binary rather than assumed, is a nested `def inner(self: Bag)`
+    // inside a Bag method: its `self` resolves to exactly
+    // Class("Bag"), the guard passes, and `self.q: int = 1` there declares
+    // "q" on Bag, so a later `self.q` read comes out CLEAN where mypy reports
+    // four errors (`Type cannot be declared in assignment to non-self
+    // attribute`, plus attr-defined at both the store and the read). Missed
+    // errors, never false ones -- telling that case apart needs the
+    // syntactic "is this parameter the FIRST one of a method, not of some
+    // nested def" question this guard deliberately does not ask, since it
+    // resolves `self` by TYPE.
     std::optional<Type> self_attribute_receiver_type(const ast::Attribute& target) const;
 
     // Which of three states a `self.x` store's attribute name is in --

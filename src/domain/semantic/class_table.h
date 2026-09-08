@@ -105,6 +105,27 @@ public:
     std::optional<int> member_declared_line(const std::string& qualified_name,
                                              const std::string& member) const;
 
+    // "Did declare_member write this member on THIS class, rather than on
+    // something in its base chain?" -- the one question member_type cannot
+    // answer, since it walks the chain and reports a hit either way.
+    //
+    // Exists because mypy's rule for RE-DECLARING an attribute is two
+    // different rules depending on the answer (verified against mypy 1.18.1;
+    // see visit(AnnAssign)'s self.x branch for the probe output): a
+    // re-declaration in the SAME class is ignored -- the first declaration
+    // stays the attribute's type -- while one in a SUBCLASS installs a real,
+    // narrower per-class type, and is an error unless it is a subtype of the
+    // inherited one. Conflating the two costs a false TypeError in one
+    // direction or the other, whichever way round the comparison is written.
+    //
+    // Deliberately does NOT canonicalise through canonical_name and does NOT
+    // fall back to a shadowed class the way member_type's query_chain does:
+    // it must resolve `qualified_name` to exactly the key declare_member
+    // itself writes under, or it would answer a question about a DIFFERENT
+    // class's member map than the one the caller is about to declare into.
+    std::optional<Type> own_member_type(const std::string& qualified_name,
+                                        const std::string& member) const;
+
     // A method's declared signature, including its `self` parameter, found
     // transitively through the base chain. Callers that need the BOUND
     // signature drop args[0] themselves -- mypy numbers arguments from the

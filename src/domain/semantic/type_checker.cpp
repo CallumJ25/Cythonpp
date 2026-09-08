@@ -867,39 +867,92 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
                     : std::nullopt;
             const bool method_name_collision =
                 state == SelfMemberState::ExistingDeclaration && !existing.has_value();
-            if (existing.has_value()) {
-                // A genuine EARLIER declaration (a `self.x = ...` in a method
-                // above, or a class-body annotation). Direction taken from
-                // the class-body branch above, unchanged: the ANNOTATION is
-                // the declared type and the earlier INFERRED type is the
-                // expression checked against it. Getting these two round the
-                // wrong way is a mistake this file has already made twice.
-                //
-                // Verified against mypy 1.18.1 that the direction is not
-                // observable HERE: mypy rejects every program that reaches
-                // this state through a METHOD annotation (`Attribute "n"
-                // already defined on line 3`, plus an assignment error, both
-                // at the annotation's own line) -- including the widening
-                // `self.n = 5` then `self.n: float = 1.5`, which this branch
-                // therefore accepts silently, a missed error and not a false
-                // one. The order mypy DOES accept is the reverse (annotate
-                // first, then plainly assign a subtype), and that one never
-                // reaches this branch at all: the annotation is the first
-                // occurrence, so it takes OwnPlaceholder below, and the plain
-                // assignment lands in assign_attribute's ordinary
-                // read-then-compare path.
+            // WHICH CLASS the earlier declaration lives on decides everything
+            // below, because mypy has TWO different rules here, not one --
+            // measured against mypy 1.18.1, and an earlier single rule
+            // (whichever way its comparison was written) was a false
+            // TypeError on one of the two shapes:
+            //
+            //   INHERITED (`self.v: object` in Base, `self.v: int` in Child):
+            //     accepted, and the annotation really does become Child's own
+            //     declared type. `reveal_type(self.v)` is "builtins.int" in
+            //     EVERY Child method (not just the annotating one) and
+            //     "builtins.object" in Base; `self.v = "s"` in Child is an
+            //     error while the same line in Base is clean. The narrower
+            //     annotation must therefore be INSTALLED on the current class
+            //     -- keeping the base's type instead makes Child's own
+            //     `self.v + 1` (mypy-clean) a false TypeError.
+            //     Widening IS reported, as `expression has type "object",
+            //     base class "Base" defined the type as "int"` -- so the
+            //     annotation is the `expression` and the inherited
+            //     declaration is the `variable`, which is the direction the
+            //     comparison and the report below are written in.
+            //
+            //   SAME CLASS (class-body `n: object` plus `self.n: int = 7` in
+            //     a method, or two method-level declarations): the annotation
+            //     is IGNORED -- it declares nothing and is not checked for
+            //     compatibility at all. `reveal_type(self.n)` stays
+            //     "builtins.object" in every other method, a later
+            //     `self.n = "s"` is CLEAN, and even the flatly contradictory
+            //     `self.n: int = "s"` under a class-body `n: object` is clean
+            //     (mypy checks the VALUE against the class-body type, "s"
+            //     against object, and never against the annotation).
+            //     Installing `int` here would make that clean `self.n = "s"`
+            //     a false TypeError -- the exact trade the inherited case
+            //     demands in the other direction.
+            //
+            // (mypy does additionally report `Attribute "n" already defined
+            // on line N` for two METHOD-level declarations in one class, and
+            // for a class-body plain assignment plus a method declaration,
+            // whatever the types. We do not: a missed error is safe, and
+            // reporting one would need the class-body/method distinction this
+            // branch does not carry. It is NOT reported for the class-body
+            // ANNOTATION plus method-annotation pair, which mypy accepts
+            // outright.)
+            const std::optional<Type> own_existing =
+                existing.has_value() ? classes_.own_member_type(current_class_qualified_name_,
+                                                                target_attribute->attribute())
+                                     : std::nullopt;
+            // An Unknown own declaration is not a real one to keep: it is
+            // either a class-body plain Assign's placeholder that Phase 3 has
+            // not reached yet (the assignment sits BELOW this method, a shape
+            // mypy rejects outright as a re-definition) or an earlier
+            // `self.x = <unmodellable>`. Nothing can be checked against
+            // Unknown and nothing is lost by installing over it, so it falls
+            // through to the install path with BrandNew and OwnPlaceholder.
+            const bool keep_earlier_declaration =
+                own_existing.has_value() && own_existing->kind != TypeKind::Unknown;
+            if (keep_earlier_declaration) {
+                // The annotation is discarded HERE, not merely left
+                // undeclared: `info.type` feeds the value check at the end of
+                // this function and the TypeMap entries just below, and both
+                // must see the type the attribute actually HAS. That is what
+                // makes `self.n: int = "s"` under a class-body `n: object`
+                // come out clean (value against object) and `self.n: str =
+                // "s"` under a class-body `n: int` report `expression has
+                // type "str", variable has type "int"` -- mypy's own message
+                // for that program, verbatim.
+                info.type = *own_existing;
+            } else if (existing.has_value()) {
+                // Inherited from a base: a narrowing override, reported only
+                // when it is not in fact a narrowing. Unknown on either side
+                // means we cannot tell, so nothing is reported and the
+                // annotation is installed regardless (below) -- an Unknown
+                // annotation replacing a known inherited type silences later
+                // reads of it, a missed error rather than a false one.
                 if (info.type.kind != TypeKind::Unknown && existing->kind != TypeKind::Unknown &&
-                    !is_subtype(*existing, info.type, &classes_)) {
-                    report_incompatible_assignment(node, *existing, info.type, "variable");
+                    !is_subtype(info.type, *existing, &classes_)) {
+                    report_incompatible_assignment(node, info.type, *existing, "variable");
                 }
             }
-            if (!method_name_collision) {
-                // Brand new, this statement's own placeholder, or a genuine
-                // earlier declaration the annotation now overrides -- in all
-                // three the ANNOTATION becomes the declared type. Runs
-                // regardless of node.has_value(): `self.ys: list[int]` with
-                // no value is legal in a method body and still declares the
-                // member (verified mypy-clean, and a later read of it too).
+            if (!method_name_collision && !keep_earlier_declaration) {
+                // Brand new, this statement's own placeholder, or an
+                // inherited declaration this annotation overrides on the
+                // current class -- in all three the ANNOTATION becomes the
+                // declared type. Runs regardless of node.has_value():
+                // `self.ys: list[int]` with no value is legal in a method
+                // body and still declares the member (verified mypy-clean,
+                // and a later read of it too).
                 classes_.declare_member(current_class_qualified_name_,
                                         target_attribute->attribute(), info.type, line);
             }

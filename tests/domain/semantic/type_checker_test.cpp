@@ -795,6 +795,11 @@ TEST(TypeChecker, AValuelessAnnotatedSelfAssignmentStillDeclaresTheAttribute) {
 // mypy reports `List item 0 has incompatible type "str"; expected "int"` for
 // exactly this program, and the per-item rule is what fires here too -- ONE
 // diagnostic, not the item error plus an assignment error on top.
+//
+// A REGRESSION GUARD, not coverage of the declaring branch: this passed
+// before that branch existed too, since the old non-Name fallback already
+// resolved the annotation and ran the same value check. What it pins is that
+// no later rework of the branch drops that check.
 TEST(TypeChecker, AnAnnotatedSelfAssignmentStillChecksItsValue) {
     const Checked checked = check_module(
         "class Bag:\n"
@@ -807,14 +812,19 @@ TEST(TypeChecker, AnAnnotatedSelfAssignmentStillChecksItsValue) {
     EXPECT_EQ(error.line, 3);
 }
 
-// An earlier PLAIN self.x assignment already declared the attribute, so the
-// annotation is a genuine second declaration. Verified against mypy 1.18.1:
-// mypy rejects EVERY program of this shape -- `Attribute "x" already defined
-// on line 3` plus an assignment error, at the annotation's own line -- so
-// which of the two types is treated as the declared one is not observable
-// against mypy here, and this follows the class-body branch's direction (the
-// annotation is the declared type, the earlier inferred type is what is
-// checked against it) purely so the two branches agree.
+// An earlier PLAIN self.x assignment IN THE SAME CLASS already declared the
+// attribute. mypy 1.18.1 on exactly this program:
+//
+//   error: Attribute "x" already defined on line 3  [no-redef]
+//   error: Incompatible types in assignment (expression has type "str",
+//          variable has type "int")  [assignment]
+//   note: Revealed type is "builtins.int"          (a third method's self.x)
+//
+// So the EARLIER declaration stays the attribute's type and the annotated
+// statement's VALUE is what gets checked against it -- the annotation itself
+// is ignored. We report the assignment error only (the no-redef is a
+// deliberate missed error, see the branch's own comment). Both diagnostics
+// land at the annotation's own line, which is where we report too.
 TEST(TypeChecker, AnAnnotationConflictingWithAnEarlierSelfAssignmentIsReported) {
     const Checked checked = check_module(
         "class Bag:\n"
@@ -825,13 +835,26 @@ TEST(TypeChecker, AnAnnotationConflictingWithAnEarlierSelfAssignmentIsReported) 
 
     const diagnostics::Diagnostic error = only_error(checked);
     EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"str\", "
+              "variable has type \"int\")")
+        << "the EARLIER declaration is the variable; the annotation is ignored";
     EXPECT_EQ(error.line, 5) << "reported at the annotation, which is where mypy reports too";
 }
 
 // The ORDER THAT IS ACTUALLY MYPY-CLEAN (verified 1.18.1, unlike the
 // annotation-second shape above): annotate first, then plainly assign a
-// subtype. int into a float attribute must not report, which is what stops
-// the comparison above from becoming a false positive on this program.
+// subtype. int into a float attribute must not report.
+//
+// What this covers is the PLAIN sibling path, NOT the annotated branch's
+// existing-declaration arm: the annotation at line 3 is the first occurrence
+// of "n", so it takes the OwnPlaceholder path (its own placeholder was
+// declared at its own line) and the arm below is never reached at all. The
+// float-vs-int comparison this pins is assign_attribute's ordinary
+// read-then-compare one, on line 5. Left in place because that comparison
+// has been written backwards before, but it is not coverage of the
+// annotated form's own rules -- AClassBodyAnnotationSurvivesAMethod
+// Annotation and its neighbours below are.
 TEST(TypeChecker, APlainSelfAssignmentOfASubtypeAfterAnAnnotationIsClean) {
     expect_clean(
         "class Bag:\n"
@@ -843,13 +866,140 @@ TEST(TypeChecker, APlainSelfAssignmentOfASubtypeAfterAnAnnotationIsClean) {
         "f: float = b.n\n");
 }
 
+// ---------------------------------------------------------------------------
+// THE TWO RULES for an annotated `self.x` whose attribute is ALREADY
+// declared. mypy 1.18.1 has two different answers here depending on WHICH
+// CLASS the earlier declaration lives on, and a single rule -- whichever way
+// round its comparison was written -- was a false TypeError on one of them.
+// Thirteen mypy-clean programs of the narrowing shape reported a false
+// TypeError before this fix; the four tests below are the ones that would
+// have caught it.
+// ---------------------------------------------------------------------------
+
+// INHERITED, narrowing. mypy: `Success: no issues found`, and
+// `reveal_type(self.v)` is "builtins.int" in EVERY Child method, not only the
+// annotating one -- so the subclass annotation really does install a
+// narrower per-class type. The `self.v + 1` here is what pins the install:
+// keeping the base's `object` instead makes this mypy-clean line a false
+// "unsupported operand types" TypeError.
+TEST(TypeChecker, ASubclassAnnotationMayNarrowAnInheritedAttribute) {
+    expect_clean(
+        "class Base:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.v: object = 1\n"
+        "class Child(Base):\n"
+        "    def m(self) -> None:\n"
+        "        self.v: int = 1\n"
+        "    def use(self) -> int:\n"
+        "        return self.v + 1\n");
+}
+
+// INHERITED, and the narrowing is CONFINED to the subclass: mypy accepts
+// `self.v = "s"` in Base (declared object there) on the very same program,
+// and reports it in Child. Both halves matter -- declaring the override onto
+// the CURRENT class rather than onto the class that owns the declaration is
+// what keeps Base's own `object` intact.
+TEST(TypeChecker, ASubclassNarrowingDoesNotChangeTheBaseClassDeclaration) {
+    expect_clean(
+        "class Base:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.v: object = 1\n"
+        "    def w(self) -> None:\n"
+        "        self.v = \"s\"\n"
+        "class Child(Base):\n"
+        "    def m(self) -> None:\n"
+        "        self.v: int = 1\n");
+
+    const Checked checked = check_module(
+        "class Base:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.v: object = 1\n"
+        "class Child(Base):\n"
+        "    def m(self) -> None:\n"
+        "        self.v: int = 1\n"
+        "    def w(self) -> None:\n"
+        "        self.v = \"s\"\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 8) << "the narrowed int is Child's declared type for writes too";
+}
+
+// INHERITED, WIDENING -- the direction mypy DOES reject: `error: Incompatible
+// types in assignment (expression has type "object", base class "Base"
+// defined the type as "int")`. The comparison must stay, and must stay this
+// way round: the annotation is the expression, the inherited declaration the
+// variable. Deleting the comparison outright makes this test fail.
+TEST(TypeChecker, ASubclassAnnotationWideningAnInheritedAttributeIsReported) {
+    const Checked checked = check_module(
+        "class Base:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.v: int = 1\n"
+        "class Child(Base):\n"
+        "    def m(self) -> None:\n"
+        "        self.v: object = 1\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"object\", "
+              "variable has type \"int\")");
+    EXPECT_EQ(error.line, 6);
+}
+
+// SAME CLASS: a class-body annotation is NOT replaced by a method
+// annotation. mypy on the first program: `Success`, with
+// `reveal_type(self.n)` still "builtins.object" in every other method and in
+// `Bag().n` -- so the `self.n = "s"` here is clean, and installing the
+// method's `int` would make it a false TypeError. On the second program mypy
+// reports `expression has type "str", variable has type "int"`, its own
+// message for a VALUE checked against the class-body type, verbatim -- and
+// note it is the value, not the annotation, that is checked: `self.n: int =
+// "s"` under a class-body `n: object` is mypy-CLEAN.
+TEST(TypeChecker, AClassBodyAnnotationSurvivesAMethodAnnotation) {
+    expect_clean(
+        "class Bag:\n"
+        "    n: object\n"
+        "    def set(self) -> None:\n"
+        "        self.n: int = 7\n"
+        "    def w(self) -> None:\n"
+        "        self.n = \"s\"\n");
+
+    expect_clean(
+        "class Bag:\n"
+        "    n: object\n"
+        "    def set(self) -> None:\n"
+        "        self.n: int = \"s\"\n");
+
+    const Checked checked = check_module(
+        "class Bag:\n"
+        "    n: int\n"
+        "    def set(self) -> None:\n"
+        "        self.n: str = \"s\"\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"str\", "
+              "variable has type \"int\")");
+    EXPECT_EQ(error.line, 4);
+}
+
 // THE GUARD, and the reason self_attribute_receiver_type resolves `self`
-// through ScopeStack rather than trusting the spelling: an unrelated NESTED
-// def whose own first parameter happens to be named `self` must NOT declare
-// a member on the enclosing class. mypy reports its own errors for this
-// program (a non-self attribute declaration, and `"int" has no attribute
-// "q"`), so the read below must still be attr-defined here -- a clean result
-// would mean the nested def had silently declared "q" on Bag.
+// through ScopeStack rather than trusting the spelling: a NESTED def whose
+// own first parameter is named `self` but TYPED AS SOMETHING ELSE must NOT
+// declare a member on the enclosing class. mypy reports its own errors for
+// this program (a non-self attribute declaration, and `"int" has no
+// attribute "q"`), so the read below must still be attr-defined here -- a
+// clean result would mean the nested def had silently declared "q" on Bag.
+//
+// A NEGATIVE GUARD, not coverage of the declaring branch: it passes with
+// that branch removed too (nothing declared "q" then either). What it pins
+// is that the branch did not widen the guard. It pins only the
+// DIFFERENT-type case -- `def inner(self: Bag)` inside a Bag method DOES
+// pass the guard and declares onto Bag, verified against the built binary;
+// see self_attribute_receiver_type's own comment for that measured missed
+// error.
 TEST(TypeChecker, AnAnnotatedAttributeOnAShadowedSelfDeclaresNothing) {
     const Checked checked = check_module(
         "class Bag:\n"
@@ -873,6 +1023,9 @@ TEST(TypeChecker, AnAnnotatedAttributeOnAShadowedSelfDeclaresNothing) {
 // test pins is that the store declared NOTHING, evidenced by the read below
 // it still being attr-defined. If the self.x branch ever stopped checking
 // the receiver, the read would come back clean instead.
+//
+// A NEGATIVE GUARD, like the one above: it passes with the declaring branch
+// removed too, since nothing declared "z" on Other before it either.
 TEST(TypeChecker, AnAnnotatedAttributeOnANonSelfReceiverDeclaresNothing) {
     const Checked checked = check_module(
         "class Other:\n"

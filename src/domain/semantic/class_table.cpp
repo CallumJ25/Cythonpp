@@ -151,6 +151,22 @@ std::optional<Type> ClassTable::member_type(const std::string& qualified_name,
         });
 }
 
+std::optional<Type> ClassTable::own_member_type(const std::string& qualified_name,
+                                                const std::string& member) const {
+    // declare_member's own lookup, verbatim -- no canonicalisation, no chain
+    // walk, no scoped-alias fallback (see the header for why each is wrong
+    // here).
+    const auto entry = classes_.find(qualified_name);
+    if (entry == classes_.end()) {
+        return std::nullopt;
+    }
+    const auto it = entry->second.members.find(member);
+    if (it == entry->second.members.end()) {
+        return std::nullopt;
+    }
+    return it->second.type;
+}
+
 std::optional<int> ClassTable::member_declared_line(const std::string& qualified_name,
                                                     const std::string& member) const {
     // Shares member_type's fallback deliberately: a caller gates on this

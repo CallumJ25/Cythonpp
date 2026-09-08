@@ -84,6 +84,31 @@ TEST(ClassTable, MembersAreFoundThroughTheBaseChain) {
     EXPECT_EQ(*inherited, Type::int_());
 }
 
+// own_member_type answers the ONE question member_type cannot: is this
+// member declared HERE, or inherited? TypeChecker's annotated-self.x branch
+// applies two different mypy rules depending on the answer, so a version of
+// this that walked the chain (or that just delegated to member_type) would
+// collapse them back together and re-introduce the false TypeError the
+// distinction exists to remove.
+TEST(ClassTable, OwnMemberTypeIgnoresTheBaseChain) {
+    ClassTable table;
+    table.declare("Base", {});
+    table.declare_member("Base", "v", Type::object(), 3);
+    table.declare("Child", {"Base"});
+    table.declare_member("Child", "w", Type::str(), 7);
+
+    EXPECT_EQ(table.member_type("Child", "v"), Type::object()) << "inherited, as before";
+    EXPECT_EQ(table.own_member_type("Child", "v"), std::nullopt)
+        << "not declared on Child itself";
+
+    const std::optional<Type> own = table.own_member_type("Child", "w");
+    ASSERT_TRUE(own.has_value());
+    EXPECT_EQ(*own, Type::str());
+
+    EXPECT_EQ(table.own_member_type("Child", "absent"), std::nullopt);
+    EXPECT_EQ(table.own_member_type("NeverDeclared", "v"), std::nullopt);
+}
+
 // Depth-first, left to right. mypy lands here too, and additionally REJECTS
 // the conflict with code `misc` -- a check this spec puts out of scope as a
 // missed error rather than a false one.
