@@ -262,9 +262,6 @@ TEST(ExpressionTyper, RecordsTheNegatedConstantInTheTypeMapToo) {
 // returns Unknown, would pass unnoticed.
 TEST(ExpressionTyper, SilentlyReturnsUnknownForEveryArmNotYetImplemented) {
     const std::vector<std::string> not_yet_implemented = {
-        "[1]",             // ListExpr -- Task 13.
-        "{1: 2}",          // DictExpr -- Task 13.
-        "(1, 2)",          // TupleExpr -- Task 13.
         "x[0]",            // Subscript -- Task 14.
         "x.y",             // Attribute -- Task 14.
         "f()",             // Call -- Task 15.
@@ -321,6 +318,127 @@ TEST(ExpressionTyper, ReportsAGenuineUnaryOperandTypeError) {
     const diagnostics::Diagnostic error = only_error(typed);
     EXPECT_EQ(error.code, "TypeError");
     EXPECT_EQ(error.message, "unsupported operand type for unary - (\"str\")");
+}
+
+// Verified: reveal_type([1, 2]) is list[int]; [1, 1.5] is list[float];
+// [1, True] is list[int]; [1, "s"] is list[object]; [1, None] is
+// list[int | None].
+TEST(ExpressionTyper, JoinsUnannotatedListElements) {
+    EXPECT_EQ(typed_name("[1, 2]"), "list[int]");
+    EXPECT_EQ(typed_name("[1, 1.5]"), "list[float]");
+    EXPECT_EQ(typed_name("[1, True]"), "list[int]");
+    EXPECT_EQ(typed_name("[1, \"s\"]"), "list[object]");
+    EXPECT_EQ(typed_name("[1, None]"), "list[int | None]");
+}
+
+// Verified: reveal_type([[1], ["a"]]) is list[object], NOT
+// list[list[object]] -- the join is not recursive into invariant arguments.
+TEST(ExpressionTyper, DoesNotJoinRecursivelyIntoNestedDisplays) {
+    EXPECT_EQ(typed_name("[[1], [2]]"), "list[list[int]]");
+    EXPECT_EQ(typed_name("[[1], [\"a\"]]"), "list[object]");
+}
+
+// WITH CONTEXT there is no join: each element is checked against the declared
+// element type and the result is the DECLARED type.
+TEST(ExpressionTyper, TypeContextIsUsedInsteadOfAJoin) {
+    const Typed floats =
+        type_expression("[1, 2]", {}, Type::list_of(Type::float_()));
+    EXPECT_TRUE(floats.diagnostics.empty());
+    EXPECT_EQ(type_name(floats.type), "list[float]") << "declared, not joined to int";
+
+    const Typed unions = type_expression(
+        "[1, \"s\"]", {}, Type::list_of(Type::union_of({Type::int_(), Type::str()})));
+    EXPECT_TRUE(unions.diagnostics.empty())
+        << "an annotation makes the union work where inference would join to object";
+    EXPECT_EQ(type_name(unions.type), "list[int | str]");
+}
+
+// Verified: x: list[int] = [1, "s"] reports
+// 'List item 1 has incompatible type "str"; expected "int"' -- per item,
+// naming the INDEX.
+TEST(ExpressionTyper, ReportsPerItemAgainstTheDeclaredElementType) {
+    const Typed typed = type_expression("[1, \"s\"]", {}, Type::list_of(Type::int_()));
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "list item 1 has incompatible type \"str\"; expected \"int\"");
+    EXPECT_EQ(type_name(typed.type), "list[int]") << "the declared type still comes back";
+}
+
+TEST(ExpressionTyper, EachBadListItemIsItsOwnRootCause) {
+    const Typed typed =
+        type_expression("[\"a\", 1, \"b\"]", {}, Type::list_of(Type::int_()));
+
+    EXPECT_EQ(typed.diagnostics.size(), 2u) << "items 0 and 2";
+}
+
+// Type context propagates recursively. Verified both clean.
+TEST(ExpressionTyper, TypeContextPropagatesIntoNestedDisplays) {
+    const Typed nested = type_expression(
+        "[[1], [2]]", {}, Type::list_of(Type::list_of(Type::int_())));
+    EXPECT_TRUE(nested.diagnostics.empty());
+    EXPECT_EQ(type_name(nested.type), "list[list[int]]");
+}
+
+// Verified: reveal_type({1: "a", 2: "b"}) is dict[int, str];
+// {1: "a", "k": "b"} is dict[object, str]; {1: "a", 2: 3} is
+// dict[int, object]. Keys and values join INDEPENDENTLY.
+TEST(ExpressionTyper, JoinsDictKeysAndValuesIndependently) {
+    EXPECT_EQ(typed_name("{1: \"a\", 2: \"b\"}"), "dict[int, str]");
+    EXPECT_EQ(typed_name("{1: \"a\", \"k\": \"b\"}"), "dict[object, str]");
+    EXPECT_EQ(typed_name("{1: \"a\", 2: 3}"), "dict[int, object]");
+}
+
+// Verified: reveal_type((1, "s")) keeps positional element types -- tuples
+// are heterogeneous and there is NO join.
+TEST(ExpressionTyper, TuplesKeepTheirPositionalElementTypes) {
+    EXPECT_EQ(typed_name("(1, \"s\")"), "tuple[int, str]");
+    EXPECT_EQ(typed_name("(1, 1.5)"), "tuple[int, float]");
+}
+
+// Verified: reveal_type(()) is tuple[()] and it is CLEAN -- the one display
+// that needs no annotation, because tuple[()] is a complete non-generic type.
+TEST(ExpressionTyper, TheEmptyTupleNeedsNoAnnotation) {
+    const Typed typed = type_expression("()");
+
+    EXPECT_TRUE(typed.diagnostics.empty());
+    EXPECT_EQ(typed.printed, "tuple[()]");
+}
+
+// Verified: bare x = [] is 'Need type annotation for "x"' [var-annotated] --
+// a genuine mypy error, so TypeError is correct and in direction (b).
+// ExpressionTyper does NOT report here: mypy types a bare `[]` in EXPRESSION
+// position as list[Never] and says nothing. The var-annotated error belongs
+// to the ASSIGNMENT, which is the only place the variable's name exists to
+// put in the message. So the typer returns Unknown silently and Task 17's
+// Assign arm reports.
+TEST(ExpressionTyper, AnEmptyDisplayWithNoContextIsSilentlyUnknown) {
+    const Typed typed = type_expression("[]");
+
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "the assignment reports, not the display -- mypy types a bare [] as list[Never]";
+    EXPECT_EQ(typed.printed, "Unknown");
+}
+
+TEST(ExpressionTyper, AnEmptyDisplayWithContextTakesTheContext) {
+    const Typed list = type_expression("[]", {}, Type::list_of(Type::int_()));
+    EXPECT_TRUE(list.diagnostics.empty());
+    EXPECT_EQ(type_name(list.type), "list[int]");
+
+    const Typed dict =
+        type_expression("{}", {}, Type::dict_of(Type::str(), Type::int_()));
+    EXPECT_TRUE(dict.diagnostics.empty());
+    EXPECT_EQ(type_name(dict.type), "dict[str, int]");
+}
+
+// A context of the WRONG SHAPE must not be silently adopted: x: int = [1]
+// is a genuine error, and it is the statement checker's to report, so the
+// display arm falls back to inference rather than pretending the context fits.
+TEST(ExpressionTyper, AContextOfTheWrongShapeFallsBackToInference) {
+    const Typed typed = type_expression("[1, 2]", {}, Type::int_());
+
+    EXPECT_TRUE(typed.diagnostics.empty()) << "the assignment check reports, not the display";
+    EXPECT_EQ(type_name(typed.type), "list[int]");
 }
 
 } // namespace

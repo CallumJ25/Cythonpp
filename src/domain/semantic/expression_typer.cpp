@@ -1,5 +1,6 @@
 #include "expression_typer.h"
 
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -10,6 +11,7 @@
 #include "domain/lexer/token_type.h"
 #include "literal_type.h"
 #include "operator_rules.h"
+#include "type_compatibility.h"
 #include "type_name.h"
 
 namespace cythonpp::domain::semantic {
@@ -58,11 +60,17 @@ Type ExpressionTyper::type_of(const ast::Expr& expr, const Type& expected) {
         result = type_of_compare(*compare);
     } else if (const auto* bool_op = dynamic_cast<const ast::BoolOp*>(&expr)) {
         result = type_of_bool_op(*bool_op);
+    } else if (const auto* list = dynamic_cast<const ast::ListExpr*>(&expr)) {
+        result = type_of_list(*list, expected);
+    } else if (const auto* dict = dynamic_cast<const ast::DictExpr*>(&expr)) {
+        result = type_of_dict(*dict, expected);
+    } else if (const auto* tuple = dynamic_cast<const ast::TupleExpr*>(&expr)) {
+        result = type_of_tuple(*tuple, expected);
     } else {
-        // Every other Expr kind is a later task's arm (container displays:
-        // 13, Subscript/Attribute: 14, Call: 15, ListComp: 16, ...).
-        // Deliberately SILENT -- not error() -- so an intermediate build
-        // never emits a diagnostic a later task has to un-emit.
+        // Every other Expr kind is a later task's arm (Subscript/Attribute:
+        // 14, Call: 15, ListComp: 16, ...). Deliberately SILENT -- not
+        // error() -- so an intermediate build never emits a diagnostic a
+        // later task has to un-emit.
         result = Type::unknown();
     }
     // Every expression the typer types gets an entry, unconditionally --
@@ -70,7 +78,6 @@ Type ExpressionTyper::type_of(const ast::Expr& expr, const Type& expected) {
     // type it. Annotation subtrees never reach here at all: AnnotationResolver
     // walks those directly and type_of() is never called on one.
     types_.insert(&expr, result);
-    (void)expected; // Consumed starting with Task 13's container displays.
     return result;
 }
 
@@ -161,6 +168,123 @@ Type ExpressionTyper::type_of_bool_op(const ast::BoolOp& bool_op) {
     // exercised by a mypy-clean program; it exists only so apply()'s
     // NotApplicable arm has something to say.
     return apply(result, bool_op, "unsupported operand types for " + operator_symbol(bool_op.op()));
+}
+
+Type ExpressionTyper::type_of_list(const ast::ListExpr& list, const Type& expected) {
+    const std::vector<ast::ExprPtr>& elements = list.elements();
+
+    // "Matching kind and the right argument count": List always carries
+    // exactly one element type via list_of, so the count check is really
+    // just defending against a hand-built Type; it can never fail for one
+    // produced by AnnotationResolver.
+    const bool has_context = expected.kind == TypeKind::List && expected.args.size() == 1;
+
+    if (has_context) {
+        const Type& element_type = expected.args[0];
+        for (std::size_t index = 0; index < elements.size(); ++index) {
+            const Type actual = type_of(*elements[index], element_type);
+            if (!is_subtype(actual, element_type, &classes_)) {
+                error(*elements[index], "TypeError",
+                     "list item " + std::to_string(index) + " has incompatible type \"" +
+                         type_name(actual) + "\"; expected \"" + type_name(element_type) + "\"");
+            }
+        }
+        // Declared, not joined -- even a bad element does not change the
+        // list's own reported type, matching mypy: the error is about the
+        // element, not the container.
+        return expected;
+    }
+
+    // No usable context: fold every element's own inferred type through
+    // join(). An empty display has no element to seed the fold with and no
+    // annotation to fall back on, so it is silently Unknown -- reporting here
+    // would be a second diagnostic for the same root cause a later task's
+    // Assign/AnnAssign arm already owns.
+    if (elements.empty()) {
+        return Type::unknown();
+    }
+    Type joined = type_of(*elements.front(), Type::unknown());
+    for (std::size_t index = 1; index < elements.size(); ++index) {
+        joined = join(joined, type_of(*elements[index], Type::unknown()), &classes_);
+    }
+    return Type::list_of(std::move(joined));
+}
+
+Type ExpressionTyper::type_of_dict(const ast::DictExpr& dict, const Type& expected) {
+    const std::vector<ast::DictExpr::Entry>& entries = dict.entries();
+    const bool has_context = expected.kind == TypeKind::Dict && expected.args.size() == 2;
+
+    if (has_context) {
+        const Type& key_expected = expected.args[0];
+        const Type& value_expected = expected.args[1];
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            const Type actual_key = type_of(*entries[index].key, key_expected);
+            const Type actual_value = type_of(*entries[index].value, value_expected);
+            const bool key_ok = is_subtype(actual_key, key_expected, &classes_);
+            const bool value_ok = is_subtype(actual_value, value_expected, &classes_);
+            // One diagnostic per bad entry, not one per bad half -- mypy
+            // reports the whole "key: value" pair together even when only
+            // one side is wrong (see the class comment's example, where the
+            // value side ("int": "int") matches but is still quoted).
+            if (!key_ok || !value_ok) {
+                error(*entries[index].key, "TypeError",
+                     "dict entry " + std::to_string(index) + " has incompatible type \"" +
+                         type_name(actual_key) + "\": \"" + type_name(actual_value) +
+                         "\"; expected \"" + type_name(key_expected) + "\": \"" +
+                         type_name(value_expected) + "\"");
+            }
+        }
+        return expected;
+    }
+
+    if (entries.empty()) {
+        return Type::unknown();
+    }
+    Type joined_key = type_of(*entries.front().key, Type::unknown());
+    Type joined_value = type_of(*entries.front().value, Type::unknown());
+    for (std::size_t index = 1; index < entries.size(); ++index) {
+        joined_key = join(joined_key, type_of(*entries[index].key, Type::unknown()), &classes_);
+        joined_value =
+            join(joined_value, type_of(*entries[index].value, Type::unknown()), &classes_);
+    }
+    return Type::dict_of(std::move(joined_key), std::move(joined_value));
+}
+
+Type ExpressionTyper::type_of_tuple(const ast::TupleExpr& tuple, const Type& expected) {
+    const std::vector<ast::ExprPtr>& elements = tuple.elements();
+
+    // Unlike List/Dict, a Tuple's arity is genuinely variable, so "the right
+    // argument count" is a real condition here, not a defensive no-op: a
+    // context of a DIFFERENT arity is the wrong shape (x: tuple[int] =
+    // (1, 2)) and must fall back to plain inference rather than being
+    // adopted, exactly as AContextOfTheWrongShapeFallsBackToInference does
+    // for List.
+    const bool has_context =
+        expected.kind == TypeKind::Tuple && expected.args.size() == elements.size();
+
+    // No join branch at all: a tuple's elements are positional, not
+    // homogeneous, so the result is always built from each element's own
+    // inferred type -- WITH a matching context, that inferred type is simply
+    // checked against the corresponding declared element type on the way,
+    // and a mismatch reports its own TypeError naming its index.
+    std::vector<Type> element_types;
+    element_types.reserve(elements.size());
+    for (std::size_t index = 0; index < elements.size(); ++index) {
+        const Type element_expected = has_context ? expected.args[index] : Type::unknown();
+        Type actual = type_of(*elements[index], element_expected);
+        if (has_context && !is_subtype(actual, element_expected, &classes_)) {
+            error(*elements[index], "TypeError",
+                 "tuple item " + std::to_string(index) + " has incompatible type \"" +
+                     type_name(actual) + "\"; expected \"" + type_name(element_expected) + "\"");
+        }
+        element_types.push_back(std::move(actual));
+    }
+    // Not `expected`, even when has_context: unlike List/Dict, Tuple has no
+    // single "declared element type" to fall back on for a bad position, so
+    // the tuple's own positional element types -- not the declared ones --
+    // are what carries into the result, matching every other display's own
+    // elements always driving the answer here.
+    return Type::tuple_of(std::move(element_types));
 }
 
 Type ExpressionTyper::apply(const RuleResult& result, const ast::Expr& at,
