@@ -173,7 +173,11 @@ TEST(CompilePipeline, ModuleTokensHaveBeenThroughTheIndentationPass) {
 }
 
 TEST(CompilePipeline, ACleanFileReportsNothingAndSetsNoErrorFlag) {
-    FakeSourceReader reader({{"a.py", "if x:\n    y\n"}});
+    // Was "if x:\n    y\n" before semantic analysis was wired in; x and y were
+    // never bound, so once the type checker runs they are legitimate
+    // NameErrors, not a clean file. Literals sidestep binding entirely while
+    // still exercising the indented-block parse this test cares about.
+    FakeSourceReader reader({{"a.py", "if 1:\n    2\n"}});
     FakeSourceLister lister({});
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
@@ -269,6 +273,68 @@ TEST(CompilePipeline, TheAstIsNeverNullEvenForAFileThatFailedEntirely) {
     ASSERT_NE(result.modules.at("a.py").ast, nullptr);
     EXPECT_TRUE(result.modules.at("a.py").ast->body().empty());
     EXPECT_TRUE(result.has_errors);
+}
+
+// THE SEAM. If the drain were left above the semantic pass this would pass
+// vacuously with zero reported diagnostics and an exit code of success.
+TEST(CompilePipeline, ReportsSemanticDiagnosticsToTheReporter) {
+    FakeSourceReader reader({{"a.py", "x: int = \"s\"\n"}});
+    FakeSourceLister lister({});
+    RecordingDiagnosticsReporter reporter;
+    CompilePipeline pipeline(reader, lister, reporter);
+
+    const CompileResult result = pipeline.compile_file("a.py");
+
+    ASSERT_EQ(reporter.entries.size(), 1u) << "the semantic diagnostic must reach the reporter";
+    EXPECT_EQ(reporter.entries.front().path, "a.py");
+    EXPECT_EQ(reporter.entries.front().diagnostic.code, "TypeError");
+    EXPECT_TRUE(result.has_errors) << "and the exit code must say the compile failed";
+}
+
+TEST(CompilePipeline, PopulatesTheTypeMapForACleanFile) {
+    FakeSourceReader reader({{"a.py", "x: int = 5\n"}});
+    FakeSourceLister lister({});
+    RecordingDiagnosticsReporter reporter;
+    CompilePipeline pipeline(reader, lister, reporter);
+
+    const CompileResult result = pipeline.compile_file("a.py");
+
+    EXPECT_FALSE(result.has_errors);
+    EXPECT_TRUE(reporter.entries.empty());
+    EXPECT_GT(result.modules.at("a.py").types.size(), 0u);
+}
+
+// Skipped when the sink already has errors: a dropped statement removes a
+// binding, so running the checker would invent a NameError for every later
+// use of it.
+TEST(CompilePipeline, SkipsSemanticAnalysisWhenParsingFailed) {
+    FakeSourceReader reader({{"a.py", "x: int = 5\nimport os\ny: int = x\n"}});
+    FakeSourceLister lister({});
+    RecordingDiagnosticsReporter reporter;
+    CompilePipeline pipeline(reader, lister, reporter);
+
+    const CompileResult result = pipeline.compile_file("a.py");
+
+    EXPECT_TRUE(result.has_errors);
+    EXPECT_EQ(result.modules.at("a.py").types.size(), 0u) << "the map must be empty";
+    // Exactly the one syntax error, and no invented NameErrors.
+    ASSERT_EQ(reporter.entries.size(), 1u);
+    EXPECT_EQ(reporter.entries.front().diagnostic.code, "SyntaxError");
+}
+
+TEST(CompilePipeline, ChecksEveryFileInADirectoryRun) {
+    FakeSourceReader reader({{"a.py", "x: int = 5\n"}, {"b.py", "y: int = \"s\"\n"}});
+    FakeSourceLister lister({"a.py", "b.py"});
+    RecordingDiagnosticsReporter reporter;
+    CompilePipeline pipeline(reader, lister, reporter);
+
+    const CompileResult result = pipeline.compile_directory(".");
+
+    EXPECT_TRUE(result.has_errors);
+    EXPECT_GT(result.modules.at("a.py").types.size(), 0u);
+    ASSERT_EQ(reporter.entries.size(), 1u);
+    EXPECT_EQ(reporter.entries.front().path, "b.py");
+    EXPECT_EQ(reporter.entries.front().diagnostic.code, "TypeError");
 }
 
 TEST(CompilePipeline, TheTokenStreamCursorIsRewoundForTheCaller) {

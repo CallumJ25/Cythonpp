@@ -7,6 +7,7 @@
 
 #include "domain/ast/module.h"
 #include "domain/lexer/token_stream.h"
+#include "domain/semantic/type_map.h"
 #include "ports/diagnostics_reporter.h"
 #include "ports/source_lister.h"
 #include "ports/source_reader.h"
@@ -27,6 +28,11 @@ struct CompiledModule {
     // Never null. StatementParser::parse_module returns an empty Module for a
     // file whose every statement failed, rather than nothing at all.
     std::unique_ptr<domain::ast::Module> ast;
+
+    // Every expression's type, populated by TypeChecker. Left empty when
+    // semantic analysis was skipped -- see compile_one's comment on why a
+    // file with a syntax error never reaches the type checker.
+    domain::semantic::TypeMap types;
 };
 
 struct CompileResult {
@@ -45,8 +51,8 @@ struct CompileResult {
 
 // Orchestrates the compiler pipeline stages. Depends only on port
 // interfaces, so it never learns whether source comes from a directory on
-// disk, an archive, or a test fixture. Currently wires the lexer and parser
-// stages; semantic analysis and codegen stages are TODO.
+// disk, an archive, or a test fixture. Wires the lexer, parser, and semantic
+// analysis stages; codegen is TODO.
 class CompilePipeline {
 public:
     CompilePipeline(ports::SourceReader& source_reader,

@@ -7,6 +7,8 @@
 #include "domain/lexer/indentation_pass.h"
 #include "domain/lexer/lexer.h"
 #include "domain/parser/statement_parser.h"
+#include "domain/semantic/type_checker.h"
+#include "domain/semantic/type_map.h"
 
 namespace cythonpp::application {
 
@@ -35,18 +37,33 @@ void CompilePipeline::compile_one(const std::string& path, CompileResult& result
     // the CompiledModule gets a stream at the start, not wherever it stopped.
     tokens.rewind();
 
+    // Skipped when the sink already has errors, unlike the parse above. The
+    // parse ran after an indentation error because IndentationPass is
+    // balanced by contract and the stream was guaranteed parseable. There is
+    // no equivalent guarantee here: StatementParser DROPS a failed statement,
+    // and a dropped statement removes a BINDING, so every later use of it
+    // becomes a spurious NameError. One honest syntax error beats one syntax
+    // error plus twenty invented name errors.
+    domain::semantic::TypeMap types;
+    if (!sink.has_errors()) {
+        types = domain::semantic::TypeChecker(sink).check(*module);
+    }
+
     // Reported per file as it is processed rather than buffered into the
     // result: on a directory run the user wants the first file's errors before
-    // the last file has even been read.
+    // the last file has even been read. Drained AFTER the semantic pass, not
+    // before -- the TODO this replaced sat above this drain, so a stage wired
+    // in there would have had every diagnostic silently discarded and still
+    // exited zero.
     for (const domain::diagnostics::Diagnostic& diagnostic : sink.diagnostics()) {
         diagnostics_reporter_.report(path, diagnostic);
     }
     result.has_errors = result.has_errors || sink.has_errors();
 
-    // TODO: semantic analysis / codegen stages once implemented.
     CompiledModule compiled;
     compiled.tokens = std::move(tokens);
     compiled.ast = std::move(module);
+    compiled.types = std::move(types);
     result.modules.emplace(path, std::move(compiled));
 }
 
