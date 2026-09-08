@@ -2,8 +2,10 @@
 #define CYTHONPP_DOMAIN_SEMANTIC_TYPE_CHECKER_H
 
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "class_table.h"
@@ -200,6 +202,16 @@ namespace cythonpp::domain::semantic {
 // the wrong (reported-as-erroneous) class's bases/members; collect_signatures
 // already had the matching skip for a colliding FunctionDef, so this was an
 // asymmetry, not a deliberate choice.
+
+// One enclosing function's worth of scope-limited class aliases (fix round 3,
+// Critical 2): every bare class name TypeChecker installed into ClassTable
+// while walking that function's body, each paired with whatever that same
+// bare name resolved to in ClassTable's scoped-alias map BEFORE the install
+// (nullopt when nothing did). Torn down in REVERSE order, restoring rather
+// than deleting, so an inner function's own same-named local class shadows
+// the outer one's for exactly its own body and no longer.
+using LocalClassAliasFrame = std::vector<std::pair<std::string, std::optional<std::string>>>;
+
 class TypeChecker : public ast::RecursiveVisitor {
 public:
     explicit TypeChecker(diagnostics::DiagnosticSink& sink);
@@ -310,9 +322,19 @@ private:
     // Phase-3 walk, turning a correct NameError for a later, unrelated
     // module-level use of the same bare name into a silent false
     // acceptance. Always isolating under the synthetic name closes both
-    // holes at the accepted cost that `Local()` can no longer be resolved as
-    // a constructor call at all, even from inside its own defining function
-    // -- see visit(ClassDef)'s own comment for the full tradeoff.
+    // holes.
+    //
+    // Fix round 3, Critical 2: round 2 accepted, as a supposed cost of that
+    // isolation, that `Local()` could no longer be resolved as a constructor
+    // call at all -- even from inside its own defining function. That was
+    // not a missed error but a FALSE one (`NameError: name 'Local' is not
+    // defined` on a program mypy 1.18.1 accepts), on EVERY function-local
+    // class construction. There is now no such cost: the isolated key stays,
+    // and visit(ClassDef) additionally installs a SCOPE-LIMITED alias from
+    // the bare source-level name to it (ClassTable::declare_scoped_alias),
+    // removed by LocalClassAliasGuard when the enclosing function's body
+    // walk ends -- so the bare name resolves inside that function and
+    // nowhere else. See visit(ClassDef)'s own comment.
     //
     // Two, unrelated situations both need this because neither one was ever
     // reached by collect_classes' Phase-1 walk, which only recurses into
@@ -663,6 +685,23 @@ private:
     // return statements (a SEPARATE diagnostic already flags the missing
     // annotation itself).
     Type current_return_type_ = Type::unknown();
+
+    // Fix round 3, Critical 2. One frame per function body currently being
+    // walked, innermost last (pushed and popped by LocalClassAliasGuard, in
+    // the .cpp, alongside the FunctionScopeGuard that pushes that body's own
+    // ScopeKind::Function). A function-local ClassDef is declared into
+    // ClassTable under a synthetic ISOLATED qualified name -- which is what
+    // keeps two same-named local classes in different functions from
+    // overwriting each other, and keeps neither from leaking to later
+    // module-level code -- and registers a scope-limited alias from its BARE
+    // source-level name to that isolated name in the innermost frame here,
+    // so bare-name constructor dispatch (ExpressionTyper::type_of_name_call's
+    // classes_.is_class(identifier) lookup, which has no scope awareness of
+    // its own), attribute lookup and annotation resolution all resolve it --
+    // but only from inside the function that declares it. Empty at module
+    // level, which is exactly why a module-level `L()` after a `def f` that
+    // declares `class L` still reports the NameError mypy reports for it.
+    std::vector<LocalClassAliasFrame> local_class_alias_frames_;
 };
 
 } // namespace cythonpp::domain::semantic

@@ -38,10 +38,22 @@ ClassTable::ClassTable() {
 }
 
 std::string ClassTable::canonical_name(const std::string& name) const {
-    // A live entry under the exact spelling wins -- this is what makes a
-    // user class declared under an alias spelling (`class IOError: ...`,
-    // legal ordinary Python) reachable, since declare() writes under the
-    // exact spelling with no canonicalisation. Only on a miss does the
+    // A live SCOPE-LIMITED alias wins over everything, including an entry
+    // under the identical spelling: one of these only exists while the block
+    // that declared it is being walked, and it is by construction a
+    // SHADOWING binding (a function-local `class L` shadows a module-level
+    // `class L` for the rest of that function, exactly as Python's own name
+    // binding does). Resolving to the module-level entry instead would point
+    // a member lookup at the WRONG class, which is a false attr-defined
+    // error waiting to happen.
+    const auto scoped = scoped_aliases_.find(name);
+    if (scoped != scoped_aliases_.end()) {
+        return scoped->second;
+    }
+    // Then a live entry under the exact spelling -- this is what makes a
+    // user class declared under a builtin alias spelling (`class IOError:
+    // ...`, legal ordinary Python) reachable, since declare() writes under
+    // the exact spelling with no canonicalisation. Only on a miss does the
     // builtin alias mapping apply, and only on a miss there does the name
     // resolve to itself.
     if (classes_.find(name) != classes_.end()) {
@@ -50,6 +62,21 @@ std::string ClassTable::canonical_name(const std::string& name) const {
     const auto it = aliases_.find(name);
     return it == aliases_.end() ? name : it->second;
 }
+
+std::optional<std::string> ClassTable::declare_scoped_alias(std::string alias,
+                                                            std::string target) {
+    std::optional<std::string> previous;
+    const auto it = scoped_aliases_.find(alias);
+    if (it != scoped_aliases_.end()) {
+        previous = it->second;
+        it->second = std::move(target);
+        return previous;
+    }
+    scoped_aliases_.emplace(std::move(alias), std::move(target));
+    return previous;
+}
+
+void ClassTable::remove_scoped_alias(const std::string& alias) { scoped_aliases_.erase(alias); }
 
 const ClassTable::Entry* ClassTable::find_entry(const std::string& name) const {
     const auto it = classes_.find(canonical_name(name));

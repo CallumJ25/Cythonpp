@@ -688,11 +688,19 @@ TEST(TypeChecker, CollectsAPlainClassBodyAssignment) {
 // its AnnAssign sibling (Finding 5) and assign_attribute's own self.x path
 // -- so a plain class-body Assign appearing BELOW a method that already
 // assigned self.x silently RE-TYPED the attribute with ZERO diagnostics.
-// Reproduced against the built binary before this fix (see also mypy's own
-// verified output for this exact program under Finding E's test below,
-// which additionally pins mypy's line/polarity for the sibling AnnAssign
-// case -- this plain-Assign case is fixed only against the narrower "must
-// not be silently accepted" bar Finding A itself asked for).
+// Reproduced against the built binary before this fix.
+//
+// Fix round 3, Critical 1: round 2's comparison here ran the WRONG WAY
+// ROUND, which is why this test originally asserted the OPPOSITE polarity
+// from mypy's. Verified against real mypy 1.18.1 on this exact program:
+//   c3.py:3: error: Incompatible types in assignment (expression has type
+//   "int", variable has type "str")  [assignment]
+// -- a class-body assignment's inferred type is the attribute's DECLARED
+// type, and the earlier self.x's value is what gets checked against it, so
+// the message below is now mypy's own wording verbatim. Only the LINE still
+// differs (mypy reports at the self.x assignment, line 3; we report at the
+// class-body statement, line 4), the residual round 2 recorded and round 3
+// does not close.
 TEST(TypeChecker, APlainClassBodyAssignmentConflictingWithAnEarlierSelfAssignmentIsReported) {
     const Checked checked = check_module(
         "class C:\n"
@@ -703,8 +711,48 @@ TEST(TypeChecker, APlainClassBodyAssignmentConflictingWithAnEarlierSelfAssignmen
     const diagnostics::Diagnostic error = only_error(checked);
     EXPECT_EQ(error.code, "TypeError");
     EXPECT_EQ(error.message,
-              "incompatible types in assignment (expression has type \"str\", "
-              "variable has type \"int\")");
+              "incompatible types in assignment (expression has type \"int\", "
+              "variable has type \"str\")");
+}
+
+// Fix round 3, Critical 1 (the false-positive half, and the whole reason the
+// direction above had to be swapped). Both of these are mypy-clean --
+// verified against real mypy 1.18.1, including reveal_type of the resulting
+// attribute, which is the CLASS-BODY assignment's type in both cases
+// ("builtins.int" for the first, "builtins.float" for the second) -- and
+// round 2's backwards comparison made both a false TypeError, the hard
+// invariant this project exists to protect.
+TEST(TypeChecker, AClassBodyAssignmentWideningAnEarlierSelfAssignmentIsClean) {
+    // bool widens into the declared int.
+    expect_clean(
+        "class C:\n"
+        "    def m(self) -> None:\n"
+        "        self.x = True\n"
+        "    x = 5\n");
+    // int widens into the declared float, via the numeric tower.
+    expect_clean(
+        "class C:\n"
+        "    def m(self) -> None:\n"
+        "        self.x = 5\n"
+        "    x = 1.5\n");
+}
+
+// Fix round 3, Critical 1 (the SECOND arm, in visit(AnnAssign), which round
+// 2's own report did not disclose). pre_collect_class_body's Finding-E
+// sub-pass only handles a DIRECT class-body AnnAssign, so one NESTED inside
+// an `if` within the class body still reaches visit(AnnAssign)'s own
+// already_member comparison -- which ran the same wrong way round. Verified
+// mypy-clean against real mypy 1.18.1 (and reveal_type of the attribute is
+// "builtins.int", the ANNOTATION's type, confirming the annotation is the
+// declared type here exactly as it is for a direct one).
+TEST(TypeChecker, AClassBodyAnnotationNestedInAnIfWideningAnEarlierSelfAssignmentIsClean) {
+    expect_clean(
+        "FLAG = True\n"
+        "class C:\n"
+        "    def m(self) -> None:\n"
+        "        self.x = True\n"
+        "    if FLAG:\n"
+        "        x: int\n");
 }
 
 // Fix round 1, Finding 4. A ClassDef lexically inside a `def` is never seen
@@ -715,45 +763,54 @@ TEST(TypeChecker, APlainClassBodyAssignmentConflictingWithAnEarlierSelfAssignmen
 // when Phase 3's walk reaches it.
 //
 // Fix round 2, Finding B: round 1's own fix declared a NON-colliding local
-// class under its own BARE name, which is what let `Local()` construct from
-// inside its own defining function in the first place (this test originally
-// asserted exactly that, via expect_clean). That bare-name declare() had no
-// collision detection of its own, though, so a SECOND same-named local class
-// declared in a DIFFERENT function silently overwrote the first one's
-// ClassTable entry -- see AFunctionLocalClassesDoNotLeakOrOverwriteEachOther
-// below for the false attr-defined this produced. Fixed by ALWAYS isolating
-// under a synthetic name, at the accepted cost that `Local()` can no longer
-// be resolved as a constructor call at all -- this test is rewritten to pin
-// exactly that: a MISSED error (NameError on the call) rather than a FALSE
-// one, and critically, no SECOND, cascading diagnostic on `v.x` (the
-// resulting Unknown is absorbing, so this must be the sink's ONLY entry).
-TEST(TypeChecker, AFunctionLocalClassIsIsolatedSoItsBareNameConstructorCallReportsNameError) {
-    const Checked checked = check_module(
+// class under its own BARE name, which had no collision detection of its
+// own, so a SECOND same-named local class declared in a DIFFERENT function
+// silently overwrote the first one's ClassTable entry. Round 2 fixed that by
+// ALWAYS isolating under a synthetic name -- and, having done so, rewrote
+// this test to assert a NameError on `Local()`, since bare-name constructor
+// dispatch had been left scope-blind.
+//
+// Fix round 3, Critical 2: that NameError is a FALSE positive. This exact
+// program is clean under real mypy 1.18.1 (`mypy --strict`: "Success: no
+// issues found in 1 source file"), so round 2 traded a narrow false
+// attr-defined for a BROAD false NameError on EVERY function-local class
+// construction -- strictly worse, and not covered by "a missed error beats a
+// false one", since the outcome was itself a false diagnostic. The isolated
+// ClassTable key stays (it is what closes the overwrite and the leak); what
+// is added is a SCOPE-LIMITED alias from the bare name to it, live for
+// exactly the enclosing function's body. So the expect_clean this test
+// carried before round 2 is restored, and it is once again the only
+// assertion that pins bare-name construction of a local class working at
+// all.
+TEST(TypeChecker, AFunctionLocalClassIsConstructibleByItsBareNameInsideItsOwnFunction) {
+    expect_clean(
         "def make() -> None:\n"
         "    class Local:\n"
         "        def __init__(self) -> None:\n"
         "            self.x = 5\n"
         "    v = Local()\n"
         "    y: int = v.x\n");
-
-    const diagnostics::Diagnostic error = only_error(checked);
-    EXPECT_EQ(error.code, "NameError");
-    EXPECT_EQ(error.message, "name 'Local' is not defined");
 }
 
 // Fix round 2, Finding B (the reviewer's own primary repro). Two DIFFERENT
 // functions each declare their own local class under the identical bare
-// name "L". Before this fix, both computed the same bare "L" qualified name
-// (declare() has no collision detection of its own), so the SECOND
+// name "L". Before round 2's fix, both computed the same bare "L" qualified
+// name (declare() has no collision detection of its own), so the SECOND
 // function's own `L()` call resolved to the FIRST function's class -- not
 // merely "no longer a constructor call", but the WRONG one -- and a member
 // access the first class genuinely lacks (`w.b`) was a FALSE attr-defined
-// TypeError, the hard invariant this project exists to protect. Isolating
-// EVERY local class under its own synthetic, per-declaration-site name means
-// neither can ever be mistaken for the other: each `L()` call now reports
-// its own (missed, not false) NameError, and nothing cascades from it.
+// TypeError.
+//
+// Fix round 3, Critical 2: round 2 closed that by making `L()` unresolvable
+// altogether, and this test was written to assert the resulting NameError --
+// which is itself a false positive (`mypy --strict` on this exact program:
+// "Success: no issues found in 1 source file"). It now asserts what mypy
+// says: CLEAN. The isolation this test was written to protect is still
+// pinned, by the scope-limitedness of the alias rather than by its absence --
+// see AFunctionLocalClassIsNotVisibleFromASiblingFunction below, and
+// AFunctionLocalClassDoesNotCorruptASameNamedTopLevelClass further down.
 TEST(TypeChecker, AFunctionLocalClassesDoNotLeakOrOverwriteEachOther) {
-    const Checked checked = check_module(
+    expect_clean(
         "def f() -> None:\n"
         "    class L:\n"
         "        def __init__(self) -> None:\n"
@@ -764,22 +821,83 @@ TEST(TypeChecker, AFunctionLocalClassesDoNotLeakOrOverwriteEachOther) {
         "            self.b = 2\n"
         "    w = L()\n"
         "    y: int = w.b\n");
+}
 
-    EXPECT_EQ(checked.diagnostics.size(), 1u);
-    if (checked.diagnostics.size() == 1) {
-        EXPECT_EQ(checked.diagnostics.front().code, "NameError");
-        EXPECT_EQ(checked.diagnostics.front().message, "name 'L' is not defined");
-    }
+// Fix round 3, Critical 2, the other half of the same coin: the alias is
+// SCOPE-LIMITED, so a local class is invisible from a SIBLING function that
+// declares no class of its own under that name. Verified against real mypy
+// 1.18.1, which agrees exactly: `d.py:5: error: Name "L" is not defined
+// [name-defined]`. Without the removal half of LocalClassAliasGuard this
+// would silently resolve as a constructor call instead.
+TEST(TypeChecker, AFunctionLocalClassIsNotVisibleFromASiblingFunction) {
+    const Checked checked = check_module(
+        "def f() -> None:\n"
+        "    class L:\n"
+        "        pass\n"
+        "def g() -> None:\n"
+        "    v = L()\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'L' is not defined");
+}
+
+// Fix round 3, Critical 2: shadowing composes by stack discipline. An inner
+// function's own same-named local class shadows the outer one's for exactly
+// its own body -- so `w.b` resolves against INNER's L -- and the outer one
+// is restored, not deleted, once inner's body walk is done, so `v.a` after
+// it still resolves against OUTER's L. A LocalClassAliasGuard that merely
+// ERASED each alias on teardown, instead of restoring the previous target,
+// would make that trailing `L()` a false NameError. Verified mypy-clean
+// against real mypy 1.18.1.
+TEST(TypeChecker, ANestedFunctionsLocalClassShadowsTheEnclosingOnesOnlyForItsOwnBody) {
+    expect_clean(
+        "def outer() -> None:\n"
+        "    class L:\n"
+        "        def __init__(self) -> None:\n"
+        "            self.a = 1\n"
+        "    def inner() -> None:\n"
+        "        class L:\n"
+        "            def __init__(self) -> None:\n"
+        "                self.b = 2\n"
+        "        w = L()\n"
+        "        y: int = w.b\n"
+        "    v = L()\n"
+        "    z: int = v.a\n");
+}
+
+// Fix round 3, Critical 2: a function-local class shadows a MODULE-LEVEL
+// class of the same name for the duration of that function, which is what
+// makes the scoped alias outrank a live ClassTable entry under the identical
+// spelling (see ClassTable::canonical_name's own precedence comment).
+// Resolving to the module-level "L" instead would point `v.b` at the wrong
+// class and produce a false attr-defined TypeError. Verified mypy-clean
+// against real mypy 1.18.1.
+TEST(TypeChecker, AFunctionLocalClassShadowsASameNamedModuleLevelClass) {
+    expect_clean(
+        "class L:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.a = 1\n"
+        "def f() -> None:\n"
+        "    class L:\n"
+        "        def __init__(self) -> None:\n"
+        "            self.b = 2\n"
+        "    v = L()\n"
+        "    y: int = v.b\n");
 }
 
 // Fix round 2, Finding B (the reviewer's own second repro): a function-local
 // class's bare name must NOT leak into ClassTable as a permanently live
-// entry for the REST of the module's Phase-3 walk. Before this fix,
+// entry for the REST of the module's Phase-3 walk. Before that fix,
 // `class L` inside `f` declared under the bare name "L" the first time
 // Phase 3 reached it, so a module-level `L()` occurring TEXTUALLY AFTER `f`
 // silently resolved as a constructor call instead of reporting NameError --
 // an order-dependent regression from the pre-round-1 (correct) behaviour.
-TEST(TypeChecker, AFunctionLocalClasssBareNameDoesNotLeakToLaterModuleLevelCode) {
+// Round 3's scoped alias keeps this correct for the same reason: the alias
+// is removed when `f`'s own body walk ends, so nothing at module level can
+// see it. Real mypy 1.18.1 agrees this one IS an error:
+// `c6.py:4: error: Name "L" is not defined  [name-defined]`.
+TEST(TypeChecker, AFunctionLocalClassBareNameDoesNotLeakToLaterModuleLevelCode) {
     const Checked checked = check_module(
         "def f() -> None:\n"
         "    class L:\n"

@@ -71,6 +71,41 @@ private:
     std::string previous_;
 };
 
+// RAII guard for one function body's worth of scope-limited class aliases
+// (fix round 3, Critical 2): pushes an empty frame onto
+// local_class_alias_frames_ alongside the FunctionScopeGuard that pushes that
+// body's own ScopeKind::Function, and on destruction undoes every alias
+// visit(ClassDef) registered in it -- in REVERSE order, RESTORING each bare
+// name's previous scoped target rather than deleting it outright, so an inner
+// function's own same-named local class shadows an outer one's for exactly
+// its own body: `def outer: class L; def inner: class L; ...; L()` must still
+// see OUTER's L at that trailing call, not nothing at all.
+class LocalClassAliasGuard {
+public:
+    LocalClassAliasGuard(ClassTable& classes, std::vector<LocalClassAliasFrame>& frames)
+        : classes_(classes), frames_(frames) {
+        frames_.emplace_back();
+    }
+    ~LocalClassAliasGuard() {
+        const LocalClassAliasFrame& frame = frames_.back();
+        for (auto it = frame.rbegin(); it != frame.rend(); ++it) {
+            if (it->second.has_value()) {
+                classes_.declare_scoped_alias(it->first, *it->second);
+            } else {
+                classes_.remove_scoped_alias(it->first);
+            }
+        }
+        frames_.pop_back();
+    }
+
+    LocalClassAliasGuard(const LocalClassAliasGuard&) = delete;
+    LocalClassAliasGuard& operator=(const LocalClassAliasGuard&) = delete;
+
+private:
+    ClassTable& classes_;
+    std::vector<LocalClassAliasFrame>& frames_;
+};
+
 // RAII guard for the declared return type Return's own checks (Task 20) read
 // -- current_return_type_ -- saved and restored exactly like
 // ClassContextGuard restores current_class_qualified_name_, so a nested def's
@@ -466,6 +501,24 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
             // the real type -- no comparison, nothing real to compare
             // against yet); anything else is a genuine earlier declaration,
             // compared rather than silently overwritten.
+            //
+            // Fix round 3, Critical 1: round 2's comparison ran the WRONG
+            // WAY ROUND, and that alone made two mypy-clean programs false
+            // TypeErrors. mypy's precedence here (verified against mypy
+            // 1.18.1, including reveal_type on the resulting attribute) is
+            // that a class-body assignment's inferred type is the DECLARED
+            // type of the attribute for the whole class body, and the
+            // earlier `self.x = ...` value is what gets checked AGAINST it
+            // -- exactly the rule fix round 2's Finding E already
+            // established for a class-body ANNOTATION. So `self.x = True`
+            // above `x = 5` is clean (bool widens into the declared int),
+            // `self.x = 5` above `x = 1.5` is clean (int widens into float),
+            // and only a genuine mismatch such as `self.x = 5` above
+            // `x = "s"` reports -- with mypy's own exact wording,
+            // `expression has type "int", variable has type "str"`. The LINE
+            // still differs from mypy's (we report at this class-body
+            // statement, mypy at the self.x assignment), the residual round
+            // 2 already recorded and this round does not close.
             const bool already_method =
                 classes_.method_type(current_class_qualified_name_, name->identifier()).has_value();
             const std::optional<int> existing_line =
@@ -480,9 +533,21 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
                 const Type existing_type =
                     *classes_.member_type(current_class_qualified_name_, name->identifier());
                 if (value_type.kind != TypeKind::Unknown && existing_type.kind != TypeKind::Unknown &&
-                    !is_subtype(value_type, existing_type, &classes_)) {
-                    report_incompatible_assignment(*name, value_type, existing_type, "variable");
+                    !is_subtype(existing_type, value_type, &classes_)) {
+                    report_incompatible_assignment(*name, existing_type, value_type, "variable");
                 }
+                // The class-body assignment's type WINS, reported or not:
+                // mypy treats it as the attribute's declared type for the
+                // whole class body (reveal_type(C().x) is "str" for
+                // `self.x = 5` above `x = "s"`, and "float" for `self.x = 5`
+                // above `x = 1.5`), so leaving the earlier self.x's inferred
+                // type in place would keep every LATER read of the attribute
+                // resolving to the wrong type. The line moves with it, so a
+                // subsequent statement's own placeholder disambiguation
+                // still compares against this declaration rather than
+                // mistaking it for its own.
+                classes_.declare_member(current_class_qualified_name_, name->identifier(),
+                                        value_type, line);
             }
             // A same-name METHOD collision is left unreported here, matching
             // the AnnAssign branch's own precedent.
@@ -718,12 +783,37 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
                 classes_.declare_member(current_class_qualified_name_, target_name->identifier(),
                                         info.type, node.span().start_line);
             } else if (already_member) {
+                // Fix round 3, Critical 1 (the second, undisclosed arm). The
+                // comparison here ran the WRONG WAY ROUND for exactly the
+                // same reason assign_to's plain-Assign sibling did, and it
+                // is still reachable: pre_collect_class_body's Finding-E
+                // sub-pass only handles a DIRECT class-body AnnAssign, so
+                // one NESTED inside an `if` within the class body arrives
+                // here with an earlier `self.x = ...` already declared.
+                // `FLAG = True / class C: def m(self): self.x = True /
+                // if FLAG: x: int` is mypy-clean (verified against mypy
+                // 1.18.1) and was a false TypeError. The ANNOTATION is the
+                // declared type; the earlier self.x's inferred type is the
+                // expression checked against it.
+                //
+                // For a DIRECT class-body AnnAssign this branch is a no-op
+                // either way -- the sub-pass already declared this exact
+                // member with this exact type at this exact line, so the
+                // comparison and the re-declaration below are both against
+                // themselves.
                 const Type existing_type =
                     *classes_.member_type(current_class_qualified_name_, target_name->identifier());
                 if (info.type.kind != TypeKind::Unknown && existing_type.kind != TypeKind::Unknown &&
-                    !is_subtype(info.type, existing_type, &classes_)) {
-                    report_incompatible_assignment(node, info.type, existing_type, "variable");
+                    !is_subtype(existing_type, info.type, &classes_)) {
+                    report_incompatible_assignment(node, existing_type, info.type, "variable");
                 }
+                // The annotation's declared type wins, reported or not --
+                // same rule, and same reason, as assign_to's sibling: mypy's
+                // reveal_type of the attribute is the ANNOTATED type, so a
+                // later read must see that and not the earlier self.x's
+                // inferred one.
+                classes_.declare_member(current_class_qualified_name_, target_name->identifier(),
+                                        info.type, node.span().start_line);
             }
             // A same-name METHOD collision is left unreported here -- a
             // combined method+attribute namespace is a pre-existing gap
@@ -792,6 +882,12 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         }
         report(node, "TypeError", "method must have at least one argument");
         FunctionScopeGuard guard(scopes_);
+        // A `class` statement is legal in even this broken method's body, and
+        // its body IS still walked below, so the alias frame belongs here
+        // too -- otherwise visit(ClassDef) would find no frame to register in
+        // and silently fall back to leaving the local class unreachable by
+        // its own bare name.
+        LocalClassAliasGuard alias_guard(classes_, local_class_alias_frames_);
         // No real return type was ever computed for this broken signature
         // (there is no self to build param_types from, so this whole
         // branch skips that machinery), so Return checks inside it get
@@ -989,6 +1085,12 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // is_unfilled_placeholder needs this same flag to avoid mistaking a
     // same-line parameter for its own placeholder-fill case.
     FunctionScopeGuard guard(scopes_);
+    // Fix round 3, Critical 2: the frame every function-local `class`
+    // statement in THIS body registers its bare-name alias into, torn down
+    // (restoring any shadowed outer one) when this body's walk is done -- so
+    // a local class's bare name resolves inside its defining function and
+    // nowhere else. See local_class_alias_frames_' own comment.
+    LocalClassAliasGuard alias_guard(classes_, local_class_alias_frames_);
     // Task 20: `return_type` (resolved above, either freshly or from
     // top_level_signatures_'s cache) becomes the declared type Return's own
     // checks read for the DURATION of this body walk -- restored by
@@ -1091,25 +1193,49 @@ void TypeChecker::visit(const ast::ClassDef& node) {
         // Fixed by ALWAYS isolating a local ClassDef under a synthetic,
         // per-declaration-site qualified name embedding '#' (a character no
         // Python identifier can ever contain) -- never the bare name, even
-        // when nothing else currently uses it. The accepted cost: `Local()`
-        // (a bare-Name call) can no longer be resolved as a constructor
-        // call, even from inside its OWN defining function --
-        // classes_.is_class(node.name()) is now permanently false for one of
-        // these, since type_of_name_call's constructor dispatch
-        // (expression_typer_calls.cpp) has no scope awareness at all and
-        // looks up the literal source-level identifier -- so this now
-        // reports a plain NameError instead of constructing. A MISSED error
-        // beats a FALSE one: the class's own attributes are still correctly
-        // collected (self.x = ... inside its methods still declares members
-        // exactly as before), so a local class used only for its side
-        // effects, or never referenced by a bare call at all, is entirely
-        // unaffected. Scope-aware constructor dispatch would avoid even this
-        // cost, but that dispatch lives in ExpressionTyper
-        // (expression_typer_calls.cpp), a different file outside this fix
-        // round's assigned scope, and is judged out of proportion for a
-        // construct this rare.
+        // when nothing else currently uses it.
+        //
+        // Fix round 3, Critical 2: round 2 stopped there, and that alone
+        // made EVERY function-local class construction a FALSE NameError --
+        // `def make(): class Local: ...; v = Local()` is mypy-clean
+        // (verified against mypy 1.18.1) and reported `name 'Local' is not
+        // defined`, because constructor dispatch
+        // (ExpressionTyper::type_of_name_call's classes_.is_class(identifier)
+        // lookup, expression_typer_calls.cpp) looks up the literal
+        // source-level identifier and has no scope awareness of its own.
+        // Round 2 traded a NARROW false attr-defined for a BROAD false
+        // NameError -- strictly worse, and "a missed error beats a false
+        // one" does not apply when the outcome is itself a false diagnostic.
+        //
+        // Isolation of the ClassTable KEY is kept exactly as round 2 left it
+        // (it is what closes the cross-function overwrite and the
+        // module-level leak); what is added is a SCOPE-LIMITED ALIAS from
+        // the class's BARE source-level name to that isolated key, installed
+        // here and removed by LocalClassAliasGuard when the ENCLOSING
+        // function's body walk finishes. Every read query in ClassTable --
+        // is_class, member_type, method_type, constructor_type,
+        // bases_of, inherits_builtin -- funnels through canonical_name, so
+        // one alias makes all of them, plus AnnotationResolver's own
+        // Type::class_of(canonical_name(...)) and is_subtype's class-chain
+        // walk, agree on the same isolated entry with no per-consumer
+        // change. Outside that function the alias is gone, so a
+        // module-level `L()` after the `def f` that declares `class L` still
+        // reports the NameError mypy reports for it.
         qualified_name = declare_isolated_class(
             node, "<local-class>#" + std::to_string(node.span().start_line) + "#" + node.name());
+        if (!local_class_alias_frames_.empty()) {
+            // Installed AFTER declare_isolated_class, so the entry the alias
+            // points at already exists. The frame records the bare name with
+            // whatever it previously resolved to, so teardown RESTORES a
+            // shadowed outer local class rather than deleting it -- see
+            // LocalClassAliasGuard. The emptiness guard is not decoration: a
+            // frame is pushed by visit(FunctionDef) alone, so a ClassDef
+            // reaching this branch from some other non-module, non-class
+            // scope would have nowhere to register a removal and must not
+            // install an alias that then leaks forever.
+            local_class_alias_frames_.back().emplace_back(
+                node.name(), classes_.declare_scoped_alias(node.name(), qualified_name));
+        }
     } else {
         qualified_name = current_class_qualified_name_.empty()
                              ? node.name()

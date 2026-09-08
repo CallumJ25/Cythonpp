@@ -391,5 +391,75 @@ TEST(ClassTable, DeclareMethodOnAnUndeclaredClassDoesNothing) {
     EXPECT_EQ(table.method_type("Typo", "m"), std::nullopt);
 }
 
+// Task 19 fix round 3, Critical 2. A scope-limited alias makes an isolated
+// entry reachable under a bare name, and must OUTRANK a live entry under
+// that identical spelling: a function-local `class L` shadows a
+// module-level `class L` for the rest of that function, exactly as Python's
+// own name binding does, so resolving to the module-level one would point a
+// member lookup at the wrong class.
+TEST(ClassTable, AScopedAliasOutranksALiveEntryUnderTheSameSpelling) {
+    ClassTable table;
+    table.declare("L", {});
+    table.declare_member("L", "a", Type::int_(), 1);
+    table.declare("<local-class>#5#L", {});
+    table.declare_member("<local-class>#5#L", "b", Type::str(), 6);
+
+    EXPECT_EQ(table.canonical_name("L"), "L");
+    EXPECT_EQ(table.member_type("L", "b"), std::nullopt);
+
+    EXPECT_EQ(table.declare_scoped_alias("L", "<local-class>#5#L"), std::nullopt);
+    EXPECT_EQ(table.canonical_name("L"), "<local-class>#5#L");
+    EXPECT_EQ(table.member_type("L", "b"), Type::str());
+    EXPECT_EQ(table.member_type("L", "a"), std::nullopt);
+    EXPECT_EQ(type_name(table.constructor_type("L")),
+              type_name(Type::callable({}, Type::class_of("<local-class>#5#L"))));
+
+    table.remove_scoped_alias("L");
+    EXPECT_EQ(table.canonical_name("L"), "L");
+    EXPECT_EQ(table.member_type("L", "a"), Type::int_());
+    EXPECT_EQ(table.member_type("L", "b"), std::nullopt);
+}
+
+// declare_scoped_alias returns the PREVIOUS scoped target so an RAII caller
+// can restore rather than erase -- which is what makes a nested function's
+// own same-named local class shadow the enclosing one's for exactly its own
+// body, and no longer.
+TEST(ClassTable, AScopedAliasReportsThePreviousTargetItShadowed) {
+    ClassTable table;
+    table.declare("<local-class>#2#L", {});
+    table.declare("<local-class>#6#L", {});
+
+    EXPECT_EQ(table.declare_scoped_alias("L", "<local-class>#2#L"), std::nullopt);
+    EXPECT_EQ(table.declare_scoped_alias("L", "<local-class>#6#L"),
+              std::optional<std::string>("<local-class>#2#L"));
+    EXPECT_EQ(table.canonical_name("L"), "<local-class>#6#L");
+
+    // What the guard's teardown does with that return value.
+    table.declare_scoped_alias("L", "<local-class>#2#L");
+    EXPECT_EQ(table.canonical_name("L"), "<local-class>#2#L");
+}
+
+// A scoped alias is REMOVABLE; the seeded builtin ones are permanent. The
+// two live in separate maps precisely so that difference cannot be blurred
+// by accident -- removing a scoped alias must not be able to delete
+// IOError -> OSError, and a scoped alias under an alias spelling must
+// outrank it while installed.
+TEST(ClassTable, AScopedAliasDoesNotDisturbThePermanentBuiltinAliases) {
+    ClassTable table;
+    table.declare("<local-class>#3#IOError", {});
+
+    table.declare_scoped_alias("IOError", "<local-class>#3#IOError");
+    EXPECT_EQ(table.canonical_name("IOError"), "<local-class>#3#IOError");
+
+    table.remove_scoped_alias("IOError");
+    EXPECT_EQ(table.canonical_name("IOError"), "OSError");
+    EXPECT_TRUE(table.is_class("IOError"));
+
+    // Removing an alias that was never installed is a no-op, not a way to
+    // reach into the permanent map.
+    table.remove_scoped_alias("EnvironmentError");
+    EXPECT_EQ(table.canonical_name("EnvironmentError"), "OSError");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

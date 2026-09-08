@@ -44,15 +44,47 @@ public:
     // is not a class.
     std::vector<std::string> bases_of(const std::string& name) const override;
 
-    // The name every read query below actually looks up through: a live
-    // entry under the EXACT spelling wins (so a user class declared under an
-    // alias spelling, e.g. `class IOError: ...`, resolves to itself, not to
-    // OSError), and only when there is no live entry does this fall back to
-    // the seeded alias mapping (see builtin_class_table.h's
-    // kBuiltinClassAliases) -- canonical_name("IOError") == "OSError" when
-    // "IOError" is undeclared. Every other name, including an already
-    // canonical one, resolves to itself.
+    // The name every read query below actually looks up through, in
+    // precedence order:
+    //   1. a live SCOPE-LIMITED alias (declare_scoped_alias) -- these exist
+    //      only while the block that declared them is being walked, and each
+    //      one is by construction a SHADOWING binding, so it must outrank
+    //      even an entry under the exact same spelling (a function-local
+    //      `class L` shadows a module-level `class L` for the rest of that
+    //      function, exactly as Python's own name binding does);
+    //   2. a live entry under the EXACT spelling (so a user class declared
+    //      under a builtin alias spelling, e.g. `class IOError: ...`,
+    //      resolves to itself, not to OSError);
+    //   3. the seeded, PERMANENT builtin alias mapping (see
+    //      builtin_class_table.h's kBuiltinClassAliases) --
+    //      canonical_name("IOError") == "OSError" when "IOError" is
+    //      undeclared.
+    // Every other name, including an already canonical one, resolves to
+    // itself.
     std::string canonical_name(const std::string& name) const override;
+
+    // A SCOPE-LIMITED alias: one extra spelling under which an
+    // already-declared class is reachable, for as long as the caller keeps
+    // it installed. Deliberately kept in its own map, separate from the
+    // seeded builtin ones (IOError -> OSError and friends), because those
+    // are PERMANENT and these are not: only these may be removed, and only
+    // these outrank a live entry under the exact same spelling.
+    //
+    // The one caller today is TypeChecker::visit(ClassDef) for a
+    // FUNCTION-LOCAL class, which is declared under a synthetic, isolated
+    // qualified name (so two same-named local classes in different functions
+    // cannot overwrite each other, and neither leaks to later module-level
+    // code) and needs its BARE source-level name to resolve back to that
+    // entry -- but ONLY inside the function that declares it.
+    //
+    // Returns whatever `alias` resolved to in this map BEFORE the call
+    // (nullopt when it was not scope-aliased at all), so an RAII caller can
+    // RESTORE it rather than delete it and shadowing composes by plain stack
+    // discipline: an inner function's own `class L` may shadow an outer
+    // one's, and the outer one is still reachable once the inner function's
+    // body is done.
+    std::optional<std::string> declare_scoped_alias(std::string alias, std::string target);
+    void remove_scoped_alias(const std::string& alias);
 
     // Declares a class (possibly nested, via a qualified name) with its
     // direct bases. Bases are stored as given; a base that never gets its
@@ -155,7 +187,15 @@ private:
     }
 
     std::map<std::string, Entry> classes_;
+    // The seeded, PERMANENT builtin alias mapping (IOError -> OSError, ...).
+    // Never written to after construction, never removed from.
     std::map<std::string, std::string> aliases_;
+    // Scope-limited aliases (declare_scoped_alias): installed and removed as
+    // the checking pass enters and leaves the block that declares them, and
+    // consulted BEFORE classes_ so they shadow. Kept apart from aliases_
+    // precisely because that difference in lifetime and precedence must not
+    // be expressible by accident.
+    std::map<std::string, std::string> scoped_aliases_;
 };
 
 } // namespace cythonpp::domain::semantic
