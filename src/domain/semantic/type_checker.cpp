@@ -71,8 +71,8 @@ private:
     std::string previous_;
 };
 
-// RAII guard for one function body's worth of scope-limited class aliases
-//: pushes an empty frame onto
+// RAII guard for one function body's worth of scope-limited class aliases:
+// pushes an empty frame onto
 // local_class_alias_frames_ alongside the FunctionScopeGuard that pushes that
 // body's own ScopeKind::Function, and on destruction undoes every alias
 // visit(ClassDef) registered in it -- in REVERSE order, RESTORING each bare

@@ -830,9 +830,14 @@ TEST(ElementType, IteratingAClassThatInheritsABuiltinYieldsTheBuiltinsElement) {
 
 // A NON-iterable builtin base does NOT make iteration an error: the class is
 // free to define its own __iter__ on top of what it inherits, which this rule
-// table cannot see. And a PARAMETRIC base (`class IntList(list[int])`) comes
-// back argument-less, since ClassLookup deals in bare base NAMES, so there is
-// no element type to report -- also Unsupported, never NotApplicable.
+// table cannot see. IntList below stands in for a BARE container base
+// (`class IntList(list)`) -- ClassLookup deals in bare base NAMES, so that is
+// the only spelling that comes back argument-less here, and it also has no
+// element type to report -- Unsupported, never NotApplicable. (A genuinely
+// PARAMETRIC base, `class IntList(list[int])`, is not recorded at all:
+// base_names drops a Subscript base entirely, so builtin_base_of_class never
+// sees it in the first place -- and mypy --strict rejects the bare spelling
+// anyway: "Missing type parameters for generic type \"list\"".)
 TEST(ElementType, AnInheritedBuiltinThatPinsNoElementTypeIsStillUnsupported) {
     const semantic_test_support::FakeClassLookup classes(
         {{"Sub", {"int"}}, {"IntList", {"list"}}});

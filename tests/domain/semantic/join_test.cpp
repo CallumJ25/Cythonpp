@@ -216,5 +216,24 @@ TEST(Join, CanonicalisesClassNamesNestedInsideContainerArguments) {
                 Type::list_of(Type::class_of("OSError")), &classes);
 }
 
+// Regression: operator== compares defaulted_params (see type.h), so two
+// Callables differing ONLY in that field are is_equivalent (is_subtype
+// ignores it deliberately) and fall into the tie-break arm above. type_less
+// must therefore also order by defaulted_params, or the tie-break picks
+// whichever operand the caller happened to pass as `left` -- silently
+// contradicting this file's own "function of the unordered pair" comment.
+// Does not use expect_join/type_name: type_name's Callable rendering never
+// shows defaulted_params, so a string comparison would pass even with the
+// bug present. Compares the field itself, in both call orders.
+TEST(Join, IsOrderIndependentForCallablesDifferingOnlyInDefaultedParams) {
+    const Type with_default = Type::callable({Type::int_(), Type::int_()}, Type::int_(), 1);
+    const Type without_default = Type::callable({Type::int_(), Type::int_()}, Type::int_(), 0);
+
+    const Type left_first = join(with_default, without_default, nullptr);
+    const Type right_first = join(without_default, with_default, nullptr);
+
+    EXPECT_EQ(left_first.defaulted_params, right_first.defaulted_params);
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

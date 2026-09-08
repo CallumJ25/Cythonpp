@@ -682,8 +682,8 @@ TEST(TypeChecker, TheFirstSelfAssignmentDeclaresTheAttributeType) {
 // ---------------------------------------------------------------------------
 // Forward references through self,
 // a plain class-body Assign, a function-local class,
-// a class-body annotation conflicting with an earlier self assignment
-//, and a losing class redefinition's own body no longer
+// a class-body annotation conflicting with an earlier self assignment,
+// and a losing class redefinition's own body no longer
 // corrupting the winner's constructor.
 // ---------------------------------------------------------------------------
 

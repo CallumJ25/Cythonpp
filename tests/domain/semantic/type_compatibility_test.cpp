@@ -406,11 +406,18 @@ TEST(BuiltinBaseOfClass, IgnoresObject) {
     EXPECT_FALSE(builtin_base_of_class(classes, "Plain").has_value());
 }
 
-// A PARAMETRIC builtin base comes back argument-less: ClassLookup deals in
-// bare base NAMES, so `class IntList(list[int])` records "list" and the
-// element type in the source spelling is simply not recoverable here. Pinned
-// so a caller cannot mistake the empty args for an error.
-TEST(BuiltinBaseOfClass, AParametricBuiltinBaseComesBackWithoutArguments) {
+// This pins builtin_base_of_class's OWN contract given a bare base name in
+// the lookup -- it does not claim TypeChecker ever produces that input.
+// TypeChecker::base_names only records a base via a dynamic_cast to
+// ast::Name, so a Subscript base like `list[int]` is dropped entirely with
+// no trace: `class IntList(list[int])` ends up with an EMPTY base list, and
+// builtin_base_of_class("IntList") answers nullopt, not an argument-less
+// `List` (see type_compatibility.h's doc comment on this function). The bare
+// spelling that WOULD reach this arm for real, `class L(list)`, is itself
+// rejected by mypy --strict: "Missing type parameters for generic type
+// \"list\"" -- so the arm below is exercised only by this hand-fed
+// FakeClassLookup, never by a mypy-clean program.
+TEST(BuiltinBaseOfClass, GivenABareContainerNameItComesBackWithoutArguments) {
     const semantic_test_support::FakeClassLookup classes({{"IntList", {"list"}}});
 
     const std::optional<Type> base = builtin_base_of_class(classes, "IntList");

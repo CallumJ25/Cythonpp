@@ -502,12 +502,17 @@ RuleResult element_type(const Type& iterable, const ClassLookup* classes) {
             if (const std::optional<Type> base = builtin_base_of_class(*classes, iterable.name)) {
                 // Recursive, so the builtin's own rules below decide, rather
                 // than a second copy of them. Ok only: a NotApplicable here
-                // means either an argument-less container base
-                // (`class IntList(list[int])`, whose element type
-                // ClassLookup cannot report -- see builtin_base_of_class)
-                // or a non-iterable builtin base (`class Sub(int)`), and
-                // NEITHER may become a TypeError, because the class is free
+                // means a non-iterable builtin base (`class Sub(int)`), and
+                // that may not become a TypeError, because the class is free
                 // to define its own __iter__ on top of what it inherits.
+                // (`class IntList(list[int])` never reaches this branch at
+                // all: base_names drops a Subscript base entirely, so
+                // builtin_base_of_class(classes, "IntList") is nullopt and
+                // this `if` does not fire -- see builtin_base_of_class and
+                // TypeChecker::base_names. The only spelling that DOES record
+                // a bare container name here, `class L(list)`, is itself
+                // rejected by mypy --strict: "Missing type parameters for
+                // generic type \"list\"".)
                 const RuleResult inherited = element_type(*base, classes);
                 if (inherited.status == RuleResult::Status::Ok) {
                     return inherited;

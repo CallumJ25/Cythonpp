@@ -384,8 +384,8 @@ private:
     //     top_level_signatures_'s own contract exactly;
     //   - every direct plain Assign to a bare Name is placeholder-declared
     //     (Type::unknown(), at ITS OWN line) the same has_value()-guarded
-    //     way, so `class D: x = 5` registers "x" as an attribute at all
-    // -- the REAL inferred type is filled in later, when
+    //     way, so `class D: x = 5` registers "x" as an attribute at all --
+    //     the REAL inferred type is filled in later, when
     //     Phase 3's own visit(Assign) actually reaches this exact statement
     //     (see assign_to's own is_new_definition-gated declare_member call,
     //     itself now guarded against overwriting a genuine earlier

@@ -27,11 +27,15 @@ namespace cythonpp::domain::semantic {
 // question about a NAME rather than a Type because that is what
 // ClassLookup::bases_of deals in.
 //
-// A PARAMETRIC builtin base (`class IntList(list[int])`) comes back with
-// EMPTY args, not `list[int]`: ClassTable stores bases as bare names (see
-// TypeChecker::base_names), so the element type in the source spelling is
-// not recoverable here. Callers must treat an argument-less container as
-// "unknown element type", never as an error.
+// A PARAMETRIC builtin base (`class IntList(list[int])`) is not recorded at
+// all: TypeChecker::base_names only records a base via a dynamic_cast to
+// ast::Name, so a Subscript base like `list[int]` is dropped entirely with no
+// trace, leaving IntList with an EMPTY base list. This function therefore
+// returns nullopt for it, the same answer as for a class with no builtin
+// base at all -- not an argument-less `List`. (The bare-name spelling,
+// `class L(list)`, IS recorded, but mypy --strict itself rejects it: "Missing
+// type parameters for generic type \"list\"".) Callers must treat that
+// nullopt as "unknown element type", never as an error.
 std::optional<Type> builtin_base_of_class(const ClassLookup& classes, const std::string& name);
 
 // Position in Python's numeric tower -- Bool 1, Int 2, Float 3, Complex 4 --

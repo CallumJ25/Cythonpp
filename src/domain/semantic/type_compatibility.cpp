@@ -261,6 +261,9 @@ bool type_less(const Type& left, const Type& right) {
             return false;
         }
     }
+    if (left.defaulted_params != right.defaulted_params) {
+        return left.defaulted_params < right.defaulted_params;
+    }
     return false;
 }
 
