@@ -603,6 +603,19 @@ TEST(ExpressionTyper, ReportsSubscriptingAUserClassAsUnsupported) {
     EXPECT_EQ(only_error(typed).code, "NotImplementedError");
 }
 
+// Absorbing: an unbound container's NameError is the only report.
+// subscript_result returns Ok(Unknown) whenever either operand is Unknown
+// (operator_rules.cpp), and apply()'s Ok arm never reports -- so this pins
+// that a miss upstream draws exactly ONE diagnostic, not a second false
+// TypeError/NotImplementedError layered on top.
+TEST(ExpressionTyper, SubscriptSilentlyAbsorbsAnUnboundContainer) {
+    const Typed typed = type_expression("nope[0]");
+
+    EXPECT_EQ(typed.diagnostics.size(), 1u);
+    EXPECT_EQ(typed.diagnostics.front().code, "NameError");
+    EXPECT_EQ(typed.printed, "Unknown");
+}
+
 // --- Attribute (Task 14) ----------------------------------------------------
 
 TEST(ExpressionTyper, ResolvesAUserClassAttribute) {
@@ -622,18 +635,27 @@ TEST(ExpressionTyper, ResolvesAnInheritedAttribute) {
     table.declare_member("Base", "x", Type::str(), 2);
     table.declare("Leaf", {"Base"});
 
-    EXPECT_EQ(type_expression("w.x", {{"w", Type::class_of("Leaf")}}, Type::unknown(), &table)
-                  .printed,
-              "str");
+    const Typed typed =
+        type_expression("w.x", {{"w", Type::class_of("Leaf")}}, Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty());
+    EXPECT_EQ(typed.printed, "str");
 }
 
 // ClassTable has TWO member queries -- member_type (Entry::members) and
 // method_type (Entry::methods) -- and a bare `c.m` reference (never called)
 // must resolve through method_type too, or every ordinary method reference
-// would be a false attr-defined TypeError. Returned WITH `self` still in the
-// signature: Task 15's Call arm drops args[0] itself when it binds a call,
-// so this must not do that pre-emptively.
-TEST(ExpressionTyper, ResolvesAMethodReferenceIncludingSelf) {
+// would be a false attr-defined TypeError.
+//
+// THE self CONTRACT (a Fix Round 1 design reversal -- see the report):
+// verified against mypy 1.18.1, an INSTANCE receiver's `self` is dropped AT
+// THE ATTRIBUTE ACCESS, not at a later call: `c: C = C()` then
+// `reveal_type(c.m)` is `def () -> int`. So `w.resize` below -- `w`'s type
+// is Widget, an instance, not the class object -- must already be BOUND
+// (self gone). Task 15's Call arm must NOT drop args[0] again for an
+// Attribute callee; it is already bound here. Renamed from
+// ResolvesAMethodReferenceIncludingSelf, which pinned the OPPOSITE (and now
+// known wrong) expectation.
+TEST(ExpressionTyper, ResolvesABoundMethodReferenceWithSelfDropped) {
     ClassTable table;
     table.declare("Widget", {});
     table.declare_method("Widget", "resize",
@@ -642,8 +664,84 @@ TEST(ExpressionTyper, ResolvesAMethodReferenceIncludingSelf) {
     const Typed typed = type_expression("w.resize", {{"w", Type::class_of("Widget")}},
                                         Type::unknown(), &table);
     EXPECT_TRUE(typed.diagnostics.empty());
+    EXPECT_EQ(typed.printed, "Callable[[int], None]")
+        << "self is dropped here, at the instance attribute access -- not by Task 15's Call arm";
+}
+
+// The CLASS-OBJECT counterpart of the test above: `Widget.resize`, receiver
+// is the class itself (a bare Name satisfying classes_.is_class), not an
+// instance. Verified against mypy 1.18.1: reveal_type(C.m) is
+// `def (self: C) -> int` -- self stays, unlike the instance case.
+TEST(ExpressionTyper, ResolvesAClassObjectMethodReferenceKeepingSelf) {
+    ClassTable table;
+    table.declare("Widget", {});
+    table.declare_method("Widget", "resize",
+                         Type::callable({Type::class_of("Widget"), Type::int_()}, Type::none()));
+
+    const Typed typed = type_expression("Widget.resize", {}, Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty());
     EXPECT_EQ(typed.printed, "Callable[[Widget, int], None]")
-        << "self stays in the signature; Task 15's Call arm drops it";
+        << "self stays for a class-object receiver";
+}
+
+// `C.x`: a class-object receiver accessing a plain (non-method) member.
+// Verified mypy-clean, reveal_type(C.x) is builtins.int -- Decision 7 in the
+// spec requires C.x to be accepted, since mypy accesses a member through
+// EITHER the instance or the class.
+TEST(ExpressionTyper, ResolvesAClassObjectMemberAttribute) {
+    ClassTable table;
+    table.declare("Widget", {});
+    table.declare_member("Widget", "width", Type::int_(), 2);
+
+    const Typed typed = type_expression("Widget.width", {}, Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty());
+    EXPECT_EQ(typed.printed, "int");
+}
+
+// `C.nope`: a class-object receiver missing the attribute is a genuine mypy
+// attr-defined error, exactly like the instance case.
+TEST(ExpressionTyper, ReportsAMissingAttributeOnAClassObjectReceiver) {
+    ClassTable table;
+    table.declare("Widget", {});
+
+    const Typed typed = type_expression("Widget.nope", {}, Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Widget\" has no attribute \"nope\"");
+}
+
+// A class defining __getattr__ makes ARBITRARY attribute access mypy-clean.
+// Verified against mypy 1.18.1: `class G: def __getattr__(self, name: str)
+// -> int: ...` then `g.anything` is mypy-CLEAN, revealing builtins.int.
+// Without this, `g.anything` would draw a false attr-defined TypeError --
+// the hard invariant this fix closes.
+TEST(ExpressionTyper, GetattrResolvesAnArbitraryAttribute) {
+    ClassTable table;
+    table.declare("G", {});
+    table.declare_method(
+        "G", "__getattr__",
+        Type::callable({Type::class_of("G"), Type::str()}, Type::int_()));
+
+    const Typed typed =
+        type_expression("g.anything", {{"g", Type::class_of("G")}}, Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty());
+    EXPECT_EQ(typed.printed, "int");
+}
+
+// A DECLARED member/method still wins over __getattr__ -- the fallback is
+// only consulted on a genuine miss.
+TEST(ExpressionTyper, ADeclaredMemberStillWinsOverGetattr) {
+    ClassTable table;
+    table.declare("G", {});
+    table.declare_member("G", "label", Type::str(), 2);
+    table.declare_method(
+        "G", "__getattr__",
+        Type::callable({Type::class_of("G"), Type::str()}, Type::int_()));
+
+    const Typed typed =
+        type_expression("g.label", {{"g", Type::class_of("G")}}, Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty());
+    EXPECT_EQ(typed.printed, "str") << "the declared member wins, not __getattr__'s int";
 }
 
 // mypy's attr-defined, and it IS in direction (b)'s rule set.
@@ -684,10 +782,12 @@ TEST(ExpressionTyper, ADeclaredMemberOnABuiltinInheritingClassStillResolves) {
     table.declare("Sub", {"int"});
     table.declare_member("Sub", "label", Type::str(), 3);
 
-    EXPECT_EQ(type_expression("s.label", {{"s", Type::class_of("Sub")}}, Type::unknown(),
-                              &table)
-                  .printed,
-              "str");
+    const Typed typed =
+        type_expression("s.label", {{"s", Type::class_of("Sub")}}, Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "an implementation that returned the member AND reported the carve-out's "
+           "NotImplementedError would otherwise still pass";
+    EXPECT_EQ(typed.printed, "str");
 }
 
 // Verified: xs.append(1), s.upper() and d.keys() are ALL mypy-clean. With no

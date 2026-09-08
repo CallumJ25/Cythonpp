@@ -310,6 +310,26 @@ Type ExpressionTyper::type_of_subscript(const ast::Subscript& subscript) {
 }
 
 Type ExpressionTyper::type_of_attribute(const ast::Attribute& attribute) {
+    // CLASS-OBJECT RECEIVER, checked syntactically and BEFORE the receiver
+    // is ever typed: `C.x` / `C.m`. Verified against mypy 1.18.1: both are
+    // mypy-clean (`reveal_type(C.x)` is `builtins.int`, `reveal_type(C.m)` is
+    // `def (self: C) -> int`). `C` is a bare Name that nothing binds into
+    // ScopeStack -- typing it through the ordinary type_of()/type_of_name()
+    // path below would report a false NameError. A qualified nested-class
+    // receiver (`Outer.Inner.x`) is out of scope: its own receiver is an
+    // Attribute, not a Name, so it falls through to the ordinary path below
+    // and reports (rather than guesses) once it gets there.
+    if (const auto* receiver_name = dynamic_cast<const ast::Name*>(&attribute.value())) {
+        if (classes_.is_class(receiver_name->identifier())) {
+            const Type class_type = Type::class_of(receiver_name->identifier());
+            // Recorded by hand, not through type_of(), since type_of_name()
+            // -- which would consult ScopeStack and report NameError -- is
+            // exactly the path being avoided here.
+            types_.insert(receiver_name, class_type);
+            return type_of_class_attribute(class_type, attribute, /*bind_self=*/false);
+        }
+    }
+
     const Type receiver = type_of(attribute.value(), Type::unknown());
     switch (receiver.kind) {
     case TypeKind::Unknown:
@@ -323,7 +343,9 @@ Type ExpressionTyper::type_of_attribute(const ast::Attribute& attribute) {
         return error(attribute, "NotImplementedError",
                      unsupported_message(UnsupportedReason::UnionOperand));
     case TypeKind::Class:
-        return type_of_class_attribute(receiver, attribute);
+        // An INSTANCE receiver: self is bound (dropped) below, per THE self
+        // CONTRACT -- see type_of_class_attribute's declaration comment.
+        return type_of_class_attribute(receiver, attribute, /*bind_self=*/true);
     // Every builtin kind: no typeshed is consulted here, so a member access
     // on any of these is unmodellable rather than a guess -- reporting
     // attr-defined without knowing str/list/dict's real members would be a
@@ -353,25 +375,65 @@ Type ExpressionTyper::type_of_attribute(const ast::Attribute& attribute) {
     return Type::unknown();
 }
 
-Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::Attribute& attribute) {
+Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::Attribute& attribute,
+                                              bool bind_self) {
     // member_type and method_type are TWO SEPARATE ClassTable queries --
     // declare_member writes into Entry::members, declare_method into
     // Entry::methods, and each query only ever searches its own map. Trying
     // member_type alone would make every ordinary method reference (`c.m`)
-    // a false attr-defined TypeError, which is the hard invariant. Member
-    // wins first since it is checked first here, but a real class never
-    // declares the same name as both, so the order does not paper over a
-    // genuine ambiguity.
+    // a false attr-defined TypeError, which is the hard invariant. Member is
+    // checked first, and WITHIN one class that ordering is not load-bearing
+    // (a real class never declares the same name as both a member and a
+    // method). It IS load-bearing across a base chain, though: member_type
+    // walks the WHOLE chain before method_type is ever tried, so a base's
+    // attribute beats a derived class's method of the same name. Harmless in
+    // practice -- mypy itself rejects that shape of override, so the program
+    // is not clean anyway -- but the guarantee only holds at that strength,
+    // not "no class can have the same name in both" as a prior version of
+    // this comment overclaimed.
     if (const std::optional<Type> member =
             classes_.member_type(receiver.name, attribute.attribute())) {
         return *member;
     }
-    // Returned AS-IS, `self` parameter included -- Task 15's Call arm is what
-    // drops args[0] when binding a call; a bare reference like `c.m` (never
-    // called) has no binding step to do that, so this must not do it either.
     if (const std::optional<Type> method =
             classes_.method_type(receiver.name, attribute.attribute())) {
-        return *method;
+        if (!bind_self) {
+            // CLASS-OBJECT receiver (`C.m`): returned AS-IS, self included.
+            // Verified against mypy 1.18.1: reveal_type(C.m) is
+            // `def (self: C) -> int`.
+            return *method;
+        }
+        // INSTANCE receiver (`c.m`): self is dropped HERE, not by a later
+        // Call arm. Verified against mypy 1.18.1: reveal_type(c.m) is
+        // `def () -> int` -- mypy binds self at the attribute access itself.
+        // method->args is [self, param..., return] (Type::callable's
+        // convention, return LAST), so erasing args[0] is exactly "bind
+        // self". THE self CONTRACT for Task 15: a Call arm whose callee is
+        // this Attribute must NOT drop args[0] again -- it is already bound.
+        Type bound = *method;
+        bound.args.erase(bound.args.begin());
+        return bound;
+    }
+    // A class may define __getattr__ to make ARBITRARY attribute access
+    // clean. Verified against mypy 1.18.1: `class G: def __getattr__(self,
+    // name: str) -> int: ...` then `g.anything` is mypy-CLEAN, revealing
+    // `builtins.int`. Checked before concluding a miss -- otherwise this
+    // would be a false TypeError on mypy-clean code, the hard invariant.
+    //
+    // Resolved EXACTLY here, unlike the operator dunders (__add__, __eq__,
+    // ...), which remain DEFERRED for a later task: operator dispatch needs
+    // ~30 names with reflected fallbacks and fiddly exceptions (`in` is
+    // always `bool` regardless of what `__contains__` declares), whereas
+    // __getattr__ is a single lookup with no binding subtlety and no
+    // reflected form. The asymmetry between the two is deliberate, not an
+    // oversight.
+    //
+    // __getattr__'s own args are [self, name: str, return], return LAST, so
+    // args.back() is its declared return type -- exactly what every access
+    // it resolves reveals as.
+    if (const std::optional<Type> getattr =
+            classes_.method_type(receiver.name, "__getattr__")) {
+        return getattr->args.back();
     }
     // THE CARVE-OUT: `class Sub(int): pass` then `Sub().bit_length()` is
     // mypy-clean, because Sub inherits int's members, which this compiler

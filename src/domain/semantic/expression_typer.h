@@ -116,13 +116,39 @@ private:
     // kind, a Union needing narrowing, or Unknown) is handled without ever
     // consulting the class table. See type_of_class_attribute for the
     // Class-receiver cases.
+    //
+    // CLASS-OBJECT RECEIVER, checked FIRST and syntactically, before the
+    // receiver expression is ever typed: `C.x` / `C.m` have a bare ast::Name
+    // receiver whose identifier names a class itself (classes_.is_class(...)
+    // is true). Nothing binds a class's own name into ScopeStack -- the
+    // not-yet-written statement checker never does -- so routing `C` through
+    // the ordinary type_of()/type_of_name() path would report a false
+    // NameError on mypy-clean code (verified: `C.x` and `C.m` are both
+    // mypy-clean). A qualified nested-class receiver (`Outer.Inner.x`) is out
+    // of scope: its own receiver is an Attribute, not a Name, so it falls
+    // through to the ordinary path and reports rather than guesses.
     Type type_of_attribute(const ast::Attribute& attribute);
 
     // The Class-receiver half of type_of_attribute, split out because it
     // alone has more than one case: a member (declared or inherited) wins,
     // then a method (a SEPARATE ClassTable query -- see class_table.h), then
-    // the builtin-inheriting carve-out, then a genuine attr-defined TypeError.
-    Type type_of_class_attribute(const Type& receiver, const ast::Attribute& attribute);
+    // a class-defined __getattr__ fallback, then the builtin-inheriting
+    // carve-out, then a genuine attr-defined TypeError.
+    //
+    // `bind_self` is THE self CONTRACT, verified against mypy 1.18.1:
+    //   - true  (an INSTANCE receiver, `c.m`): a resolved method's signature
+    //     has args[0] (self) DROPPED here -- reveal_type(c.m) is
+    //     `def () -> int`. Binding happens at THIS attribute access, not at
+    //     a later call.
+    //   - false (a CLASS-OBJECT receiver, `C.m`): the signature is returned
+    //     UNCHANGED, self included -- reveal_type(C.m) is
+    //     `def (self: C) -> int`.
+    // Task 15's Call arm must NOT drop args[0] again for an Attribute
+    // callee: an instance-bound method is already bound by the time the Call
+    // arm sees it, and a class-object one is deliberately left unbound. A
+    // double-drop is a silent arity bug.
+    Type type_of_class_attribute(const Type& receiver, const ast::Attribute& attribute,
+                                 bool bind_self);
 
     // The three-way switch, in one place. Every rule-table call goes through
     // this, which is what makes the false-TypeError path unreachable by
