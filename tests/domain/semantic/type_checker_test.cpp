@@ -663,8 +663,48 @@ TEST(TypeChecker, AMethodMayReadAClassBodyAttributeDeclaredBelowIt) {
 // Name-target branch now, gated on is_new_definition so the member's type is
 // the FIRST assignment's, matching every other "first assignment is sticky"
 // rule in this file.
+//
+// Fix round 2, Finding D: the positive half ALONE is VACUOUS -- deleting the
+// declare_member call this test is meant to pin still leaves it passing,
+// because pre_collect_class_body's own pre-pass placeholder-declares "x" as
+// Unknown regardless, type_of_attribute returns that Unknown for `d.x`, and
+// the AnnAssign compare below is guarded on BOTH sides being non-Unknown, so
+// `y: int = d.x` is clean either way. Strengthened with the negative half:
+// this only passes once the REAL inferred type (int, not Unknown) is filled
+// in by assign_to's own declare_member call.
 TEST(TypeChecker, CollectsAPlainClassBodyAssignment) {
     expect_clean("class D:\n    x = 5\nd = D()\ny: int = d.x\n");
+
+    const Checked checked = check_module("class D:\n    x = 5\nd = D()\ny: str = d.x\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"int\", "
+              "variable has type \"str\")");
+}
+
+// Fix round 2, Finding A. Round 1's own Finding 3 fix (the plain class-body
+// Assign path, in assign_to) had NO has_value()/line guard at all, unlike
+// its AnnAssign sibling (Finding 5) and assign_attribute's own self.x path
+// -- so a plain class-body Assign appearing BELOW a method that already
+// assigned self.x silently RE-TYPED the attribute with ZERO diagnostics.
+// Reproduced against the built binary before this fix (see also mypy's own
+// verified output for this exact program under Finding E's test below,
+// which additionally pins mypy's line/polarity for the sibling AnnAssign
+// case -- this plain-Assign case is fixed only against the narrower "must
+// not be silently accepted" bar Finding A itself asked for).
+TEST(TypeChecker, APlainClassBodyAssignmentConflictingWithAnEarlierSelfAssignmentIsReported) {
+    const Checked checked = check_module(
+        "class C:\n"
+        "    def m(self) -> None:\n"
+        "        self.x = 5\n"
+        "    x = \"s\"\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"str\", "
+              "variable has type \"int\")");
 }
 
 // Fix round 1, Finding 4. A ClassDef lexically inside a `def` is never seen
@@ -673,14 +713,82 @@ TEST(TypeChecker, CollectsAPlainClassBodyAssignment) {
 // Phase 3 reached it -- every self.attr inside was a false attr-defined
 // TypeError. It is now declared, under an isolated qualified name, exactly
 // when Phase 3's walk reaches it.
-TEST(TypeChecker, AFunctionLocalClassDeclaresItsOwnAttributes) {
-    expect_clean(
+//
+// Fix round 2, Finding B: round 1's own fix declared a NON-colliding local
+// class under its own BARE name, which is what let `Local()` construct from
+// inside its own defining function in the first place (this test originally
+// asserted exactly that, via expect_clean). That bare-name declare() had no
+// collision detection of its own, though, so a SECOND same-named local class
+// declared in a DIFFERENT function silently overwrote the first one's
+// ClassTable entry -- see AFunctionLocalClassesDoNotLeakOrOverwriteEachOther
+// below for the false attr-defined this produced. Fixed by ALWAYS isolating
+// under a synthetic name, at the accepted cost that `Local()` can no longer
+// be resolved as a constructor call at all -- this test is rewritten to pin
+// exactly that: a MISSED error (NameError on the call) rather than a FALSE
+// one, and critically, no SECOND, cascading diagnostic on `v.x` (the
+// resulting Unknown is absorbing, so this must be the sink's ONLY entry).
+TEST(TypeChecker, AFunctionLocalClassIsIsolatedSoItsBareNameConstructorCallReportsNameError) {
+    const Checked checked = check_module(
         "def make() -> None:\n"
         "    class Local:\n"
         "        def __init__(self) -> None:\n"
         "            self.x = 5\n"
         "    v = Local()\n"
         "    y: int = v.x\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'Local' is not defined");
+}
+
+// Fix round 2, Finding B (the reviewer's own primary repro). Two DIFFERENT
+// functions each declare their own local class under the identical bare
+// name "L". Before this fix, both computed the same bare "L" qualified name
+// (declare() has no collision detection of its own), so the SECOND
+// function's own `L()` call resolved to the FIRST function's class -- not
+// merely "no longer a constructor call", but the WRONG one -- and a member
+// access the first class genuinely lacks (`w.b`) was a FALSE attr-defined
+// TypeError, the hard invariant this project exists to protect. Isolating
+// EVERY local class under its own synthetic, per-declaration-site name means
+// neither can ever be mistaken for the other: each `L()` call now reports
+// its own (missed, not false) NameError, and nothing cascades from it.
+TEST(TypeChecker, AFunctionLocalClassesDoNotLeakOrOverwriteEachOther) {
+    const Checked checked = check_module(
+        "def f() -> None:\n"
+        "    class L:\n"
+        "        def __init__(self) -> None:\n"
+        "            self.a = 1\n"
+        "def g() -> None:\n"
+        "    class L:\n"
+        "        def __init__(self) -> None:\n"
+        "            self.b = 2\n"
+        "    w = L()\n"
+        "    y: int = w.b\n");
+
+    EXPECT_EQ(checked.diagnostics.size(), 1u);
+    if (checked.diagnostics.size() == 1) {
+        EXPECT_EQ(checked.diagnostics.front().code, "NameError");
+        EXPECT_EQ(checked.diagnostics.front().message, "name 'L' is not defined");
+    }
+}
+
+// Fix round 2, Finding B (the reviewer's own second repro): a function-local
+// class's bare name must NOT leak into ClassTable as a permanently live
+// entry for the REST of the module's Phase-3 walk. Before this fix,
+// `class L` inside `f` declared under the bare name "L" the first time
+// Phase 3 reached it, so a module-level `L()` occurring TEXTUALLY AFTER `f`
+// silently resolved as a constructor call instead of reporting NameError --
+// an order-dependent regression from the pre-round-1 (correct) behaviour.
+TEST(TypeChecker, AFunctionLocalClasssBareNameDoesNotLeakToLaterModuleLevelCode) {
+    const Checked checked = check_module(
+        "def f() -> None:\n"
+        "    class L:\n"
+        "        pass\n"
+        "v = L()\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'L' is not defined");
 }
 
 // Fix round 1, Finding 4 (the cross-class-corruption half). Before this fix,
@@ -706,11 +814,29 @@ TEST(TypeChecker, AFunctionLocalClassDoesNotCorruptASameNamedTopLevelClass) {
     EXPECT_EQ(only_error(checked).code, "TypeError");
 }
 
-// Fix round 1, Finding 5 (Minor). An EARLIER self.x = ... assignment (in a
-// method occurring ABOVE this class-body annotation) declares "x" as int;
-// declare_member has no collision detection of its own, so the conflicting
-// `x: str` below it must not silently re-type the attribute with zero
-// diagnostics.
+// Fix round 1, Finding 5 (Minor) / Fix round 2, Finding E. An EARLIER
+// self.x = ... assignment (in a method occurring ABOVE this class-body
+// annotation) declares "x" as int; declare_member has no collision
+// detection of its own, so the conflicting `x: str` below it must not
+// silently re-type the attribute with zero diagnostics.
+//
+// Fix round 2, Finding E: round 1's own fix reported this at the
+// ANNOTATION's line (4), treating the annotation as "expression" and the
+// self-assignment's inferred type as "variable" -- verified against real
+// mypy 1.18.1 (`mypy --strict` on this exact program) to be BACKWARDS on
+// both counts:
+//   case.py:3: error: Incompatible types in assignment (expression has type
+//   "int", variable has type "str")  [assignment]
+// mypy treats a class-body annotation as the DECLARED type of the attribute
+// for the WHOLE class body regardless of where it appears textually, and
+// reports the conflict at the ASSIGNMENT's own line (3, self.x = 5) with the
+// assignment's inferred type as "expression" and the annotation's declared
+// type as "variable" -- exactly the reverse of round 1's own polarity and
+// line. pre_collect_class_body now resolves and declares every direct
+// class-body AnnAssign in its own sub-pass BEFORE any method's self.x scan,
+// so this ordering-independent precedence holds regardless of which
+// statement is textually first (see AClassBodyAnnotationAboveAConflicting
+// SelfAssignmentIsReported below for the already-correct reverse ordering).
 TEST(TypeChecker, AClassBodyAnnotationConflictingWithAnEarlierSelfAssignmentIsReported) {
     const Checked checked = check_module(
         "class C:\n"
@@ -720,9 +846,33 @@ TEST(TypeChecker, AClassBodyAnnotationConflictingWithAnEarlierSelfAssignmentIsRe
 
     const diagnostics::Diagnostic error = only_error(checked);
     EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 3);
     EXPECT_EQ(error.message,
-              "incompatible types in assignment (expression has type \"str\", "
-              "variable has type \"int\")");
+              "incompatible types in assignment (expression has type \"int\", "
+              "variable has type \"str\")");
+}
+
+// Fix round 2, Finding E (the reverse ordering, verified mypy-identical):
+// `mypy --strict` on this exact program (annotation ABOVE the conflicting
+// self.x) reports:
+//   case3.py:5: error: Incompatible types in assignment (expression has type
+//   "int", variable has type "str")  [assignment]
+// -- the SAME line/polarity convention as the "annotation below" case above,
+// confirming the class-body annotation is authoritative and self.x is
+// always the "expression" being checked against it, regardless of order.
+TEST(TypeChecker, AClassBodyAnnotationAboveAConflictingSelfAssignmentIsReported) {
+    const Checked checked = check_module(
+        "class C:\n"
+        "    x: str\n"
+        "    def m(self) -> None:\n"
+        "        self.x = 5\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 4);
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"int\", "
+              "variable has type \"str\")");
 }
 
 // Fix round 1, Finding 7: a LOSING top-level class redefinition's own body
@@ -1156,6 +1306,54 @@ TEST(TypeChecker, ANestedDefsReturnTypeDoesNotLeakToTheEnclosingFunction) {
         "        return 1\n"
         "    inner()\n"
         "    return\n");
+}
+
+// ---------------------------------------------------------------------------
+// Task 19 fix round 2: an asymmetric guard reintroducing round 1's own
+// Finding 5 defect for the plain-Assign sibling (Finding A), a function-local
+// class's bare name leaking globally and shadowing across sibling functions
+// (Finding B), TypeChecker's internal synthetic-isolation name leaking into a
+// user-facing diagnostic (Finding C), a vacuous test (Finding D), and a
+// class-body-annotation-vs-self.x conflict's line/polarity corrected against
+// real mypy output (Finding E). Findings A, B and D/E each have their own
+// tests placed next to the round 1 test they amend, above; this section holds
+// only Finding C, which has no round 1 predecessor to sit next to.
+// ---------------------------------------------------------------------------
+
+// Fix round 2, Finding C. `type.name`/`ClassTable`'s own qualified name for
+// an ISOLATED class (here, a LOSING top-level redefinition -- Finding 7's
+// own mechanism) embeds TypeChecker's internal "<tag>#<line>#" isolation
+// prefix. Before this fix, that prefix leaked VERBATIM into any diagnostic
+// naming the class -- reachable via attr-defined, assignment, arg-type,
+// return-type and operator messages, i.e. every path through type_name PLUS
+// the two raw uses of a Class's `.name` in expression_typer.cpp/
+// expression_typer_calls.cpp -- not only when `self` is the subject. This
+// asserts the MESSAGE, not merely the diagnostic code (a code-only assertion
+// would pass identically whether or not the leak were fixed): the loser's
+// own body is still checked (Finding 7), so a genuine error INSIDE it (here,
+// attr-defined on a name the loser itself never declares) must name the
+// class as "C" -- exactly as the user wrote it -- never the internal
+// "<shadowed-class>#4#C" ClassTable key.
+TEST(TypeChecker, ASyntheticIsolationPrefixDoesNotLeakIntoAnAttrDefinedMessage) {
+    const Checked checked = check_module(
+        "class C:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.a = 1\n"
+        "class C:\n"
+        "    def m(self) -> None:\n"
+        "        y: int = self.missing\n");
+
+    EXPECT_EQ(checked.diagnostics.size(), 2u);
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    // Diagnostic 1: scan_top_level_names' own redefinition report (line 4,
+    // module-level, unrelated to this finding -- see
+    // ALosingClassRedefinitionDoesNotOverrideTheWinningOnesConstructor for
+    // that message's own dedicated coverage).
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    // Diagnostic 2: the loser's own attr-defined miss, inside its isolated
+    // body -- this is the one the leak reaches.
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"C\" has no attribute \"missing\"");
 }
 
 } // namespace

@@ -37,6 +37,21 @@ std::string callable_name(const std::vector<Type>& args) {
 
 } // namespace
 
+std::string strip_synthetic_class_prefix(const std::string& name) {
+    if (name.empty() || name.front() != '<') {
+        return name;
+    }
+    const std::size_t close = name.find('>');
+    if (close == std::string::npos || close + 1 >= name.size() || name[close + 1] != '#') {
+        return name;
+    }
+    const std::size_t second_hash = name.find('#', close + 2);
+    if (second_hash == std::string::npos) {
+        return name;
+    }
+    return name.substr(second_hash + 1);
+}
+
 std::string type_name(const Type& type) {
     switch (type.kind) {
     case TypeKind::Unknown:
@@ -78,7 +93,11 @@ std::string type_name(const Type& type) {
     case TypeKind::Callable:
         return callable_name(type.args);
     case TypeKind::Class:
-        return type.name;
+        // Fix round 2, Finding C: strip TypeChecker's own internal isolation
+        // prefix (see strip_synthetic_class_prefix's own comment) before
+        // display -- an isolated class's `type.name` is a ClassTable KEY,
+        // not something the user ever wrote.
+        return strip_synthetic_class_prefix(type.name);
     case TypeKind::Object:
         return "object";
     }

@@ -287,28 +287,38 @@ private:
     // ClassDef nested in its own body) into ClassTable under `qualified_name`
     // -- returned back to the caller unchanged, for use exactly like an
     // ordinarily-declared one for the REST of that class's handling
-    // (ClassContextGuard, pre_collect_class_body, self's binding). Two
-    // callers, two different KINDS of name:
-    //   - Finding 4's own non-colliding case passes the class's plain bare
-    //     name (see visit(ClassDef)'s own comment for why -- classes_.
-    //     is_class(identifier), the constructor-call dispatch's own lookup,
-    //     has no scope awareness at all, so only a bare name keeps a
-    //     function-local class's own `Local()` call resolvable).
-    //   - Every OTHER caller (Finding 4's colliding case, and Finding 7)
-    //     passes a freshly synthesised name that embeds `#`, a character no
-    //     Python identifier can ever contain, so it can never collide with
-    //     any legitimately dotted "Outer.Inner" name collect_classes
-    //     produced, or with any other class's bare name.
+    // (ClassContextGuard, pre_collect_class_body, self's binding). Both
+    // callers (Finding 4's function-local case, and Finding 7's losing
+    // top-level collision) now ALWAYS pass a freshly synthesised name that
+    // embeds `#`, a character no Python identifier can ever contain, so it
+    // can never collide with any legitimately dotted "Outer.Inner" name
+    // collect_classes produced, or with any other class's bare name.
+    //
+    // Fix round 2, Finding B: Finding 4's own case used to pass the class's
+    // plain BARE name whenever that name was not already live in ClassTable
+    // -- kept, back then, specifically so a function-local `Local()` call
+    // stayed resolvable as a constructor from inside its own defining
+    // function (classes_.is_class(identifier), the constructor-call
+    // dispatch's own lookup in expression_typer_calls.cpp, has no scope
+    // awareness at all). That bare-name declare() has no collision detection
+    // of its own, though: a SECOND, later-declared local class of the
+    // identical name (a different function's own same-named local class)
+    // silently overwrote the first one's entry, so a call from inside the
+    // second function resolved to the FIRST function's class and a member
+    // access on the result was a FALSE attr-defined TypeError -- and the
+    // bare name stayed a LIVE ClassTable entry for the rest of the module's
+    // Phase-3 walk, turning a correct NameError for a later, unrelated
+    // module-level use of the same bare name into a silent false
+    // acceptance. Always isolating under the synthetic name closes both
+    // holes at the accepted cost that `Local()` can no longer be resolved as
+    // a constructor call at all, even from inside its own defining function
+    // -- see visit(ClassDef)'s own comment for the full tradeoff.
     //
     // Two, unrelated situations both need this because neither one was ever
     // reached by collect_classes' Phase-1 walk, which only recurses into
     // MODULE-level and CLASS-level bodies:
     //   - Finding 4: a ClassDef lexically inside a `def` (or any other
-    //     non-module, non-class scope) -- using its bare name UNCONDITIONALLY
-    //     would, when that name is ALREADY a class, silently write its
-    //     members onto an unrelated SAME-NAMED top-level class's entry
-    //     (visit(ClassDef) checks classes_.is_class(node.name()) first and
-    //     only reaches for the synthesised name in that case).
+    //     non-module, non-class scope).
     //   - Finding 7: a top-level ClassDef scan_top_level_names already
     //     reported as a LOSING same-name collision. Phase 1 already skips
     //     the loser's own declare() call (Task 19's gap-5(b) fix), but Phase
@@ -332,6 +342,17 @@ private:
     // collect_signatures at module level, but for ONE class body, run from
     // visit(ClassDef) right after ClassContextGuard is constructed and
     // BEFORE any of the class's own body statements are walked --
+    //   - every direct AnnAssign's annotation is resolved (and, if a bad
+    //     annotation, reported) FIRST, in its own dedicated sub-pass over the
+    //     WHOLE body (fix round 2, Finding E -- see below), cached in
+    //     class_body_annotation_types_ so visit(AnnAssign)'s own later walk
+    //     of that SAME node reuses it rather than invoking AnnotationResolver
+    //     (and so double-reporting a bad annotation) a second time, and
+    //     declared into ClassTable via declare_member UNLESS a member or
+    //     method under that name already exists (Finding 5's own
+    //     has_value() guard -- reachable now only for a second class-body
+    //     AnnAssign of the same name, since this sub-pass runs before any
+    //     self.x placeholder ever could exist);
     //   - every direct FunctionDef (i.e. every method) gets its signature
     //     resolved and declared into ClassTable via declare_method
     //     immediately (see resolve_method_signature), and cached in
@@ -339,20 +360,14 @@ private:
     //     that SAME node reuses it rather than invoking AnnotationResolver
     //     (and so double-reporting a bad annotation) a second time -- mirrors
     //     top_level_signatures_'s own contract exactly;
-    //   - every direct AnnAssign's annotation is resolved (and, if a bad
-    //     annotation, reported) here, cached in class_body_annotation_types_
-    //     for the identical reason, and declared into ClassTable via
-    //     declare_member UNLESS a member or method under that name already
-    //     exists (Finding 5's own has_value() guard, matching the self.x
-    //     path's -- see assign_attribute -- so an EARLIER self.x = ...
-    //     assignment inside a method occurring ABOVE this annotation in the
-    //     class body is not silently clobbered);
     //   - every direct plain Assign to a bare Name is placeholder-declared
     //     (Type::unknown(), at ITS OWN line) the same has_value()-guarded
     //     way, so `class D: x = 5` registers "x" as an attribute at all
     //     (Finding 3) -- the REAL inferred type is filled in later, when
     //     Phase 3's own visit(Assign) actually reaches this exact statement
-    //     (see assign_to's own is_new_definition-gated declare_member call);
+    //     (see assign_to's own is_new_definition-gated declare_member call,
+    //     itself now guarded against overwriting a genuine earlier
+    //     declaration -- fix round 2, Finding A);
     //   - every method's OWN body is, in turn, scanned (recursively through
     //     If/While/For, matching pre_bind_function_body's own scope
     //     boundary: NOT into a nested def) for a `self.x = ...` assignment,
@@ -364,13 +379,22 @@ private:
     //     method `b` defined below `a`, or reading an attribute a later
     //     method first assigns, no longer depends on visitation order.
     //
-    // All three kinds are processed in ONE top-to-bottom pass over `node`'s
-    // OWN body (methods' nested bodies scanned inline, as each method is
-    // reached), which is exactly the order Phase 3's real single-pass walk
-    // would eventually establish each one in -- so "first occurrence wins"
-    // here agrees with "first occurrence wins" there, and Finding 5's
-    // has_value() guard sees a genuine conflict exactly when Phase 3's own
-    // walk would eventually have seen one.
+    // Fix round 2, Finding E: the AnnAssign sub-pass runs BEFORE the
+    // method/plain-Assign sub-pass below, over the WHOLE body, rather than
+    // interleaved with it in textual order as round 1 had it -- verified
+    // against mypy 1.18.1, a class-body annotation is the DECLARED type of
+    // that attribute for the WHOLE class body regardless of where it
+    // appears textually, so it must win over a self.x placeholder
+    // REGARDLESS of which one is textually first (round 1's interleaved,
+    // textual-order pass got this backwards whenever the annotation
+    // appeared BELOW the self.x assignment it conflicts with -- see
+    // AClassBodyAnnotationConflictingWithAnEarlierSelfAssignmentIsReported).
+    // This reordering is sound specifically because an annotation's type
+    // comes from the annotation EXPRESSION alone (order-independent), unlike
+    // a plain Assign's inferred type, which stays interleaved in textual
+    // order with methods below because it genuinely depends on a
+    // (possibly order-sensitive) VALUE expression Phase 3 alone can safely
+    // resolve.
     void pre_collect_class_body(const ast::ClassDef& node, const std::string& qualified_name);
 
     // The method-signature half of pre_collect_class_body's per-FunctionDef

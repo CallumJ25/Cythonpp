@@ -23,6 +23,26 @@ namespace cythonpp::domain::semantic {
 // normalises identity but not order.
 std::string type_name(const Type& type);
 
+// Fix round 2 (Task 19 fix round 2, Finding C): strips TypeChecker's own
+// synthetic class-isolation prefix -- "<tag>#<line>#" (see
+// type_checker.cpp's declare_isolated_class) -- from a class's qualified
+// name, leaving the ORIGINAL, user-written (possibly dotted) name. A losing
+// top-level class redefinition, and (as of TypeChecker fix round 2) EVERY
+// function-local class, is declared under such a synthetic name so its
+// ClassTable entry can never collide with a real one; '<', '>' and '#' are
+// used specifically because no Python identifier can contain them. That
+// uniqueness guarantee is an internal ClassTable-key concern only -- left
+// unstripped, it leaked verbatim into a user-facing diagnostic (an
+// attr-defined message naming an isolated class, say), quoting a "type"
+// that appears nowhere in the user's source. type_name's own Class case
+// routes through this; a raw `Type::name`/`ClassTable` name used directly
+// in a hand-built message (expression_typer.cpp's attr-defined message,
+// expression_typer_calls.cpp's method-call label) must route through this
+// too, rather than through type_name itself, since neither builds a Type to
+// call type_name on. A name with no such prefix is returned unchanged, so
+// this is safe to call on every class name unconditionally.
+std::string strip_synthetic_class_prefix(const std::string& name);
+
 } // namespace cythonpp::domain::semantic
 
 #endif // CYTHONPP_DOMAIN_SEMANTIC_TYPE_NAME_H

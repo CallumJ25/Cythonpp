@@ -100,7 +100,12 @@ Type ExpressionTyper::type_of_call(const ast::Call& call, const Type& expected) 
         std::string label = "\"" + attribute->attribute() + "\"";
         if (const Type* receiver_type = types_.find(&attribute->value())) {
             if (receiver_type->kind == TypeKind::Class) {
-                label += " of \"" + receiver_type->name + "\"";
+                // Fix round 2 (Task 19 fix round 2, Finding C): stripped the
+                // same way type_name's own Class case is -- see that
+                // function's comment -- so a call-argument error on an
+                // isolated class's method never quotes TypeChecker's
+                // internal "<tag>#<line>#" disambiguator.
+                label += " of \"" + strip_synthetic_class_prefix(receiver_type->name) + "\"";
             }
         }
         return type_of_call_result(callee_type, call, label);

@@ -516,8 +516,19 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
     // Every base is an ordinary user-class-shaped entry (including a seeded
     // exception class -- inherits_builtin is deliberately false for those),
     // so a miss here is a genuine mypy attr-defined error.
+    //
+    // Fix round 2 (Task 19 fix round 2, Finding C): routed through
+    // strip_synthetic_class_prefix rather than quoting receiver.name raw --
+    // an ISOLATED class (a losing top-level redefinition, or a function-local
+    // class -- see type_checker.cpp's declare_isolated_class) has a
+    // ClassTable KEY embedding TypeChecker's own internal "<tag>#<line>#"
+    // disambiguator, which must never leak into a user-facing message: this
+    // is, in practice, the single most reachable leak point of all (every
+    // attribute miss on such a class goes through here), since it does not
+    // even require the receiver to be `self`.
     return error(attribute, "TypeError",
-                 "\"" + receiver.name + "\" has no attribute \"" + attribute.attribute() + "\"");
+                 "\"" + strip_synthetic_class_prefix(receiver.name) + "\" has no attribute \"" +
+                     attribute.attribute() + "\"");
 }
 
 // type_of_call, type_of_name_call, type_of_positional_call and

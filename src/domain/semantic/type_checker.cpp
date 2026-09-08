@@ -450,12 +450,42 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
             // other "first assignment is sticky" rule in this checker --
             // pre_collect_class_body may already have placeholder-declared
             // this exact name as Unknown at this exact line (so a method
-            // ABOVE this statement reading self.x already sees it exists);
-            // this overwrites that placeholder with the real inferred type,
-            // the same fill-in pattern assign_attribute uses for its own
-            // placeholder.
-            classes_.declare_member(current_class_qualified_name_, name->identifier(), value_type,
-                                    line);
+            // ABOVE this statement reading self.x already sees it exists).
+            //
+            // Fix round 2, Finding A: round 1's own fix here had NO guard at
+            // all -- unconditionally overwriting classes_.declare_member,
+            // even when a member ALREADY exists under a DIFFERENT line (a
+            // genuine earlier self.x = ... assignment in a method ABOVE this
+            // statement), silently RE-TYPING the attribute with zero
+            // diagnostics. That is the exact defect round 1's own Finding 5
+            // already fixed for the AnnAssign sibling and assign_attribute's
+            // own self.x path; this was the one place the guard was missed.
+            // Routed through the SAME member_declared_line line-equality
+            // disambiguation assign_attribute already uses: a member at
+            // THIS exact line is this statement's own placeholder (fill in
+            // the real type -- no comparison, nothing real to compare
+            // against yet); anything else is a genuine earlier declaration,
+            // compared rather than silently overwritten.
+            const bool already_method =
+                classes_.method_type(current_class_qualified_name_, name->identifier()).has_value();
+            const std::optional<int> existing_line =
+                classes_.member_declared_line(current_class_qualified_name_, name->identifier());
+            const bool is_brand_new = !already_method && !existing_line.has_value();
+            const bool is_own_placeholder =
+                !already_method && existing_line.has_value() && *existing_line == line;
+            if (is_brand_new || is_own_placeholder) {
+                classes_.declare_member(current_class_qualified_name_, name->identifier(), value_type,
+                                        line);
+            } else if (!already_method) {
+                const Type existing_type =
+                    *classes_.member_type(current_class_qualified_name_, name->identifier());
+                if (value_type.kind != TypeKind::Unknown && existing_type.kind != TypeKind::Unknown &&
+                    !is_subtype(value_type, existing_type, &classes_)) {
+                    report_incompatible_assignment(*name, value_type, existing_type, "variable");
+                }
+            }
+            // A same-name METHOD collision is left unreported here, matching
+            // the AnnAssign branch's own precedent.
         }
         return;
     }
@@ -612,10 +642,18 @@ void TypeChecker::assign_attribute(const ast::Attribute& target, const ast::Expr
     // member now exists, from the first assignment above), matching
     // assign_name's own "first assignment's type is sticky" rule -- no join,
     // no union, just a compatibility check against the already-declared type.
+    //
+    // Fix round 2, Finding E: label corrected from "target" to "variable" --
+    // verified against mypy 1.18.1 (both a same-class conflicting self.x
+    // assignment and an outside-the-class `c.x = ...` reassignment) that an
+    // attribute target's own incompatible-assignment message always reads
+    // "variable has type ...", never "target has type ...", exactly like an
+    // ordinary Name target's (assign_name already used "variable"; this was
+    // the one call site left saying something else with no test pinning it).
     const Type member_type = typer_.type_of(target, Type::unknown());
     if (value_type.kind != TypeKind::Unknown && member_type.kind != TypeKind::Unknown &&
         !is_subtype(value_type, member_type, &classes_)) {
-        report_incompatible_assignment(target, value_type, member_type, "target");
+        report_incompatible_assignment(target, value_type, member_type, "variable");
     }
 }
 
@@ -1033,28 +1071,45 @@ void TypeChecker::visit(const ast::ClassDef& node) {
         // other non-module, non-class scope) was never seen by
         // collect_classes' Phase-1 walk either, for the identical reason.
         //
-        // Declared under its OWN bare name whenever that name is not
-        // ALREADY a class -- which is what keeps `Local()` (a bare-Name
-        // call) resolvable from within the SAME function: type_of_name_call
-        // (expression_typer_calls.cpp) dispatches a constructor call purely
-        // via classes_.is_class(identifier), the literal source-level
-        // identifier, with NO scope awareness at all -- an isolated,
-        // synthetic qualified name would be permanently unreachable through
-        // that path, which a full nested-scope-aware Phase 1 walk could fix
-        // but this fix round judges out of proportion for a construct this
-        // rare. Only when the bare name is ALREADY a class (a top-level one,
-        // or another already-declared local one -- the actual corruption
-        // hazard this finding is about) is it isolated instead: its own
-        // attributes are still correctly collected and never corrupt the
-        // pre-existing class's entry, at the accepted cost that referring to
-        // it by name no longer resolves to a constructor call either, in
-        // that one already-ambiguous case.
-        qualified_name =
-            classes_.is_class(node.name())
-                ? declare_isolated_class(node, "<local-class>#" +
-                                                   std::to_string(node.span().start_line) + "#" +
-                                                   node.name())
-                : declare_isolated_class(node, node.name());
+        // Fix round 2, Finding B: round 1's own fix declared a NON-colliding
+        // local class under its own BARE name -- but `declare()` has no
+        // collision detection of its own, so a SECOND, later-declared local
+        // class of the identical name (in a DIFFERENT function, or a second
+        // call to the SAME function-shaped class-factory pattern) silently
+        // OVERWROTE the first one's ClassTable entry. `L()` from inside the
+        // second function's own body then resolved to the FIRST function's
+        // class -- not "no longer a constructor call", but the WRONG class
+        // -- and a member access on the result was a FALSE attr-defined
+        // TypeError, exactly the hard invariant this project exists to
+        // protect. Worse, a local class's bare name is then a LIVE
+        // ClassTable entry for the REST of the module's Phase-3 walk (Phase 1
+        // never runs for one of these, so nothing ever removes the entry),
+        // so a module-level `L()` occurring TEXTUALLY AFTER the function
+        // that declares `class L` went from a correct NameError to a silent
+        // false acceptance.
+        //
+        // Fixed by ALWAYS isolating a local ClassDef under a synthetic,
+        // per-declaration-site qualified name embedding '#' (a character no
+        // Python identifier can ever contain) -- never the bare name, even
+        // when nothing else currently uses it. The accepted cost: `Local()`
+        // (a bare-Name call) can no longer be resolved as a constructor
+        // call, even from inside its OWN defining function --
+        // classes_.is_class(node.name()) is now permanently false for one of
+        // these, since type_of_name_call's constructor dispatch
+        // (expression_typer_calls.cpp) has no scope awareness at all and
+        // looks up the literal source-level identifier -- so this now
+        // reports a plain NameError instead of constructing. A MISSED error
+        // beats a FALSE one: the class's own attributes are still correctly
+        // collected (self.x = ... inside its methods still declares members
+        // exactly as before), so a local class used only for its side
+        // effects, or never referenced by a bare call at all, is entirely
+        // unaffected. Scope-aware constructor dispatch would avoid even this
+        // cost, but that dispatch lives in ExpressionTyper
+        // (expression_typer_calls.cpp), a different file outside this fix
+        // round's assigned scope, and is judged out of proportion for a
+        // construct this rare.
+        qualified_name = declare_isolated_class(
+            node, "<local-class>#" + std::to_string(node.span().start_line) + "#" + node.name());
     } else {
         qualified_name = current_class_qualified_name_.empty()
                              ? node.name()
@@ -1079,6 +1134,46 @@ void TypeChecker::visit(const ast::ClassDef& node) {
 
 void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
                                          const std::string& qualified_name) {
+    // Fix round 2, Finding E: every direct class-body AnnAssign is resolved
+    // and declared in its OWN sub-pass, over the WHOLE body, strictly BEFORE
+    // any method's self.x scan runs below -- verified against mypy 1.18.1:
+    // a class-body annotation is the DECLARED type of that attribute for the
+    // WHOLE class body regardless of where it appears textually (`x: str`
+    // BELOW an earlier `self.x = 5` still makes "x" a str variable, and the
+    // conflict is reported at the ASSIGNMENT's own line, never the
+    // annotation's -- see AClassBodyAnnotationConflictingWithAnEarlierSelf
+    // AssignmentIsReported), matching how mypy treats every other flat
+    // (Python has no block scoping) variable declaration. This is safe to
+    // resolve eagerly and order-independently -- unlike a plain Assign's
+    // inferred type below, which stays deferred to Phase 3's own
+    // order-sensitive walk -- because an annotation's type comes from the
+    // ANNOTATION EXPRESSION alone (AnnotationResolver, which depends only on
+    // ClassTable, already fully populated by Phase 1), never from a VALUE
+    // expression that could itself forward-reference another not-yet-bound
+    // class-body name.
+    for (const ast::StmtPtr& statement : node.body()) {
+        if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
+            if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
+                AnnotationResolver resolver(classes_, sink_);
+                const Type type = resolver.resolve(ann_assign->annotation());
+                class_body_annotation_types_.emplace(ann_assign, type);
+                // Fix round 1, Finding 5: guarded exactly like assign_attribute's
+                // own has_value() check -- a SECOND class-body AnnAssign
+                // under the same name (the only remaining way `already_member`
+                // can be true here, now that this sub-pass runs before any
+                // self.x placeholder ever could) is left as the first
+                // occurrence's declaration; declare_member has no collision
+                // detection of its own, so declaring over it unconditionally
+                // would silently re-type the attribute with zero diagnostics.
+                if (!classes_.member_type(qualified_name, target_name->identifier()).has_value() &&
+                    !classes_.method_type(qualified_name, target_name->identifier()).has_value()) {
+                    classes_.declare_member(qualified_name, target_name->identifier(), type,
+                                            ann_assign->span().start_line);
+                }
+            }
+        }
+    }
+
     for (const ast::StmtPtr& statement : node.body()) {
         if (const auto* function_def = dynamic_cast<const ast::FunctionDef*>(statement.get())) {
             if (function_def->params().empty()) {
@@ -1093,24 +1188,6 @@ void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
             class_method_signatures_.emplace(function_def, signature);
             classes_.declare_method(qualified_name, function_def->name(), signature);
             collect_self_attribute_placeholders(qualified_name, function_def->body());
-        } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
-            if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
-                AnnotationResolver resolver(classes_, sink_);
-                const Type type = resolver.resolve(ann_assign->annotation());
-                class_body_annotation_types_.emplace(ann_assign, type);
-                // Fix round 1, Finding 5: guarded exactly like assign_attribute's
-                // own has_value() check -- an EARLIER self.x = ... assignment
-                // (in a method occurring ABOVE this annotation in the class
-                // body) may already have placeholder-declared this same
-                // name; declare_member has no collision detection of its
-                // own, so declaring over it unconditionally would silently
-                // re-type the attribute with zero diagnostics.
-                if (!classes_.member_type(qualified_name, target_name->identifier()).has_value() &&
-                    !classes_.method_type(qualified_name, target_name->identifier()).has_value()) {
-                    classes_.declare_member(qualified_name, target_name->identifier(), type,
-                                            ann_assign->span().start_line);
-                }
-            }
         } else if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
             if (const auto* target_name = dynamic_cast<const ast::Name*>(&assign->target())) {
                 // Fix round 1, Finding 3: a plain class-body Assign
