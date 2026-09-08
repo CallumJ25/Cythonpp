@@ -728,6 +728,166 @@ TEST(TypeChecker, AMethodMayReadAClassBodyAttributeDeclaredBelowIt) {
         "    x: int\n");
 }
 
+// ---------------------------------------------------------------------------
+// Carried defect N1: the ANNOTATED self.x form.
+//
+// `self.ys: list[int] = ys` -- close to universal in typed Python -- reached
+// visit(AnnAssign)'s non-Name-target fallback, which resolved the annotation
+// for `expected` and declared NOTHING, so every later read of the attribute
+// was a false attr-defined TypeError on mypy-clean code. Two halves: this
+// branch of visit(AnnAssign) (the declaration itself) and
+// collect_self_attribute_placeholders' own AnnAssign arm (which is what makes
+// a reader method sitting ABOVE the declaring one work). Each test below
+// fails if EITHER half is removed, except where noted.
+// ---------------------------------------------------------------------------
+
+// The declared type is the ANNOTATION, not Unknown -- so the negative half
+// is what stops this passing vacuously against an absorbing placeholder.
+TEST(TypeChecker, AnAnnotatedSelfAssignmentDeclaresTheAttribute) {
+    expect_clean(
+        "class Bag:\n"
+        "    def __init__(self, ys: list[int]) -> None:\n"
+        "        self.ys: list[int] = ys\n"
+        "    def total(self) -> int:\n"
+        "        return sum(self.ys)\n");
+
+    const Checked checked = check_module(
+        "class Bag:\n"
+        "    def __init__(self, ys: list[int]) -> None:\n"
+        "        self.ys: list[int] = ys\n"
+        "b = Bag([1])\n"
+        "s: str = b.ys\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"list[int]\", "
+              "variable has type \"str\")")
+        << "the ANNOTATION must be the declared type, not an absorbing Unknown";
+}
+
+// Half A on its own: the reader method sits ABOVE the declaring one, so
+// nothing has walked the annotation by the time the read is typed. Only
+// collect_self_attribute_placeholders' AnnAssign arm can make this clean.
+TEST(TypeChecker, AMethodMayReadAnAttributeFirstAnnotatedByALaterMethod) {
+    expect_clean(
+        "class Bag:\n"
+        "    def total(self) -> int:\n"
+        "        return sum(self.ys)\n"
+        "    def __init__(self, ys: list[int]) -> None:\n"
+        "        self.ys: list[int] = ys\n");
+}
+
+// A VALUE-LESS annotated form declares the member too (`self.ys: list[int]`
+// with no value is legal in a method body, and mypy-clean both to write and
+// to read back). The declaration must not be skipped on the no-value path.
+TEST(TypeChecker, AValuelessAnnotatedSelfAssignmentStillDeclaresTheAttribute) {
+    expect_clean(
+        "class Bag:\n"
+        "    def declare(self) -> None:\n"
+        "        self.ys: list[int]\n"
+        "    def total(self) -> int:\n"
+        "        return sum(self.ys)\n");
+}
+
+// The value is still CHECKED against the annotation, so declaring the member
+// did not cost the diagnostic that makes the annotated form worth writing.
+// mypy reports `List item 0 has incompatible type "str"; expected "int"` for
+// exactly this program, and the per-item rule is what fires here too -- ONE
+// diagnostic, not the item error plus an assignment error on top.
+TEST(TypeChecker, AnAnnotatedSelfAssignmentStillChecksItsValue) {
+    const Checked checked = check_module(
+        "class Bag:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.ys: list[int] = [\"s\"]\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "list item 0 has incompatible type \"str\"; expected \"int\"");
+    EXPECT_EQ(error.line, 3);
+}
+
+// An earlier PLAIN self.x assignment already declared the attribute, so the
+// annotation is a genuine second declaration. Verified against mypy 1.18.1:
+// mypy rejects EVERY program of this shape -- `Attribute "x" already defined
+// on line 3` plus an assignment error, at the annotation's own line -- so
+// which of the two types is treated as the declared one is not observable
+// against mypy here, and this follows the class-body branch's direction (the
+// annotation is the declared type, the earlier inferred type is what is
+// checked against it) purely so the two branches agree.
+TEST(TypeChecker, AnAnnotationConflictingWithAnEarlierSelfAssignmentIsReported) {
+    const Checked checked = check_module(
+        "class Bag:\n"
+        "    def a(self) -> None:\n"
+        "        self.x = 5\n"
+        "    def b(self) -> None:\n"
+        "        self.x: str = \"s\"\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 5) << "reported at the annotation, which is where mypy reports too";
+}
+
+// The ORDER THAT IS ACTUALLY MYPY-CLEAN (verified 1.18.1, unlike the
+// annotation-second shape above): annotate first, then plainly assign a
+// subtype. int into a float attribute must not report, which is what stops
+// the comparison above from becoming a false positive on this program.
+TEST(TypeChecker, APlainSelfAssignmentOfASubtypeAfterAnAnnotationIsClean) {
+    expect_clean(
+        "class Bag:\n"
+        "    def a(self) -> None:\n"
+        "        self.n: float = 1.5\n"
+        "    def b(self) -> None:\n"
+        "        self.n = 5\n"
+        "b = Bag()\n"
+        "f: float = b.n\n");
+}
+
+// THE GUARD, and the reason self_attribute_receiver_type resolves `self`
+// through ScopeStack rather than trusting the spelling: an unrelated NESTED
+// def whose own first parameter happens to be named `self` must NOT declare
+// a member on the enclosing class. mypy reports its own errors for this
+// program (a non-self attribute declaration, and `"int" has no attribute
+// "q"`), so the read below must still be attr-defined here -- a clean result
+// would mean the nested def had silently declared "q" on Bag.
+TEST(TypeChecker, AnAnnotatedAttributeOnAShadowedSelfDeclaresNothing) {
+    const Checked checked = check_module(
+        "class Bag:\n"
+        "    def outer(self) -> None:\n"
+        "        def inner(self: int) -> None:\n"
+        "            self.q: int = 1\n"
+        "    def read(self) -> int:\n"
+        "        return self.q\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(error.line, 6);
+}
+
+// An annotated attribute store on a NON-self receiver is unchanged: the
+// annotation is resolved for `expected`, nothing is declared, and the TARGET
+// is never typed -- so the store itself is silent (mypy reports two errors
+// for it: a non-self type declaration, and attr-defined). That silence is a
+// pre-existing MISSED error on this path, deliberately left alone; what this
+// test pins is that the store declared NOTHING, evidenced by the read below
+// it still being attr-defined. If the self.x branch ever stopped checking
+// the receiver, the read would come back clean instead.
+TEST(TypeChecker, AnAnnotatedAttributeOnANonSelfReceiverDeclaresNothing) {
+    const Checked checked = check_module(
+        "class Other:\n"
+        "    y: int\n"
+        "def f(o: Other) -> None:\n"
+        "    o.z: int = 3\n"
+        "def g(o: Other) -> int:\n"
+        "    return o.z\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Other\" has no attribute \"z\"");
+    EXPECT_EQ(error.line, 6) << "the READ reports; the annotated store itself stays silent";
+}
+
 // Reproduced against the built binary
 // before this fix: `class D: x = 5` then `d.x` reported a false "D has no
 // attribute x" -- only the AnnAssign path ever called declare_member; a bare

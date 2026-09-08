@@ -152,6 +152,35 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
         if (builtin_type_kind(name.identifier()).has_value()) {
             return Type::class_of("type");
         }
+        // N2, the exact mirror of the carve-out above for a USER class name
+        // used as a VALUE (`w = Widget`): mypy types that `type[Widget]` and
+        // says nothing, while we reported `name 'Widget' is not defined`.
+        // Class names are deliberately never bound into ScopeStack -- both
+        // type_of_attribute's class-object-receiver check and
+        // type_of_name_call's bare-`C()` constructor branch depend on a bare
+        // class name being ABSENT from it -- so a resolution miss is the
+        // NORMAL state for one, not evidence it does not exist. ClassTable is
+        // the sole source of truth, and is_class goes through
+        // ClassTable::canonical_name, so a function-local class reached by
+        // its scope-limited alias resolves here too.
+        //
+        // Class("type") for the same reason as the builtin case: this model
+        // has no `type[...]`, so the metaclass itself is the closest
+        // representable answer. `w = Widget` then `w()` lands on
+        // type_of_call_result's Class arm and reports NotImplementedError --
+        // a missed error, not a false one.
+        //
+        // Two things this deliberately does NOT do. It does not fire when a
+        // live scope binding of the same spelling exists (`def f(Widget: int)
+        // -> int: return Widget.bit_length()`), because resolve() comes back
+        // non-null there and control never enters this branch -- the check
+        // must stay INSIDE it. And it makes `w = Widget` written ABOVE
+        // `class Widget` silently clean, where mypy errors: classes are
+        // declared by a whole-module pre-pass with no line information here
+        // to order-check against. A missed error, accepted.
+        if (classes_.is_class(name.identifier())) {
+            return Type::class_of("type");
+        }
         return error(name, "NameError", "name '" + name.identifier() + "' is not defined");
     }
     // THE ORDERING RULE (Task 11): a read is order-checked only against a

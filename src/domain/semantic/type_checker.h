@@ -171,7 +171,12 @@ namespace cythonpp::domain::semantic {
 //     other "first assignment is sticky" rule in this file.
 //   - `self.x = ...` inside ANY method (not just __init__) -- handled in
 //     assign_attribute, checked BEFORE the ordinary read path so a brand-new
-//     attribute is not a false attr-defined miss.
+//     attribute is not a false attr-defined miss. The ANNOTATED form,
+//     `self.x: T = ...` (and the value-less `self.x: T`), declares the
+//     member the same way from visit(AnnAssign)'s Attribute-target branch,
+//     sharing assign_attribute's guard and line disambiguation verbatim; the
+//     annotation is the declared type there, where the plain form infers one
+//     from the value.
 //
 // ALL THREE of the above were once purely single-pass -- declared only when
 // TypeChecker's own visitation actually reached the declaring statement, in
@@ -436,8 +441,13 @@ private:
     // pre_collect_class_body runs over EVERY method's own body (If/While/For
     // recursed into, matching pre_bind_function_body's scope boundary -- a
     // nested def is NOT recursed into, since 'self' there may be shadowed or
-    // simply absent) looking for `self.x = ...` -- a plain Assign whose
-    // target is an Attribute on a bare Name spelled "self". The FIRST such
+    // simply absent) looking for `self.x = ...` -- a plain Assign OR an
+    // AnnAssign (`self.x: T = ...`, and the value-less `self.x: T` too)
+    // whose target is an Attribute on a bare Name spelled "self". The
+    // annotated form is NOT resolved here, deliberately: its placeholder is
+    // Unknown at its own line exactly like the plain form's, since resolving
+    // it would double-report a bad annotation and would also lose the
+    // declared-line disambiguator below. The FIRST such
     // occurrence for a given attribute name (in this same top-to-bottom scan
     // order) that names neither an existing member NOR an existing method is
     // placeholder-declared: Type::unknown(), at ITS OWN line. This is what
@@ -449,6 +459,23 @@ private:
     // up front) or a second, real conflicting assignment.
     void collect_self_attribute_placeholders(const std::string& qualified_name,
                                              const std::vector<ast::StmtPtr>& body);
+
+    // One statement's worth of the scan above, shared by its plain-Assign and
+    // its AnnAssign arm so the two forms cannot drift into recognising
+    // different sets of targets. A no-op unless `target` is an Attribute on a
+    // bare Name spelled "self" whose attribute name has neither a member nor
+    // a method already; otherwise declares Type::unknown() at `line`.
+    //
+    // Note this does NOT resolve `self` through ScopeStack the way
+    // self_attribute_receiver_type does -- it CANNOT, since no scope is
+    // pushed during a pre-pass. Its scope discipline is structural instead:
+    // collect_self_attribute_placeholders never recurses into a nested
+    // def/class, so the only `self` it can see is the enclosing method's own
+    // first parameter. The real walk re-checks the binding properly before
+    // filling any placeholder in, so a shadowed `self` still declares
+    // nothing real.
+    void declare_self_attribute_placeholder(const std::string& qualified_name,
+                                            const ast::Expr& target, int line);
 
     // Phase 2: resolve every top-level FunctionDef signature and every
     // module-level AnnAssign's annotation, binding each name into ScopeStack
@@ -550,6 +577,42 @@ private:
     // rule as assign_name) and an attribute store from OUTSIDE the class a
     // genuine attr-defined TypeError (the set is closed there).
     void assign_attribute(const ast::Attribute& target, const ast::Expr& value);
+
+    // THE `self.x` GUARD, in ONE place: the Class type `self` is bound to
+    // when `target` really is an attribute store on the enclosing class's
+    // own instance, and std::nullopt otherwise. Shared -- literally, not by
+    // a second copy -- by assign_attribute (plain `self.x = ...`) and
+    // visit(AnnAssign)'s Attribute-target branch (`self.x: T = ...`), which
+    // must agree on it exactly: any divergence would let one form declare a
+    // member the other refuses to, and the resulting attr-defined TypeError
+    // would depend on which form was written.
+    //
+    // Purely syntactic plus one ScopeStack::resolve (the receiver is never
+    // itself typed here, so this check alone can never report anything): the
+    // receiver must be a bare Name spelled "self" that currently resolves to
+    // Class(current_class_qualified_name_) -- i.e. we are really inside one
+    // of that class's own methods, not merely inside some unrelated nested
+    // function that happens to have a parameter also named "self" (`def
+    // inner(self: int) -> None: self.q = 1` must not declare "q" on the
+    // enclosing class; mypy reports its own attr-defined error there).
+    std::optional<Type> self_attribute_receiver_type(const ast::Attribute& target) const;
+
+    // Which of three states a `self.x` store's attribute name is in --
+    // pre_collect_class_body placeholder-declares (Unknown, at ITS OWN line)
+    // the first `self.x = ...` AND the first `self.x: T = ...` it finds
+    // scanning every method's body up front, so by the time this real,
+    // single-pass walk reaches ANY of them ClassTable already has an entry
+    // for practically every attribute and a bare "does a member/method exist
+    // already" test can no longer tell "brand new" from "this IS my own
+    // placeholder, fill it in". The declared LINE is the disambiguator,
+    // exactly like is_unfilled_placeholder's ScopeStack analogue.
+    //
+    // ExistingDeclaration covers BOTH a member declared at a DIFFERENT line
+    // (a genuine earlier, real assignment or annotation) and a same-name
+    // METHOD -- the two cases every caller handles the same way, by NOT
+    // treating the statement as this attribute's own first declaration.
+    enum class SelfMemberState { BrandNew, OwnPlaceholder, ExistingDeclaration };
+    SelfMemberState self_member_state(const std::string& attribute, int line) const;
 
     // The one place a Name target is bound or checked, for both a plain
     // Assign and each element of a tuple-unpacking Assign. See

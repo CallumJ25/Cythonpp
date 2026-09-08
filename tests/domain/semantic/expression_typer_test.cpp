@@ -146,6 +146,65 @@ TEST(ExpressionTyper, ALocalBindingNamedLikeABuiltinTypeWinsOverTheBuiltinPath) 
     EXPECT_EQ(typed_name("int", {{"int", Type::str()}}), "str");
 }
 
+// Carried defect N2: a USER CLASS name used as a VALUE (`w = Widget`) is
+// mypy-clean -- reveal_type(Widget) is `type[Widget]` -- but drew
+// `NameError: name 'Widget' is not defined`, because class names are
+// deliberately never bound into ScopeStack (two precedence checks depend on
+// their absence) so a resolution miss is a class name's NORMAL state.
+// Resolved through ClassTable to Class("type"), the exact mirror of the
+// builtin-type-name carve-out above.
+TEST(ExpressionTyper, ResolvesAUserClassNameUsedAsAValue) {
+    ClassTable table;
+    table.declare("Widget", {});
+
+    const Typed typed = type_expression("Widget", {}, Type::unknown(), &table);
+
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "expected no diagnostics, got "
+        << (typed.diagnostics.empty() ? "" : typed.diagnostics.front().message);
+    EXPECT_EQ(typed.printed, "type");
+}
+
+// PRECEDENCE HAZARD, pinned: a live SCOPE BINDING of the same spelling as a
+// class must still win -- `def f(Widget: int) -> int: return
+// Widget.bit_length()` types `Widget` as `int`, not as the class object.
+// This is what placing the carve-out INSIDE the `resolution.binding ==
+// nullptr` branch buys; hoisting it out would silently invert this.
+TEST(ExpressionTyper, ALocalBindingNamedLikeAClassWinsOverTheClassValuePath) {
+    ClassTable table;
+    table.declare("Widget", {});
+
+    const Typed typed = type_expression("Widget", {{"Widget", Type::int_()}}, Type::unknown(),
+                                        &table);
+
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "expected no diagnostics, got "
+        << (typed.diagnostics.empty() ? "" : typed.diagnostics.front().message);
+    EXPECT_EQ(typed.printed, "int");
+}
+
+// A name that is neither bound, nor a builtin type name, nor a class is
+// STILL a NameError -- the guard that the carve-out above did not simply
+// swallow the diagnostic for every unresolved name.
+TEST(ExpressionTyper, ANameThatIsNotAClassIsStillUndefined) {
+    ClassTable table;
+    table.declare("Widget", {});
+
+    const Typed typed = type_expression("Gadget", {}, Type::unknown(), &table);
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'Gadget' is not defined");
+}
+
+// Two NEIGHBOURING paths this carve-out must not disturb are pinned by
+// tests that already exist rather than by copies here, which would be
+// vacuous: a CALL on a bare class name goes through type_of_name_call, never
+// type_of_name (ConstructsAUserClass, below), and a SEEDED BUILTIN class
+// name -- range/int/list are all in ClassTable too -- still takes the
+// builtin-call arm (TypesTheSupportedBuiltinCalls, below). Neither routes a
+// callee through type_of_name, which is the only function this fix touched.
+
 TEST(ExpressionTyper, TypesArithmeticThroughTheRuleTable) {
     EXPECT_EQ(typed_name("1 + 2"), "int");
     EXPECT_EQ(typed_name("1 / 2"), "float") << "Python 3 true division";

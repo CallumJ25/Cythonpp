@@ -639,72 +639,70 @@ void TypeChecker::assign_subscript(const ast::Subscript& target, const ast::Expr
     }
 }
 
+std::optional<Type> TypeChecker::self_attribute_receiver_type(const ast::Attribute& target) const {
+    const auto* receiver = dynamic_cast<const ast::Name*>(&target.value());
+    if (receiver == nullptr || receiver->identifier() != "self" ||
+        current_class_qualified_name_.empty()) {
+        return std::nullopt;
+    }
+    const Resolution self_resolution = scopes_.resolve("self");
+    if (self_resolution.binding == nullptr ||
+        self_resolution.binding->type.kind != TypeKind::Class ||
+        self_resolution.binding->type.name != current_class_qualified_name_) {
+        return std::nullopt;
+    }
+    return self_resolution.binding->type;
+}
+
+TypeChecker::SelfMemberState TypeChecker::self_member_state(const std::string& attribute,
+                                                            int line) const {
+    if (classes_.method_type(current_class_qualified_name_, attribute).has_value()) {
+        return SelfMemberState::ExistingDeclaration;
+    }
+    const std::optional<int> existing_line =
+        classes_.member_declared_line(current_class_qualified_name_, attribute);
+    if (!existing_line.has_value()) {
+        // No member and no method at all -- an attribute
+        // pre_collect_class_body's scan could not see, e.g. one first
+        // assigned inside a nested def's own body.
+        return SelfMemberState::BrandNew;
+    }
+    return *existing_line == line ? SelfMemberState::OwnPlaceholder
+                                  : SelfMemberState::ExistingDeclaration;
+}
+
 void TypeChecker::assign_attribute(const ast::Attribute& target, const ast::Expr& value) {
     // THE TRAP's escape hatch (Task 19): `self.x = ...` inside a method
     // declares a NEW instance attribute the first time it is seen, checked
     // BEFORE the ordinary read-then-compare path below -- which would
     // otherwise call type_of_attribute on a member that does not exist YET
-    // and report a false attr-defined TypeError. Purely syntactic plus one
-    // ScopeStack::resolve (never itself typed, so this check alone can never
-    // report anything): the receiver must be a bare Name spelled "self" that
-    // currently resolves to Class(current_class_qualified_name_) -- i.e. we
-    // are really inside one of that class's own methods, not merely inside
-    // some unrelated nested function that happens to have a parameter also
-    // named "self".
-    //
-    // pre_collect_class_body now placeholder-declares
-    // (Unknown, at ITS OWN line) the first self.x = ... it finds scanning
-    // EVERY method's body up front, so by the time this real, single-pass
-    // walk reaches ANY self.x = ..., classes_.member_type already has_value()
-    // for practically every attribute -- the OLD "does a member/method
-    // already exist" test alone can no longer tell "brand new" apart from
-    // "this IS that very placeholder, fill it in for real". The declared
-    // LINE is the disambiguator, exactly like is_unfilled_placeholder's
-    // ScopeStack analogue: a member whose declared_line equals THIS
-    // statement's own line (and is not a method) is this statement's own
-    // placeholder; anything else -- no member/method at all (an attribute
-    // pre_collect_class_body's scan could not see, e.g. one first assigned
-    // inside a nested def's own body) or a member at a DIFFERENT line (a
-    // genuine earlier, real assignment) -- is handled below exactly as
-    // before.
-    if (const auto* receiver = dynamic_cast<const ast::Name*>(&target.value())) {
-        if (receiver->identifier() == "self" && !current_class_qualified_name_.empty()) {
-            const Resolution self_resolution = scopes_.resolve("self");
-            if (self_resolution.binding != nullptr &&
-                self_resolution.binding->type.kind == TypeKind::Class &&
-                self_resolution.binding->type.name == current_class_qualified_name_) {
-                const bool is_method_name =
-                    classes_.method_type(current_class_qualified_name_, target.attribute()).has_value();
-                const std::optional<int> existing_line =
-                    classes_.member_declared_line(current_class_qualified_name_, target.attribute());
-                const bool is_brand_new = !is_method_name && !existing_line.has_value();
-                const bool is_own_placeholder = !is_method_name && existing_line.has_value() &&
-                                                *existing_line == target.span().start_line;
-
-                if (is_brand_new || is_own_placeholder) {
-                    // Either the FIRST self.x = ... TypeChecker's own
-                    // visitation has reached for this name (in THIS class; a
-                    // base's member/method of the same name already fails
-                    // is_brand_new and falls through to the ordinary path
-                    // instead), or this exact statement's own placeholder
-                    // from pre_collect_class_body -- infer the type from the
-                    // value, exactly like an ordinary Name assignment, and
-                    // declare it (overwriting the Unknown placeholder, in the
-                    // latter case, with the real one). No comparison: there
-                    // is nothing REAL yet to compare against either way.
-                    const Type value_type = typer_.type_of(value, Type::unknown());
-                    classes_.declare_member(current_class_qualified_name_, target.attribute(), value_type,
-                                            target.span().start_line);
-                    // type_of_attribute never ran for `target`, so its TypeMap
-                    // entries would otherwise be missing -- recorded by hand,
-                    // matching type_of_attribute's own class-object-receiver
-                    // branch (expression_typer.cpp), which does the same for the
-                    // same reason.
-                    types_.insert(&target, value_type);
-                    types_.insert(receiver, self_resolution.binding->type);
-                    return;
-                }
-            }
+    // and report a false attr-defined TypeError. The guard itself lives in
+    // self_attribute_receiver_type and the three-way line disambiguation in
+    // self_member_state, both shared verbatim with visit(AnnAssign)'s
+    // `self.x: T = ...` branch -- see those two for the full mechanism.
+    if (const std::optional<Type> self_type = self_attribute_receiver_type(target)) {
+        const SelfMemberState state = self_member_state(target.attribute(), target.span().start_line);
+        if (state == SelfMemberState::BrandNew || state == SelfMemberState::OwnPlaceholder) {
+            // Either the FIRST self.x = ... TypeChecker's own visitation has
+            // reached for this name (in THIS class; a base's member/method of
+            // the same name is ExistingDeclaration instead and falls through
+            // to the ordinary path), or this exact statement's own
+            // placeholder from pre_collect_class_body -- infer the type from
+            // the value, exactly like an ordinary Name assignment, and
+            // declare it (overwriting the Unknown placeholder, in the latter
+            // case, with the real one). No comparison: there is nothing REAL
+            // yet to compare against either way.
+            const Type value_type = typer_.type_of(value, Type::unknown());
+            classes_.declare_member(current_class_qualified_name_, target.attribute(), value_type,
+                                    target.span().start_line);
+            // type_of_attribute never ran for `target`, so its TypeMap
+            // entries would otherwise be missing -- recorded by hand,
+            // matching type_of_attribute's own class-object-receiver
+            // branch (expression_typer.cpp), which does the same for the
+            // same reason.
+            types_.insert(&target, value_type);
+            types_.insert(&target.value(), *self_type);
+            return;
         }
     }
 
@@ -830,10 +828,88 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
             // outside this fix round's scope.
         }
     } else {
-        // A non-Name target (outside this task's tested scope): resolve the
-        // annotation for `expected` only, no binding.
+        // A non-Name target. The annotation is resolved EXACTLY ONCE here,
+        // for both cases below -- nothing on this path resolves it a second
+        // time, which is what keeps a bad annotation from double-reporting.
         AnnotationResolver resolver(classes_, sink_);
         info.type = resolver.resolve(node.annotation());
+
+        // N1: `self.x: T = ...` inside a method DECLARES the instance
+        // attribute, exactly like the plain `self.x = ...` form
+        // assign_attribute already handled. Without this branch the
+        // annotated form -- close to universal in typed Python -- declared
+        // NOTHING, so any later read of self.x was a false attr-defined
+        // TypeError on mypy-clean code. The guard and the three-way line
+        // disambiguation are assign_attribute's own, shared verbatim rather
+        // than copied (see self_attribute_receiver_type / self_member_state);
+        // Half B of the fix, pre_collect_class_body's AnnAssign arm being
+        // Half A, which is what makes a reader method sitting ABOVE the
+        // declaring one work too.
+        //
+        // Every other non-Name target (`xs[0]: int = 5`, `other.x: int = 5`)
+        // is unchanged: annotation resolved for `expected` only, no binding,
+        // and the shared value check below still runs.
+        const auto* target_attribute = dynamic_cast<const ast::Attribute*>(&node.target());
+        const std::optional<Type> self_type =
+            target_attribute != nullptr ? self_attribute_receiver_type(*target_attribute)
+                                        : std::nullopt;
+        if (self_type.has_value()) {
+            const int line = node.span().start_line;
+            const SelfMemberState state = self_member_state(target_attribute->attribute(), line);
+            // ExistingDeclaration ALSO covers a same-name METHOD, for which
+            // member_type is empty -- left unreported and undeclared here,
+            // matching the class-body AnnAssign branch above: a combined
+            // method+attribute namespace is a pre-existing gap.
+            const std::optional<Type> existing =
+                state == SelfMemberState::ExistingDeclaration
+                    ? classes_.member_type(current_class_qualified_name_,
+                                           target_attribute->attribute())
+                    : std::nullopt;
+            const bool method_name_collision =
+                state == SelfMemberState::ExistingDeclaration && !existing.has_value();
+            if (existing.has_value()) {
+                // A genuine EARLIER declaration (a `self.x = ...` in a method
+                // above, or a class-body annotation). Direction taken from
+                // the class-body branch above, unchanged: the ANNOTATION is
+                // the declared type and the earlier INFERRED type is the
+                // expression checked against it. Getting these two round the
+                // wrong way is a mistake this file has already made twice.
+                //
+                // Verified against mypy 1.18.1 that the direction is not
+                // observable HERE: mypy rejects every program that reaches
+                // this state through a METHOD annotation (`Attribute "n"
+                // already defined on line 3`, plus an assignment error, both
+                // at the annotation's own line) -- including the widening
+                // `self.n = 5` then `self.n: float = 1.5`, which this branch
+                // therefore accepts silently, a missed error and not a false
+                // one. The order mypy DOES accept is the reverse (annotate
+                // first, then plainly assign a subtype), and that one never
+                // reaches this branch at all: the annotation is the first
+                // occurrence, so it takes OwnPlaceholder below, and the plain
+                // assignment lands in assign_attribute's ordinary
+                // read-then-compare path.
+                if (info.type.kind != TypeKind::Unknown && existing->kind != TypeKind::Unknown &&
+                    !is_subtype(*existing, info.type, &classes_)) {
+                    report_incompatible_assignment(node, *existing, info.type, "variable");
+                }
+            }
+            if (!method_name_collision) {
+                // Brand new, this statement's own placeholder, or a genuine
+                // earlier declaration the annotation now overrides -- in all
+                // three the ANNOTATION becomes the declared type. Runs
+                // regardless of node.has_value(): `self.ys: list[int]` with
+                // no value is legal in a method body and still declares the
+                // member (verified mypy-clean, and a later read of it too).
+                classes_.declare_member(current_class_qualified_name_,
+                                        target_attribute->attribute(), info.type, line);
+            }
+            // type_of_attribute never ran for this target, so the two TypeMap
+            // entries it would have written are recorded by hand, exactly as
+            // assign_attribute does -- a missing entry is a visible hole in
+            // `--types` output and in the TypedPrinter tests.
+            types_.insert(target_attribute, info.type);
+            types_.insert(&target_attribute->value(), *self_type);
+        }
     }
 
     if (!node.has_value()) {
@@ -1371,20 +1447,56 @@ Type TypeChecker::resolve_method_signature(const ast::FunctionDef& method,
     return Type::callable(param_types, return_type, defaulted_param_count(params));
 }
 
+void TypeChecker::declare_self_attribute_placeholder(const std::string& qualified_name,
+                                                     const ast::Expr& target, int line) {
+    const auto* attribute = dynamic_cast<const ast::Attribute*>(&target);
+    if (attribute == nullptr) {
+        return;
+    }
+    const auto* receiver = dynamic_cast<const ast::Name*>(&attribute->value());
+    if (receiver == nullptr || receiver->identifier() != "self") {
+        return;
+    }
+    // The FIRST occurrence in this scan's own top-to-bottom order wins: a
+    // name that already has a member or a method is left alone, since
+    // declare_member has no collision detection of its own and declaring
+    // over it would silently re-type the attribute with zero diagnostics.
+    if (classes_.member_type(qualified_name, attribute->attribute()).has_value() ||
+        classes_.method_type(qualified_name, attribute->attribute()).has_value()) {
+        return;
+    }
+    classes_.declare_member(qualified_name, attribute->attribute(), Type::unknown(), line);
+}
+
 void TypeChecker::collect_self_attribute_placeholders(const std::string& qualified_name,
                                                        const std::vector<ast::StmtPtr>& body) {
     for (const ast::StmtPtr& statement : body) {
         if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
-            if (const auto* attribute = dynamic_cast<const ast::Attribute*>(&assign->target())) {
-                if (const auto* receiver = dynamic_cast<const ast::Name*>(&attribute->value())) {
-                    if (receiver->identifier() == "self" &&
-                        !classes_.member_type(qualified_name, attribute->attribute()).has_value() &&
-                        !classes_.method_type(qualified_name, attribute->attribute()).has_value()) {
-                        classes_.declare_member(qualified_name, attribute->attribute(), Type::unknown(),
-                                                assign->span().start_line);
-                    }
-                }
-            }
+            declare_self_attribute_placeholder(qualified_name, assign->target(),
+                                               assign->span().start_line);
+        } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
+            // N1, Half A: the ANNOTATED form, `self.x: T = ...` (and the
+            // value-less `self.x: T`), placeholder-declares through the exact
+            // same helper as the plain form above -- not a second copy of it,
+            // so the two forms cannot drift into recognising different sets
+            // of targets. Without this arm a reader method sitting ABOVE the
+            // declaring one was still a false attr-defined TypeError even
+            // with visit(AnnAssign)'s own branch (Half B) in place, because
+            // nothing had declared the attribute by the time the reader was
+            // walked.
+            //
+            // The annotation is deliberately NOT resolved here, for two
+            // reasons: resolving it would double-report a bad annotation
+            // (Half B resolves it again when the real walk reaches this
+            // statement), and an Unknown placeholder at this statement's own
+            // LINE is the disambiguator self_member_state needs to tell "this
+            // IS my own placeholder" from "a genuine earlier declaration".
+            // The cost is that a reader ABOVE the declarer sees Unknown
+            // rather than the annotated type -- precisely what the plain form
+            // already does, and Unknown is absorbing, so the worst case is a
+            // missed error, never a false one.
+            declare_self_attribute_placeholder(qualified_name, ann_assign->target(),
+                                               ann_assign->span().start_line);
         } else if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
             collect_self_attribute_placeholders(qualified_name, if_stmt->body());
             collect_self_attribute_placeholders(qualified_name, if_stmt->orelse());
