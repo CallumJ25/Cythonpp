@@ -183,16 +183,24 @@ void TypeChecker::scan_top_level_names(const ast::Module& module) {
     // definition there collides with a flat one exactly as two flat ones do.
     //
     // BUT ONLY WHEN A CLASS IS INVOLVED. Measured against mypy 1.18.1, all
-    // six arrangements:
+    // seven arrangements:
     //   flat def    + flat def           -> `Name "f" already defined` [no-redef]
     //   flat def    + def inside an if   -> Success
     //   def in if   + def in same if     -> Success
+    //   def in if   + flat def           -> `Name "f" already defined` [no-redef]
     //   flat class  + class inside an if -> `Name "Bag" already defined`
     //   class in if + class in else      -> `Name "Bag" already defined`
     //   flat def    + class inside an if -> `Name "Bag" already defined`
     // mypy allows a CONDITIONAL FUNCTION redefinition and allows no
-    // conditional class redefinition at all. So the collision fires when
-    // either definition is a class, or when both sit flat in the module body.
+    // conditional class redefinition at all -- but ONLY in the order
+    // "conditional first, flat second": `def in if + flat def` DOES collide
+    // under real mypy, yet this rule stays silent on it too, since only the
+    // FIRST occurrence's `at_flat_top_level` is ever recorded and it is
+    // false. That is a deliberately over-applied allowance -- it misses a
+    // real error in that one ordering rather than risk a false one, the
+    // safe direction this pass exists to protect. So the collision fires
+    // when either definition is a class, or when both sit flat in the
+    // module body.
     // Reporting every def/def pair this recursion now reaches would be a
     // false TypeError on mypy-clean code -- the exact invariant this pass
     // exists to protect -- which is why the kind and the flatness are both
@@ -271,6 +279,8 @@ void TypeChecker::collect_classes(const ast::Module& module) {
                 // redefinition; declaring it anyway would silently overwrite
                 // the WINNING same-named class's ClassTable entry, since
                 // declare() has no collision detection of its own.
+                // collect_signatures already skips a collided FunctionDef for
+                // the identical reason.
                 return;
             }
             declare_class_recursive(*class_def, "", all_classes);
@@ -844,15 +854,18 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
         // reference to a class still works: Phase 1 already declared every
         // top-level class before Phase 3 (this walk) ever started.
         //
-        // A DIRECT class-body AnnAssign was already resolved
-        // once by pre_collect_class_body's own eager pass -- reuse that
-        // cached Type via bind_resolved_annotation (the scope-bind half of
+        // A class-body AnnAssign, whether flat or NESTED inside an
+        // if/while/for (pre_collect_class_body recurses control flow just as
+        // this walk does), was already resolved once by
+        // pre_collect_class_body's own eager pass -- reuse that cached Type
+        // via bind_resolved_annotation (the scope-bind half of
         // bind_annotation) rather than invoking AnnotationResolver a second
-        // time, which would double-report a bad annotation. One NESTED
-        // inside an if/for within the class body (pre_collect_class_body
-        // only scans the body directly, matching its own documented
-        // simplification) is not in the cache and falls to the ordinary,
-        // un-cached bind_annotation exactly as before.
+        // time. The cache is what keeps a bad annotation from being reported
+        // TWICE for the nested case: without it, this fallback would call
+        // the un-cached bind_annotation and re-resolve (and re-report) the
+        // same annotation pre_collect_class_body's pass already reported.
+        // Verified: `class C:` / `    if FLAG:` / `        x: Nope = 1`
+        // (with FLAG bound) draws exactly one NameError for "Nope", not two.
         const auto cached_annotation = class_body_annotation_types_.find(&node);
         info = cached_annotation != class_body_annotation_types_.end()
                    ? bind_resolved_annotation(*target_name, cached_annotation->second,

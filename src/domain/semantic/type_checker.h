@@ -265,18 +265,23 @@ private:
     // scope and every later use of it is clean, with no "possibly undefined"
     // complaint.
     //
-    // THE BOUNDARY, and it is the OPPOSITE of
-    // collect_self_attribute_placeholders' one, which is why the two
-    // recursions look alike and must not be merged: that scan must NOT reach
-    // into a nested ClassDef/FunctionDef, because `self` there may be
-    // shadowed or simply absent. This walk must reach a ClassDef/FunctionDef
-    // that SITS inside an `if` (same enclosing scope, so its name really does
-    // bind here), but must still never descend INTO a ClassDef's or
-    // FunctionDef's own body: a class declared in a `def` is function-local,
-    // owned by visit(ClassDef)'s isolated-name and scoped-alias mechanism,
-    // and declaring it from here would leak it to the whole module. A class
+    // THE BOUNDARY: this walk reaches a ClassDef/FunctionDef that SITS inside
+    // an `if`/`while`/`for` (same enclosing scope, so its name really does
+    // bind here), but never descends INTO a ClassDef's or FunctionDef's own
+    // body -- a class declared in a `def` is function-local, owned by
+    // visit(ClassDef)'s isolated-name and scoped-alias mechanism, and
+    // declaring it from here would leak it to the whole module. A class
     // body's own nested classes are reached by declare_class_recursive
     // instead, which calls back into this function per class body.
+    //
+    // collect_self_attribute_placeholders has the SAME boundary (it recurses
+    // If/While/For, never a nested ClassDef/FunctionDef, for the analogous
+    // reason that `self` there may be shadowed or simply absent) and so
+    // could be re-expressed in terms of this walk -- a simplification worth
+    // naming, though not one taken here, so that a maintainer adding a new
+    // compound statement node knows both walks encode the same rule and must
+    // both change together, rather than believing they differ and updating
+    // only one.
     //
     // `visitor` is invoked for every statement in `body` and in every nested
     // control-flow block, in source order, INCLUDING the If/While/For
@@ -306,19 +311,23 @@ private:
     //
     // RECURSED THROUGH CONTROL FLOW (see for_each_flat_statement) -- BUT ONLY
     // A CLASS ON EITHER SIDE COLLIDES WITH A CONDITIONAL DEFINITION. Measured
-    // against mypy 1.18.1, all six arrangements:
+    // against mypy 1.18.1, all seven arrangements:
     //   flat def    + flat def           -> `Name "f" already defined` [no-redef]
     //   flat def    + def inside an if   -> Success
     //   def in if   + def in same if     -> Success
+    //   def in if   + flat def           -> `Name "f" already defined` [no-redef]
     //   flat class  + class inside an if -> `Name "Bag" already defined`
     //   class in if + class in else      -> `Name "Bag" already defined`
     //   flat def    + class inside an if -> `Name "Bag" already defined`
-    // mypy allows a CONDITIONAL FUNCTION redefinition and allows no
-    // conditional class redefinition at all. So the collision fires when
-    // either definition is a class, or when both sit flat in the module (or
-    // class) body -- see TopLevelDefinition and the function's own body for
-    // why the kind and the flatness are both recorded rather than just the
-    // line.
+    // mypy allows a CONDITIONAL FUNCTION redefinition, but ONLY ONE order --
+    // "def in if + flat def" DOES collide, and this rule stays silent there
+    // too, since only the first occurrence's flatness is recorded; a
+    // deliberately over-applied, missed-error-not-false-error allowance (see
+    // scan_top_level_names' own comment). mypy also allows no conditional
+    // class redefinition at all. So the collision fires when either
+    // definition is a class, or when both sit flat in the module body -- see
+    // TopLevelDefinition and the function's own body for why the kind
+    // and the flatness are both recorded rather than just the line.
     void scan_top_level_names(const ast::Module& module);
 
     // Phase 1: declare every top-level ClassDef's name and bases into
