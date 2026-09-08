@@ -121,6 +121,31 @@ TEST(ExpressionTyper, ReportsAnUnboundName) {
     EXPECT_EQ(typed.printed, "Unknown") << "a failed lookup must yield Unknown";
 }
 
+// Corpus defect 2 (2026-09-07): `x: type = int` is mypy-clean
+// (reveal_type(int) is `type[int]`), but a bare builtin type name used as a
+// VALUE (not an annotation, not a call) resolved through nothing but
+// ScopeStack, which never holds these names, so this drew a false
+// `NameError: name 'int' is not defined`. Option (a) from the fix brief:
+// resolved to Class("type") instead, the closest representable stand-in
+// since this model has no type[...].
+TEST(ExpressionTyper, ResolvesABareBuiltinTypeNameAsAValue) {
+    const Typed typed = type_expression("int");
+
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "expected no diagnostics, got "
+        << (typed.diagnostics.empty() ? "" : typed.diagnostics.front().message);
+    EXPECT_EQ(typed.printed, "type");
+}
+
+// PRECEDENCE, pinned explicitly per the fix brief: a live SCOPE BINDING of
+// the same spelling as a builtin type name must win over the builtin-type-
+// name-as-value path -- `def f(int: str) -> None: print(int)` types `int` as
+// `str`, not as Class("type"). Simulated here the same way every other
+// shadowing test in this file does, via the bindings map.
+TEST(ExpressionTyper, ALocalBindingNamedLikeABuiltinTypeWinsOverTheBuiltinPath) {
+    EXPECT_EQ(typed_name("int", {{"int", Type::str()}}), "str");
+}
+
 TEST(ExpressionTyper, TypesArithmeticThroughTheRuleTable) {
     EXPECT_EQ(typed_name("1 + 2"), "int");
     EXPECT_EQ(typed_name("1 / 2"), "float") << "Python 3 true division";
@@ -1069,6 +1094,62 @@ TEST(ExpressionTyper, TypesAListComprehension) {
     EXPECT_EQ(typed_name("[s for s in \"abc\"]"), "list[str]");
     EXPECT_EQ(typed_name("[k for k in d]", {{"d", Type::dict_of(Type::str(), Type::int_())}}),
              "list[str]") << "iterating a dict yields its keys";
+}
+
+// Corpus defect 1 (2026-09-07): a list comprehension's element expression
+// reading its OWN loop variable (`[v * v for v in values]`, nearly every real
+// comprehension) is mypy-clean but drew a false `NameError: name 'v' is used
+// before definition` -- TWICE, once per occurrence of `v` -- because the
+// comprehension target's Binding never set order_exempt. This is the THIRD
+// site needing that flag (see Binding::order_exempt's own comment: function
+// parameters were the first, a `for` target the second).
+//
+// type_expression()/typed_name() cannot exercise this: the shared harness
+// never calls ExpressionTyper::set_statement_line, so statement_line_ stays
+// at its inert default (std::numeric_limits<int>::max()) and the ordering
+// check this bug lives in can never fire -- exactly why
+// TypesAListComprehension above, whose element is a bare `i`, passed even
+// with the bug present, and exactly why no existing unit test caught this
+// before the corpus did. This test builds the pipeline by hand instead, so
+// it can call set_statement_line(1) itself, mirroring what TypeChecker does
+// for every real statement. `values` is bound at declared_line=0 -- an
+// earlier, real line -- rather than through the bindings map (which pins
+// declared_line=1, indistinguishable from a same-line binding for this
+// check), so the test isolates the comprehension target's own exemption
+// rather than accidentally tripping the ordering check on `values` too.
+TEST(ExpressionTyper, AListComprehensionMayReadItsOwnTarget) {
+    const std::string source = "[v * v for v in values]\n";
+    lexer::Lexer lexer(source);
+    const lexer::TokenStream lexed(lexer.tokenize());
+
+    diagnostics::DiagnosticSink parse_sink;
+    lexer::TokenStream tokens = lexer::IndentationPass().run(lexed, parse_sink);
+    const std::unique_ptr<ast::Module> module =
+        parser::StatementParser(tokens, parse_sink).parse_module();
+    ASSERT_TRUE(parse_sink.empty()) << "fixture must parse cleanly";
+    ASSERT_EQ(module->body().size(), 1u) << "fixture must be one statement";
+
+    const auto* statement = dynamic_cast<const ast::ExprStmt*>(module->body().front().get());
+    ASSERT_NE(statement, nullptr) << "fixture must be an expression statement";
+
+    ScopeStack scopes;
+    Binding values_binding;
+    values_binding.type = Type::list_of(Type::int_());
+    values_binding.declared_line = 0;
+    scopes.bind("values", values_binding);
+
+    ClassTable classes;
+    TypeMap types;
+    diagnostics::DiagnosticSink sink;
+    ExpressionTyper typer(scopes, classes, types, sink);
+    typer.set_statement_line(1);
+
+    const Type result = typer.type_of(statement->value(), Type::unknown());
+
+    EXPECT_TRUE(sink.diagnostics().empty())
+        << "expected no diagnostics, got "
+        << (sink.diagnostics().empty() ? "" : sink.diagnostics().front().message);
+    EXPECT_EQ(type_name(result), "list[int]");
 }
 
 // Verified against mypy 1.18.1: `xs = [i for i in [1, 2]]` then `print(i)`

@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "builtin_type_names.h"
 #include "domain/ast/source_span.h"
 #include "domain/lexer/keyword_table.h"
 #include "domain/lexer/operator_table.h"
@@ -129,6 +130,28 @@ Type ExpressionTyper::type_of_constant(const ast::Constant& constant, bool negat
 Type ExpressionTyper::type_of_name(const ast::Name& name) {
     const Resolution resolution = scopes_.resolve(name.identifier());
     if (resolution.binding == nullptr) {
+        // Defect 2: a bare BUILTIN TYPE NAME used as a VALUE (`x: type = int`)
+        // is mypy-clean -- reveal_type(int) is `type[int]`. ScopeStack never
+        // holds these names (nothing binds `int` itself), so a plain
+        // resolution miss would otherwise fall straight into the NameError
+        // below on some of the most ordinary code there is. The model has no
+        // `type[...]` to reach for, so this resolves to the metaclass itself,
+        // Class("type") -- a seeded builtin class (builtin_class_table.h) --
+        // which is the closest representable answer: `x: type = int`
+        // type-checks cleanly against it, and calling the result through
+        // (`y = int` then `y(5)`) lands on type_of_call_result's Class arm and
+        // reports NotImplementedError, a missed error rather than a false
+        // one, preserving the hard invariant.
+        //
+        // Checked ONLY inside this `resolution.binding == nullptr` branch: a
+        // live SCOPE BINDING of the same spelling (`def f(int: str) -> None:
+        // print(int)`) makes resolve() come back non-null, so control never
+        // enters this branch at all and falls through instead to the
+        // ordinary binding-typed return below -- a parameter or local named
+        // `int` still wins, exactly as it must.
+        if (builtin_type_kind(name.identifier()).has_value()) {
+            return Type::class_of("type");
+        }
         return error(name, "NameError", "name '" + name.identifier() + "' is not defined");
     }
     // THE ORDERING RULE (Task 11): a read is order-checked only against a
@@ -581,6 +604,18 @@ Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
             Binding binding;
             binding.type = element_type_value;
             binding.declared_line = target_span.start_line;
+            // order_exempt=true: the THIRD site needing this exemption (see
+            // Binding::order_exempt's own comment -- function parameters were
+            // the first, a `for` target the second). A comprehension target
+            // is bound here, before the element expression and every later
+            // clause's iterable/condition are ever typed, so a same-line read
+            // of it (`[v * v for v in values]`, all on one line) can never be
+            // a genuine use-before-definition. Without this, the ordinary
+            // `declared_line >= statement_line_` check misfires on nearly
+            // every list comprehension, since a comprehension's target,
+            // element and enclosing statement are overwhelmingly written on
+            // one line.
+            binding.order_exempt = true;
             scopes_.bind(name_target->identifier(), binding);
         }
         // Every other assignable target shape (Attribute, Subscript) binds
