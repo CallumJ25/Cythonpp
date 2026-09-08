@@ -410,7 +410,18 @@ TEST(ClassTable, AScopedAliasOutranksALiveEntryUnderTheSameSpelling) {
     EXPECT_EQ(table.declare_scoped_alias("L", "<local-class>#5#L"), std::nullopt);
     EXPECT_EQ(table.canonical_name("L"), "<local-class>#5#L");
     EXPECT_EQ(table.member_type("L", "b"), Type::str());
-    EXPECT_EQ(table.member_type("L", "a"), std::nullopt);
+    // Task 19 fix round 4: `a` lives on the SHADOWED entry, and the lookup
+    // through the alias MISSES it -- but rather than concluding the
+    // attribute does not exist, the query falls back to the shadowed entry
+    // and finds it. Round 3 asserted nullopt here, which is precisely the
+    // false attr-defined this round removes: a `Class("L")` resolved OUTSIDE
+    // the function re-canonicalises to the LOCAL class inside it, so
+    // "misses through the alias" and "does not exist" are not the same
+    // question. See ClassTable::shadowed_name.
+    EXPECT_EQ(table.member_type("L", "a"), Type::int_());
+    // constructor_type gets NO fallback: it must keep constructing the
+    // LOCAL class, or a shadowed __init__'s parameters would make the
+    // mypy-clean bare `L()` a false "too few arguments".
     EXPECT_EQ(type_name(table.constructor_type("L")),
               type_name(Type::callable({}, Type::class_of("<local-class>#5#L"))));
 
@@ -459,6 +470,59 @@ TEST(ClassTable, AScopedAliasDoesNotDisturbThePermanentBuiltinAliases) {
     // reach into the permanent map.
     table.remove_scoped_alias("EnvironmentError");
     EXPECT_EQ(table.canonical_name("EnvironmentError"), "OSError");
+}
+
+// Task 19 fix round 4. The miss-fallback engages ONLY where the scoped alias
+// actually shadows something. A function-local class whose name collides
+// with no other class shadows nothing, so a genuine attribute miss on it
+// stays a miss -- the attr-defined check must still be able to fire.
+//
+// HONEST LABEL: this is a BOUNDARY PIN, not a defect-detector. It passes
+// against the pre-round-4 code by construction (there was no fallback at
+// all), and no neutering of shadowed_name breaks it either, because with
+// nothing declared under the bare spelling there is nothing for any
+// fallback to find. Its value is documenting the intended boundary against
+// a FUTURE implementation that widens the fallback (e.g. into a scan of
+// every entry). The discriminating tests for this round are
+// TypeChecker.AModuleLevelTypedValueKeepsItsOwnClassInsideAShadowingFunction
+// and TypeChecker.AShadowedClassesConstructorParametersDoNotReachTheLocalClass.
+TEST(ClassTable, AScopedAliasShadowingNothingKeepsAGenuineMemberMissAMiss) {
+    ClassTable table;
+    table.declare("<local-class>#2#Local", {});
+    table.declare_member("<local-class>#2#Local", "x", Type::int_(), 3);
+    table.declare_scoped_alias("Local", "<local-class>#2#Local");
+
+    EXPECT_EQ(table.member_type("Local", "x"), Type::int_());
+    EXPECT_EQ(table.member_type("Local", "nope"), std::nullopt);
+    EXPECT_EQ(table.method_type("Local", "nope"), std::nullopt);
+    EXPECT_EQ(table.member_declared_line("Local", "nope"), std::nullopt);
+    EXPECT_FALSE(table.inherits_builtin("Local"));
+}
+
+// The fallback reaches METHODS and inherits_builtin too, not only plain
+// members -- all four are read by the SAME attribute-access arm
+// (expression_typer.cpp), so a fallback in one and not the others would
+// leave the false attr-defined reachable through whichever was missed.
+// inherits_builtin in particular gates the "inherits an unmodelled builtin"
+// carve-out, and `true` there only ever SUPPRESSES a diagnostic.
+TEST(ClassTable, TheScopedAliasFallbackCoversMethodsAndBuiltinInheritance) {
+    ClassTable table;
+    table.declare("L", {"list"});
+    table.declare_method("L", "b", Type::callable({Type::class_of("L")}, Type::int_()));
+    table.declare_member("L", "a", Type::str(), 2);
+    table.declare("<local-class>#5#L", {});
+    table.declare_scoped_alias("L", "<local-class>#5#L");
+
+    EXPECT_FALSE(table.is_class("nope"));
+    EXPECT_EQ(table.method_type("L", "b"),
+              Type::callable({Type::class_of("L")}, Type::int_()));
+    EXPECT_EQ(table.member_declared_line("L", "a"), 2);
+    EXPECT_TRUE(table.inherits_builtin("L"));
+
+    // bases_of is NOT part of the fallback: the isolated entry exists with
+    // an empty base list, and that empty answer is legitimate rather than a
+    // miss, so it must not be replaced by the shadowed class's bases.
+    EXPECT_TRUE(table.bases_of("L").empty());
 }
 
 } // namespace

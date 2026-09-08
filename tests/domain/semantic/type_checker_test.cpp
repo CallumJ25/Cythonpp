@@ -886,6 +886,68 @@ TEST(TypeChecker, AFunctionLocalClassShadowsASameNamedModuleLevelClass) {
         "    y: int = v.b\n");
 }
 
+// Fix round 4, THE open critical. Round 3's two shadowing tests each used
+// only ONE of the two same-named classes inside the function -- the local one
+// (above) or the module one (below) -- so neither covered the shape where
+// BOTH are live at the same point: a value whose type was resolved OUTSIDE
+// the function, used INSIDE it, while a local `class L` shadows the name.
+//
+// A `Class` Type carries a NAME STRING that is re-canonicalised at every
+// use, so `obj`'s type -- bare `Class("L")`, canonicalised in Phase 2 before
+// any alias existed -- re-resolved to the LOCAL class the moment it was read
+// inside `f`, and `obj.b()` was a FALSE `"L" has no attribute "b"`. Both
+// programs here are `Success: no issues found` under real mypy 1.18.1.
+//
+// Closed by ClassTable::shadowed_name: a MISS through a scoped alias retries
+// against the entry that alias shadows instead of concluding the attribute
+// does not exist. See that function's own comment for why the four
+// membership queries take the fallback and constructor_type must not.
+TEST(TypeChecker, AModuleLevelTypedValueKeepsItsOwnClassInsideAShadowingFunction) {
+    expect_clean(
+        "class L:\n"
+        "    def b(self) -> int:\n"
+        "        return 1\n"
+        "obj = L()\n"
+        "def f() -> None:\n"
+        "    class L:\n"
+        "        pass\n"
+        "    y: int = obj.b()\n");
+}
+
+// The same defect reached through an ANNOTATION rather than an inferred
+// module-level binding: `p: L` is resolved by AnnotationResolver in Phase 2,
+// long before `f`'s body walk installs the scoped alias, so the parameter's
+// type is likewise a bare `Class("L")` that re-canonicalises to the local
+// class. Also mypy-clean.
+TEST(TypeChecker, AParameterAnnotatedWithAModuleLevelClassSurvivesAShadowingLocalClass) {
+    expect_clean(
+        "class L:\n"
+        "    def b(self) -> int:\n"
+        "        return 1\n"
+        "def f(p: L) -> None:\n"
+        "    class L:\n"
+        "        pass\n"
+        "    y: int = p.b()\n");
+}
+
+// The regression guard for the ONE query deliberately excluded from the
+// fallback. Had constructor_type taken it, the shadowed `L.__init__`'s
+// parameter list would have become the local `L`'s, making this mypy-clean
+// program a false "too few arguments" -- a NEW false positive, i.e. exactly
+// what this round exists to remove. The bare `L()` inside `f` must keep
+// constructing the LOCAL class, which takes no arguments.
+TEST(TypeChecker, AShadowedClassesConstructorParametersDoNotReachTheLocalClass) {
+    expect_clean(
+        "class L:\n"
+        "    def __init__(self, a: int) -> None:\n"
+        "        self.a = a\n"
+        "def f() -> None:\n"
+        "    class L:\n"
+        "        pass\n"
+        "    v = L()\n"
+        "    print(v)\n");
+}
+
 // Fix round 2, Finding B (the reviewer's own second repro): a function-local
 // class's bare name must NOT leak into ClassTable as a permanently live
 // entry for the REST of the module's Phase-3 walk. Before that fix,

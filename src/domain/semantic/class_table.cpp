@@ -78,6 +78,28 @@ std::optional<std::string> ClassTable::declare_scoped_alias(std::string alias,
 
 void ClassTable::remove_scoped_alias(const std::string& alias) { scoped_aliases_.erase(alias); }
 
+std::optional<std::string> ClassTable::shadowed_name(const std::string& name) const {
+    if (scoped_aliases_.find(name) == scoped_aliases_.end()) {
+        // Not scope-aliased, so canonical_name did not re-route this lookup
+        // and there is nothing for a fallback to mean.
+        return std::nullopt;
+    }
+    // Deliberately NOT the previous SCOPED target (declare_scoped_alias's own
+    // return value): what a function-local `class L` shadows is almost always
+    // the module-level entry under the exact spelling -- canonical_name's step
+    // (2) -- and there was no previous scoped alias at all in that case.
+    if (classes_.find(name) != classes_.end()) {
+        return name;
+    }
+    const auto it = aliases_.find(name);
+    if (it != aliases_.end()) {
+        return it->second;
+    }
+    // Scope-aliased but shadowing NOTHING: the ordinary function-local class
+    // whose name collides with no other class. Unchanged behaviour.
+    return std::nullopt;
+}
+
 const ClassTable::Entry* ClassTable::find_entry(const std::string& name) const {
     const auto it = classes_.find(canonical_name(name));
     return it == classes_.end() ? nullptr : &it->second;
@@ -118,10 +140,8 @@ void ClassTable::declare_method(const std::string& qualified_name, std::string m
 
 std::optional<Type> ClassTable::member_type(const std::string& qualified_name,
                                             const std::string& member) const {
-    std::vector<std::string> visited;
-    return walk_chain<Type>(
-        qualified_name, visited,
-        [&member](const std::string&, const Entry& entry) -> std::optional<Type> {
+    return query_chain<Type>(
+        qualified_name, [&member](const std::string&, const Entry& entry) -> std::optional<Type> {
             const auto it = entry.members.find(member);
             if (it == entry.members.end()) {
                 return std::nullopt;
@@ -132,10 +152,12 @@ std::optional<Type> ClassTable::member_type(const std::string& qualified_name,
 
 std::optional<int> ClassTable::member_declared_line(const std::string& qualified_name,
                                                     const std::string& member) const {
-    std::vector<std::string> visited;
-    return walk_chain<int>(
-        qualified_name, visited,
-        [&member](const std::string&, const Entry& entry) -> std::optional<int> {
+    // Shares member_type's fallback deliberately: a caller gates on this
+    // having a value and then dereferences member_type (type_checker.cpp's
+    // class-body placeholder disambiguation), so the two must miss and hit
+    // in lockstep or that dereference is on an empty optional.
+    return query_chain<int>(
+        qualified_name, [&member](const std::string&, const Entry& entry) -> std::optional<int> {
             const auto it = entry.members.find(member);
             if (it == entry.members.end()) {
                 return std::nullopt;
@@ -146,10 +168,8 @@ std::optional<int> ClassTable::member_declared_line(const std::string& qualified
 
 std::optional<Type> ClassTable::method_type(const std::string& qualified_name,
                                             const std::string& method) const {
-    std::vector<std::string> visited;
-    return walk_chain<Type>(
-        qualified_name, visited,
-        [&method](const std::string&, const Entry& entry) -> std::optional<Type> {
+    return query_chain<Type>(
+        qualified_name, [&method](const std::string&, const Entry& entry) -> std::optional<Type> {
             const auto it = entry.methods.find(method);
             if (it == entry.methods.end()) {
                 return std::nullopt;
@@ -193,10 +213,12 @@ Type ClassTable::constructor_type(const std::string& qualified_name) const {
 }
 
 bool ClassTable::inherits_builtin(const std::string& qualified_name) const {
-    std::vector<std::string> visited;
-    const std::optional<bool> found = walk_chain<bool>(
-        qualified_name, visited,
-        [](const std::string& canonical, const Entry&) -> std::optional<bool> {
+    // Fallback included: nullopt here means "no builtin in this chain", which
+    // is exactly the miss that lets the attr-defined check fire. Effectively
+    // an OR across the local class and the one it shadows, and `true` only
+    // ever SUPPRESSES a diagnostic, so this direction cannot manufacture one.
+    const std::optional<bool> found = query_chain<bool>(
+        qualified_name, [](const std::string& canonical, const Entry&) -> std::optional<bool> {
             // object is excluded deliberately: every class conceptually
             // derives from it, and is_subtype already treats Object as the
             // top of the lattice, so counting it here would make every
