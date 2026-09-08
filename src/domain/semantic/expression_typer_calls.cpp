@@ -11,6 +11,7 @@
 // still had to land in it.
 #include "expression_typer.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -242,6 +243,16 @@ Type ExpressionTyper::type_of_positional_call(const Type& callable, const ast::C
     }
     const std::size_t param_count = callable.args.size() - 1;
     const Type& return_type = callable.args.back();
+    // How many arguments the caller MUST supply. A defaulted parameter may be
+    // omitted -- `def log(msg: str, level: int = 1) -> None` accepts
+    // `log("start")`, which mypy 1.18.1 confirms is clean, and which this
+    // check used to reject as "too few arguments" because Type::callable
+    // carried no notion of an optional parameter at all. std::min rather than
+    // a bare subtraction: defaulted_params is a plain count and nothing in
+    // Type's own invariants bounds it by the parameter count, so an
+    // out-of-range value must clamp rather than underflow to SIZE_MAX and
+    // make every call "too few".
+    const std::size_t required_count = param_count - std::min(param_count, callable.defaulted_params);
 
     // Every argument is typed FIRST, unconditionally -- including an extra
     // one past param_count, which gets Type::unknown() as its own context --
@@ -257,8 +268,8 @@ Type ExpressionTyper::type_of_positional_call(const Type& callable, const ast::C
     if (arg_exprs.size() > param_count) {
         return error(call, "TypeError", "too many arguments for " + label);
     }
-    if (arg_exprs.size() < param_count) {
-        // Fix round 1, Finding 2 (IMPORTANT): mypy names the missing
+    if (arg_exprs.size() < required_count) {
+        // mypy names the missing
         // PARAMETER ('Missing positional argument "b" in call to "f"'), but
         // Type carries no parameter names (see type.h -- Callable's args are
         // types only), so there is no "b" to recover -- that constraint is
@@ -271,14 +282,21 @@ Type ExpressionTyper::type_of_positional_call(const Type& callable, const ast::C
         return error(call, "TypeError", "too few arguments for " + label);
     }
 
-    // Arity matches exactly: each argument is checked against its own
-    // parameter type, is_subtype (never operator==) so a subclass or a
-    // wider numeric rank is accepted. A mismatch is its own diagnostic --
-    // N bad arguments is N diagnostics, matching the per-item list/dict
-    // rule -- numbered from the FIRST USER argument; self is never counted,
-    // since it was already dropped (or never added) before `callable`
-    // reached this function.
-    for (std::size_t index = 0; index < param_count; ++index) {
+    // Arity is now known good: between required_count and param_count
+    // inclusive. Each SUPPLIED argument is checked against its own parameter
+    // type, is_subtype (never operator==) so a subclass or a wider numeric
+    // rank is accepted. A mismatch is its own diagnostic -- N bad arguments
+    // is N diagnostics, matching the per-item list/dict rule -- numbered from
+    // the FIRST USER argument; self is never counted, since it was already
+    // dropped (or never added) before `callable` reached this function.
+    //
+    // The bound is arg_types.size(), NOT param_count: with a defaulted
+    // parameter omitted the two differ, and indexing arg_types[index] up to
+    // param_count would read past the end. An omitted parameter's default was
+    // already checked against its annotation at the `def` itself
+    // (type_checker.cpp's FunctionDef arm), so there is nothing to check for
+    // it here.
+    for (std::size_t index = 0; index < arg_types.size(); ++index) {
         const Type& expected_param = callable.args[index];
         if (!is_subtype(arg_types[index], expected_param, &classes_)) {
             error(*arg_exprs[index], "TypeError",

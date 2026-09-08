@@ -144,10 +144,35 @@ private:
     // not-yet-written statement checker never does -- so routing `C` through
     // the ordinary type_of()/type_of_name() path would report a false
     // NameError on mypy-clean code (verified: `C.x` and `C.m` are both
-    // mypy-clean). A qualified nested-class receiver (`Outer.Inner.x`) is out
-    // of scope: its own receiver is an Attribute, not a Name, so it falls
-    // through to the ordinary path and reports rather than guesses.
+    // mypy-clean). That check is now recursive over the whole dotted chain,
+    // so a qualified nested-class receiver (`Outer.Inner.x`, `A.B.C`) is
+    // handled too -- see class_object_receiver.
     Type type_of_attribute(const ast::Attribute& attribute);
+
+    // The qualified class name a receiver expression denotes as a CLASS
+    // OBJECT -- "Outer" for `Outer`, "Outer.Inner" for `Outer.Inner` -- or an
+    // empty string when the expression is not a chain of plain names ending
+    // in a known class.
+    //
+    // Recursive over the chain, which is what makes nested classes work at
+    // any depth. `x = Outer.Inner` and `A.B.C()` were both a false
+    // `"Outer" has no attribute "Inner"` TypeError before this existed: the
+    // one-segment version only recognised a bare-Name receiver, so the
+    // SECOND segment fell into type_of_class_attribute, which looks only at
+    // members and methods and has no notion of a nested class.
+    //
+    // PRECEDENCE is checked at the ROOT only, and it must stay there: a
+    // local binding of the same name as a class wins (`def f(Widget: int)`
+    // makes `Widget` an int parameter, not the class), so the root name is
+    // rejected outright when scopes_ resolves it. Later segments are
+    // attribute names, which no scope can bind.
+    //
+    // SIDE EFFECT, deliberately: every node in the chain it accepts gets its
+    // TypeMap entry recorded here, by hand. That is the whole reason this
+    // path exists -- typing those nodes through type_of() would consult
+    // ScopeStack and report the false NameError -- so the recording cannot
+    // be left to the caller.
+    std::string class_object_receiver(const ast::Expr& expr);
 
     // The Class-receiver half of type_of_attribute, split out because it
     // alone has more than one case: a member (declared or inherited) wins,

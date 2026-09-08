@@ -1,5 +1,6 @@
 #include "domain/semantic/class_table.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <utility>
 
@@ -199,6 +200,14 @@ Type ClassTable::constructor_type(const std::string& qualified_name) const {
         });
 
     std::vector<Type> params;
+    // Carried over from __init__'s own signature: `self` never has a default,
+    // so stripping it changes the parameter COUNT but not how many of the
+    // trailing ones are optional. Without this, `class G:` with
+    // `def __init__(self, name: str = "world")` would make `G()` a false
+    // "too few arguments" -- the constructor is the one signature in this
+    // file that is rebuilt rather than handed back as stored, so it is also
+    // the one place the count could be silently lost.
+    std::size_t defaulted = 0;
     if (init.has_value()) {
         // init->args is [self, param..., return], return last. Strip both
         // ends: self is not a caller-supplied argument, and the return is
@@ -208,8 +217,9 @@ Type ClassTable::constructor_type(const std::string& qualified_name) const {
         for (std::size_t i = 1; i + 1 < init->args.size(); ++i) {
             params.push_back(init->args[i]);
         }
+        defaulted = std::min(init->defaulted_params, params.size());
     }
-    return Type::callable(std::move(params), Type::class_of(resolved));
+    return Type::callable(std::move(params), Type::class_of(resolved), defaulted);
 }
 
 bool ClassTable::inherits_builtin(const std::string& qualified_name) const {

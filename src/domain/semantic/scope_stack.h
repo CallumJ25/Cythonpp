@@ -74,12 +74,17 @@ struct Resolution {
 };
 
 // A pure data structure modelling Python's lexical scoping for name
-// resolution. From a Function or Comprehension scope, resolution searches
-// self, then enclosing Function/Comprehension scopes SKIPPING every Class
-// scope, then the Module scope. A Class scope itself (i.e. when the current
-// scope IS a Class, such as evaluating a class body) searches outward
-// without skipping -- only method bodies skip class scopes, not the other
-// way round.
+// resolution. Resolution searches the current scope, then every enclosing
+// Function/Comprehension scope, then the Module scope, SKIPPING every
+// enclosing Class scope on the way -- whatever kind the current scope is.
+//
+// The skip is a property of the scope being READ, not of the reader: a class
+// body's names are visible only to the code lexically in that same body.
+// That covers the familiar case (a method body cannot see its class body's
+// names) and the less familiar one it used to get wrong (a class nested in a
+// class cannot see the OUTER class body's names either). The current scope is
+// resolved before the outward walk begins, so a class body still sees its own
+// names.
 class ScopeStack {
 public:
     ScopeStack();                       // pushes the Module scope

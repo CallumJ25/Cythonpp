@@ -39,18 +39,26 @@ Resolution ScopeStack::resolve(const std::string& name) const {
         return result;
     }
 
-    // Class-scope skipping only applies when the search originates from a
-    // Function or Comprehension: those are the scopes whose bodies genuinely
-    // cannot see an enclosing class body's names. A Class scope searching
-    // outward (evaluating a class body) does not skip anything -- only
-    // method bodies skip class scopes, not the other way round.
-    const bool skip_class_scopes =
-        current.kind == ScopeKind::Function || current.kind == ScopeKind::Comprehension;
-
+    // EVERY class scope in the outward walk is skipped, whatever kind the
+    // reader's own scope is. Python's rule is about the class scope being
+    // read, not about who is reading it: a class body is visible only to the
+    // code lexically inside that same body, never to anything nested within
+    // it. The reader's OWN scope is already handled above, before this loop
+    // ever runs, so keying on `current.kind` here bought nothing and was
+    // wrong in one direction -- a class nested in a class then saw the outer
+    // class body's names, which neither mypy nor CPython allows:
+    //
+    //   class C1:
+    //       x: int = 1
+    //       class C2:
+    //           y: int = x     # mypy: Name "x" is not defined
+    //
+    // Verified against mypy 1.18.1 and CPython 3.14: mypy reports
+    // name-defined and CPython raises NameError at class-creation time.
     for (std::size_t i = scopes_.size() - 1; i > 0;) {
         --i;
         const Scope& scope = scopes_[i];
-        if (skip_class_scopes && scope.kind == ScopeKind::Class) {
+        if (scope.kind == ScopeKind::Class) {
             continue;
         }
         const auto found = scope.bindings.find(name);

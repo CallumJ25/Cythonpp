@@ -200,6 +200,16 @@ std::vector<std::string> TypeChecker::base_names(const std::vector<ast::ExprPtr>
     return names;
 }
 
+std::size_t TypeChecker::defaulted_param_count(const std::vector<ast::Parameter>& params) {
+    std::size_t count = 0;
+    for (const ast::Parameter& parameter : params) {
+        if (parameter.default_value != nullptr) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 void TypeChecker::collect_classes(const ast::Module& module) {
     std::vector<const ast::ClassDef*> all_classes;
     for (const ast::StmtPtr& statement : module.body()) {
@@ -299,7 +309,8 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
             // visit(FunctionDef) can reuse this exact resolution rather than
             // calling AnnotationResolver a second time on the same
             // annotations (see top_level_signatures_'s own comment).
-            const Type signature_type = Type::callable(params, return_type);
+            const Type signature_type = Type::callable(params, return_type,
+                                                       defaulted_param_count(function_def->params()));
             top_level_signatures_.emplace(function_def, signature_type);
             // Fix round 1, Finding 2: the bool `bind` returns MUST be
             // checked -- `bind` itself has no sink and never reported
@@ -996,7 +1007,8 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         // into ScopeStack: see the class-level comment on why a class's (and
         // now a method's) own name must not be.
         classes_.declare_method(current_class_qualified_name_, node.name(),
-                                Type::callable(param_types, return_type));
+                                Type::callable(param_types, return_type,
+                                               defaulted_param_count(params)));
     }
 
     // Verified against mypy 1.18.1, and contradicting Spec 5a: __init__ does
@@ -1047,7 +1059,8 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // is that placeholder's one real fill-in, mirroring assign_name's own
     // "still-unfilled placeholder" pattern.
     if (!is_method && scopes_.current_kind() == ScopeKind::Function) {
-        const Type signature_type = Type::callable(param_types, return_type);
+        const Type signature_type =
+            Type::callable(param_types, return_type, defaulted_param_count(params));
         const Binding signature{signature_type, def_line, /*annotated=*/true};
         if (scopes_.bound_in_current_scope(node.name())) {
             const Resolution existing = scopes_.resolve(node.name());
@@ -1357,7 +1370,7 @@ Type TypeChecker::resolve_method_signature(const ast::FunctionDef& method,
     }
     const Type return_type = method.has_return_annotation() ? resolver.resolve(method.return_annotation())
                                                              : Type::unknown();
-    return Type::callable(param_types, return_type);
+    return Type::callable(param_types, return_type, defaulted_param_count(params));
 }
 
 void TypeChecker::collect_self_attribute_placeholders(const std::string& qualified_name,
@@ -1509,7 +1522,25 @@ void TypeChecker::visit(const ast::Return& node) {
         return;
     }
     if (current_return_type_.kind == TypeKind::NoneType) {
-        report(node, "TypeError", "no return value expected");
+        // A value is PRESENT, but that alone is not the error -- returning a
+        // None-VALUED expression from a `-> None` function is ordinary,
+        // mypy-clean Python:
+        //
+        //   def maybe(x: int) -> None:
+        //       if x < 0:
+        //           return None      # mypy-clean
+        //   def forward(x: int) -> None:
+        //       return g()           # mypy-clean, where g() -> None
+        //
+        // Verified against mypy 1.18.1: both are accepted, and only a
+        // non-None value ("return 5") draws mypy's "No return value
+        // expected". So the value's TYPE decides, exactly as it does for
+        // every other declared return type below. Unknown is absorbing here
+        // as everywhere: the root cause already reported.
+        if (value_type.kind != TypeKind::Unknown &&
+            !is_subtype(value_type, Type::none(), &classes_)) {
+            report(node, "TypeError", "no return value expected");
+        }
         return;
     }
     if (value_type.kind != TypeKind::Unknown &&

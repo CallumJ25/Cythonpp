@@ -1,6 +1,7 @@
 #ifndef CYTHONPP_DOMAIN_SEMANTIC_TYPE_H
 #define CYTHONPP_DOMAIN_SEMANTIC_TYPE_H
 
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -46,6 +47,29 @@ struct Type {
     // arbitrary and a reader must not have to guess.
     std::vector<Type> args;
 
+    // Only meaningful for TypeKind::Callable: how many of the TRAILING
+    // parameters have a default value, so the number a caller must actually
+    // supply is (args.size() - 1) - defaulted_params. Zero otherwise, which
+    // is also the honest answer for a signature with no defaults, so there is
+    // no sentinel to get wrong -- a Callable built without saying anything
+    // about defaults simply requires all of its parameters.
+    //
+    // It lives HERE, inside the signature, rather than beside it in a
+    // Binding field or a ClassTable side map, because a signature Type is
+    // copied around constantly and every copy needs the same answer:
+    // `g = log` rebinds log's Callable under a new name, `c.m` erases args[0]
+    // to bind self, and ClassTable::constructor_type rebuilds __init__'s
+    // signature minus self. Each of those would have to remember to carry a
+    // separate field across, and the arity check is exactly the place where
+    // forgetting produces a FALSE TypeError on mypy-clean code. Carried by
+    // the value itself, it cannot be dropped by omission.
+    //
+    // Compared by operator==: two signatures over the same types that differ
+    // in how many arguments a caller may omit are genuinely different
+    // signatures. is_subtype deliberately ignores it (see
+    // type_compatibility.cpp's Callable arm).
+    std::size_t defaulted_params = 0;
+
     static Type unknown() { return Type{}; }
     static Type none() { return of(TypeKind::NoneType); }
     static Type bool_() { return of(TypeKind::Bool); }
@@ -74,9 +98,16 @@ struct Type {
     }
 
     // Parameters then the return type, matching the `args` convention above.
-    static Type callable(std::vector<Type> params, Type result) {
+    // `defaulted` is how many of the trailing parameters have a default (see
+    // defaulted_params); omitting it means every parameter is required, which
+    // is the right reading both for a signature that genuinely has no
+    // defaults and for a `Callable[[int], str]` annotation, where the
+    // spelling itself cannot express an optional parameter.
+    static Type callable(std::vector<Type> params, Type result, std::size_t defaulted = 0) {
         params.push_back(std::move(result));
-        return parametric(TypeKind::Callable, std::move(params));
+        Type type = parametric(TypeKind::Callable, std::move(params));
+        type.defaulted_params = defaulted;
+        return type;
     }
 
     static Type class_of(std::string name) {
@@ -121,7 +152,8 @@ private:
 // mutual membership. Compatibility -- the thing callers actually ask about --
 // does not care about order. This is for tests and for map keys.
 inline bool operator==(const Type& left, const Type& right) {
-    return left.kind == right.kind && left.name == right.name && left.args == right.args;
+    return left.kind == right.kind && left.name == right.name && left.args == right.args &&
+           left.defaulted_params == right.defaulted_params;
 }
 
 inline bool operator!=(const Type& left, const Type& right) { return !(left == right); }

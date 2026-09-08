@@ -499,6 +499,15 @@ private:
     // matters once something walks the base chain looking for it.
     static std::vector<std::string> base_names(const std::vector<ast::ExprPtr>& bases);
 
+    // How many of `params` carry a default value, for Type::callable's
+    // `defaulted` argument -- the count a call site needs in order NOT to
+    // report "too few arguments" for a call that legitimately omits them.
+    // Counted from the END: Python's grammar already guarantees defaulted
+    // parameters are trailing, so a plain count is the trailing count, and
+    // this is the ONE place the AST's Parameter::default_value is turned
+    // into that number, so no signature producer can compute it differently.
+    static std::size_t defaulted_param_count(const std::vector<ast::Parameter>& params);
+
     // Resolves `annotation` and attempts to bind `target` into the CURRENT
     // scope with it (annotated = true). If the name is already bound there,
     // reports the settled redefinition wording and returns

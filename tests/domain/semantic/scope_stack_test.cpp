@@ -108,8 +108,9 @@ TEST(ScopeStack, AMethodBodyStillSeesModuleGlobals) {
     EXPECT_EQ(scopes.resolve("g").binding->type, Type::str());
 }
 
-// A class body DOES see enclosing scopes -- only method bodies skip class
-// scopes, not the other way round.
+// A class body sees enclosing FUNCTION and MODULE scopes. (It does not see an
+// enclosing CLASS scope -- see the test below, which is the case this one
+// used to be wrongly generalised into.)
 TEST(ScopeStack, AClassBodySeesEnclosingScopes) {
     ScopeStack scopes;
     scopes.bind("g", at(Type::int_(), 1));
@@ -117,6 +118,43 @@ TEST(ScopeStack, AClassBodySeesEnclosingScopes) {
 
     ASSERT_NE(scopes.resolve("g").binding, nullptr);
     EXPECT_FALSE(scopes.resolve("g").in_own_scope);
+}
+
+// THE SAME RULE, FROM THE OTHER SIDE. The skip is a property of the scope
+// being READ, not of the reader: an OUTER class body is invisible to a class
+// nested inside it, exactly as it is to a method.
+//
+//   class C1:
+//       x: int = 1
+//       class C2:
+//           y: int = x     # mypy: Name "x" is not defined
+//
+// Verified against mypy 1.18.1 (name-defined) and CPython 3.14 (NameError at
+// class-creation time). This used to resolve, because the skip was derived
+// from the CURRENT scope's kind -- Class, so no skipping -- which made the
+// missed error invisible to every existing test. The current scope is
+// resolved before the outward walk, so keying on it bought nothing.
+TEST(ScopeStack, AClassBodyDoesNotSeeAnEnclosingClassBody) {
+    ScopeStack scopes;
+    scopes.push(ScopeKind::Class);
+    scopes.bind("x", at(Type::int_(), 2));
+    scopes.push(ScopeKind::Class);
+
+    EXPECT_EQ(scopes.resolve("x").binding, nullptr) << "the outer class scope must be skipped";
+}
+
+// And through TWO enclosing class scopes to the module, so the walk does not
+// stop at the first skip.
+TEST(ScopeStack, ANestedClassBodyStillSeesModuleGlobalsThroughTwoClassScopes) {
+    ScopeStack scopes;
+    scopes.bind("g", at(Type::str(), 1));
+    scopes.push(ScopeKind::Class);
+    scopes.bind("shadowed", at(Type::int_(), 2));
+    scopes.push(ScopeKind::Class);
+
+    ASSERT_NE(scopes.resolve("g").binding, nullptr);
+    EXPECT_EQ(scopes.resolve("g").binding->type, Type::str());
+    EXPECT_EQ(scopes.resolve("shadowed").binding, nullptr);
 }
 
 // Verified: a comprehension's loop variable does not leak, at module or

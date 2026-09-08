@@ -169,5 +169,31 @@ TEST(Type, IsCopyableUnlikeAnAstNode) {
     EXPECT_EQ(copy, original);
 }
 
+// A Callable remembers how many of its trailing parameters are optional, so
+// the arity check at a call site can tell `def f(a: int, b: int = 1)` (one
+// required argument) from `def f(a: int, b: int)` (two). Nothing else about
+// the two signatures differs, which is exactly why the count has to live on
+// the Type and be part of its identity.
+TEST(Type, ACallableRemembersItsDefaultedParameterCount) {
+    const Type no_defaults = Type::callable({Type::int_(), Type::int_()}, Type::none());
+    const Type one_default = Type::callable({Type::int_(), Type::int_()}, Type::none(), 1);
+
+    EXPECT_EQ(no_defaults.defaulted_params, 0u);
+    EXPECT_EQ(one_default.defaulted_params, 1u);
+    EXPECT_NE(no_defaults, one_default);
+    EXPECT_EQ(one_default.args.size(), 3u) << "params then the return, return last";
+    EXPECT_EQ(one_default.args.back(), Type::none());
+}
+
+// Omitting the argument means "every parameter is required", which is the
+// right reading for a signature with no defaults AND for a
+// `Callable[[int], str]` annotation, whose spelling cannot express an
+// optional parameter at all.
+TEST(Type, ACallableWithoutADefaultedCountRequiresEveryParameter) {
+    EXPECT_EQ(Type::callable({Type::int_()}, Type::str()).defaulted_params, 0u);
+    EXPECT_EQ(Type::unknown().defaulted_params, 0u);
+    EXPECT_EQ(Type::list_of(Type::int_()).defaulted_params, 0u);
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

@@ -408,16 +408,31 @@ Type ExpressionTyper::type_of_attribute(const ast::Attribute& attribute) {
     // and this whole branch would never fire, turning every `C.x` into
     // whatever the ordinary value path does with a class-valued binding.
     // Revisit this check at that point.
-    if (const auto* receiver_name = dynamic_cast<const ast::Name*>(&attribute.value())) {
-        if (classes_.is_class(receiver_name->identifier()) &&
-            scopes_.resolve(receiver_name->identifier()).binding == nullptr) {
-            const Type class_type = Type::class_of(receiver_name->identifier());
-            // Recorded by hand, not through type_of(), since type_of_name()
-            // -- which would consult ScopeStack and report NameError -- is
-            // exactly the path being avoided here.
-            types_.insert(receiver_name, class_type);
-            return type_of_class_attribute(class_type, attribute, /*bind_self=*/false);
+    const std::string receiver_class = class_object_receiver(attribute.value());
+    if (!receiver_class.empty()) {
+        // A NESTED CLASS reached through its enclosing one: `Outer.Inner`,
+        // `A.B.C`. ClassTable keys a nested class by its qualified name, so
+        // this is a single is_class() question. Checked BEFORE
+        // type_of_class_attribute, which searches members and methods only
+        // and would report `"Outer" has no attribute "Inner"` -- a false
+        // TypeError, since `x = Outer.Inner` is mypy-clean (mypy reveals
+        // `type[Outer.Inner]`).
+        //
+        // The answer is the CONSTRUCTOR's type, matching what
+        // type_of_name_call already chose for a bare `C` used as a callee:
+        // this model has no `type[...]`, and the constructor is the closest
+        // representable reading -- `Outer.Inner()` then constructs correctly
+        // through the ordinary Call arm at any nesting depth. The cost is a
+        // missed error, never a false one: `Outer.Inner.v` (a method reached
+        // through two class objects) becomes an attribute access on a
+        // Callable, which reports NotImplementedError rather than mypy's
+        // real answer.
+        const std::string qualified = receiver_class + "." + attribute.attribute();
+        if (classes_.is_class(qualified)) {
+            return classes_.constructor_type(qualified);
         }
+        return type_of_class_attribute(Type::class_of(receiver_class), attribute,
+                                       /*bind_self=*/false);
     }
 
     const Type receiver = type_of(attribute.value(), Type::unknown());
@@ -465,6 +480,42 @@ Type ExpressionTyper::type_of_attribute(const ast::Attribute& attribute) {
     return Type::unknown();
 }
 
+std::string ExpressionTyper::class_object_receiver(const ast::Expr& expr) {
+    if (const auto* name = dynamic_cast<const ast::Name*>(&expr)) {
+        // THE ROOT, and the one place the shadowing check belongs: a live
+        // scope binding of this spelling means the expression is an ordinary
+        // value, not a class object.
+        if (!classes_.is_class(name->identifier()) ||
+            scopes_.resolve(name->identifier()).binding != nullptr) {
+            return {};
+        }
+        types_.insert(name, Type::class_of(name->identifier()));
+        return name->identifier();
+    }
+    if (const auto* attribute = dynamic_cast<const ast::Attribute*>(&expr)) {
+        const std::string prefix = class_object_receiver(attribute->value());
+        if (prefix.empty()) {
+            return {};
+        }
+        const std::string qualified = prefix + "." + attribute->attribute();
+        if (!classes_.is_class(qualified)) {
+            // The prefix is a class object but this segment is not a nested
+            // class -- e.g. `Outer.count` or `Outer.method`. Not a
+            // class-object chain, so the CALLER (type_of_attribute) resolves
+            // it as an ordinary class attribute instead. The prefix's own
+            // TypeMap entries are already recorded above and stay: they are
+            // correct either way, and are exactly what the caller would
+            // otherwise have to record for itself.
+            return {};
+        }
+        types_.insert(attribute, Type::class_of(qualified));
+        return qualified;
+    }
+    // Any other expression shape (a call, a subscript, a literal) is an
+    // ordinary value: only a chain of plain names can spell a class object.
+    return {};
+}
+
 Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::Attribute& attribute,
                                               bool bind_self) {
     // member_type and method_type are TWO SEPARATE ClassTable queries --
@@ -502,6 +553,12 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
         // this Attribute must NOT drop args[0] again -- it is already bound.
         Type bound = *method;
         bound.args.erase(bound.args.begin());
+        // defaulted_params is deliberately left alone: `self` never carries a
+        // default, so dropping it changes the parameter count but not how
+        // many of the trailing parameters are optional. That is exactly why
+        // the count lives on the Type -- `c.greet()` on
+        // `def greet(self, punct: str = "!")` stays clean through this
+        // erase with nothing to remember to carry across.
         return bound;
     }
     // A class may define __getattr__ to make ARBITRARY attribute access

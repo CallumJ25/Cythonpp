@@ -382,8 +382,85 @@ TEST(TypeChecker, AWrongTypedDefaultIsReportedAtTheDefLine) {
     EXPECT_EQ(error.line, 1);
 }
 
-TEST(TypeChecker, ACompatibleDefaultIsClean) {
+// EXTENDED. This test used to only DEFINE `def f(x: int = 5)` and never call
+// it, which is why the arity check ignoring defaults entirely had zero
+// coverage: `Type::callable` carried no notion of an optional parameter, so
+// every call omitting one was "too few arguments for ..." -- a false
+// TypeError on about as ordinary a Python program as exists. The CALL is the
+// whole point of the test now.
+TEST(TypeChecker, ACompatibleDefaultIsCleanAndMayBeOmittedAtTheCall) {
     expect_clean("def f(x: int = 5) -> None:\n    pass\n");
+    expect_clean("def log(msg: str, level: int = 1) -> None:\n"
+                 "    print(msg)\n"
+                 "    print(level)\n"
+                 "\n"
+                 "\n"
+                 "log(\"start\")\n"
+                 "log(\"start\", 2)\n");
+}
+
+// A method's and a constructor's defaults, which travel by two different
+// routes -- the method signature is stored in ClassTable and has self erased
+// at the attribute access, the constructor is REBUILT by
+// ClassTable::constructor_type from __init__ minus self -- so a
+// defaulted-parameter count that survived one could still be dropped by the
+// other.
+TEST(TypeChecker, AMethodAndAConstructorDefaultMayBeOmittedAtTheCall) {
+    expect_clean("class G:\n"
+                 "    def __init__(self, name: str = \"world\") -> None:\n"
+                 "        self.name = name\n"
+                 "\n"
+                 "    def greet(self, punct: str = \"!\") -> str:\n"
+                 "        return self.name + punct\n"
+                 "\n"
+                 "\n"
+                 "g = G()\n"
+                 "print(g.greet())\n"
+                 "print(G(\"ann\").greet(\"?\"))\n");
+}
+
+// The other direction must NOT be lost: too MANY arguments is still an error,
+// and so is omitting a parameter that has no default. Verified against mypy
+// 1.18.1, which reports both.
+TEST(TypeChecker, DefaultsDoNotSilenceARealArityError) {
+    const Checked too_many =
+        check_module("def log(msg: str, level: int = 1) -> None:\n"
+                     "    print(msg)\n"
+                     "    print(level)\n"
+                     "\n"
+                     "\n"
+                     "log(\"a\", 2, 3)\n");
+    const diagnostics::Diagnostic too_many_error = only_error(too_many);
+    EXPECT_EQ(too_many_error.code, "TypeError");
+    EXPECT_EQ(too_many_error.message, "too many arguments for \"log\"");
+
+    const Checked too_few =
+        check_module("def log(msg: str, level: int = 1) -> None:\n"
+                     "    print(msg)\n"
+                     "    print(level)\n"
+                     "\n"
+                     "\n"
+                     "log()\n");
+    const diagnostics::Diagnostic too_few_error = only_error(too_few);
+    EXPECT_EQ(too_few_error.code, "TypeError");
+    EXPECT_EQ(too_few_error.message, "too few arguments for \"log\"");
+}
+
+// A SUPPLIED argument is still checked against its parameter even when that
+// parameter has a default -- the per-argument loop's bound changed with this
+// fix, so this is the case that would silently stop being checked.
+TEST(TypeChecker, ASuppliedArgumentForADefaultedParameterIsStillTypeChecked) {
+    const Checked checked =
+        check_module("def log(msg: str, level: int = 1) -> None:\n"
+                     "    print(msg)\n"
+                     "    print(level)\n"
+                     "\n"
+                     "\n"
+                     "log(\"a\", \"b\")\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "argument 2 to \"log\" has incompatible type \"str\"; expected \"int\"");
 }
 
 // Verified clean: module-level names are visible ahead of their definition
@@ -1138,6 +1215,83 @@ TEST(TypeChecker, DeclaresNestedClassesByQualifiedName) {
     expect_clean("class Outer:\n    class Inner:\n        pass\nx: Outer.Inner = Outer.Inner()\n");
 }
 
+// A nested class named but NOT called. Verified mypy-clean (`reveal_type` is
+// `type[Outer.Inner]`). This used to be `TypeError: "Outer" has no attribute
+// "Inner"`: only the CALL shape `Outer.Inner()` was special-cased, so a bare
+// reference fell into the member/method lookup, which has no notion of a
+// nested class.
+TEST(TypeChecker, ReferencingANestedClassWithoutCallingItIsClean) {
+    expect_clean("class Outer:\n"
+                 "    class Inner:\n"
+                 "        def v(self) -> int:\n"
+                 "            return 1\n"
+                 "\n"
+                 "\n"
+                 "x = Outer.Inner\n"
+                 "print(x)\n");
+}
+
+// Arbitrary nesting depth, both named and called: the class-object receiver
+// check is recursive over the whole dotted chain, so `A.B.C` needs no
+// per-depth special case. Verified mypy-clean.
+TEST(TypeChecker, ADeeplyNestedClassResolvesAndConstructs) {
+    expect_clean("class A:\n"
+                 "    class B:\n"
+                 "        class C:\n"
+                 "            def v(self) -> int:\n"
+                 "                return 1\n"
+                 "\n"
+                 "\n"
+                 "y = A.B.C()\n"
+                 "print(y.v())\n");
+}
+
+// A MEMBER reached through two class objects, which the same recursion makes
+// reachable: `Outer.Inner.count` resolves against Outer.Inner's members
+// rather than reporting that Outer has no attribute "Inner".
+TEST(TypeChecker, AMemberOfANestedClassResolvesThroughTheClassObjects) {
+    expect_clean("class Outer:\n"
+                 "    class Inner:\n"
+                 "        count: int = 0\n"
+                 "\n"
+                 "\n"
+                 "print(Outer.Inner.count)\n");
+}
+
+// PRECEDENCE, which the recursion must not break: a local binding of the
+// root name wins over the class-object reading, so the class-object path is
+// not taken and `Outer` is the int parameter it was declared as. Reported as
+// a modelling limit (attribute access on a builtin kind), never as a
+// class-object resolution.
+TEST(TypeChecker, ALocalBindingOfAClassNameStillWinsOverTheClassObjectPath) {
+    const Checked checked = check_module("class Outer:\n"
+                                         "    class Inner:\n"
+                                         "        pass\n"
+                                         "\n"
+                                         "\n"
+                                         "def f(Outer: int) -> None:\n"
+                                         "    print(Outer.Inner)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+}
+
+// The whole-module counterpart of ScopeStack's
+// AClassBodyDoesNotSeeAnEnclosingClassBody: an inner class body reading the
+// outer class body's name is a genuine NameError, which this checker used to
+// miss entirely. Verified against mypy 1.18.1 ("Name \"x\" is not defined")
+// and CPython 3.14, which raises NameError while creating the class.
+TEST(TypeChecker, ANestedClassBodyCannotReadTheEnclosingClassBody) {
+    const Checked checked = check_module("class C1:\n"
+                                         "    x: int = 1\n"
+                                         "\n"
+                                         "    class C2:\n"
+                                         "        y: int = x\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'x' is not defined");
+    EXPECT_EQ(error.line, 5);
+}
+
 // Verified: c.x = 5 from OUTSIDE the class is attr-defined. The attribute set
 // is closed at the class definition.
 TEST(TypeChecker, ReportsAssigningANewAttributeFromOutside) {
@@ -1307,6 +1461,60 @@ TEST(TypeChecker, ReportsIteratingANonIterable) {
     EXPECT_EQ(only_error(checked).code, "TypeError");
 }
 
+// A user class instance is NEVER a "not iterable" TypeError, in a `for` or in
+// a comprehension. Verified against mypy 1.18.1: the Bag/Counter pair below
+// is CLEAN with no import at all -- mypy matches __iter__/__next__
+// structurally -- so a TypeError here is a false positive on ordinary
+// mypy-clean Python. Reported as the modelling limit it is instead.
+TEST(TypeChecker, IteratingAUserClassInstanceIsUnsupportedNotAnError) {
+    const std::string source = "class Counter:\n"
+                               "    def __init__(self) -> None:\n"
+                               "        self.n = 0\n"
+                               "\n"
+                               "    def __next__(self) -> int:\n"
+                               "        self.n = self.n + 1\n"
+                               "        return self.n\n"
+                               "\n"
+                               "\n"
+                               "class Bag:\n"
+                               "    def __iter__(self) -> Counter:\n"
+                               "        return Counter()\n"
+                               "\n"
+                               "\n"
+                               "for v in Bag():\n"
+                               "    print(v)\n";
+    const Checked checked = check_module(source);
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "iterating an instance of a user-defined class is not supported");
+}
+
+TEST(TypeChecker, AComprehensionOverAUserClassInstanceIsUnsupportedNotAnError) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    pass\n"
+                                         "\n"
+                                         "\n"
+                                         "b = Bag()\n"
+                                         "xs = [v for v in b]\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "iterating an instance of a user-defined class is not supported");
+}
+
+// And where the inherited builtin pins the element type, the precise answer
+// comes through -- clean, with the element usable at that type. Verified
+// mypy-clean, revealing str for the `class Names(str)` case.
+TEST(TypeChecker, IteratingAClassThatInheritsABuiltinIsCleanAtTheInheritedElementType) {
+    expect_clean("class Names(str):\n"
+                 "    pass\n"
+                 "\n"
+                 "\n"
+                 "def f(names: Names) -> None:\n"
+                 "    for ch in names:\n"
+                 "        s: str = ch\n"
+                 "        print(s)\n");
+}
+
 // mypy ACCEPTS tuple targets, so this must be NotImplementedError.
 TEST(TypeChecker, ReportsATupleForTargetAsUnsupported) {
     const Checked checked = check_module("for a, b in [(1, 2)]:\n    pass\n");
@@ -1400,6 +1608,23 @@ TEST(TypeChecker, ReportsAValueReturnedFromANoneFunction) {
     const diagnostics::Diagnostic error = only_error(checked);
     EXPECT_EQ(error.code, "TypeError");
     EXPECT_EQ(error.message, "no return value expected");
+}
+
+// The counterpart the check above used to get wrong: a value is PRESENT, but
+// its type is None, and mypy 1.18.1 accepts both of these cleanly. The old
+// rule reported whenever a value existed at all, without ever looking at its
+// type, so `return None` -- an ordinary early exit -- was a false TypeError.
+TEST(TypeChecker, ReturningANoneValuedExpressionFromANoneFunctionIsClean) {
+    expect_clean("def maybe(x: int) -> None:\n"
+                 "    if x < 0:\n"
+                 "        return None\n"
+                 "    print(x)\n");
+    expect_clean("def g() -> None:\n"
+                 "    print(1)\n"
+                 "\n"
+                 "\n"
+                 "def forward() -> None:\n"
+                 "    return g()\n");
 }
 
 // Fix round 1, Finding 5: pins the full message text -- the one message this
