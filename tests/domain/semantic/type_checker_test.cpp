@@ -702,5 +702,39 @@ TEST(TypeChecker, ALosingClassRedefinitionDoesNotClobberTheWinningOnesMembers) {
     EXPECT_EQ(error.message, "name \"C\" already defined on line 1");
 }
 
+// Task 18 fix round 2 (the fourth call site the round-1 review missed).
+// bind_annotation handles a function-local AnnAssign target (visit(AnnAssign)
+// routes any non-module-level Name target here) and used to compare
+// `existing.binding->declared_line == line` directly, with no order_exempt
+// involvement -- so a same-line, order_exempt PARAMETER re-annotated with
+// `:` was mistaken for bind_annotation's own "still-unfilled placeholder"
+// case and silently REBOUND, discarding the parameter's real annotation with
+// zero diagnostics. Verified against mypy 1.18.1: re-annotating an existing
+// binding (parameter or otherwise) is `error: Name "x" already defined on
+// line 1`, the SAME redefinition wording every other same-line collision in
+// this file already uses -- not an assignment-error, since mypy reports the
+// redefinition alone. This pins the one-line form; the next test pins the
+// two-line form reports the identical thing.
+TEST(TypeChecker, AOneLineDefReannotatingItsOwnParameterIsARedefinition) {
+    const Checked checked = check_module("def f(x: int) -> None: x: str = \"s\"\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"x\" already defined on line 1");
+}
+
+// The two-line form takes bind_annotation's OTHER branch from the start
+// (existing.binding->declared_line == 1, the def's own line, is already !=
+// 2, the AnnAssign's own line, with no order_exempt involvement needed) --
+// this pins that it reports the SAME redefinition wording as the one-line
+// form above, so the two forms do not silently diverge.
+TEST(TypeChecker, AMultiLineDefReannotatingItsOwnParameterIsARedefinition) {
+    const Checked checked = check_module("def f(x: int) -> None:\n    x: str = \"s\"\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"x\" already defined on line 1");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

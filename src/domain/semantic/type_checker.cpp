@@ -304,7 +304,7 @@ TypeChecker::AnnotationBinding TypeChecker::bind_annotation(const ast::Name& tar
     AnnotationBinding info{type, false};
     if (scopes_.bound_in_current_scope(target.identifier())) {
         const Resolution existing = scopes_.resolve(target.identifier());
-        if (existing.binding->declared_line == line) {
+        if (is_unfilled_placeholder(*existing.binding, line)) {
             // Task 18: this exact statement's own still-unfilled placeholder
             // from pre_bind_function_body (a nested AnnAssign inside a
             // function body, placeholder-bound so an earlier same-scope
@@ -315,6 +315,15 @@ TypeChecker::AnnotationBinding TypeChecker::bind_annotation(const ast::Name& tar
             // collect_signatures binds the REAL type ahead of time instead),
             // so this branch is new surface area with no existing caller to
             // disturb.
+            //
+            // Fix round 2: routed through is_unfilled_placeholder (rather
+            // than the raw declared_line == line this used before) so an
+            // order_exempt PARAMETER binding is never mistaken for this
+            // function's own unfilled placeholder -- a same-line annotated
+            // re-assignment of a parameter (`def f(x: int) -> None:
+            // x: str = "s"`) must fall through to the redefinition report
+            // below, exactly like the multi-line form already does, instead
+            // of silently rebinding over the parameter's real annotation.
             scopes_.rebind(target.identifier(), Binding{type, line, /*annotated=*/true});
             return info;
         }
@@ -736,7 +745,17 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         const Binding signature{signature_type, def_line, /*annotated=*/true};
         if (scopes_.bound_in_current_scope(node.name())) {
             const Resolution existing = scopes_.resolve(node.name());
-            if (existing.binding->declared_line == def_line) {
+            // Fix round 2: routed through is_unfilled_placeholder for
+            // consistency with every other same-line-rebind site, though the
+            // order_exempt guard is unreachable here in practice -- an
+            // order_exempt binding is only ever a PARAMETER, whose
+            // declared_line is the ENCLOSING def's own header line, and a
+            // nested `def` (a compound statement) can never share that exact
+            // line: Python's grammar requires it to start its own indented
+            // statement line, never trail a `:` inline. Kept as the shared
+            // helper anyway rather than the raw comparison, so a future
+            // change to either rule only has one place to update.
+            if (is_unfilled_placeholder(*existing.binding, def_line)) {
                 scopes_.rebind(node.name(), signature);
             } else {
                 report(node, "TypeError",
