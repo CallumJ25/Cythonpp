@@ -1,6 +1,7 @@
 #include "type_checker.h"
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -189,6 +190,10 @@ void TypeChecker::collect_classes(const ast::Module& module) {
     // imported in this subset). Deferred until here (rather than folded into
     // declare_class_recursive) so a base naming a class declared LATER in the
     // same module, or in a different class's body, already resolves.
+    validate_class_bases(all_classes);
+}
+
+void TypeChecker::validate_class_bases(const std::vector<const ast::ClassDef*>& all_classes) {
     for (const ast::ClassDef* class_def : all_classes) {
         for (const ast::ExprPtr& base : class_def->bases()) {
             if (const auto* name = dynamic_cast<const ast::Name*>(base.get())) {
@@ -201,6 +206,19 @@ void TypeChecker::collect_classes(const ast::Module& module) {
             }
         }
     }
+}
+
+std::string TypeChecker::declare_isolated_class(const ast::ClassDef& node,
+                                                const std::string& qualified_name) {
+    classes_.declare(qualified_name, base_names(node.bases()));
+    std::vector<const ast::ClassDef*> all_classes{&node};
+    for (const ast::StmtPtr& statement : node.body()) {
+        if (const auto* nested = dynamic_cast<const ast::ClassDef*>(statement.get())) {
+            declare_class_recursive(*nested, qualified_name, all_classes);
+        }
+    }
+    validate_class_bases(all_classes);
+    return qualified_name;
 }
 
 void TypeChecker::declare_class_recursive(const ast::ClassDef& class_def,
@@ -334,7 +352,11 @@ void TypeChecker::pre_bind_function_body(const std::vector<ast::StmtPtr>& body) 
 TypeChecker::AnnotationBinding TypeChecker::bind_annotation(const ast::Name& target,
                                                             const ast::Expr& annotation, int line) {
     AnnotationResolver resolver(classes_, sink_);
-    Type type = resolver.resolve(annotation);
+    return bind_resolved_annotation(target, resolver.resolve(annotation), line);
+}
+
+TypeChecker::AnnotationBinding TypeChecker::bind_resolved_annotation(const ast::Name& target,
+                                                                      Type type, int line) {
     AnnotationBinding info{type, false};
     if (scopes_.bound_in_current_scope(target.identifier())) {
         const Resolution existing = scopes_.resolve(target.identifier());
@@ -419,6 +441,22 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
             report(*name, "TypeError", "need type annotation for \"" + name->identifier() + "\"");
         }
         assign_name(*name, value_type, line);
+        if (is_new_definition && scopes_.current_kind() == ScopeKind::Class) {
+            // Fix round 1, Finding 3: a plain class-body Assign (`class D:
+            // x = 5`) never declared an instance attribute at all before
+            // this -- only the AnnAssign path did. Declared on the FIRST
+            // real assignment only (is_new_definition, already computed
+            // above for the bare-empty-container check), matching every
+            // other "first assignment is sticky" rule in this checker --
+            // pre_collect_class_body may already have placeholder-declared
+            // this exact name as Unknown at this exact line (so a method
+            // ABOVE this statement reading self.x already sees it exists);
+            // this overwrites that placeholder with the real inferred type,
+            // the same fill-in pattern assign_attribute uses for its own
+            // placeholder.
+            classes_.declare_member(current_class_qualified_name_, name->identifier(), value_type,
+                                    line);
+        }
         return;
     }
     // Any other target shape is outside the supported subset; still type the
@@ -506,32 +544,59 @@ void TypeChecker::assign_attribute(const ast::Attribute& target, const ast::Expr
     // are really inside one of that class's own methods, not merely inside
     // some unrelated nested function that happens to have a parameter also
     // named "self".
+    //
+    // Fix round 1, Finding 1: pre_collect_class_body now placeholder-declares
+    // (Unknown, at ITS OWN line) the first self.x = ... it finds scanning
+    // EVERY method's body up front, so by the time this real, single-pass
+    // walk reaches ANY self.x = ..., classes_.member_type already has_value()
+    // for practically every attribute -- the OLD "does a member/method
+    // already exist" test alone can no longer tell "brand new" apart from
+    // "this IS that very placeholder, fill it in for real". The declared
+    // LINE is the disambiguator, exactly like is_unfilled_placeholder's
+    // ScopeStack analogue: a member whose declared_line equals THIS
+    // statement's own line (and is not a method) is this statement's own
+    // placeholder; anything else -- no member/method at all (an attribute
+    // pre_collect_class_body's scan could not see, e.g. one first assigned
+    // inside a nested def's own body) or a member at a DIFFERENT line (a
+    // genuine earlier, real assignment) -- is handled below exactly as
+    // before.
     if (const auto* receiver = dynamic_cast<const ast::Name*>(&target.value())) {
         if (receiver->identifier() == "self" && !current_class_qualified_name_.empty()) {
             const Resolution self_resolution = scopes_.resolve("self");
             if (self_resolution.binding != nullptr &&
                 self_resolution.binding->type.kind == TypeKind::Class &&
-                self_resolution.binding->type.name == current_class_qualified_name_ &&
-                !classes_.member_type(current_class_qualified_name_, target.attribute()).has_value() &&
-                !classes_.method_type(current_class_qualified_name_, target.attribute()).has_value()) {
-                // First self.x = ... TypeChecker's own visitation has reached
-                // for this name (in THIS class; a base's member/method of the
-                // same name already failed one of the two has_value() checks
-                // above and falls through to the ordinary path instead) --
-                // infer the type from the value, exactly like an ordinary
-                // Name assignment, and declare it. No comparison: there is
-                // nothing yet to compare against.
-                const Type value_type = typer_.type_of(value, Type::unknown());
-                classes_.declare_member(current_class_qualified_name_, target.attribute(), value_type,
-                                        target.span().start_line);
-                // type_of_attribute never ran for `target`, so its TypeMap
-                // entries would otherwise be missing -- recorded by hand,
-                // matching type_of_attribute's own class-object-receiver
-                // branch (expression_typer.cpp), which does the same for the
-                // same reason.
-                types_.insert(&target, value_type);
-                types_.insert(receiver, self_resolution.binding->type);
-                return;
+                self_resolution.binding->type.name == current_class_qualified_name_) {
+                const bool is_method_name =
+                    classes_.method_type(current_class_qualified_name_, target.attribute()).has_value();
+                const std::optional<int> existing_line =
+                    classes_.member_declared_line(current_class_qualified_name_, target.attribute());
+                const bool is_brand_new = !is_method_name && !existing_line.has_value();
+                const bool is_own_placeholder = !is_method_name && existing_line.has_value() &&
+                                                *existing_line == target.span().start_line;
+
+                if (is_brand_new || is_own_placeholder) {
+                    // Either the FIRST self.x = ... TypeChecker's own
+                    // visitation has reached for this name (in THIS class; a
+                    // base's member/method of the same name already fails
+                    // is_brand_new and falls through to the ordinary path
+                    // instead), or this exact statement's own placeholder
+                    // from pre_collect_class_body -- infer the type from the
+                    // value, exactly like an ordinary Name assignment, and
+                    // declare it (overwriting the Unknown placeholder, in the
+                    // latter case, with the real one). No comparison: there
+                    // is nothing REAL yet to compare against either way.
+                    const Type value_type = typer_.type_of(value, Type::unknown());
+                    classes_.declare_member(current_class_qualified_name_, target.attribute(), value_type,
+                                            target.span().start_line);
+                    // type_of_attribute never ran for `target`, so its TypeMap
+                    // entries would otherwise be missing -- recorded by hand,
+                    // matching type_of_attribute's own class-object-receiver
+                    // branch (expression_typer.cpp), which does the same for the
+                    // same reason.
+                    types_.insert(&target, value_type);
+                    types_.insert(receiver, self_resolution.binding->type);
+                    return;
+                }
             }
         }
     }
@@ -567,7 +632,21 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
         // module.body() directly, so this was never pre-bound. A forward
         // reference to a class still works: Phase 1 already declared every
         // top-level class before Phase 3 (this walk) ever started.
-        info = bind_annotation(*target_name, node.annotation(), node.span().start_line);
+        //
+        // Fix round 1: a DIRECT class-body AnnAssign was already resolved
+        // once by pre_collect_class_body's own eager pass -- reuse that
+        // cached Type via bind_resolved_annotation (the scope-bind half of
+        // bind_annotation) rather than invoking AnnotationResolver a second
+        // time, which would double-report a bad annotation. One NESTED
+        // inside an if/for within the class body (pre_collect_class_body
+        // only scans the body directly, matching its own documented
+        // simplification) is not in the cache and falls to the ordinary,
+        // un-cached bind_annotation exactly as before.
+        const auto cached_annotation = class_body_annotation_types_.find(&node);
+        info = cached_annotation != class_body_annotation_types_.end()
+                   ? bind_resolved_annotation(*target_name, cached_annotation->second,
+                                              node.span().start_line)
+                   : bind_annotation(*target_name, node.annotation(), node.span().start_line);
         if (!info.redefinition && scopes_.current_kind() == ScopeKind::Class) {
             // Task 19: a class-body AnnAssign ALSO declares an instance
             // attribute, in addition to the ordinary scope-bind above --
@@ -577,8 +656,38 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
             // for one directly in the body AND for one nested in an if/for
             // inside it (Python itself does not scope those), which is
             // exactly the set of positions mypy treats as class-body level.
-            classes_.declare_member(current_class_qualified_name_, target_name->identifier(),
-                                    info.type, node.span().start_line);
+            //
+            // Fix round 1, Finding 5: guarded by has_value() exactly like
+            // assign_attribute's own check -- without it, an EARLIER self.x
+            // = ... assignment (in a method occurring ABOVE this annotation
+            // in the class body) is silently re-typed with zero diagnostics,
+            // since declare_member has no collision detection of its own.
+            // (For a DIRECT class-body annotation -- the case reaching this
+            // branch via the cache above -- pre_collect_class_body's own
+            // identical guard already declared this exact member, so the
+            // has_value() check below is true for THIS statement's own
+            // declaration too; comparing info.type against itself is always
+            // a clean no-op subtype check, so nothing is lost.)
+            const bool already_member =
+                classes_.member_type(current_class_qualified_name_, target_name->identifier())
+                    .has_value();
+            const bool already_method =
+                classes_.method_type(current_class_qualified_name_, target_name->identifier())
+                    .has_value();
+            if (!already_member && !already_method) {
+                classes_.declare_member(current_class_qualified_name_, target_name->identifier(),
+                                        info.type, node.span().start_line);
+            } else if (already_member) {
+                const Type existing_type =
+                    *classes_.member_type(current_class_qualified_name_, target_name->identifier());
+                if (info.type.kind != TypeKind::Unknown && existing_type.kind != TypeKind::Unknown &&
+                    !is_subtype(info.type, existing_type, &classes_)) {
+                    report_incompatible_assignment(node, info.type, existing_type, "variable");
+                }
+            }
+            // A same-name METHOD collision is left unreported here -- a
+            // combined method+attribute namespace is a pre-existing gap
+            // outside this fix round's scope.
         }
     } else {
         // A non-Name target (outside this task's tested scope): resolve the
@@ -662,20 +771,31 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // Every parameter's type, and whether it counts toward "missing an
     // annotation" -- self (a method's own first parameter) is exempt, per
     // mypy's disallow-untyped-defs. A top-level FunctionDef was already
-    // resolved once by collect_signatures's Phase 2 (see
-    // top_level_signatures_'s own comment); reusing that here is what keeps
-    // AnnotationResolver from running -- and potentially double-reporting a
-    // bad annotation -- a second time on the exact same annotation
-    // expressions.
+    // resolved once by collect_signatures's Phase 2 (top_level_signatures_),
+    // and a METHOD (fix round 1) by pre_collect_class_body's own pre-pass
+    // (class_method_signatures_) -- reusing whichever cache has it is what
+    // keeps AnnotationResolver from running -- and potentially
+    // double-reporting a bad annotation -- a second time on the exact same
+    // annotation expressions.
     std::vector<Type> param_types;
     Type return_type;
     bool any_param_missing = false;
     bool any_param_annotated = false;
 
-    const auto cached = top_level_signatures_.find(&node);
-    if (cached != top_level_signatures_.end() && !cached->second.args.empty()) {
+    const Type* cached_signature = nullptr;
+    const auto top_level_cached = top_level_signatures_.find(&node);
+    if (top_level_cached != top_level_signatures_.end()) {
+        cached_signature = &top_level_cached->second;
+    } else {
+        const auto method_cached = class_method_signatures_.find(&node);
+        if (method_cached != class_method_signatures_.end()) {
+            cached_signature = &method_cached->second;
+        }
+    }
+
+    if (cached_signature != nullptr && !cached_signature->args.empty()) {
         // Task 18 fix round 1, Finding 6: `args.end() - 1`/`args.back()` are
-        // safe TODAY -- Type::callable (collect_signatures's own caller)
+        // safe TODAY -- Type::callable (both caching call sites' own caller)
         // always pushes the return, so a cached entry's args is never empty
         // -- but this cache is populated by a DIFFERENT function than the
         // one reading it, so nothing here proves that invariant holds by
@@ -683,15 +803,22 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         // (expression_typer_calls.cpp) does for a Callable built through the
         // exact same Type::callable call. Guarded rather than trusted, same
         // rationale as that guard's own comment.
-        const Type& signature = cached->second;
+        const Type& signature = *cached_signature;
         param_types.assign(signature.args.begin(), signature.args.end() - 1);
         return_type = signature.args.back();
-        for (const ast::Parameter& parameter : params) {
+        for (std::size_t i = 0; i < params.size(); ++i) {
+            const ast::Parameter& parameter = params[i];
             if (parameter.annotation != nullptr) {
                 any_param_annotated = true;
+            } else if (is_method && i == 0) {
+                // Fix round 1: a METHOD can now reach this cached branch too
+                // (class_method_signatures_) -- self (index 0, unannotated)
+                // is exempt from "missing an annotation" here exactly like
+                // it already is in the uncached branch below. A top-level
+                // def is never a method, so this exemption is simply unreached
+                // for one, matching the ORIGINAL (now-corrected) comment's
+                // intent.
             } else {
-                // A top-level def is never a method, so no index-0 self
-                // exemption applies here.
                 any_param_missing = true;
             }
         }
@@ -886,17 +1013,175 @@ void TypeChecker::visit(const ast::ClassDef& node) {
         base->accept(*this);
     }
 
-    const std::string qualified_name = current_class_qualified_name_.empty()
-                                           ? node.name()
-                                           : current_class_qualified_name_ + "." + node.name();
-    // Bases and the class itself were already declared, under this SAME
-    // qualified name, by collect_classes's declare_class_recursive (Phase
-    // 1) -- so member/method declaration below has an Entry to write into,
-    // and a forward reference to a class declared later in the same module
-    // (or a differently-nested one) already resolves.
+    std::string qualified_name;
+    if (collided_top_level_.count(&node) != 0) {
+        // Fix round 1, Finding 7: this top-level ClassDef is a LOSING
+        // same-name collision scan_top_level_names already reported --
+        // collect_classes' Phase 1 skipped its declare() call, so it has no
+        // entry under its own bare name at all. Isolate it under a name
+        // nothing else can ever resolve to, rather than falling through to
+        // the bare-name branch below (which would silently merge its
+        // members/methods, and possibly its __init__, onto the WINNING
+        // same-named class's entry). See declare_isolated_class's own
+        // comment.
+        qualified_name = declare_isolated_class(
+            node, "<shadowed-class>#" + std::to_string(node.span().start_line) + "#" + node.name());
+    } else if (scopes_.current_kind() != ScopeKind::Module && scopes_.current_kind() != ScopeKind::Class) {
+        // Fix round 1, Finding 4: a ClassDef lexically inside a `def` (or any
+        // other non-module, non-class scope) was never seen by
+        // collect_classes' Phase-1 walk either, for the identical reason.
+        //
+        // Declared under its OWN bare name whenever that name is not
+        // ALREADY a class -- which is what keeps `Local()` (a bare-Name
+        // call) resolvable from within the SAME function: type_of_name_call
+        // (expression_typer_calls.cpp) dispatches a constructor call purely
+        // via classes_.is_class(identifier), the literal source-level
+        // identifier, with NO scope awareness at all -- an isolated,
+        // synthetic qualified name would be permanently unreachable through
+        // that path, which a full nested-scope-aware Phase 1 walk could fix
+        // but this fix round judges out of proportion for a construct this
+        // rare. Only when the bare name is ALREADY a class (a top-level one,
+        // or another already-declared local one -- the actual corruption
+        // hazard this finding is about) is it isolated instead: its own
+        // attributes are still correctly collected and never corrupt the
+        // pre-existing class's entry, at the accepted cost that referring to
+        // it by name no longer resolves to a constructor call either, in
+        // that one already-ambiguous case.
+        qualified_name =
+            classes_.is_class(node.name())
+                ? declare_isolated_class(node, "<local-class>#" +
+                                                   std::to_string(node.span().start_line) + "#" +
+                                                   node.name())
+                : declare_isolated_class(node, node.name());
+    } else {
+        qualified_name = current_class_qualified_name_.empty()
+                             ? node.name()
+                             : current_class_qualified_name_ + "." + node.name();
+        // Bases and the class itself were already declared, under this SAME
+        // qualified name, by collect_classes's declare_class_recursive (Phase
+        // 1) -- so member/method declaration below has an Entry to write
+        // into, and a forward reference to a class declared later in the
+        // same module (or a differently-nested one) already resolves.
+    }
+
     ClassContextGuard guard(scopes_, current_class_qualified_name_, qualified_name);
+    // Fix round 1, Finding 1: declares every method signature and
+    // placeholder-declares every attribute BEFORE any of this class's own
+    // body statements are walked for real -- see pre_collect_class_body's
+    // own comment for the full mechanism.
+    pre_collect_class_body(node, qualified_name);
     for (const ast::StmtPtr& statement : node.body()) {
         statement->accept(*this);
+    }
+}
+
+void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
+                                         const std::string& qualified_name) {
+    for (const ast::StmtPtr& statement : node.body()) {
+        if (const auto* function_def = dynamic_cast<const ast::FunctionDef*>(statement.get())) {
+            if (function_def->params().empty()) {
+                // A method with no parameters at all (missing self) is
+                // reported by visit(FunctionDef) itself, which never
+                // registers it in ClassTable either -- this pre-pass must
+                // not add signature information for a method that will
+                // never really have one.
+                continue;
+            }
+            const Type signature = resolve_method_signature(*function_def, qualified_name);
+            class_method_signatures_.emplace(function_def, signature);
+            classes_.declare_method(qualified_name, function_def->name(), signature);
+            collect_self_attribute_placeholders(qualified_name, function_def->body());
+        } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
+            if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
+                AnnotationResolver resolver(classes_, sink_);
+                const Type type = resolver.resolve(ann_assign->annotation());
+                class_body_annotation_types_.emplace(ann_assign, type);
+                // Fix round 1, Finding 5: guarded exactly like assign_attribute's
+                // own has_value() check -- an EARLIER self.x = ... assignment
+                // (in a method occurring ABOVE this annotation in the class
+                // body) may already have placeholder-declared this same
+                // name; declare_member has no collision detection of its
+                // own, so declaring over it unconditionally would silently
+                // re-type the attribute with zero diagnostics.
+                if (!classes_.member_type(qualified_name, target_name->identifier()).has_value() &&
+                    !classes_.method_type(qualified_name, target_name->identifier()).has_value()) {
+                    classes_.declare_member(qualified_name, target_name->identifier(), type,
+                                            ann_assign->span().start_line);
+                }
+            }
+        } else if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
+            if (const auto* target_name = dynamic_cast<const ast::Name*>(&assign->target())) {
+                // Fix round 1, Finding 3: a plain class-body Assign
+                // placeholder-declares the SAME way self.x = ... does (real
+                // type filled in later, by assign_to's own is_new_definition
+                // check, when Phase 3 actually reaches this statement) --
+                // NOT eagerly typed here, since its value expression may
+                // itself reference another class-body name whose real,
+                // order-sensitive resolution must stay entirely within
+                // Phase 3's single pass.
+                if (!classes_.member_type(qualified_name, target_name->identifier()).has_value() &&
+                    !classes_.method_type(qualified_name, target_name->identifier()).has_value()) {
+                    classes_.declare_member(qualified_name, target_name->identifier(), Type::unknown(),
+                                            assign->span().start_line);
+                }
+            }
+        }
+        // A nested ClassDef is handled entirely by its OWN visit(ClassDef)
+        // call, when Phase 3's real walk reaches it -- nothing to pre-collect
+        // for one here.
+    }
+}
+
+Type TypeChecker::resolve_method_signature(const ast::FunctionDef& method,
+                                           const std::string& qualified_name) {
+    AnnotationResolver resolver(classes_, sink_);
+    const std::vector<ast::Parameter>& params = method.params();
+    std::vector<Type> param_types;
+    param_types.reserve(params.size());
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        const ast::Parameter& parameter = params[i];
+        if (parameter.annotation != nullptr) {
+            param_types.push_back(resolver.resolve(*parameter.annotation));
+        } else if (i == 0) {
+            // The ORIGINAL Task 19 "self upgrade": bound to the enclosing
+            // class, not Unknown.
+            param_types.push_back(Type::class_of(qualified_name));
+        } else {
+            param_types.push_back(Type::unknown());
+        }
+    }
+    const Type return_type = method.has_return_annotation() ? resolver.resolve(method.return_annotation())
+                                                             : Type::unknown();
+    return Type::callable(param_types, return_type);
+}
+
+void TypeChecker::collect_self_attribute_placeholders(const std::string& qualified_name,
+                                                       const std::vector<ast::StmtPtr>& body) {
+    for (const ast::StmtPtr& statement : body) {
+        if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
+            if (const auto* attribute = dynamic_cast<const ast::Attribute*>(&assign->target())) {
+                if (const auto* receiver = dynamic_cast<const ast::Name*>(&attribute->value())) {
+                    if (receiver->identifier() == "self" &&
+                        !classes_.member_type(qualified_name, attribute->attribute()).has_value() &&
+                        !classes_.method_type(qualified_name, attribute->attribute()).has_value()) {
+                        classes_.declare_member(qualified_name, attribute->attribute(), Type::unknown(),
+                                                assign->span().start_line);
+                    }
+                }
+            }
+        } else if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
+            collect_self_attribute_placeholders(qualified_name, if_stmt->body());
+            collect_self_attribute_placeholders(qualified_name, if_stmt->orelse());
+        } else if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
+            collect_self_attribute_placeholders(qualified_name, while_stmt->body());
+            collect_self_attribute_placeholders(qualified_name, while_stmt->orelse());
+        } else if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
+            collect_self_attribute_placeholders(qualified_name, for_stmt->body());
+            collect_self_attribute_placeholders(qualified_name, for_stmt->orelse());
+        }
+        // A nested FunctionDef/ClassDef is a new scope -- 'self' there may be
+        // shadowed or simply absent -- so it is out of this scan's reach,
+        // matching pre_bind_function_body's own scope boundary.
     }
 }
 

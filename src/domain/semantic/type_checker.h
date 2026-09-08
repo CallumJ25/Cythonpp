@@ -127,7 +127,7 @@ namespace cythonpp::domain::semantic {
 // attributes in the same change (self.x would otherwise become a false
 // attr-defined TypeError the moment self stops being the absorbing Unknown).
 //
-// Attributes come from two places, both closing the attribute set at
+// Attributes come from THREE places, all closing the attribute set at
 // declaration time (an assignment to an attribute the class never declared,
 // from OUTSIDE the class, is attr-defined -- see assign_attribute's ordinary
 // path, unchanged from Task 17):
@@ -138,18 +138,32 @@ namespace cythonpp::domain::semantic {
 //     the ordinary scope-bind bind_annotation already performs. Declared
 //     whether or not the AnnAssign carries a value -- verified mypy accepts
 //     `C.x` for a bare `x: int` class-body annotation.
+//   - A class-body plain Assign to a bare Name (fix round 1, Finding 3:
+//     `class D: x = 5` did not declare a member AT ALL before this) --
+//     handled in assign_to's own Name-target branch, exactly parallel to the
+//     AnnAssign case, gated on the SAME is_new_definition this checker
+//     already computes for the ordinary bare-empty-container check, so the
+//     member's type is the FIRST assignment's inferred type, matching every
+//     other "first assignment is sticky" rule in this file.
 //   - `self.x = ...` inside ANY method (not just __init__) -- handled in
 //     assign_attribute, checked BEFORE the ordinary read path so a brand-new
-//     attribute is not a false attr-defined miss. The FIRST such assignment
-//     TypeChecker's own visitation order encounters declares the member (its
-//     type inferred from the value, exactly like an ordinary Name
-//     assignment); this is single-pass, not a separate collect phase, so it
-//     matches every VERIFIED test in the corpus (every one either declares
-//     from a single method or declares-then-conflicts in textual method
-//     order) but does NOT handle a method appearing BEFORE the one that
-//     first assigns an attribute it reads via self -- an out-of-order
-//     forward reference across two methods' bodies, untested here and left
-//     for a future task if it turns out to matter.
+//     attribute is not a false attr-defined miss.
+//
+// Fix round 1, Finding 1 (CRITICAL): before this round, ALL THREE of the
+// above were purely single-pass -- declared only when TypeChecker's own
+// visitation actually reached the declaring statement, in body order. That
+// made a method appearing ABOVE the one that first assigns (or the
+// class-body statement that first annotates) an attribute it reads via
+// self -- e.g. `def a(self): self.b()` calling a method `b` defined BELOW
+// `a`, one of the single most common Python shapes there is -- a false
+// attr-defined TypeError. pre_collect_class_body now runs a REAL pre-pass
+// over the WHOLE class body (methods' own bodies included, recursively
+// through control flow) BEFORE any of it is walked for real, declaring every
+// method signature and placeholder-declaring every attribute name up front
+// -- see that function's own comment for the full mechanism, including how
+// assign_attribute (and assign_to's class-body member declare) recognise
+// "this is my own placeholder, fill in the real type" without mistaking it
+// for a genuine second, conflicting assignment.
 //
 // collect_classes (Phase 1) now RECURSES into every class body to declare a
 // NESTED ClassDef under its qualified name too, before Phase 2 resolves any
@@ -239,6 +253,134 @@ private:
     void declare_class_recursive(const ast::ClassDef& class_def, const std::string& qualified_prefix,
                                  std::vector<const ast::ClassDef*>& all_classes);
 
+    // The base-validation half of collect_classes, extracted (fix round 1)
+    // so declare_isolated_class below can reuse it for a class ClassTable
+    // never saw during Phase 1 -- same rule either way: a bare-Name base
+    // that does not resolve is a NameError, checked only once every
+    // declaration in `all_classes` exists.
+    void validate_class_bases(const std::vector<const ast::ClassDef*>& all_classes);
+
+    // Fix round 1, Findings 4 and 7: declares `node` (and, recursively, every
+    // ClassDef nested in its own body) into ClassTable under `qualified_name`
+    // -- returned back to the caller unchanged, for use exactly like an
+    // ordinarily-declared one for the REST of that class's handling
+    // (ClassContextGuard, pre_collect_class_body, self's binding). Two
+    // callers, two different KINDS of name:
+    //   - Finding 4's own non-colliding case passes the class's plain bare
+    //     name (see visit(ClassDef)'s own comment for why -- classes_.
+    //     is_class(identifier), the constructor-call dispatch's own lookup,
+    //     has no scope awareness at all, so only a bare name keeps a
+    //     function-local class's own `Local()` call resolvable).
+    //   - Every OTHER caller (Finding 4's colliding case, and Finding 7)
+    //     passes a freshly synthesised name that embeds `#`, a character no
+    //     Python identifier can ever contain, so it can never collide with
+    //     any legitimately dotted "Outer.Inner" name collect_classes
+    //     produced, or with any other class's bare name.
+    //
+    // Two, unrelated situations both need this because neither one was ever
+    // reached by collect_classes' Phase-1 walk, which only recurses into
+    // MODULE-level and CLASS-level bodies:
+    //   - Finding 4: a ClassDef lexically inside a `def` (or any other
+    //     non-module, non-class scope) -- using its bare name UNCONDITIONALLY
+    //     would, when that name is ALREADY a class, silently write its
+    //     members onto an unrelated SAME-NAMED top-level class's entry
+    //     (visit(ClassDef) checks classes_.is_class(node.name()) first and
+    //     only reaches for the synthesised name in that case).
+    //   - Finding 7: a top-level ClassDef scan_top_level_names already
+    //     reported as a LOSING same-name collision. Phase 1 already skips
+    //     the loser's own declare() call (Task 19's gap-5(b) fix), but Phase
+    //     3 still walks its body like any other statement (matching how a
+    //     colliding top-level FunctionDef's body is still checked) -- without
+    //     this, that walk would write the loser's members/methods (and,
+    //     worse, an __init__) onto the WINNER's entry under the identical
+    //     bare qualified name: a missed error (the loser's extra members
+    //     silently merge onto the winner), a silent wrong type
+    //     (declare_member overwrites with no comparison), and false
+    //     diagnostics (the loser's __init__ overwrites the winner's,
+    //     producing wrong arity errors at every legitimate `C(...)` call).
+    //     Isolating the loser under its own unreachable name means its body
+    //     is still checked for diagnostics (unchanged), but into an entry
+    //     nothing else ever queries -- nothing refers to a losing top-level
+    //     class by name, since scan_top_level_names already reported the
+    //     redefinition and no downstream lookup resolves "C" to it.
+    std::string declare_isolated_class(const ast::ClassDef& node, const std::string& qualified_name);
+
+    // Fix round 1, Finding 1 (CRITICAL, method half): the exact analogue of
+    // collect_signatures at module level, but for ONE class body, run from
+    // visit(ClassDef) right after ClassContextGuard is constructed and
+    // BEFORE any of the class's own body statements are walked --
+    //   - every direct FunctionDef (i.e. every method) gets its signature
+    //     resolved and declared into ClassTable via declare_method
+    //     immediately (see resolve_method_signature), and cached in
+    //     class_method_signatures_ so visit(FunctionDef)'s own later walk of
+    //     that SAME node reuses it rather than invoking AnnotationResolver
+    //     (and so double-reporting a bad annotation) a second time -- mirrors
+    //     top_level_signatures_'s own contract exactly;
+    //   - every direct AnnAssign's annotation is resolved (and, if a bad
+    //     annotation, reported) here, cached in class_body_annotation_types_
+    //     for the identical reason, and declared into ClassTable via
+    //     declare_member UNLESS a member or method under that name already
+    //     exists (Finding 5's own has_value() guard, matching the self.x
+    //     path's -- see assign_attribute -- so an EARLIER self.x = ...
+    //     assignment inside a method occurring ABOVE this annotation in the
+    //     class body is not silently clobbered);
+    //   - every direct plain Assign to a bare Name is placeholder-declared
+    //     (Type::unknown(), at ITS OWN line) the same has_value()-guarded
+    //     way, so `class D: x = 5` registers "x" as an attribute at all
+    //     (Finding 3) -- the REAL inferred type is filled in later, when
+    //     Phase 3's own visit(Assign) actually reaches this exact statement
+    //     (see assign_to's own is_new_definition-gated declare_member call);
+    //   - every method's OWN body is, in turn, scanned (recursively through
+    //     If/While/For, matching pre_bind_function_body's own scope
+    //     boundary: NOT into a nested def) for a `self.x = ...` assignment,
+    //     via collect_self_attribute_placeholders -- so the attribute
+    //     exists (as an Unknown placeholder, at the line of its own FIRST
+    //     such assignment) before ANY method's body -- including one
+    //     occurring EARLIER in the class body -- is actually walked. This is
+    //     Finding 1's own critical fix: `def a(self): self.b()` reading a
+    //     method `b` defined below `a`, or reading an attribute a later
+    //     method first assigns, no longer depends on visitation order.
+    //
+    // All three kinds are processed in ONE top-to-bottom pass over `node`'s
+    // OWN body (methods' nested bodies scanned inline, as each method is
+    // reached), which is exactly the order Phase 3's real single-pass walk
+    // would eventually establish each one in -- so "first occurrence wins"
+    // here agrees with "first occurrence wins" there, and Finding 5's
+    // has_value() guard sees a genuine conflict exactly when Phase 3's own
+    // walk would eventually have seen one.
+    void pre_collect_class_body(const ast::ClassDef& node, const std::string& qualified_name);
+
+    // The method-signature half of pre_collect_class_body's per-FunctionDef
+    // work, factored out because visit(FunctionDef)'s own (uncached) branch
+    // needs the identical self-parameter rule (index 0, unannotated, exempt
+    // -- bound to Class(qualified_name) instead of Unknown, the ORIGINAL
+    // "self upgrade" from Task 19) and this is the one place both call sites
+    // can share it without drifting apart. Deliberately does NOT compute
+    // any_param_missing/any_param_annotated or report anything about the
+    // signature's OWN completeness -- that diagnostic still fires exactly
+    // once, later, when Phase 3's real visit(FunctionDef) reaches this same
+    // node (reusing this resolution from class_method_signatures_ rather
+    // than re-deriving it).
+    Type resolve_method_signature(const ast::FunctionDef& method, const std::string& qualified_name);
+
+    // Fix round 1, Finding 1 (CRITICAL, attribute half): the recursive walk
+    // pre_collect_class_body runs over EVERY method's own body (If/While/For
+    // recursed into, matching pre_bind_function_body's scope boundary -- a
+    // nested def is NOT recursed into, since 'self' there may be shadowed or
+    // simply absent) looking for `self.x = ...` -- a plain Assign whose
+    // target is an Attribute on a bare Name spelled "self". The FIRST such
+    // occurrence for a given attribute name (in this same top-to-bottom scan
+    // order) that names neither an existing member NOR an existing method is
+    // placeholder-declared: Type::unknown(), at ITS OWN line. This is what
+    // lets assign_attribute's real, later pass over that EXACT statement
+    // recognise "this is my own placeholder, fill in the real type" (line
+    // equality, exactly like is_unfilled_placeholder's ScopeStack analogue)
+    // rather than mistaking it for either a genuinely new declaration (there
+    // is no "genuinely new" left once every attribute is placeholder-declared
+    // up front) or a second, real conflicting assignment.
+    void collect_self_attribute_placeholders(const std::string& qualified_name,
+                                             const std::vector<ast::StmtPtr>& body);
+
     // Phase 2: resolve every top-level FunctionDef signature and every
     // module-level AnnAssign's annotation, binding each name into ScopeStack
     // with its declaration line -- so a function body (once Task 18 checks
@@ -295,6 +437,15 @@ private:
     // the first declaration wins, matching ScopeStack::bind's own contract.
     AnnotationBinding bind_annotation(const ast::Name& target, const ast::Expr& annotation,
                                       int line);
+
+    // Fix round 1: the scope-binding HALF of bind_annotation, factored out so
+    // a class-body AnnAssign whose annotation was ALREADY resolved (and
+    // reported on) by pre_collect_class_body's own eager pass can still get
+    // the ordinary scope-bind/redefinition treatment without invoking
+    // AnnotationResolver a second time -- which would double-report a bad
+    // annotation. bind_annotation itself is now a thin wrapper: resolve, then
+    // delegate here.
+    AnnotationBinding bind_resolved_annotation(const ast::Name& target, Type type, int line);
 
     // Assign, dispatched by target shape.
     void assign_to(const ast::Expr& target, const ast::Expr& value, int line);
@@ -405,6 +556,26 @@ private:
     // (a NESTED def, or a method) has no entry here and is resolved fresh,
     // directly in visit(FunctionDef), the only time it is ever resolved.
     std::map<const ast::FunctionDef*, Type> top_level_signatures_;
+
+    // Fix round 1: pre_collect_class_body's own resolved-signature cache, one
+    // entry per METHOD (a direct FunctionDef in a class body) -- the exact
+    // analogue of top_level_signatures_ above, kept as a SEPARATE map (rather
+    // than folded into it) because that map's own contract explicitly reads
+    // "every top-level FunctionDef", and visit(FunctionDef)'s cached branch
+    // used to rely on "found in top_level_signatures_" implying "is not a
+    // method" (see its own self-exemption comment, now corrected). A method
+    // resolved here is looked up by cached_signature_for, which checks both
+    // maps.
+    std::map<const ast::FunctionDef*, Type> class_method_signatures_;
+
+    // Fix round 1: pre_collect_class_body's resolved-annotation cache for a
+    // class-body-DIRECT AnnAssign (never a nested one, matching that
+    // function's own module.body()-only-style simplification) -- the exact
+    // analogue of module_level_annotations_, so visit(AnnAssign)'s
+    // class-body branch reuses this Type via bind_resolved_annotation
+    // instead of invoking AnnotationResolver (and possibly double-reporting
+    // a bad annotation) a second time.
+    std::map<const ast::AnnAssign*, Type> class_body_annotation_types_;
 
     // The QUALIFIED name of the class whose body is currently being walked --
     // "Outer.Inner" while inside Inner's own body, restored to whatever it

@@ -602,6 +602,147 @@ TEST(TypeChecker, TheFirstSelfAssignmentDeclaresTheAttributeType) {
     EXPECT_EQ(error.line, 5);
 }
 
+// ---------------------------------------------------------------------------
+// Task 19 fix round 1: forward references through self (Finding 1, CRITICAL),
+// a plain class-body Assign (Finding 3), a function-local class (Finding 4),
+// a class-body annotation conflicting with an earlier self assignment
+// (Finding 5), and a losing class redefinition's own body no longer
+// corrupting the winner's constructor (Finding 7).
+// ---------------------------------------------------------------------------
+
+// Fix round 1, Finding 1 (CRITICAL, method half). Reproduced against the
+// built binary before this fix: `self.b()` called from a method defined
+// ABOVE `b` reported a false "C has no attribute b" -- one of the single
+// most common Python shapes there is (e.g. __init__ calling a helper defined
+// later in the class). declare_method used to run LAZILY, only when Phase
+// 3's single pass actually reached the callee's own FunctionDef node;
+// pre_collect_class_body now declares every method's signature before ANY
+// of the class's own body is walked. Verified mypy-clean.
+TEST(TypeChecker, AMethodMayCallAnotherMethodDefinedBelowIt) {
+    expect_clean(
+        "class C:\n"
+        "    def a(self) -> None:\n"
+        "        self.b()\n"
+        "    def b(self) -> None:\n"
+        "        pass\n");
+}
+
+// Fix round 1, Finding 1 (CRITICAL, attribute half): a method reading
+// self.x where the attribute is first ASSIGNED by a method occurring BELOW
+// it in the class body. pre_collect_class_body's own recursive scan over
+// every method's body (collect_self_attribute_placeholders) placeholder-
+// declares this before either method's body is walked for real.
+TEST(TypeChecker, AMethodMayReadAnAttributeFirstAssignedByALaterMethod) {
+    expect_clean(
+        "class C:\n"
+        "    def a(self) -> None:\n"
+        "        y: int = self.x\n"
+        "    def b(self) -> None:\n"
+        "        self.x = 5\n");
+}
+
+// The attribute half's other source: a class-body AnnAssign appearing BELOW
+// the method that reads it via self.
+TEST(TypeChecker, AMethodMayReadAClassBodyAttributeDeclaredBelowIt) {
+    expect_clean(
+        "class C:\n"
+        "    def m(self) -> None:\n"
+        "        y: int = self.x\n"
+        "    x: int\n");
+}
+
+// Fix round 1, Finding 3 (IMPORTANT). Reproduced against the built binary
+// before this fix: `class D: x = 5` then `d.x` reported a false "D has no
+// attribute x" -- only the AnnAssign path ever called declare_member; a bare
+// class-body constant (mypy-clean) did not. Handled in assign_to's own
+// Name-target branch now, gated on is_new_definition so the member's type is
+// the FIRST assignment's, matching every other "first assignment is sticky"
+// rule in this file.
+TEST(TypeChecker, CollectsAPlainClassBodyAssignment) {
+    expect_clean("class D:\n    x = 5\nd = D()\ny: int = d.x\n");
+}
+
+// Fix round 1, Finding 4. A ClassDef lexically inside a `def` is never seen
+// by collect_classes' Phase-1 walk (it only recurses into module- and
+// class-level bodies), so it had no ClassTable entry at all by the time
+// Phase 3 reached it -- every self.attr inside was a false attr-defined
+// TypeError. It is now declared, under an isolated qualified name, exactly
+// when Phase 3's walk reaches it.
+TEST(TypeChecker, AFunctionLocalClassDeclaresItsOwnAttributes) {
+    expect_clean(
+        "def make() -> None:\n"
+        "    class Local:\n"
+        "        def __init__(self) -> None:\n"
+        "            self.x = 5\n"
+        "    v = Local()\n"
+        "    y: int = v.x\n");
+}
+
+// Fix round 1, Finding 4 (the cross-class-corruption half). Before this fix,
+// a function-local class sharing a bare name with a real top-level class
+// would have declared ITS OWN members onto the TOP-LEVEL class's ClassTable
+// entry (both computed the same bare "C" qualified name), since ScopeStack
+// never sees a class name and so cannot tell the two apart either. The
+// isolated qualified name this fix gives the local class prevents that: the
+// TOP-LEVEL C (constructed at module scope below) genuinely has no
+// "local_only" attribute, so reading it is still reported.
+TEST(TypeChecker, AFunctionLocalClassDoesNotCorruptASameNamedTopLevelClass) {
+    const Checked checked = check_module(
+        "class C:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.real = 1\n"
+        "def make() -> None:\n"
+        "    class C:\n"
+        "        def __init__(self) -> None:\n"
+        "            self.local_only = 2\n"
+        "c = C()\n"
+        "z: int = c.local_only\n");
+
+    EXPECT_EQ(only_error(checked).code, "TypeError");
+}
+
+// Fix round 1, Finding 5 (Minor). An EARLIER self.x = ... assignment (in a
+// method occurring ABOVE this class-body annotation) declares "x" as int;
+// declare_member has no collision detection of its own, so the conflicting
+// `x: str` below it must not silently re-type the attribute with zero
+// diagnostics.
+TEST(TypeChecker, AClassBodyAnnotationConflictingWithAnEarlierSelfAssignmentIsReported) {
+    const Checked checked = check_module(
+        "class C:\n"
+        "    def m(self) -> None:\n"
+        "        self.x = 5\n"
+        "    x: str\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"str\", "
+              "variable has type \"int\")");
+}
+
+// Fix round 1, Finding 7: a LOSING top-level class redefinition's own body
+// is still checked (matching how a colliding top-level FunctionDef's body is
+// still checked), but must no longer write onto the WINNING same-named
+// class's ClassTable entry -- specifically, the loser's own __init__ must
+// not override the winner's arity, and the loser's own extra attribute must
+// not leak onto an instance of the winner. Before this fix, both classes
+// resolved to the identical bare "C" qualified name.
+TEST(TypeChecker, ALosingClassRedefinitionDoesNotOverrideTheWinningOnesConstructor) {
+    const Checked checked = check_module(
+        "class C:\n"
+        "    def __init__(self, a: int) -> None:\n"
+        "        self.a = a\n"
+        "class C:\n"
+        "    def __init__(self, a: int, b: int) -> None:\n"
+        "        self.extra = b\n"
+        "c = C(1)\n"
+        "y: int = c.a\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"C\" already defined on line 1");
+}
+
 // Verified: the class body is NOT in the method's lexical scope.
 //
 // PLAN DEFECT (reported, not silently patched): the brief's own version of
@@ -696,24 +837,35 @@ TEST(TypeChecker, AClassBodyAnnotationDoesNotLeakIntoModuleScope) {
     expect_clean("class A:\n    x: int\nx: str = \"s\"\n");
 }
 
-// Task 19 gap 2 (recorded as pre-existing, closed by this task): collect_
-// classes used to declare EVERY top-level ClassDef, even one scan_top_level_
-// names had already reported as a losing same-name collision -- silently
-// overwriting the winning class's ClassTable entry, so a later member lookup
-// resolved against the wrong (erroneous) class. The winning class's own
-// member must survive the collision.
-TEST(TypeChecker, ALosingClassRedefinitionDoesNotClobberTheWinningOnesMembers) {
+// Fix round 1, Finding 2 (CRITICAL, this test rewritten): the ORIGINAL
+// version of this test (named ALosingClassRedefinitionDoesNotClobberThe
+// WinningOnesMembers) was VACUOUS -- it passed identically with or without
+// Task 19's own fix. Phase 3 runs entirely AFTER Phase 1 declares every
+// class, so by the time the LOSING class's declare() call would have run,
+// the WINNING class's ClassTable entry had ZERO members yet (nothing is
+// declared until Phase 3 walks a body); there was never anything for the
+// loser to clobber. What the fix ACTUALLY prevents is the loser wiping the
+// winner's BASE LIST: declare() unconditionally overwrites `bases` with no
+// collision detection of its own, so a losing SECOND `class C:` (no bases)
+// sharing the SAME "C" entry as the winning `class C(B):` would silently
+// sever C's inheritance from B, making `c.x` (a member B alone declares) a
+// false attr-defined TypeError. Verified this fails without the fix
+// (temporarily reverting collect_classes' collided_top_level_ skip
+// reproduces exactly this false TypeError; restored after confirming it).
+TEST(TypeChecker, ALosingClassRedefinitionDoesNotClobberTheWinningOnesBases) {
     const Checked checked = check_module(
-        "class C:\n"
+        "class B:\n"
         "    x: int\n"
+        "class C(B):\n"
+        "    pass\n"
         "class C:\n"
-        "    y: str\n"
+        "    pass\n"
         "c = C()\n"
         "z: int = c.x\n");
 
     const diagnostics::Diagnostic error = only_error(checked);
     EXPECT_EQ(error.code, "TypeError");
-    EXPECT_EQ(error.message, "name \"C\" already defined on line 1");
+    EXPECT_EQ(error.message, "name \"C\" already defined on line 3");
 }
 
 // Task 18 fix round 2 (the fourth call site the round-1 review missed).
