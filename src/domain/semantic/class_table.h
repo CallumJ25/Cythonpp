@@ -171,11 +171,19 @@ private:
     // instead: on a MISS through a scoped alias they retry against the
     // shadowed class rather than concluding the attribute does not exist.
     //
-    // TWO RESIDUALS this containment does NOT close, both MISSED errors
-    // (never false ones), and both needing the architectural fix -- eager
-    // resolution of `Class` names to keys at binding time, so a name is
-    // never re-canonicalised -- rather than another patch here:
+    // THREE RESIDUALS this containment does NOT close, all MISSED errors
+    // (never false ones), and all three needing the architectural fix --
+    // eager resolution of `Class` names to keys at binding time, so a name
+    // is never re-canonicalised -- rather than another patch here:
     //
+    //  - the BARE-spelling receiver. `obj = L()` bound OUTSIDE the function
+    //    to the MODULE-level `L` still carries the bare spelling "L", and
+    //    canonical_name's scoped-alias check runs first regardless of where
+    //    the value came from -- so inside the function, `obj.c()` resolves
+    //    straight to the LOCAL `class L` and, if it defines `c`, HITS on
+    //    the wrong class instead of missing at all. No miss-fallback runs
+    //    (there is no miss to fall back from), so a `c` the module-level
+    //    `L` lacks but the local one defines is silently ACCEPTED.
     //  - is_subtype's dual. `w: L = obj` inside the shadowing function is
     //    silently ACCEPTED: both sides canonicalise to the SAME isolated
     //    key, so the mismatch between the local `L` and the module-level
@@ -221,29 +229,47 @@ private:
         return std::nullopt;
     }
 
-    // walk_chain, plus the scoped-alias MISS FALLBACK (see shadowed_name).
-    // The four queries that answer "does this class have this member" share
-    // this; is_class, bases_of and constructor_type deliberately DO NOT:
+    // walk_chain, plus the scoped-alias MISS FALLBACK (see shadowed_name),
+    // layered in HERE rather than inside walk_chain itself, for two
+    // reasons. First, walk_chain is invoked recursively per base inside the
+    // chain walk, so a fallback placed there would fire once per base name
+    // during every walk, not once; query_chain fires exactly once, at the
+    // root. Second, an explicit opt-in list of which queries get the
+    // fallback beats an implicit exclusion that would hold only by
+    // accident -- see constructor_type below, whose safety from this
+    // fallback today comes entirely from a pre-canonicalisation step at its
+    // own call site, not from anything walk_chain or query_chain does; if a
+    // future change passed constructor_type a bare, unresolved name
+    // instead, an implicit exclusion would silently become a false "too
+    // few arguments", while an explicit list simply would not include it.
     //
-    //  - is_class/bases_of never MISS for an isolated local class at all
-    //    (declare_isolated_class always writes an entry, possibly with no
-    //    bases), so a fallback there would fire on a legitimate empty
-    //    answer and hand back the SHADOWED class's bases.
-    //  - constructor_type must keep constructing the LOCAL class: falling
-    //    back to the shadowed class's __init__ would take its PARAMETERS,
-    //    so `class L: def __init__(self, a: int)` shadowed by a local
-    //    `class L: pass` would make the mypy-clean `L()` a false
-    //    "too few arguments". That is a NEW false positive, i.e. exactly
-    //    what this round exists to remove.
+    // Applied to the four queries that answer "does this class have this
+    // member": member_type, member_declared_line, method_type and
+    // inherits_builtin. is_class, bases_of and constructor_type are
+    // deliberately excluded, each for a different reason:
+    //
+    //  - is_class cannot miss in the first place while the alias points at
+    //    a live isolated entry (declare_isolated_class always writes one,
+    //    possibly with no bases), so there is no miss for a fallback to
+    //    catch.
+    //  - bases_of's empty result for that same isolated entry is a
+    //    LEGITIMATE answer, not a miss -- it feeds is_subtype's chain walk,
+    //    where substituting the shadowed class's bases would manufacture
+    //    spurious subtype hits rather than merely miss an attribute.
+    //  - constructor_type would take the shadowed class's __init__
+    //    PARAMETERS: `class L: def __init__(self, a: int)` shadowed by a
+    //    local `class L: pass` would make the mypy-clean `L()` a false
+    //    "too few arguments" -- exactly what this round exists to remove.
     //
     // Safety of the fallback for the four that DO use it: it only ever runs
     // where the lookup had ALREADY missed, and a miss on a Class receiver is
     // already a diagnostic (or an inherits_builtin suppression). So it can
     // turn a diagnostic into a different diagnostic, or into silence, but it
     // can never turn silence into a diagnostic -- no mypy-clean program we
-    // accept today can start being rejected. The accepted cost is a MISSED
-    // error: a genuine attr-defined on the LOCAL class whose name the
-    // shadowed class happens to define resolves instead of reporting.
+    // accept today can start being rejected. The accepted cost is exactly
+    // the three residuals shadowed_name documents above (the bare-spelling
+    // receiver, is_subtype's dual, and the nested shadow chain) -- all
+    // MISSED errors, never false ones.
     template <typename Result, typename Extract>
     std::optional<Result> query_chain(const std::string& name, const Extract& extract) const {
         std::vector<std::string> visited;
