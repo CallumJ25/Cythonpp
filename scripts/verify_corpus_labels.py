@@ -12,8 +12,11 @@ Usage:
 import argparse
 import builtins
 import collections
+import pathlib
 import platform
+import subprocess
 import sys
+import tempfile
 
 MAX_BASES = 4
 
@@ -176,13 +179,137 @@ def generate_class_table() -> str:
     )
 
 
+def corpus_dir() -> pathlib.Path:
+    # Relative to this script's own location, never a hardcoded absolute
+    # path -- this file is tracked, so it must work on any machine's clone.
+    return pathlib.Path(__file__).resolve().parent.parent / "test_files" / "semantic"
+
+
+def parse_header(lines):
+    """Returns (mypy_clean, header_line_count) for a sample's leading lines.
+
+    Mirrors semantic_corpus_test.cpp's parse_labels: the header is line 1
+    ("# mypy: clean" or "# mypy: error ...") plus every contiguous
+    "# cythonpp: ..." line right after it. Raises ValueError for anything
+    that doesn't match -- a label this cannot parse must fail loudly, not be
+    silently skipped.
+    """
+    if not lines:
+        raise ValueError("file is empty")
+
+    first = lines[0].rstrip("\r\n")
+    if first == "# mypy: clean":
+        mypy_clean = True
+    elif first.startswith("# mypy: error"):
+        mypy_clean = False
+    else:
+        raise ValueError(
+            f"first line must be '# mypy: clean' or '# mypy: error ...', got: {first!r}"
+        )
+
+    header_count = 1
+    for line in lines[1:]:
+        if line.rstrip("\r\n").startswith("# cythonpp:"):
+            header_count += 1
+        else:
+            break
+    return mypy_clean, header_count
+
+
+def strip_header(lines, header_count):
+    """Blanks out the header lines but keeps their line numbers.
+
+    A mypy error against the stripped copy still points at the same line as
+    it would in the original file, useful when diagnosing a MISMATCH. It also
+    sidesteps mypy's own inline-config parsing of a literal "# mypy: ..."
+    comment -- left in place, that line is read as a per-file mypy option
+    (e.g. "clean" or "error operator" as flag names) and mypy reports a
+    spurious "Unrecognized option" error instead of checking the code below
+    it.
+    """
+    return ["\n"] * header_count + lines[header_count:]
+
+
+def check_corpus() -> int:
+    """Runs mypy --strict on every test_files/semantic/*.py sample and
+    reports whether each one's '# mypy:' header matches reality.
+
+    Developer-run only -- NEVER invoked by ctest, which must stay hermetic
+    (no Python, no network, no shelling out). This is the only thing in the
+    project that actually confirms a '# mypy: clean' label is true rather
+    than asserted from belief.
+
+    mypy is run with its cwd set to a fresh TemporaryDirectory, so any
+    .mypy_cache it writes never touches the repository at all.
+    """
+    samples = sorted(corpus_dir().glob("*.py"))
+    if not samples:
+        print(f"no *.py files found under {corpus_dir()}", file=sys.stderr)
+        return 1
+
+    failures = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = pathlib.Path(tmpdir)
+        for sample in samples:
+            lines = sample.read_text(encoding="utf-8").splitlines(keepends=True)
+            try:
+                mypy_clean, header_count = parse_header(lines)
+            except ValueError as exc:
+                print(f"MALFORMED  {sample.name}: {exc}")
+                failures.append(f"{sample}: {exc}")
+                continue
+
+            tmp_file = tmpdir_path / sample.name
+            tmp_file.write_text("".join(strip_header(lines, header_count)), encoding="utf-8")
+
+            try:
+                result = subprocess.run(
+                    ["mypy", "--strict", str(tmp_file)],
+                    cwd=tmpdir,
+                    capture_output=True,
+                    text=True,
+                )
+            except FileNotFoundError:
+                print("mypy not found on PATH", file=sys.stderr)
+                return 1
+
+            mypy_actually_clean = result.returncode == 0
+            label = "clean" if mypy_clean else "error"
+            actual = "clean" if mypy_actually_clean else "error"
+            if mypy_actually_clean == mypy_clean:
+                print(f"OK         {sample.name}  (label: {label})")
+            else:
+                print(f"MISMATCH   {sample.name}  (label: {label}, mypy says: {actual})")
+                failures.append(
+                    f"{sample}: labelled '# mypy: {label}' but mypy --strict says "
+                    f"'{actual}':\n{result.stdout}{result.stderr}"
+                )
+
+    if failures:
+        print("\nFAILURES:", file=sys.stderr)
+        for failure in failures:
+            print(f"  - {failure}", file=sys.stderr)
+        return 1
+
+    print(f"\nAll {len(samples)} sample(s) match their '# mypy:' header.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generate-class-table", action="store_true")
+    parser.add_argument(
+        "--check-corpus",
+        action="store_true",
+        help="Run mypy --strict on every test_files/semantic sample and confirm its "
+        "'# mypy:' header matches. Developer-run only -- never part of ctest.",
+    )
     args = parser.parse_args()
     if args.generate_class_table:
         sys.stdout.write(generate_class_table())
         return 0
+    if args.check_corpus:
+        return check_corpus()
     parser.print_help()
     return 1
 

@@ -1,0 +1,301 @@
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "domain/ast/module.h"
+#include "domain/diagnostics/diagnostic.h"
+#include "domain/diagnostics/diagnostic_sink.h"
+#include "domain/lexer/indentation_pass.h"
+#include "domain/lexer/lexer.h"
+#include "domain/parser/statement_parser.h"
+#include "domain/semantic/type_checker.h"
+#include "domain/semantic/type_map.h"
+
+// The labelled-corpus harness. Every *.py file under CYTHONPP_TEST_FILES_DIR
+// /semantic carries a header (see parse_labels below) stating what mypy
+// --strict thinks of it and what cythonpp is expected to report for it. This
+// is the ONLY mechanism in this project that makes the compliance claim --
+// "cythonpp accepts everything mypy --strict accepts" -- falsifiable, rather
+// than a claim resting on however many hand-picked unit tests happen to
+// exist.
+//
+// ctest stays hermetic: nothing here shells out to mypy or python. The
+// developer-run counterpart is scripts/verify_corpus_labels.py --check-corpus,
+// which actually invokes mypy to confirm each "# mypy:" header is honest.
+namespace cythonpp::domain::semantic {
+namespace {
+
+namespace fs = std::filesystem;
+
+// One parsed "# cythonpp: CODE:LINE:COL message" line.
+struct ExpectedDiagnostic {
+    std::string code;
+    int line = 0;
+    int column = 0;
+    std::string message;
+};
+
+// A sample's parsed header. `expected` is empty for a sample with no
+// "# cythonpp:" line at all, meaning cythonpp must report ZERO diagnostics.
+struct SampleLabels {
+    bool mypy_clean = false;
+    std::vector<ExpectedDiagnostic> expected;
+    // Non-empty when the header itself could not be parsed. Reported as a
+    // hard failure rather than silently treated as "expect nothing": a typo
+    // in a label must not make the sample vanish from coverage.
+    std::string parse_error;
+};
+
+std::string strip_eol(std::string line) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+        line.pop_back();
+    }
+    return line;
+}
+
+// Parses one line already known to start with "# cythonpp:". Returns false
+// (with `error` explaining why) for anything that does not match
+// "CODE:LINE:COL message" -- a label the harness cannot parse must fail
+// loudly, not be skipped.
+bool parse_cythonpp_line(const std::string& line, ExpectedDiagnostic& out, std::string& error) {
+    static const std::string kPrefix = "# cythonpp:";
+    std::string rest = line.substr(kPrefix.size());
+
+    const std::size_t first_non_space = rest.find_first_not_of(' ');
+    if (first_non_space == std::string::npos) {
+        error = "'# cythonpp:' line has nothing after the prefix: " + line;
+        return false;
+    }
+    rest = rest.substr(first_non_space);
+
+    const std::size_t colon1 = rest.find(':');
+    const std::size_t colon2 = colon1 == std::string::npos ? std::string::npos
+                                                            : rest.find(':', colon1 + 1);
+    const std::size_t space = colon2 == std::string::npos ? std::string::npos
+                                                           : rest.find(' ', colon2 + 1);
+    if (colon1 == std::string::npos || colon2 == std::string::npos ||
+        space == std::string::npos) {
+        error = "expected 'CODE:LINE:COL message', got: " + line;
+        return false;
+    }
+
+    out.code = rest.substr(0, colon1);
+    const std::string line_str = rest.substr(colon1 + 1, colon2 - colon1 - 1);
+    const std::string col_str = rest.substr(colon2 + 1, space - colon2 - 1);
+    try {
+        std::size_t consumed = 0;
+        out.line = std::stoi(line_str, &consumed);
+        if (consumed != line_str.size()) throw std::invalid_argument(line_str);
+        out.column = std::stoi(col_str, &consumed);
+        if (consumed != col_str.size()) throw std::invalid_argument(col_str);
+    } catch (const std::exception&) {
+        error = "line/column are not plain integers: " + line;
+        return false;
+    }
+    out.message = rest.substr(space + 1);
+    return true;
+}
+
+// Reads and parses `path`'s header: the FIRST line must be "# mypy: clean" or
+// "# mypy: error ..." (freeform after "error", informational only -- the
+// harness only ever branches on clean-vs-not), followed by zero or more
+// "# cythonpp: ..." lines. The header ends at the first line that is neither,
+// exactly where the real source begins -- which is why every label's line
+// number counts the header lines too: StatementParser sees the WHOLE file,
+// header included, since "#" comments are invisible to it either way.
+SampleLabels parse_labels(const fs::path& path) {
+    SampleLabels labels;
+    std::ifstream file(path);
+    if (!file) {
+        labels.parse_error = "could not open file";
+        return labels;
+    }
+
+    std::string raw_line;
+    bool seen_mypy_line = false;
+    while (std::getline(file, raw_line)) {
+        const std::string line = strip_eol(raw_line);
+        if (!seen_mypy_line) {
+            if (line == "# mypy: clean") {
+                labels.mypy_clean = true;
+            } else if (line.rfind("# mypy: error", 0) == 0) {
+                labels.mypy_clean = false;
+            } else {
+                labels.parse_error =
+                    "first line must be '# mypy: clean' or '# mypy: error ...', got: " + line;
+                return labels;
+            }
+            seen_mypy_line = true;
+            continue;
+        }
+        if (line.rfind("# cythonpp:", 0) == 0) {
+            ExpectedDiagnostic diagnostic;
+            std::string error;
+            if (!parse_cythonpp_line(line, diagnostic, error)) {
+                labels.parse_error = error;
+                return labels;
+            }
+            labels.expected.push_back(std::move(diagnostic));
+            continue;
+        }
+        break; // First non-header line: the header is over.
+    }
+    if (!seen_mypy_line) {
+        labels.parse_error = "file is empty or has no '# mypy:' header line";
+    }
+    return labels;
+}
+
+std::string read_file(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    std::ostringstream contents;
+    contents << file.rdbuf();
+    return contents.str();
+}
+
+// The real chain -- source -> Lexer -> IndentationPass -> StatementParser ->
+// TypeChecker, ONE sink for both parse and type diagnostics -- exactly what a
+// real invocation of cythonpp does. Mirrors type_checker_test.cpp's
+// check_module for the same reason that test gives: hand-building a Module
+// would let the harness agree with a wrong belief about what the parser
+// actually produces.
+std::vector<diagnostics::Diagnostic> run_checker(const std::string& source) {
+    lexer::Lexer lexer(source);
+    const lexer::TokenStream lexed(lexer.tokenize());
+    diagnostics::DiagnosticSink sink;
+    lexer::TokenStream tokens = lexer::IndentationPass().run(lexed, sink);
+    const std::unique_ptr<ast::Module> module =
+        parser::StatementParser(tokens, sink).parse_module();
+    if (!sink.has_errors()) {
+        TypeChecker(sink).check(*module);
+    }
+    return sink.diagnostics();
+}
+
+std::string describe(const std::string& code, int line, int column, const std::string& message) {
+    std::ostringstream out;
+    out << code << ':' << line << ':' << column << ' ' << message;
+    return out.str();
+}
+
+std::string describe(const ExpectedDiagnostic& diagnostic) {
+    return describe(diagnostic.code, diagnostic.line, diagnostic.column, diagnostic.message);
+}
+
+std::string describe(const diagnostics::Diagnostic& diagnostic) {
+    return describe(diagnostic.code, diagnostic.line, diagnostic.column, diagnostic.message);
+}
+
+fs::path corpus_dir() {
+    return fs::path(CYTHONPP_TEST_FILES_DIR) / "semantic";
+}
+
+std::vector<fs::path> corpus_files() {
+    std::vector<fs::path> files;
+    if (!fs::exists(corpus_dir())) {
+        return files;
+    }
+    for (const fs::directory_entry& entry : fs::directory_iterator(corpus_dir())) {
+        if (entry.is_regular_file() && entry.path().extension() == ".py") {
+            files.push_back(entry.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+// Checks ONE sample end-to-end via non-fatal EXPECT_*/ADD_FAILURE, so one bad
+// sample never hides a failure elsewhere in the corpus.
+void check_sample(const fs::path& path) {
+    SCOPED_TRACE("sample: " + path.string());
+
+    const SampleLabels labels = parse_labels(path);
+    if (!labels.parse_error.empty()) {
+        ADD_FAILURE() << path.string() << ": malformed label header -- " << labels.parse_error;
+        return;
+    }
+
+    // THE RULE THAT EARNS THE WHOLE DESIGN, checked BEFORE anything about
+    // what the checker actually produces. The project's hard invariant is
+    // "if mypy --strict reports nothing, cythonpp reports no TypeError or
+    // NameError". A sample labelled "# mypy: clean" that ALSO expects a
+    // TypeError or NameError from cythonpp is a direct contradiction of that
+    // invariant on the labels alone -- it must fail by construction, not by
+    // whatever the checker happens to produce, so the failure message names
+    // the invariant instead of showing a string diff.
+    if (labels.mypy_clean) {
+        for (const ExpectedDiagnostic& diagnostic : labels.expected) {
+            if (diagnostic.code == "TypeError" || diagnostic.code == "NameError") {
+                ADD_FAILURE()
+                    << path.string() << ": INVARIANT VIOLATED -- labelled '# mypy: clean' "
+                    << "but also expects a '" << diagnostic.code << "' from cythonpp ("
+                    << describe(diagnostic) << "). The hard invariant this project claims is "
+                    << "\"if mypy --strict reports nothing, cythonpp reports no TypeError or "
+                    << "NameError\". Either the '# mypy: clean' label is wrong (re-verify with "
+                    << "`python scripts/verify_corpus_labels.py --check-corpus`), or cythonpp "
+                    << "reporting a " << diagnostic.code << " here is a genuine bug -- fix "
+                    << "whichever one is false, do not just edit this label.";
+                return;
+            }
+        }
+    }
+
+    const std::string source = read_file(path);
+    const std::vector<diagnostics::Diagnostic> actual = run_checker(source);
+
+    bool mismatch = actual.size() != labels.expected.size();
+    if (!mismatch) {
+        for (std::size_t i = 0; i < actual.size(); ++i) {
+            const diagnostics::Diagnostic& got = actual[i];
+            const ExpectedDiagnostic& want = labels.expected[i];
+            if (got.code != want.code || got.line != want.line || got.column != want.column ||
+                got.message != want.message) {
+                mismatch = true;
+                break;
+            }
+        }
+    }
+
+    if (mismatch) {
+        std::ostringstream out;
+        out << path.string() << ": actual diagnostics do not match the sample's header.\n";
+        const std::size_t rows = std::max(actual.size(), labels.expected.size());
+        out << "  #  EXPECTED (from header)                              ACTUAL (from TypeChecker)\n";
+        for (std::size_t i = 0; i < rows; ++i) {
+            const std::string want = i < labels.expected.size() ? describe(labels.expected[i])
+                                                                 : std::string("<none>");
+            const std::string got =
+                i < actual.size() ? describe(actual[i]) : std::string("<none>");
+            out << "  " << i << "  " << want << std::string(want.size() < 52 ? 52 - want.size() : 1, ' ')
+                << got << '\n';
+        }
+        ADD_FAILURE() << out.str();
+    }
+}
+
+// A harness that silently finds zero files and passes is the exact failure
+// mode this test guards against -- a wrong CYTHONPP_TEST_FILES_DIR produces
+// precisely that.
+TEST(SemanticCorpus, CorpusDirectoryIsNotEmpty) {
+    const std::vector<fs::path> files = corpus_files();
+    ASSERT_FALSE(files.empty())
+        << "no *.py files found under " << corpus_dir().string()
+        << " -- either the corpus is genuinely empty (add samples under "
+           "test_files/semantic/) or CYTHONPP_TEST_FILES_DIR is misconfigured "
+           "in CMakeLists.txt.";
+}
+
+TEST(SemanticCorpus, EverySampleMatchesItsLabels) {
+    for (const fs::path& path : corpus_files()) {
+        check_sample(path);
+    }
+}
+
+} // namespace
+} // namespace cythonpp::domain::semantic

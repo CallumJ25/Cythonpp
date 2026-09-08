@@ -97,6 +97,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/semantic/builtin_call_table_test.cpp
         tests/domain/semantic/type_checker_test.cpp
         tests/domain/semantic/typed_printer_test.cpp
+        tests/domain/semantic/semantic_corpus_test.cpp
         tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/application/compile_pipeline_test.cpp
         tests/adapters/filesystem/filesystem_source_lister_test.cpp
@@ -105,6 +106,8 @@ if(CYTHONPP_BUILD_TESTS)
     )
     target_link_libraries(cythonpp_tests PRIVATE cythonpp_lib gtest_main)
     target_include_directories(cythonpp_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(cythonpp_tests PRIVATE
+        CYTHONPP_TEST_FILES_DIR="${CMAKE_SOURCE_DIR}/test_files")
 
     include(GoogleTest)
     gtest_discover_tests(cythonpp_tests)
