@@ -4,6 +4,7 @@
 #include <string>
 
 #include "class_table.h"
+#include "domain/ast/attribute.h"
 #include "domain/ast/bin_op.h"
 #include "domain/ast/bool_op.h"
 #include "domain/ast/compare.h"
@@ -12,6 +13,7 @@
 #include "domain/ast/expr.h"
 #include "domain/ast/list_expr.h"
 #include "domain/ast/name.h"
+#include "domain/ast/subscript.h"
 #include "domain/ast/tuple_expr.h"
 #include "domain/ast/unary_op.h"
 #include "domain/diagnostics/diagnostic_sink.h"
@@ -24,9 +26,9 @@ namespace cythonpp::domain::semantic {
 
 // Gives every expression a Type, recording each one in `types` on the way.
 //
-// SCOPE: Constant, Name, UnaryOp, BinOp, Compare, BoolOp (Task 12) and the
-// three container displays -- ListExpr, DictExpr, TupleExpr (Task 13) -- are
-// real. Every other Expr kind -- Subscript/Attribute (Task 14), Call
+// SCOPE: Constant, Name, UnaryOp, BinOp, Compare, BoolOp (Task 12), the
+// three container displays -- ListExpr, DictExpr, TupleExpr (Task 13) -- and
+// Subscript/Attribute (Task 14) are real. Every other Expr kind -- Call
 // (Task 15), ListComp (Task 16), ... -- returns Type::unknown() SILENTLY,
 // with no report, so an intermediate build never emits a diagnostic a later
 // task has to un-emit.
@@ -102,6 +104,25 @@ private:
     Type type_of_list(const ast::ListExpr& list, const Type& expected);
     Type type_of_dict(const ast::DictExpr& dict, const Type& expected);
     Type type_of_tuple(const ast::TupleExpr& tuple, const Type& expected);
+
+    // `container[index]` (Task 14). Delegates entirely to subscript_result --
+    // every interesting row (bytes[int] -> int, a heterogeneous tuple's
+    // union, a dict key checked by assignability) already lives in that rule
+    // table -- and routes the three-way answer through apply().
+    Type type_of_subscript(const ast::Subscript& subscript);
+
+    // `value.attribute` (Task 14). Where the class table earns its keep: a
+    // Class receiver is looked up in ClassTable, everything else (a builtin
+    // kind, a Union needing narrowing, or Unknown) is handled without ever
+    // consulting the class table. See type_of_class_attribute for the
+    // Class-receiver cases.
+    Type type_of_attribute(const ast::Attribute& attribute);
+
+    // The Class-receiver half of type_of_attribute, split out because it
+    // alone has more than one case: a member (declared or inherited) wins,
+    // then a method (a SEPARATE ClassTable query -- see class_table.h), then
+    // the builtin-inheriting carve-out, then a genuine attr-defined TypeError.
+    Type type_of_class_attribute(const Type& receiver, const ast::Attribute& attribute);
 
     // The three-way switch, in one place. Every rule-table call goes through
     // this, which is what makes the false-TypeError path unreachable by

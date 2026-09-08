@@ -1,6 +1,7 @@
 #include "expression_typer.h"
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,6 +41,13 @@ std::string operand_type_error_message(lexer::token_type op, const Type& left, c
            "\" and \"" + type_name(right) + "\")";
 }
 
+// "methods on builtin types are not supported" -- reported for BOTH a
+// directly builtin receiver (xs.append, s.upper, d.keys -- no typeshed here
+// to consult) and, via the carve-out below, a user class whose base chain
+// reaches a builtin kind when the member is not one WE know about. One
+// constant so the two call sites cannot drift apart.
+const char* kBuiltinMemberMessage = "methods on builtin types are not supported";
+
 } // namespace
 
 ExpressionTyper::ExpressionTyper(ScopeStack& scopes, const ClassTable& classes, TypeMap& types,
@@ -66,11 +74,14 @@ Type ExpressionTyper::type_of(const ast::Expr& expr, const Type& expected) {
         result = type_of_dict(*dict, expected);
     } else if (const auto* tuple = dynamic_cast<const ast::TupleExpr*>(&expr)) {
         result = type_of_tuple(*tuple, expected);
+    } else if (const auto* subscript = dynamic_cast<const ast::Subscript*>(&expr)) {
+        result = type_of_subscript(*subscript);
+    } else if (const auto* attribute = dynamic_cast<const ast::Attribute*>(&expr)) {
+        result = type_of_attribute(*attribute);
     } else {
-        // Every other Expr kind is a later task's arm (Subscript/Attribute:
-        // 14, Call: 15, ListComp: 16, ...). Deliberately SILENT -- not
-        // error() -- so an intermediate build never emits a diagnostic a
-        // later task has to un-emit.
+        // Every other Expr kind is a later task's arm (Call: 15, ListComp:
+        // 16, ...). Deliberately SILENT -- not error() -- so an intermediate
+        // build never emits a diagnostic a later task has to un-emit.
         result = Type::unknown();
     }
     // Every expression the typer types gets an entry, unconditionally --
@@ -287,6 +298,97 @@ Type ExpressionTyper::type_of_tuple(const ast::TupleExpr& tuple, const Type& exp
     // are what carries into the result, matching every other display's own
     // elements always driving the answer here.
     return Type::tuple_of(std::move(element_types));
+}
+
+Type ExpressionTyper::type_of_subscript(const ast::Subscript& subscript) {
+    const Type container = type_of(subscript.value(), Type::unknown());
+    const Type index = type_of(subscript.index(), Type::unknown());
+    const RuleResult result = subscript_result(container, index, &classes_);
+    return apply(result, subscript,
+                 "invalid index type \"" + type_name(index) + "\" for \"" + type_name(container) +
+                     "\"");
+}
+
+Type ExpressionTyper::type_of_attribute(const ast::Attribute& attribute) {
+    const Type receiver = type_of(attribute.value(), Type::unknown());
+    switch (receiver.kind) {
+    case TypeKind::Unknown:
+        // The root cause (an unbound name, a prior failed subexpression, ...)
+        // already reported. Absorbing, like every other arm's Unknown input.
+        return Type::unknown();
+    case TypeKind::Union:
+        // mypy narrows; this compiler does not model per-branch environments
+        // yet, so `(A | None).f` is deferred rather than guessed at, exactly
+        // like every other union-operand case.
+        return error(attribute, "NotImplementedError",
+                     unsupported_message(UnsupportedReason::UnionOperand));
+    case TypeKind::Class:
+        return type_of_class_attribute(receiver, attribute);
+    // Every builtin kind: no typeshed is consulted here, so a member access
+    // on any of these is unmodellable rather than a guess -- reporting
+    // attr-defined without knowing str/list/dict's real members would be a
+    // false TypeError on some of the most common lines in Python
+    // (xs.append(1), s.upper(), d.keys()).
+    case TypeKind::NoneType:
+    case TypeKind::Bool:
+    case TypeKind::Int:
+    case TypeKind::Float:
+    case TypeKind::Complex:
+    case TypeKind::Str:
+    case TypeKind::Bytes:
+    case TypeKind::ByteArray:
+    case TypeKind::Ellipsis:
+    case TypeKind::List:
+    case TypeKind::Dict:
+    case TypeKind::Set:
+    case TypeKind::FrozenSet:
+    case TypeKind::Tuple:
+    case TypeKind::Range:
+    case TypeKind::Callable:
+    case TypeKind::Object:
+        return error(attribute, "NotImplementedError", kBuiltinMemberMessage);
+    }
+    // Unreachable: the switch is exhaustive over TypeKind and has no default,
+    // so adding a kind warns here rather than silently falling through.
+    return Type::unknown();
+}
+
+Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::Attribute& attribute) {
+    // member_type and method_type are TWO SEPARATE ClassTable queries --
+    // declare_member writes into Entry::members, declare_method into
+    // Entry::methods, and each query only ever searches its own map. Trying
+    // member_type alone would make every ordinary method reference (`c.m`)
+    // a false attr-defined TypeError, which is the hard invariant. Member
+    // wins first since it is checked first here, but a real class never
+    // declares the same name as both, so the order does not paper over a
+    // genuine ambiguity.
+    if (const std::optional<Type> member =
+            classes_.member_type(receiver.name, attribute.attribute())) {
+        return *member;
+    }
+    // Returned AS-IS, `self` parameter included -- Task 15's Call arm is what
+    // drops args[0] when binding a call; a bare reference like `c.m` (never
+    // called) has no binding step to do that, so this must not do it either.
+    if (const std::optional<Type> method =
+            classes_.method_type(receiver.name, attribute.attribute())) {
+        return *method;
+    }
+    // THE CARVE-OUT: `class Sub(int): pass` then `Sub().bit_length()` is
+    // mypy-clean, because Sub inherits int's members, which this compiler
+    // does not model (no typeshed). Without this row, an attribute miss on
+    // Sub would be a false TypeError. The accepted cost is a MISSED error:
+    // `Sub().nope` is a genuine mypy attr-defined error and this reports
+    // NotImplementedError instead -- direction (b) loses attr-defined for
+    // builtin-inheriting classes only, and the hard invariant (never a false
+    // TypeError) holds.
+    if (classes_.inherits_builtin(receiver.name)) {
+        return error(attribute, "NotImplementedError", kBuiltinMemberMessage);
+    }
+    // Every base is an ordinary user-class-shaped entry (including a seeded
+    // exception class -- inherits_builtin is deliberately false for those),
+    // so a miss here is a genuine mypy attr-defined error.
+    return error(attribute, "TypeError",
+                 "\"" + receiver.name + "\" has no attribute \"" + attribute.attribute() + "\"");
 }
 
 Type ExpressionTyper::apply(const RuleResult& result, const ast::Expr& at,

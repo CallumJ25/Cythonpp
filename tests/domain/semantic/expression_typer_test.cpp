@@ -262,8 +262,6 @@ TEST(ExpressionTyper, RecordsTheNegatedConstantInTheTypeMapToo) {
 // returns Unknown, would pass unnoticed.
 TEST(ExpressionTyper, SilentlyReturnsUnknownForEveryArmNotYetImplemented) {
     const std::vector<std::string> not_yet_implemented = {
-        "x[0]",            // Subscript -- Task 14.
-        "x.y",             // Attribute -- Task 14.
         "f()",             // Call -- Task 15.
         "[v for v in [1]]", // ListComp -- Task 16.
     };
@@ -560,6 +558,168 @@ TEST(ExpressionTyper, AContextOfTheWrongShapeFallsBackToInference) {
 
     EXPECT_TRUE(typed.diagnostics.empty()) << "the assignment check reports, not the display";
     EXPECT_EQ(type_name(typed.type), "list[int]");
+}
+
+// Coverage gap left by Task 13: no test exercised a TUPLE context
+// propagating into a NESTED empty display, only a top-level one. The inner
+// `[]` must resolve to list[int] from the positional element context
+// (type_of_tuple threads `element_expected` into its recursive type_of()
+// call), not fall to the no-context path and go silently Unknown.
+TEST(ExpressionTyper, TupleContextPropagatesIntoANestedEmptyDisplay) {
+    const Typed typed =
+        type_expression("([],)", {}, Type::tuple_of({Type::list_of(Type::int_())}));
+
+    EXPECT_TRUE(typed.diagnostics.empty());
+    EXPECT_EQ(typed.printed, "tuple[list[int]]");
+}
+
+// --- Subscript (Task 14) ---------------------------------------------------
+
+TEST(ExpressionTyper, TypesSubscriptThroughTheRuleTable) {
+    EXPECT_EQ(typed_name("xs[0]", {{"xs", Type::list_of(Type::str())}}), "str");
+    EXPECT_EQ(typed_name("bs[0]", {{"bs", Type::bytes()}}), "int") << "bytes[int] is int";
+    EXPECT_EQ(typed_name("d[\"k\"]", {{"d", Type::dict_of(Type::str(), Type::int_())}}), "int");
+    EXPECT_EQ(typed_name("t[0]", {{"t", Type::tuple_of({Type::int_(), Type::str()})}}),
+              "int | str")
+        << "a heterogeneous tuple yields the union";
+}
+
+TEST(ExpressionTyper, ReportsABadIndexType) {
+    const Typed typed =
+        type_expression("d[1]", {{"d", Type::dict_of(Type::str(), Type::int_())}});
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+}
+
+// Verified: `s[0]` with __getitem__(self, i: int) -> str is mypy-CLEAN, so a
+// TypeError here would be false.
+TEST(ExpressionTyper, ReportsSubscriptingAUserClassAsUnsupported) {
+    ClassTable table;
+    table.declare("Widget", {});
+    const Typed typed =
+        type_expression("w[0]", {{"w", Type::class_of("Widget")}}, Type::unknown(), &table);
+
+    EXPECT_EQ(only_error(typed).code, "NotImplementedError");
+}
+
+// --- Attribute (Task 14) ----------------------------------------------------
+
+TEST(ExpressionTyper, ResolvesAUserClassAttribute) {
+    ClassTable table;
+    table.declare("Widget", {});
+    table.declare_member("Widget", "width", Type::int_(), 2);
+
+    const Typed typed = type_expression("w.width", {{"w", Type::class_of("Widget")}},
+                                        Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty());
+    EXPECT_EQ(typed.printed, "int");
+}
+
+TEST(ExpressionTyper, ResolvesAnInheritedAttribute) {
+    ClassTable table;
+    table.declare("Base", {});
+    table.declare_member("Base", "x", Type::str(), 2);
+    table.declare("Leaf", {"Base"});
+
+    EXPECT_EQ(type_expression("w.x", {{"w", Type::class_of("Leaf")}}, Type::unknown(), &table)
+                  .printed,
+              "str");
+}
+
+// ClassTable has TWO member queries -- member_type (Entry::members) and
+// method_type (Entry::methods) -- and a bare `c.m` reference (never called)
+// must resolve through method_type too, or every ordinary method reference
+// would be a false attr-defined TypeError. Returned WITH `self` still in the
+// signature: Task 15's Call arm drops args[0] itself when it binds a call,
+// so this must not do that pre-emptively.
+TEST(ExpressionTyper, ResolvesAMethodReferenceIncludingSelf) {
+    ClassTable table;
+    table.declare("Widget", {});
+    table.declare_method("Widget", "resize",
+                         Type::callable({Type::class_of("Widget"), Type::int_()}, Type::none()));
+
+    const Typed typed = type_expression("w.resize", {{"w", Type::class_of("Widget")}},
+                                        Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty());
+    EXPECT_EQ(typed.printed, "Callable[[Widget, int], None]")
+        << "self stays in the signature; Task 15's Call arm drops it";
+}
+
+// mypy's attr-defined, and it IS in direction (b)'s rule set.
+TEST(ExpressionTyper, ReportsAMissingAttributeOnAUserClass) {
+    ClassTable table;
+    table.declare("Widget", {});
+
+    const Typed typed = type_expression("w.nope", {{"w", Type::class_of("Widget")}},
+                                        Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Widget\" has no attribute \"nope\"");
+}
+
+// THE CARVE-OUT that closing Task 9's violation forced. Verified:
+// `class Sub(int): pass` then Sub().bit_length() is mypy-CLEAN, because Sub
+// inherits int's members. Without this row, Task 9's fix would make every
+// attribute miss on Sub a FALSE TypeError.
+//
+// The accepted cost: Sub().nope IS a genuine mypy attr-defined error and we
+// report NotImplementedError instead -- a MISSED error, so invariant (a)
+// holds and direction (b) loses attr-defined for builtin-inheriting classes
+// only.
+TEST(ExpressionTyper, AMissingAttributeOnABuiltinInheritingClassIsUnsupported) {
+    ClassTable table;
+    table.declare("Sub", {"int"});
+
+    const Typed typed = type_expression("s.bit_length", {{"s", Type::class_of("Sub")}},
+                                        Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "methods on builtin types are not supported");
+}
+
+// A DECLARED member still wins over the carve-out.
+TEST(ExpressionTyper, ADeclaredMemberOnABuiltinInheritingClassStillResolves) {
+    ClassTable table;
+    table.declare("Sub", {"int"});
+    table.declare_member("Sub", "label", Type::str(), 3);
+
+    EXPECT_EQ(type_expression("s.label", {{"s", Type::class_of("Sub")}}, Type::unknown(),
+                              &table)
+                  .printed,
+              "str");
+}
+
+// Verified: xs.append(1), s.upper() and d.keys() are ALL mypy-clean. With no
+// typeshed, reporting attr-defined here would be a false TypeError on one of
+// the most common lines in Python.
+TEST(ExpressionTyper, ReportsBuiltinAttributeAccessAsUnsupported) {
+    for (const Type& receiver :
+         {Type::list_of(Type::int_()), Type::str(), Type::dict_of(Type::str(), Type::int_())}) {
+        const Typed typed = type_expression("r.anything", {{"r", receiver}});
+        const diagnostics::Diagnostic error = only_error(typed);
+        EXPECT_EQ(error.code, "NotImplementedError");
+        EXPECT_EQ(error.message, "methods on builtin types are not supported");
+    }
+}
+
+TEST(ExpressionTyper, ReportsAttributeAccessOnAUnionAsNeedingNarrowing) {
+    const Typed typed = type_expression(
+        "x.f", {{"x", Type::union_of({Type::class_of("A"), Type::none()})}});
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message,
+              "operations on a union-typed value require narrowing, which is not supported");
+}
+
+// Absorbing: the NameError is the only report.
+TEST(ExpressionTyper, AttributeAccessOnUnknownIsSilent) {
+    const Typed typed = type_expression("nope.f");
+
+    EXPECT_EQ(typed.diagnostics.size(), 1u);
+    EXPECT_EQ(typed.diagnostics.front().code, "NameError");
+    EXPECT_EQ(typed.printed, "Unknown");
 }
 
 } // namespace
