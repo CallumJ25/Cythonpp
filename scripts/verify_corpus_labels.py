@@ -207,9 +207,17 @@ def parse_header(lines):
     "# cythonpp: ..." line right after it. Raises ValueError for anything
     that doesn't match -- a label this cannot parse must fail loudly, not be
     silently skipped.
+
+    Once the header ends (the first line that is neither), the REST of the
+    lines are still scanned -- not ignored -- purely to catch a
+    "# cythonpp:" line placed below the header by mistake. Silently dropping
+    such a line would shrink the expected-diagnostics list without a trace,
+    which is exactly the "must fail loudly, not be skipped" doctrine this
+    parser claims to follow, so a detached label is a parse error, not a
+    no-op. Mirrors the C++ `in_header` flag exactly.
     """
     if not lines:
-        raise ValueError("file is empty")
+        raise ValueError("file is empty or has no '# mypy:' header line")
 
     first = lines[0].rstrip("\r\n")
     if first == "# mypy: clean":
@@ -219,15 +227,30 @@ def parse_header(lines):
     else:
         raise ValueError(
             f"first line must be '# mypy: clean' or '# mypy: error ...', got: {first!r} "
-            "(if this looks identical to a valid header, check for trailing whitespace)"
+            "(if this looks identical to a valid header, check for trailing whitespace -- "
+            "an editor auto-save is a common cause, and '# mypy: clean' must match exactly)"
         )
 
     header_count = 1
+    in_header = True
     for line in lines[1:]:
-        if line.rstrip("\r\n").startswith("# cythonpp:"):
+        stripped = line.rstrip("\r\n")
+        is_cythonpp_line = stripped.startswith("# cythonpp:")
+        if in_header and is_cythonpp_line:
             header_count += 1
-        else:
-            break
+            continue
+        if in_header:
+            in_header = False  # First non-header line: the header is over.
+        # Past the header now (possibly as of this very line). A
+        # "# cythonpp:" line here is detached from the header block and
+        # would otherwise vanish from the expected-diagnostics list without
+        # a trace.
+        if is_cythonpp_line:
+            raise ValueError(
+                "'# cythonpp:' line found below the header, detached from the leading "
+                "'# mypy:'/'# cythonpp:' block -- move it up next to the other label "
+                f"lines: {stripped}"
+            )
     return mypy_clean, header_count
 
 
