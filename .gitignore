@@ -57,3 +57,9 @@ docs/
 # self-protects with a nested ignore it generates, but relying on that means
 # the protection disappears if the directory is ever recreated by hand.
 .mypy_cache/
+
+# The scratch directory used to run mypy on probe programs OUTSIDE the corpus.
+# Empty in a clean tree, so `git status` never mentions it -- which is exactly
+# why it needs listing here rather than being noticed in time: one `git add
+# -A` while it holds probes is all it takes to commit them.
+scratch_mypy/
