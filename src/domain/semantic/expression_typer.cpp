@@ -131,8 +131,20 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
     if (resolution.binding == nullptr) {
         return error(name, "NameError", "name '" + name.identifier() + "' is not defined");
     }
+    // THE ORDERING RULE (Task 11): a read is order-checked only against a
+    // binding in its OWN immediately-enclosing scope; a read resolving
+    // OUTWARD is never order-checked. >= , not >: `x = x + 1` where `x` is
+    // not yet bound is a violation, because the right-hand side is evaluated
+    // before the target is bound, so a read on the SAME line as its own
+    // binding is already too late.
+    if (resolution.in_own_scope && resolution.binding->declared_line >= statement_line_) {
+        return error(name, "NameError",
+                     "name '" + name.identifier() + "' is used before definition");
+    }
     return resolution.binding->type;
 }
+
+void ExpressionTyper::set_statement_line(int line) { statement_line_ = line; }
 
 Type ExpressionTyper::type_of_unary_op(const ast::UnaryOp& unary) {
     const ast::Expr& operand_expr = unary.operand();

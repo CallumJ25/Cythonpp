@@ -32,6 +32,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/semantic/expression_typer.cpp
     src/domain/semantic/expression_typer_calls.cpp
     src/domain/semantic/builtin_call_table.cpp
+    src/domain/semantic/type_checker.cpp
     src/application/compile_pipeline.cpp
     src/adapters/filesystem/filesystem_source_reader.cpp
     src/adapters/filesystem/filesystem_source_lister.cpp
@@ -93,6 +94,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/semantic/scope_stack_test.cpp
         tests/domain/semantic/expression_typer_test.cpp
         tests/domain/semantic/builtin_call_table_test.cpp
+        tests/domain/semantic/type_checker_test.cpp
         tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/application/compile_pipeline_test.cpp
         tests/adapters/filesystem/filesystem_source_lister_test.cpp
