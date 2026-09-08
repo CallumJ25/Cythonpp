@@ -23,22 +23,44 @@ struct Binding {
     // ordinary assignment check.
     bool annotated = false;
 
-    // Task 18 fix round 1, Finding 1 (CRITICAL): true only for a function
-    // parameter. A parameter can NEVER be used-before-definition inside its
-    // own body -- by the time the body runs, every parameter is already
-    // bound -- yet a one-line `def f(x: int) -> None: print(x)` binds `x` at
-    // the SAME line the body statement sits on (there is no separate body
-    // line to be strictly greater), so the ordinary ordering check's `>=`
+    // General rule: a binding is order-exempt when the name is bound BEFORE
+    // the code that may read it, so a same-line read of it can never be a
+    // genuine use-before-definition. The ordinary ordering check's `>=`
     // (declared_line >= statement_line_, deliberately `>=` so `x = x + 1`
-    // still trips) would misfire on the read of `x` and on any other
-    // same-line read of a parameter. This flag is the exemption:
-    // ExpressionTyper::type_of_name skips the ordering check entirely when
-    // it is set. It ALSO lets assign_to/assign_name tell a parameter apart
-    // from pre_bind_function_body's own "still-unfilled placeholder" pattern
+    // still trips) cannot tell "same line because bound first" apart from
+    // "same line because read first" on its own -- this flag is how the
+    // binding site, which does know which one it is, tells
+    // ExpressionTyper::type_of_name to skip the check entirely.
+    //
+    // This bug class has shipped three separate times, each caught only
+    // after the previous fix had already gone out, because every site looks
+    // like an isolated special case until the next one turns up with the
+    // same shape:
+    //   1. A function parameter -- `def f(x: int) -> None: print(x)` reads
+    //      `x` on the `def`'s own line; there is no separate body line for
+    //      it to be strictly greater than.
+    //   2. A `for` target -- `for i in range(3): print(i)`, same shape.
+    //   3. A comprehension target -- `[v * v for v in values]`, same shape
+    //      again. This one was found by the labelled corpus AFTER 1013 unit
+    //      tests passed, and it fires on essentially every real list
+    //      comprehension.
+    //
+    // The flag also lets assign_to/assign_name tell a parameter apart from
+    // pre_bind_function_body's own "still-unfilled placeholder" pattern
     // (same test, declared_line == the current statement's line) -- without
     // it, `def f(x: int) -> None: x = "s"` would be mistaken for the
     // placeholder-fill case and silently REBIND over the parameter's
     // annotation instead of reporting the incompatible assignment.
+    //
+    // Before adding a fourth site: this is true exactly when the binding is
+    // established before the expression(s) that could read it on the same
+    // line are typed (a target bound ahead of its RHS/element/body). Leave
+    // it false for anything where the read happens first or independently
+    // of the bind -- a plain `x = value` RHS, a placeholder rebind, or a
+    // signature bound in an outer scope that the body only resolves
+    // outward into -- since those are genuine before/after cases where a
+    // same-line collision would be a real use-before-definition, not a
+    // same-line coincidence.
     bool order_exempt = false;
 };
 
