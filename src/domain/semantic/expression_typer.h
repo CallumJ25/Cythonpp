@@ -268,6 +268,13 @@ private:
     // omission.
     Type apply(const RuleResult& result, const ast::Expr& at, std::string type_error_message);
 
+    // Fix round 1, Finding 6: the ONE place the "is not iterable" message
+    // literal is spelled, shared by type_of_list_comp's own element_type
+    // call and the public element_type_of (which For's TypeChecker arm
+    // uses) -- previously each built the identical string inline, so this
+    // is a genuine de-duplication, not just routing through apply().
+    static std::string not_iterable_message(const Type& iterable_type);
+
     // Reports at `at`'s span start and returns Unknown, mirroring
     // AnnotationResolver::error, so every failure path is one line.
     Type error(const ast::Expr& at, std::string code, std::string message);

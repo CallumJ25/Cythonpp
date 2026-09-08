@@ -464,9 +464,11 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
     typer_.type_of(value, Type::unknown());
 }
 
-void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, int line) {
+void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, int line,
+                              bool order_exempt) {
     if (!scopes_.bound_in_current_scope(target.identifier())) {
-        scopes_.bind(target.identifier(), Binding{value_type, line, /*annotated=*/false});
+        scopes_.bind(target.identifier(),
+                     Binding{value_type, line, /*annotated=*/false, order_exempt});
         return;
     }
     const Resolution existing = scopes_.resolve(target.identifier());
@@ -1231,13 +1233,43 @@ void TypeChecker::visit(const ast::For& node) {
         // type_of_list_comp's identical tuple-target arm.
         report(*tuple_target, "NotImplementedError",
               "tuple targets in for loops are not supported");
+        // Fix round 1, Finding 8: bind each element to Unknown anyway, the
+        // same precedent assign_tuple's own arity-mismatch fallback sets --
+        // otherwise the body is still walked (unlike a `pass`-only fixture, a
+        // real body reading `a`/`b` here would see them wholly UNBOUND) and a
+        // real use cascades its own NameError on top of this
+        // NotImplementedError instead of being silently absorbed like every
+        // other "unsupported shape" case in this checker. order_exempt=true
+        // for the same reason the Name-target arm below needs it: bound
+        // before the body runs, so a one-line suite reading one right back
+        // can never be a genuine use-before-definition.
+        for (const ast::ExprPtr& element : tuple_target->elements()) {
+            if (const auto* name = dynamic_cast<const ast::Name*>(element.get())) {
+                if (!scopes_.bound_in_current_scope(name->identifier())) {
+                    scopes_.bind(name->identifier(),
+                                 Binding{Type::unknown(), line, /*annotated=*/false,
+                                        /*order_exempt=*/true});
+                }
+            }
+        }
     } else if (const auto* name_target = dynamic_cast<const ast::Name*>(&node.target())) {
         // A for target does NOT get its own scope (unlike a comprehension's
         // Comprehension scope) -- bound via assign_name, exactly like an
         // ordinary Name assignment, into the CURRENT scope, so it survives
         // the loop and a reassignment through a second loop is checked for
         // compatibility rather than silently rebound.
-        assign_name(*name_target, element, line);
+        //
+        // order_exempt=true (fix round 1, Finding 1, CRITICAL): a for target
+        // is bound before its OWN body ever runs, exactly like a parameter --
+        // so a one-line suite (`for i in range(3): print(i)`) reading it
+        // within that same body is never a genuine use-before-definition.
+        // Without this, the body's ExprStmt sets statement_line_ to this same
+        // line, and the ordinary `declared_line >= statement_line_` ordering
+        // check (declared_line == line here too) misfires exactly like it did
+        // for a one-line def's own parameter before Task 18 fixed that case.
+        // A read BEFORE the loop is untouched by this: the name is not bound
+        // at all yet, so it still correctly reports "is not defined".
+        assign_name(*name_target, element, line, /*order_exempt=*/true);
     }
     // Any other target shape (Attribute, Subscript) is outside this task's
     // tested scope; nothing to bind.
@@ -1304,18 +1336,38 @@ bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body
             }
             continue;
         }
-        // A nested For/While's own body/orelse is deliberately NOT
-        // recursed into: a break there can only ever escape THAT loop, never
-        // this one, so counting it here would over-count and turn a
-        // genuinely fall-through-reachable `while True` into a false-clean
-        // one. FunctionDef/ClassDef bodies are new scopes a `break` cannot
-        // reach out of at all (and could not legally appear there either),
-        // so they are skipped for the same reason.
+        // Fix round 1, Finding 3: a nested For/While's own BODY is
+        // deliberately not recursed into -- a break there can only ever
+        // escape THAT loop, never this one. But its ORELSE is the opposite
+        // case: a loop's `else` clause runs OUTSIDE the loop's own break
+        // scope (that is precisely why `for x in []: pass` / `else: break`
+        // is a top-level `SyntaxError: 'break' outside loop` -- the `else`
+        // is not inside the loop it is attached to), so a `break` written
+        // there targets the ENCLOSING loop and must count here. The previous
+        // version of this comment claimed a break in ANY nested loop
+        // construct "can only ever escape that inner loop" -- true of the
+        // body, false of the orelse, and this is the fix for that false
+        // claim.
+        if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
+            if (contains_reachable_break(for_stmt->orelse())) {
+                return true;
+            }
+            continue;
+        }
+        if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
+            if (contains_reachable_break(while_stmt->orelse())) {
+                return true;
+            }
+            continue;
+        }
+        // FunctionDef/ClassDef bodies are new scopes a `break` cannot reach
+        // out of at all (and could not legally appear there either), so they
+        // are skipped.
     }
     return false;
 }
 
-bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) const {
+bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
     for (const ast::StmtPtr& statement : body) {
         if (dynamic_cast<const ast::Return*>(statement.get()) != nullptr) {
             return true;

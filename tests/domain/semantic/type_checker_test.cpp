@@ -248,18 +248,23 @@ TEST(TypeChecker, AnAnnotationMayNameAClassDeclaredLater) {
     expect_clean("class A:\n    x: B\nclass B:\n    pass\n");
 }
 
-// Fix round 1, Finding 1: this test was VACUOUS before this fix round --
-// `return g` walks to RecursiveVisitor::visit(Return), which visits the Name
-// `g` via accept(), and TypeChecker's Name arm is RecursiveVisitor's own
-// no-op default (Name carries nothing to check), so `g` was never typed at
-// all and the test could not have failed regardless of what the checker did.
-// Swapped for `print(g)`, an ExprStmt TypeChecker DOES override, so `g`
-// actually reaches ExpressionTyper::type_of_name. This also needed
-// TypeChecker::visit(FunctionDef) to push a Function scope (see type_checker.h/
-// .cpp) -- without it, the body was checked in the still-current Module
-// scope, so this read resolved in_own_scope == true and falsely reported
-// "used before definition" against `g`'s later module-level binding. Both
-// forms verified mypy-clean.
+// Fix round 1 (of the ORIGINAL task, Task 18-era numbering), Finding 1: this
+// test was VACUOUS before that fix round -- back then `return g` walked to
+// RecursiveVisitor::visit(Return), which visits the Name `g` via accept(),
+// and TypeChecker's Name arm was RecursiveVisitor's own no-op default (Name
+// carries nothing to check), so `g` was never typed at all and the test
+// could not have failed regardless of what the checker did. `print(g)` was
+// added alongside it then, since ExprStmt IS overridden and actually reaches
+// ExpressionTyper::type_of_name. This also needed TypeChecker::visit(FunctionDef)
+// to push a Function scope (see type_checker.h/.cpp) -- without it, the body
+// was checked in the still-current Module scope, so this read resolved
+// in_own_scope == true and falsely reported "used before definition" against
+// `g`'s later module-level binding.
+//
+// Task 20 fix round 1 update: `return g` is no longer the vacuous half this
+// comment used to describe -- Return is now a real, overridden arm, so `g`
+// in `return g` is typed through ExpressionTyper exactly like `print(g)`
+// already was. Both forms verified mypy-clean.
 TEST(TypeChecker, AFunctionBodySeesGlobalsDefinedBelowIt) {
     expect_clean("def f() -> int:\n    print(g)\n    return g\ng: int = 5\n");
     expect_clean("def f() -> None:\n    print(x)\nx = 5\n");
@@ -930,6 +935,43 @@ TEST(TypeChecker, TheForTargetSurvivesTheLoop) {
     expect_clean("for i in range(3):\n    pass\nx: int = i\n");
 }
 
+// Fix round 1, Finding 1, CRITICAL: a one-line `for` suite reading its own
+// target was a false NameError before this fix -- the body's ExprStmt sets
+// statement_line_ to the SAME line the for-loop bound `i` at (there is no
+// separate body line to be strictly greater, exactly the one-line-def shape
+// Task 18 already fixed for parameters), so the ordinary `declared_line >=
+// statement_line_` ordering check misfired as "name 'i' is used before
+// definition" on mypy-clean code. Verified against mypy 1.18.1: --strict
+// clean. Also verified directly against the compiled binary (see the fix
+// round 1 report) with the same fixture.
+TEST(TypeChecker, AOneLineForSuiteReadingItsOwnTargetIsClean) {
+    expect_clean("for i in range(3): print(i)\n");
+}
+
+// The multi-line form was already clean before this fix (the body's own line
+// is genuinely greater than the for-loop's line, so the bug never reached
+// it) -- pinned here anyway so both forms have direct, explicit coverage
+// rather than relying on BindsTheForTargetToTheElementType's incidental
+// reads. Verified mypy-clean.
+TEST(TypeChecker, AMultiLineForSuiteReadingItsOwnTargetIsClean) {
+    expect_clean("for i in range(3):\n    print(i)\n");
+}
+
+// The other half of Finding 1: a read BEFORE the loop is untouched by the
+// order_exempt fix, because `i` is not bound AT ALL yet at that point --
+// neither pre-bind pass covers a For target, so there is no placeholder for
+// an early read to find, unlike an ordinary module-level assignment (compare
+// ReportsAModuleLevelUseBeforeDefinition's "used before definition", which
+// DOES have a pre-bind placeholder). "is not defined" is therefore the
+// correct outcome, not "used before definition".
+TEST(TypeChecker, AReadBeforeTheForLoopStillReportsNotDefined) {
+    const Checked checked = check_module("print(i)\nfor i in range(3):\n    pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'i' is not defined");
+}
+
 TEST(TypeChecker, ReportsIteratingANonIterable) {
     const Checked checked = check_module("for i in 1:\n    pass\n");
     EXPECT_EQ(only_error(checked).code, "TypeError");
@@ -942,6 +984,20 @@ TEST(TypeChecker, ReportsATupleForTargetAsUnsupported) {
     const diagnostics::Diagnostic error = only_error(checked);
     EXPECT_EQ(error.code, "NotImplementedError");
     EXPECT_EQ(error.message, "tuple targets in for loops are not supported");
+}
+
+// Fix round 1, Finding 8: without binding the tuple target's elements to
+// Unknown, a REAL use inside the body (unlike every other tuple-for-target
+// fixture in this file, which is pass-only) would cascade its own NameError
+// on top of the NotImplementedError above -- Unknown is absorbing, so
+// `x: int = a` triggers no compatibility check of its own. Mirrors
+// assign_tuple's own arity-mismatch fallback, which sets this exact
+// precedent for the same reason.
+TEST(TypeChecker, ATupleForTargetsElementsAreBoundToUnknownRatherThanCascading) {
+    const Checked checked = check_module("for a, b in [(1, 2)]:\n    x: int = a\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
 }
 
 // Verified: reported at the DEF line. mypy's code is empty-body for a
@@ -1016,14 +1072,34 @@ TEST(TypeChecker, ReportsAValueReturnedFromANoneFunction) {
     EXPECT_EQ(error.message, "no return value expected");
 }
 
+// Fix round 1, Finding 5: pins the full message text -- the one message this
+// task invented -- rather than only its code, matching every other new
+// message in this file.
 TEST(TypeChecker, ReportsAnIncompatibleReturnValue) {
     const Checked checked = check_module("def f() -> int:\n    return \"s\"\n");
-    EXPECT_EQ(only_error(checked).code, "TypeError");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "incompatible return value type (got \"str\", expected \"int\")");
 }
 
-// The declared return type is the value's expected context.
+// Fix round 1, Finding 2: the ORIGINAL fixture here (`def f() -> list[int]:
+// return []`) was VACUOUS -- it passes with or without the context
+// propagation this test is supposed to pin, since an empty display with no
+// context takes the no-context path and returns Unknown, which
+// visit(Return)'s `value_type.kind != Unknown` guard then skips entirely.
+// This version uses a MISTYPED element so the check can only pass by
+// actually threading list[int] into the list display as context: without
+// that context, `["s"]` types as list[str] with no declared element type to
+// check `"s"` against, producing the DIFFERENT "incompatible return value
+// type" message instead of this per-item one -- verified by temporarily
+// removing the context propagation and confirming the message changes.
 TEST(TypeChecker, TheDeclaredReturnTypeIsTheValuesContext) {
-    expect_clean("def f() -> list[int]:\n    return []\n");
+    const Checked checked = check_module("def f() -> list[int]:\n    return [\"s\"]\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "list item 0 has incompatible type \"str\"; expected \"int\"");
 }
 
 // Verified: x: float = f() where f() -> int is clean -- the numeric tower
@@ -1043,6 +1119,28 @@ TEST(TypeChecker, ABreakInANestedLoopDoesNotEscapeTheOuterWhileTrue) {
         "        for x in xs:\n"
         "            break\n"
         "        return 1\n");
+}
+
+// Fix round 1, Finding 3: the OPPOSITE case from the test above -- a break in
+// a nested loop's own ORELSE (not its body) targets the ENCLOSING loop, since
+// a loop's `else` clause runs OUTSIDE that loop's own break scope (which is
+// exactly why a top-level `for x in []: pass` / `else: break` is a plain
+// `SyntaxError: 'break' outside loop`, not a compile error about the for
+// loop). contains_reachable_break must recurse into a nested loop's orelse
+// even though it does not recurse into its body. Verified against mypy
+// 1.18.1: `error: Missing return statement  [return]`.
+TEST(TypeChecker, ABreakInANestedLoopsOrelseEscapesTheOuterLoop) {
+    const Checked checked = check_module(
+        "def f(xs: list[int]) -> int:\n"
+        "    while True:\n"
+        "        for x in xs:\n"
+        "            pass\n"
+        "        else:\n"
+        "            break\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "missing return statement");
 }
 
 // current_return_type_ is a single member restored by ReturnContextGuard, not

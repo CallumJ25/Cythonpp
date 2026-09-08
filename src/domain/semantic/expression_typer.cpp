@@ -541,8 +541,8 @@ Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
     for (const ast::ComprehensionClause& clause : list_comp.clauses()) {
         const Type iterable = type_of(*clause.iterable, Type::unknown());
         const RuleResult element_result = element_type(iterable);
-        const Type element_type_value = apply(
-            element_result, *clause.iterable, "\"" + type_name(iterable) + "\" is not iterable");
+        const Type element_type_value =
+            apply(element_result, *clause.iterable, not_iterable_message(iterable));
         if (element_result.status != RuleResult::Status::Ok) {
             // apply() already reported. If this is the first clause, the
             // guard was never constructed and there is nothing to pop; if it
@@ -586,7 +586,11 @@ Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
 
 Type ExpressionTyper::element_type_of(const ast::Expr& iterable_expr, const Type& iterable_type) {
     const RuleResult result = element_type(iterable_type);
-    return apply(result, iterable_expr, "\"" + type_name(iterable_type) + "\" is not iterable");
+    return apply(result, iterable_expr, not_iterable_message(iterable_type));
+}
+
+std::string ExpressionTyper::not_iterable_message(const Type& iterable_type) {
+    return "\"" + type_name(iterable_type) + "\" is not iterable";
 }
 
 Type ExpressionTyper::apply(const RuleResult& result, const ast::Expr& at,

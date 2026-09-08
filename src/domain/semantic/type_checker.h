@@ -85,13 +85,36 @@ namespace cythonpp::domain::semantic {
 // BOTH branches always return; a While counts only when its condition is the
 // literal `True` (a Constant whose token type is BOOL_TRUE) AND its body has
 // no reachable break (see contains_reachable_break -- a break belonging to a
-// NESTED For/While does not count, since it can never escape THIS loop); a
-// For, or a While with any other condition, is always assumed skippable
-// (false) -- both directions verified against mypy, and the only possible
-// error from the approximation is a MISSED one (mypy says "definitely
-// returns", this checker says "maybe not"), never a false positive. Checked
-// once per FunctionDef, at the very end of its body walk, ONLY when the
-// function has a return annotation that is neither None nor Unknown --
+// nested For/While's own BODY does not count, since it can never escape THIS
+// loop, but one in that nested loop's ORELSE does, since a loop's else runs
+// outside its own break scope); a For, or a While with any other condition,
+// is always assumed skippable (false).
+//
+// This is a syntactic approximation of mypy's real reachability analysis, and
+// fix round 1 (Finding 4) corrects a false claim that used to live here: it
+// does NOT err in only one direction. Both are reachable:
+//   - MISSED error (mypy says "definitely returns", we say "maybe not"): the
+//     loop-else case above, before this fix round -- `while True: / for x in
+//     xs: pass / else: break` with no return after it. mypy proves the
+//     `break` (loop-else, so it targets the `while`) makes fall-through
+//     reachable and demands a return; the old code did not look inside a
+//     nested loop's orelse at all, so it silently agreed with neither.
+//   - FALSE POSITIVE (mypy says "maybe not", we say "definitely returns" --
+//     or the reverse, whichever direction the missing return check reads as
+//     an error): `while True: / if False: / break / return 1` (unreachable
+//     code after `if False:` is fine by itself, but syntactically this body
+//     TEXTUALLY contains a `break`, so contains_reachable_break says true and
+//     the enclosing `while True` is judged skippable). mypy prunes the
+//     `if False:` block as unreachable and never counts that break, so it
+//     still judges the loop non-terminating; this checker reports a spurious
+//     "missing return statement" mypy would not.
+// This ships anyway because building real reachability analysis (constant
+// folding, unreachable-code pruning) is out of scope for this task -- the
+// syntactic rule catches the overwhelmingly common shapes correctly and both
+// known failure modes require an artificial exercise in dead code to trigger.
+//
+// Checked once per FunctionDef, at the very end of its body walk, ONLY when
+// the function has a return annotation that is neither None nor Unknown --
 // reported at the `def` line as TypeError "missing return statement" (mypy
 // splits this one message across two codes, empty-body and return; this
 // checker does not distinguish them).
@@ -477,7 +500,18 @@ private:
     // Assign and each element of a tuple-unpacking Assign. See
     // pre_bind_assignment_targets for what "my own still-unfilled
     // placeholder" means and why declared_line == line is the signal for it.
-    void assign_name(const ast::Name& target, const Type& value_type, int line);
+    //
+    // `order_exempt` (fix round 1, Finding 1, CRITICAL) defaults to false for
+    // every ordinary assignment, but a `for` target's own first bind passes
+    // true: like a parameter, it is bound before its body ever runs, so a
+    // one-line suite (`for i in range(3): print(i)`) reading it within that
+    // same body can never be a genuine use-before-definition, only a false
+    // positive from the ordinary `declared_line >= read_line` check. Only
+    // the FRESH-bind branch honours this flag -- the placeholder-fill and
+    // reassignment branches never build a new Binding, so there is nothing
+    // for it to change there.
+    void assign_name(const ast::Name& target, const Type& value_type, int line,
+                     bool order_exempt = false);
 
     // Task 18 fix round 1, Finding 1: true when `binding` is THIS exact
     // statement's own still-unfilled placeholder (from
@@ -506,22 +540,26 @@ private:
     // `tuple()`, which mypy leaves just as unannotated as `[]`.
     static bool is_bare_empty_container(const ast::Expr& value);
 
-    // Task 20's return-path check. Purely syntactic and const -- it touches
-    // no scope, no ClassTable, nothing but the AST shape -- so it can be
-    // (and is) called after the function's own body has already been
-    // visited, with no ordering hazard either way. See the class-level
-    // comment for the exact per-statement rule; "a body always returns if
-    // ANY of its statements does" is the fold this recursion performs at
-    // every level, mirroring collect_classes' own recursive-then-fold shape.
-    bool always_returns(const std::vector<ast::StmtPtr>& body) const;
+    // Task 20's return-path check. Purely syntactic -- it touches no member,
+    // no scope, no ClassTable, nothing but the AST shape -- so it can be (and
+    // is) called after the function's own body has already been visited,
+    // with no ordering hazard either way. static (fix round 1, Finding 10),
+    // matching contains_reachable_break right below it for the same reason.
+    // See the class-level comment for the exact per-statement rule; "a body
+    // always returns if ANY of its statements does" is the fold this
+    // recursion performs at every level, mirroring collect_classes' own
+    // recursive-then-fold shape.
+    static bool always_returns(const std::vector<ast::StmtPtr>& body);
 
     // The `while True` arm's "no reachable break" half: true when `body`
     // contains a `break` at any depth EXCEPT inside a nested For/While's own
-    // body/orelse -- a break belonging to a nested loop can only ever escape
-    // THAT loop, never this one, so recursing into one would over-count.
-    // Recurses into If's body/orelse (an `if` is not a loop, so a break
-    // inside one still belongs to the enclosing loop), which is the one
-    // compound statement this helper DOES look through.
+    // BODY -- a break belonging to a nested loop's body can only ever escape
+    // THAT loop, never this one, so recursing into one would over-count. Its
+    // ORELSE is the opposite case (fix round 1, Finding 3) and IS recursed
+    // into: a loop's `else` runs outside that loop's own break scope, so a
+    // break there targets the enclosing loop. Recurses into If's body/orelse
+    // unconditionally (an `if` is not a loop at all, so a break inside one
+    // always still belongs to the enclosing loop).
     static bool contains_reachable_break(const std::vector<ast::StmtPtr>& body);
 
     void report(const ast::Node& at, std::string code, std::string message);
