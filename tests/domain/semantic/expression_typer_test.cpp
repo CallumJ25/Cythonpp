@@ -259,10 +259,10 @@ TEST(ExpressionTyper, RecordsTheNegatedConstantInTheTypeMapToo) {
 // say) -- because the silent arm never recurses into its children at all.
 // Tasks 13-16 fill these arms one at a time; without this guard, an arm that
 // starts reporting prematurely, or one that is filled but still silently
-// returns Unknown, would pass unnoticed.
+// returns Unknown, would pass unnoticed. Call (`f()`) is real as of Task 15
+// and dropped from this list -- see the Call arm's own tests below.
 TEST(ExpressionTyper, SilentlyReturnsUnknownForEveryArmNotYetImplemented) {
     const std::vector<std::string> not_yet_implemented = {
-        "f()",             // Call -- Task 15.
         "[v for v in [1]]", // ListComp -- Task 16.
     };
     for (const std::string& expression : not_yet_implemented) {
@@ -861,6 +861,190 @@ TEST(ExpressionTyper, AttributeAccessOnUnknownIsSilent) {
     EXPECT_EQ(typed.diagnostics.size(), 1u);
     EXPECT_EQ(typed.diagnostics.front().code, "NameError");
     EXPECT_EQ(typed.printed, "Unknown");
+}
+
+// --- Call (Task 15) ---------------------------------------------------------
+
+TEST(ExpressionTyper, CallsAUserFunction) {
+    EXPECT_EQ(typed_name("f(1)", {{"f", Type::callable({Type::int_()}, Type::str())}}), "str");
+}
+
+TEST(ExpressionTyper, ReportsCallArityBothWays) {
+    const Typed missing =
+        type_expression("f()", {{"f", Type::callable({Type::int_()}, Type::str())}});
+    EXPECT_EQ(only_error(missing).code, "TypeError");
+
+    const Typed extra = type_expression(
+        "f(1, 2)", {{"f", Type::callable({Type::int_()}, Type::str())}});
+    EXPECT_EQ(only_error(extra).code, "TypeError");
+    EXPECT_EQ(only_error(extra).message, "too many arguments for \"f\"");
+}
+
+// Numbered from the first USER argument; self is never counted.
+TEST(ExpressionTyper, ReportsAnIncompatibleArgument) {
+    const Typed typed = type_expression(
+        "f(\"s\")", {{"f", Type::callable({Type::int_()}, Type::str())}});
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "argument 1 to \"f\" has incompatible type \"str\"; expected \"int\"");
+}
+
+// The parameter type is the argument's expected context, which is what makes
+// f([]) work when f takes a list[int].
+TEST(ExpressionTyper, TheParameterTypeIsTheArgumentsContext) {
+    const Typed typed = type_expression(
+        "f([])", {{"f", Type::callable({Type::list_of(Type::int_())}, Type::none())}});
+
+    EXPECT_TRUE(typed.diagnostics.empty()) << "[] takes its element type from the parameter";
+}
+
+TEST(ExpressionTyper, ConstructsAUserClass) {
+    ClassTable table;
+    table.declare("Widget", {});
+    table.declare_method("Widget", "__init__",
+                         Type::callable({Type::class_of("Widget"), Type::int_()},
+                                        Type::none()));
+
+    EXPECT_EQ(type_expression("Widget(1)", {}, Type::unknown(), &table).printed, "Widget");
+}
+
+// Verified: `class C: pass` then C(1) is "Too many arguments for C".
+TEST(ExpressionTyper, AClassWithNoInitTakesNoArguments) {
+    ClassTable table;
+    table.declare("Widget", {});
+
+    const Typed typed = type_expression("Widget(1)", {}, Type::unknown(), &table);
+    EXPECT_EQ(only_error(typed).code, "TypeError");
+}
+
+TEST(ExpressionTyper, CallsAMethodWithSelfDropped) {
+    ClassTable table;
+    table.declare("Widget", {});
+    table.declare_method("Widget", "area",
+                         Type::callable({Type::class_of("Widget")}, Type::int_()));
+
+    const Typed typed = type_expression("w.area()", {{"w", Type::class_of("Widget")}},
+                                        Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty());
+    EXPECT_EQ(typed.printed, "int");
+}
+
+TEST(ExpressionTyper, TypesTheSupportedBuiltinCalls) {
+    EXPECT_EQ(typed_name("print(1)"), "None");
+    EXPECT_EQ(typed_name("len([1])"), "int");
+    EXPECT_EQ(typed_name("range(3)"), "range");
+    EXPECT_EQ(typed_name("range(1, 10, 2)"), "range");
+    EXPECT_EQ(typed_name("int(\"5\")"), "int");
+    EXPECT_EQ(typed_name("str(5)"), "str");
+    EXPECT_EQ(typed_name("abs(-1)"), "int");
+    EXPECT_EQ(typed_name("abs(-1.5)"), "float");
+    EXPECT_EQ(typed_name("sorted([1])"), "list[int]");
+    EXPECT_EQ(typed_name("divmod(5, 2)"), "tuple[int, int]");
+}
+
+// An unsupported builtin is NotImplementedError, NEVER NameError -- the name
+// IS defined, mypy accepts the call, and a NameError would be a false
+// positive against the hard invariant.
+TEST(ExpressionTyper, ReportsAnUnsupportedBuiltinCallAsUnsupportedNotUndefined) {
+    const Typed typed = type_expression("zip([1], [2])");
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "calls to builtin 'zip' are not supported");
+}
+
+// list() takes the same path as []: context or an error, one rule for the
+// construct rather than two.
+TEST(ExpressionTyper, BareContainerConstructorsFollowTheEmptyDisplayRule) {
+    const Typed with_context = type_expression("list()", {}, Type::list_of(Type::int_()));
+    EXPECT_TRUE(with_context.diagnostics.empty());
+    EXPECT_EQ(type_name(with_context.type), "list[int]");
+
+    // Silent, like the empty display it shares a path with: the ASSIGNMENT
+    // reports the name-bearing var-annotated message (Task 17), not the call.
+    const Typed without = type_expression("list()");
+    EXPECT_TRUE(without.diagnostics.empty());
+    EXPECT_EQ(without.printed, "Unknown");
+}
+
+TEST(ExpressionTyper, ReportsCallingANonCallable) {
+    const Typed typed = type_expression("x()", {{"x", Type::int_()}});
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"int\" not callable");
+}
+
+// Verified: `c(1)` with __call__ defined is mypy-CLEAN, so a TypeError on a
+// Class receiver would be false.
+TEST(ExpressionTyper, CallingAClassInstanceIsUnsupportedNotAnError) {
+    ClassTable table;
+    table.declare("Widget", {});
+
+    const Typed typed = type_expression("w(1)", {{"w", Type::class_of("Widget")}},
+                                        Type::unknown(), &table);
+    EXPECT_EQ(only_error(typed).code, "NotImplementedError");
+}
+
+TEST(ExpressionTyper, ACallWithAFailedArgumentReportsOnce) {
+    const Typed typed =
+        type_expression("f(nope)", {{"f", Type::callable({Type::int_()}, Type::str())}});
+
+    EXPECT_EQ(typed.diagnostics.size(), 1u) << "the NameError is the only root cause";
+    EXPECT_EQ(typed.diagnostics.front().code, "NameError");
+    EXPECT_EQ(typed.printed, "str") << "the call's return type is still known";
+}
+
+// The class-object counterpart of CallsAMethodWithSelfDropped: `Widget.resize`
+// keeps self (see ResolvesAClassObjectMethodReferenceKeepingSelf), so calling
+// it through the class object must supply self EXPLICITLY as the first
+// argument -- mypy accepts `C.m(c)` for exactly this reason. This is the test
+// that would catch a double-drop of args[0] in the Call arm.
+TEST(ExpressionTyper, CallingThroughTheClassObjectRequiresSelfExplicitly) {
+    ClassTable table;
+    table.declare("Widget", {});
+    table.declare_method("Widget", "resize",
+                         Type::callable({Type::class_of("Widget"), Type::int_()}, Type::none()));
+
+    const Typed typed = type_expression("Widget.resize(w, 1)", {{"w", Type::class_of("Widget")}},
+                                        Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "self is still required positionally through the class object";
+    EXPECT_EQ(typed.printed, "None");
+}
+
+// A named diagnostic naming the METHOD and its CLASS, not a bare function
+// name -- `"m" of "C"`, verified against real mypy 1.18.1.
+TEST(ExpressionTyper, ReportsAMethodArgumentErrorNamingTheMethodAndItsClass) {
+    ClassTable table;
+    table.declare("Widget", {});
+    table.declare_method("Widget", "resize",
+                         Type::callable({Type::class_of("Widget"), Type::int_()}, Type::none()));
+
+    const Typed typed = type_expression("w.resize(\"s\")", {{"w", Type::class_of("Widget")}},
+                                        Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "argument 1 to \"resize\" of \"Widget\" has incompatible type \"str\"; expected "
+              "\"int\"");
+}
+
+// A Union callee needs narrowing before mypy would even decide whether the
+// call is legal (e.g. `Callable[[], int] | None`); reporting a plain
+// TypeError here would risk a false positive on a union whose every member
+// is in fact callable, so this must match every other operand arm's Union
+// handling (Attribute, BinOp, ...): NotImplementedError, never TypeError.
+TEST(ExpressionTyper, ReportsCallingAUnionAsNeedingNarrowing) {
+    const Typed typed = type_expression(
+        "x()", {{"x", Type::union_of({Type::callable({}, Type::int_()), Type::none()})}});
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message,
+              "operations on a union-typed value require narrowing, which is not supported");
 }
 
 } // namespace

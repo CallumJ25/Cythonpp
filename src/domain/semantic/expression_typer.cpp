@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "builtin_call_table.h"
 #include "domain/ast/source_span.h"
 #include "domain/lexer/keyword_table.h"
 #include "domain/lexer/operator_table.h"
@@ -48,6 +49,15 @@ std::string operand_type_error_message(lexer::token_type op, const Type& left, c
 // constant so the two call sites cannot drift apart.
 const char* kBuiltinMemberMessage = "methods on builtin types are not supported";
 
+// Only the five container constructors -- list, dict, set, frozenset, tuple
+// -- follow the empty-display rule; every other supported builtin's nullopt
+// from builtin_call_result is a genuine mismatch, which IS reported. A tiny
+// local helper rather than duplicating is_empty_display_builtin's own name
+// list, so the two call sites cannot drift apart.
+bool is_silent_when_argumentless(const std::string& name, bool has_arguments) {
+    return !has_arguments && is_empty_display_builtin(name);
+}
+
 } // namespace
 
 ExpressionTyper::ExpressionTyper(ScopeStack& scopes, const ClassTable& classes, TypeMap& types,
@@ -78,10 +88,12 @@ Type ExpressionTyper::type_of(const ast::Expr& expr, const Type& expected) {
         result = type_of_subscript(*subscript);
     } else if (const auto* attribute = dynamic_cast<const ast::Attribute*>(&expr)) {
         result = type_of_attribute(*attribute);
+    } else if (const auto* call = dynamic_cast<const ast::Call*>(&expr)) {
+        result = type_of_call(*call, expected);
     } else {
-        // Every other Expr kind is a later task's arm (Call: 15, ListComp:
-        // 16, ...). Deliberately SILENT -- not error() -- so an intermediate
-        // build never emits a diagnostic a later task has to un-emit.
+        // Every other Expr kind is a later task's arm (ListComp: 16, ...).
+        // Deliberately SILENT -- not error() -- so an intermediate build
+        // never emits a diagnostic a later task has to un-emit.
         result = Type::unknown();
     }
     // Every expression the typer types gets an entry, unconditionally --
@@ -469,6 +481,230 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
     // so a miss here is a genuine mypy attr-defined error.
     return error(attribute, "TypeError",
                  "\"" + receiver.name + "\" has no attribute \"" + attribute.attribute() + "\"");
+}
+
+Type ExpressionTyper::type_of_call(const ast::Call& call, const Type& expected) {
+    if (const auto* callee_name = dynamic_cast<const ast::Name*>(&call.callee())) {
+        return type_of_name_call(*callee_name, call, expected);
+    }
+
+    // Attribute and every other callee shape: type the callee through the
+    // ordinary dispatcher (for an Attribute this runs type_of_attribute,
+    // which already applies THE self CONTRACT -- an instance method arrives
+    // here already bound, a class-object one deliberately unbound -- so
+    // type_of_call_result below must NOT drop args[0] again).
+    const Type callee_type = type_of(call.callee(), Type::unknown());
+
+    if (const auto* attribute = dynamic_cast<const ast::Attribute*>(&call.callee())) {
+        // The method-call naming shape, `"m" of "C"`: the receiver's type was
+        // already recorded in `types_` by type_of_attribute -- either via its
+        // own type_of() call on an ordinary (instance) receiver, or by hand
+        // for a class-object receiver -- so it is read back here rather than
+        // re-typing the receiver a second time.
+        std::string label = "\"" + attribute->attribute() + "\"";
+        if (const Type* receiver_type = types_.find(&attribute->value())) {
+            if (receiver_type->kind == TypeKind::Class) {
+                label += " of \"" + receiver_type->name + "\"";
+            }
+        }
+        return type_of_call_result(callee_type, call, label);
+    }
+
+    // Any other callee shape the parser permits (e.g. `f()()`, a Call
+    // callee): no name to quote, so the callee's own rendered type stands in
+    // for the label. Untested corner -- nothing in this task's corpus
+    // exercises it -- but total rather than unreachable.
+    return type_of_call_result(callee_type, call, "\"" + type_name(callee_type) + "\"");
+}
+
+Type ExpressionTyper::type_of_name_call(const ast::Name& callee, const ast::Call& call,
+                                        const Type& expected) {
+    const std::string& identifier = callee.identifier();
+
+    // PRECEDENCE: a live scope binding wins first. The brief's own wording
+    // ("then a user class, then a builtin") turns out to invert against
+    // builtin_class_table.h's own documented invariant once seeded names are
+    // considered: "range", "int", "str", "list", "zip" and friends are ALL
+    // present in ClassTable (see builtin_class_table.h's "Names that ARE
+    // model kinds... appear here too" and its generic-class carve-out for
+    // zip/map/filter/enumerate/reversed), because that table is a generated
+    // extraction of every class in Python's builtins module, not a
+    // hand-curated "user classes only" list. Every other consumer in this
+    // codebase (annotation_resolver.cpp) already checks the builtin
+    // classifier BEFORE ClassLookup::is_class() for exactly this reason;
+    // checking is_class() first here made `range(3)`, `int("5")` and
+    // `zip(...)` all resolve as zero-arg-constructor CLASSES instead of
+    // builtin calls, verified by this task's own test failures. So the
+    // builtin check runs first, and classes_.is_class() only ever sees a
+    // name that is NOT one of this project's known builtin call names --
+    // genuine user classes and seeded exception classes (ValueError, ...),
+    // which are not in that set at all.
+    if (scopes_.resolve(identifier).binding != nullptr) {
+        const Type callee_type = type_of(callee, Type::unknown());
+        return type_of_call_result(callee_type, call, "\"" + identifier + "\"");
+    }
+
+    if (is_supported_builtin_call(identifier)) {
+        // No modelled "value" type for a builtin function itself (unlike a
+        // user Callable, there is no signature Type to hand back for `print`
+        // on its own) -- Unknown is recorded so the callee expression still
+        // gets a TypeMap entry, matching every other expression.
+        types_.insert(&callee, Type::unknown());
+
+        std::vector<Type> arg_types;
+        arg_types.reserve(call.args().size());
+        for (const ast::ExprPtr& arg : call.args()) {
+            arg_types.push_back(type_of(*arg, Type::unknown()));
+        }
+
+        if (const std::optional<Type> result =
+                builtin_call_result(identifier, arg_types, expected)) {
+            return *result;
+        }
+        if (is_silent_when_argumentless(identifier, !arg_types.empty())) {
+            // The empty-display rule: a bare list()/dict()/set()/
+            // frozenset()/tuple() with no usable context is silently
+            // Unknown, exactly like []/{} -- the var-annotated error belongs
+            // to a later task's Assign arm, which alone has the variable's
+            // name to put in it.
+            return Type::unknown();
+        }
+        // Every other supported builtin's nullopt is a genuine, modelled
+        // mismatch (wrong arity or argument kind). Type::callable carries no
+        // parameter NAMES, so this cannot reproduce mypy's real per-overload
+        // wording; it names the builtin instead.
+        return error(call, "TypeError",
+                     "argument has incompatible type for \"" + identifier + "\"");
+    }
+
+    if (is_builtin_callable_name(identifier)) {
+        types_.insert(&callee, Type::unknown());
+        for (const ast::ExprPtr& arg : call.args()) {
+            type_of(*arg, Type::unknown());
+        }
+        // NEVER NameError: the name IS defined and mypy accepts the call, so
+        // NameError would be a false positive against the hard invariant.
+        return error(call, "NotImplementedError",
+                     "calls to builtin '" + identifier + "' are not supported");
+    }
+
+    if (classes_.is_class(identifier)) {
+        // The constructor. constructor_type already walks the base chain for
+        // an inherited __init__ and already strips self, so callable's args
+        // here are exactly the caller-supplied parameters, return LAST.
+        // Recorded by hand, not through type_of(): nothing binds a class's
+        // own name into ScopeStack, so type_of_name() would report a false
+        // NameError, exactly as type_of_attribute's class-object receiver
+        // comment explains.
+        const Type constructor = classes_.constructor_type(identifier);
+        types_.insert(&callee, constructor);
+        return type_of_positional_call(constructor, call, "\"" + identifier + "\"");
+    }
+
+    // An ordinary unbound name. Routed through type_of() (which dispatches
+    // to type_of_name()) so the wording, position and TypeMap entry match
+    // every other unbound-name path exactly, rather than duplicating them
+    // here.
+    const Type callee_type = type_of(callee, Type::unknown());
+    for (const ast::ExprPtr& arg : call.args()) {
+        type_of(*arg, Type::unknown());
+    }
+    return callee_type;
+}
+
+Type ExpressionTyper::type_of_positional_call(const Type& callable, const ast::Call& call,
+                                              const std::string& label) {
+    const std::vector<ast::ExprPtr>& arg_exprs = call.args();
+    // callable.args is [param..., return], return LAST (Type::callable's
+    // convention), so it is never empty and param_count is args.size() - 1.
+    const std::size_t param_count = callable.args.size() - 1;
+    const Type& return_type = callable.args.back();
+
+    // Every argument is typed FIRST, unconditionally -- including an extra
+    // one past param_count, which gets Type::unknown() as its own context --
+    // so a root cause inside any argument (an unbound name, say) is reported
+    // exactly once regardless of whether the call's arity is even right.
+    std::vector<Type> arg_types;
+    arg_types.reserve(arg_exprs.size());
+    for (std::size_t index = 0; index < arg_exprs.size(); ++index) {
+        const Type param_expected = index < param_count ? callable.args[index] : Type::unknown();
+        arg_types.push_back(type_of(*arg_exprs[index], param_expected));
+    }
+
+    if (arg_exprs.size() > param_count) {
+        return error(call, "TypeError", "too many arguments for " + label);
+    }
+    if (arg_exprs.size() < param_count) {
+        const std::size_t missing = param_count - arg_exprs.size();
+        // mypy names the missing PARAMETER ('Missing positional argument "b"
+        // in call to "f"'); Type carries no parameter names (see type.h --
+        // Callable's args are types only), so this reports the COUNT
+        // instead. A recorded, deliberate divergence from the brief's exact
+        // wording -- see the task report.
+        return error(call, "TypeError",
+                     "missing " + std::to_string(missing) + " positional argument" +
+                         (missing == 1 ? "" : "s") + " in call to " + label);
+    }
+
+    // Arity matches exactly: each argument is checked against its own
+    // parameter type, is_subtype (never operator==) so a subclass or a
+    // wider numeric rank is accepted. A mismatch is its own diagnostic --
+    // N bad arguments is N diagnostics, matching the per-item list/dict
+    // rule -- numbered from the FIRST USER argument; self is never counted,
+    // since it was already dropped (or never added) before `callable`
+    // reached this function.
+    for (std::size_t index = 0; index < param_count; ++index) {
+        const Type& expected_param = callable.args[index];
+        if (!is_subtype(arg_types[index], expected_param, &classes_)) {
+            error(*arg_exprs[index], "TypeError",
+                 "argument " + std::to_string(index + 1) + " to " + label +
+                     " has incompatible type \"" + type_name(arg_types[index]) + "\"; expected \"" +
+                     type_name(expected_param) + "\"");
+        }
+    }
+    return return_type;
+}
+
+Type ExpressionTyper::type_of_call_result(const Type& callee_type, const ast::Call& call,
+                                          const std::string& label) {
+    if (callee_type.kind == TypeKind::Callable) {
+        return type_of_positional_call(callee_type, call, label);
+    }
+
+    // No parameter list to check arguments against, but every argument is
+    // still typed against Type::unknown() -- consistent with every other
+    // arm: a root cause inside one (an unbound name, say) must still report
+    // exactly once.
+    for (const ast::ExprPtr& arg : call.args()) {
+        type_of(*arg, Type::unknown());
+    }
+
+    if (callee_type.kind == TypeKind::Unknown) {
+        // Absorbing: the callee's own root cause (an unresolved name, a
+        // prior failed subexpression, an already-reported attribute miss)
+        // already reported.
+        return Type::unknown();
+    }
+    if (callee_type.kind == TypeKind::Union) {
+        // mypy narrows before deciding whether the call is even legal (a
+        // `Callable[[], int] | None` callee needs narrowing first); this
+        // compiler does not model per-branch environments yet, matching
+        // every other operand arm's Union handling (see type_of_attribute,
+        // binary_result, ...). Reporting TypeError here -- as the brief's
+        // table implies by omission -- would risk a false positive on a
+        // union whose every member is in fact callable.
+        return error(call, "NotImplementedError",
+                     unsupported_message(UnsupportedReason::UnionOperand));
+    }
+    if (callee_type.kind == TypeKind::Class) {
+        // `__call__` may be user-defined; unmodelled, but NOT a genuine
+        // TypeError -- verified mypy-clean when __call__ exists, so
+        // reporting TypeError here would be a false positive against the
+        // hard invariant.
+        return error(call, "NotImplementedError",
+                     "calling an instance of a user-defined class is not supported");
+    }
+    return error(call, "TypeError", "\"" + type_name(callee_type) + "\" not callable");
 }
 
 Type ExpressionTyper::apply(const RuleResult& result, const ast::Expr& at,

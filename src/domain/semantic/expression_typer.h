@@ -7,6 +7,7 @@
 #include "domain/ast/attribute.h"
 #include "domain/ast/bin_op.h"
 #include "domain/ast/bool_op.h"
+#include "domain/ast/call.h"
 #include "domain/ast/compare.h"
 #include "domain/ast/constant.h"
 #include "domain/ast/dict_expr.h"
@@ -27,9 +28,9 @@ namespace cythonpp::domain::semantic {
 // Gives every expression a Type, recording each one in `types` on the way.
 //
 // SCOPE: Constant, Name, UnaryOp, BinOp, Compare, BoolOp (Task 12), the
-// three container displays -- ListExpr, DictExpr, TupleExpr (Task 13) -- and
-// Subscript/Attribute (Task 14) are real. Every other Expr kind -- Call
-// (Task 15), ListComp (Task 16), ... -- returns Type::unknown() SILENTLY,
+// three container displays -- ListExpr, DictExpr, TupleExpr (Task 13) --
+// Subscript/Attribute (Task 14), and Call (Task 15) are real. Every other
+// Expr kind -- ListComp (Task 16), ... -- returns Type::unknown() SILENTLY,
 // with no report, so an intermediate build never emits a diagnostic a later
 // task has to un-emit.
 //
@@ -149,6 +150,78 @@ private:
     // double-drop is a silent arity bug.
     Type type_of_class_attribute(const Type& receiver, const ast::Attribute& attribute,
                                  bool bind_self);
+
+    // `f(x)`, `C(x)`, `w.m(x)`, ... (Task 15). `Call::callee()` is one of
+    // five shapes, resolved with THIS precedence for a Name callee -- a live
+    // SCOPE BINDING wins first, then a builtin, then a user class (see
+    // type_of_name_call's own comment: this is the OPPOSITE order from the
+    // brief's "class, then builtin" wording, because builtin_class_table.h
+    // seeds "range", "int", "list", "zip" and friends into ClassTable too --
+    // checking is_class() before the builtin classifier made `range(3)` and
+    // `zip(...)` resolve as zero-arg-constructor CLASSES instead, matching
+    // this codebase's existing builtin_type_kind-before-is_class invariant,
+    // not the brief's plain-English summary of it). A purely syntactic
+    // class/builtin check would ALSO misread `def f(len: int): return
+    // len(1)` as the builtin, which is why the scope check runs first of
+    // all -- the same shape as type_of_attribute's class-object precedence
+    // check.
+    //
+    // `expected` is threaded through ONLY for a supported builtin callee --
+    // list()/dict()/set()/frozenset()/tuple() with zero arguments need it,
+    // identical to an empty []/{} display (Task 13's empty-display rule,
+    // corrected for Task 15: WITH a usable context, take it; WITHOUT one,
+    // Unknown SILENTLY, never a report -- the var-annotated diagnostic
+    // belongs to a later task's Assign arm). Every other row ignores it.
+    Type type_of_call(const ast::Call& call, const Type& expected);
+
+    // The Name-callee half of type_of_call, split out because it alone has
+    // the three-way precedence (scope binding, then builtin, then class) and
+    // needs `expected` for the builtin branch.
+    Type type_of_name_call(const ast::Name& callee, const ast::Call& call, const Type& expected);
+
+    // Checks `call.args()` POSITIONALLY against `callable`'s own parameter
+    // types (args()[0..N-1], return LAST -- Type::callable's convention) and
+    // yields the return type. `label` is how the callee is named in a
+    // diagnostic -- `"f"` for a function or constructor, `"m" of "C"` for a
+    // method -- already fully quoted, so callers just concatenate it into a
+    // sentence.
+    //
+    // Every argument is typed FIRST, unconditionally, with its own parameter
+    // type as `expected` when one exists (this is what makes `f([])` work
+    // when f takes a list[int]) -- BEFORE the arity check, so an extra or
+    // missing argument still gets every IN-RANGE argument's own subexpression
+    // typed (and any root cause inside one, e.g. an unbound name, still
+    // reported). An ARITY mismatch (too many or too few) reports ONCE and
+    // returns early, WITHOUT also running the per-parameter type check below
+    // it -- mirroring mypy, which does not pile a second "incompatible type"
+    // diagnostic for the same call on top of an arity error. Only once arity
+    // matches exactly does each argument get checked against its parameter
+    // type via is_subtype (never operator==), each mismatch its own
+    // diagnostic (N bad arguments is N diagnostics, matching the per-item
+    // list/dict rule), numbered from the FIRST user argument -- self is never
+    // counted or mentioned, because a method's `self` was already dropped by
+    // type_of_class_attribute (or never added, for a constructor, since
+    // ClassTable::constructor_type strips it) before this function ever
+    // sees `callable`.
+    Type type_of_positional_call(const Type& callable, const ast::Call& call,
+                                 const std::string& label);
+
+    // The shared tail for every callee shape ONCE ITS OWN TYPE IS KNOWN --
+    // a bound Name, an Attribute (already correctly self-bound or
+    // self-unbound per THE self CONTRACT above), or anything else: Callable
+    // dispatches to type_of_positional_call; Unknown absorbs silently (the
+    // root cause already reported); Union reports NotImplementedError
+    // (needs narrowing, exactly like every other operand arm's Union
+    // handling -- a `Callable | None` callee might still be legal after
+    // narrowing, so TypeError would risk a false positive); Class reports
+    // NotImplementedError too, since `__call__` may be user-defined and this
+    // model does not check for it (verified mypy-clean when it exists);
+    // anything else reports TypeError "\"<kind>\" not callable". Every
+    // argument is still typed against Type::unknown() in every non-Callable
+    // case, so a root cause inside one still reports exactly once even
+    // though there is no parameter list to check it against.
+    Type type_of_call_result(const Type& callee_type, const ast::Call& call,
+                             const std::string& label);
 
     // The three-way switch, in one place. Every rule-table call goes through
     // this, which is what makes the false-TypeError path unreachable by
