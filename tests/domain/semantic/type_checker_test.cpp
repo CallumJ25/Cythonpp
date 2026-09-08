@@ -310,5 +310,144 @@ TEST(TypeChecker, PopulatesTheTypeMapForExpressionsOnly) {
     EXPECT_EQ(checked.typed_expressions, 1u);
 }
 
+// ---------------------------------------------------------------------------
+// Task 18: FunctionDef.
+// ---------------------------------------------------------------------------
+
+// Verified: --strict's disallow-untyped-defs/disallow-incomplete-defs. A
+// top-level function is never a method, so no self exemption applies.
+TEST(TypeChecker, AMissingParameterAnnotationIsAnError) {
+    const Checked checked = check_module("def f(x) -> None:\n    pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "function is missing a type annotation");
+}
+
+TEST(TypeChecker, AMissingReturnAnnotationIsAnError) {
+    const Checked checked = check_module("def f(x: int):\n    pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "function is missing a type annotation");
+}
+
+TEST(TypeChecker, AFullyAnnotatedFunctionIsClean) {
+    expect_clean("def f(x: int) -> int:\n    return x\n");
+}
+
+// The correction to the brief. If this test fails, the implementation is
+// requiring -> None; that is a FALSE error on a mypy-clean program.
+TEST(TypeChecker, InitNeedsNoReturnAnnotationWhenAParameterIsAnnotated) {
+    expect_clean("class C:\n    def __init__(self, a: int):\n        self.a = a\n");
+}
+
+TEST(TypeChecker, AFullyUnannotatedInitIsStillAnError) {
+    const Checked checked = check_module("class C:\n    def __init__(self):\n        pass\n");
+    EXPECT_EQ(only_error(checked).code, "TypeError");
+}
+
+TEST(TypeChecker, AnOrdinaryMethodStillNeedsAReturnAnnotation) {
+    const Checked checked = check_module("class C:\n    def m(self, a: int):\n        pass\n");
+    EXPECT_EQ(only_error(checked).code, "TypeError");
+}
+
+// Verified: mypy reports "Method must have at least one argument. Did you
+// forget the "self" argument?" at the definition (and again at each call
+// site, which we do not repeat). Reported ONCE, here, at the def line.
+TEST(TypeChecker, AMethodWithNoParametersIsReportedOnceAtTheDefinition) {
+    const Checked checked = check_module("class C:\n    def m():\n        pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "method must have at least one argument");
+    EXPECT_EQ(error.line, 2);
+}
+
+// Verified: mypy's code is `assignment`, not `arg-type`, for a wrong-typed
+// default; reported at the `def` line.
+TEST(TypeChecker, AWrongTypedDefaultIsReportedAtTheDefLine) {
+    const Checked checked = check_module("def f(x: int = \"s\") -> None:\n    pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible default for argument \"x\" (default has type \"str\", "
+              "argument has type \"int\")");
+    EXPECT_EQ(error.line, 1);
+}
+
+TEST(TypeChecker, ACompatibleDefaultIsClean) {
+    expect_clean("def f(x: int = 5) -> None:\n    pass\n");
+}
+
+// Verified clean: module-level names are visible ahead of their definition
+// inside function bodies, and the function's own name is one of them.
+//
+// PLAN DEFECT (reported, not silently patched): the brief's own version of
+// this test used `return f(n)`, which is VACUOUS -- Return is not yet
+// overridden (Task 20) and RecursiveVisitor's default just walks to the
+// Name "f", whose own visit() is RecursiveVisitor's no-op default, so
+// nothing is ever typed through ExpressionTyper and the test would pass
+// regardless of whether recursion resolution works at all. This is the
+// exact same class of defect Task 17's fix round 1 found and fixed for
+// `return g` (rewritten to `print(g)`). Rewritten the same way here, inside
+// the `if`, so the call genuinely reaches ExpressionTyper via the
+// TypeChecker-overridden ExprStmt arm.
+TEST(TypeChecker, DirectRecursionIsClean) {
+    expect_clean("def f(n: int) -> int:\n    if n:\n        print(f(n))\n    return 0\n");
+}
+
+// Verified: calling a nested function defined LATER in the same body is
+// used-before-def -- a nested def is bound at its lexical position, so a
+// Function scope gets NO collect pass.
+TEST(TypeChecker, ANestedDefIsNotHoisted) {
+    const Checked checked = check_module(
+        "def outer() -> int:\n"
+        "    r: int = inner()\n"
+        "    def inner() -> int:\n"
+        "        return 1\n"
+        "    return r\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'inner' is used before definition");
+}
+
+// Verified CLEAN, and it looks contradictory next to the test above: a CALL
+// happens now, a closure READ happens at call time. The unifying rule is
+// that only same-scope reads are order-checked.
+//
+// PLAN DEFECT (reported, not silently patched): the brief's own version used
+// `return v` inside `i`, which is the SAME vacuous-Return shape as
+// DirectRecursionIsClean above -- `v` is never typed through ExpressionTyper
+// either way, so the test cannot fail regardless of the implementation.
+// Rewritten to `print(v)`, matching the same established fix pattern.
+TEST(TypeChecker, AClosureMayReadALocalAssignedAfterItsOwnDef) {
+    expect_clean(
+        "def o() -> int:\n"
+        "    def i() -> int:\n"
+        "        print(v)\n"
+        "    v: int = 1\n"
+        "    return i()\n");
+}
+
+TEST(TypeChecker, AParameterAnnotationDeclaresTheNameForTheWholeBody) {
+    const Checked checked =
+        check_module("def f(x: int) -> None:\n    x = \"s\"\n");
+    EXPECT_EQ(only_error(checked).code, "TypeError");
+}
+
+// A local variable assigned later in the SAME function body is the function-
+// scope analogue of ReportsAModuleLevelUseBeforeDefinition -- exercises
+// pre_bind_function_body's Assign-target placeholder.
+TEST(TypeChecker, AFunctionLocalUseBeforeDefinitionIsAViolation) {
+    const Checked checked = check_module("def f() -> None:\n    print(x)\n    x = 5\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'x' is used before definition");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

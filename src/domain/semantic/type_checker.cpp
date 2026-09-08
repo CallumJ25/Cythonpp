@@ -37,6 +37,28 @@ private:
     ScopeStack& scopes_;
 };
 
+// RAII guard for in_class_body_: sets it to `new_value`, restores whatever
+// it was on destruction. Used both ways round -- visit(ClassDef) sets it
+// TRUE around walking a class's own body, visit(FunctionDef) sets it FALSE
+// around walking a def's own body (a method's nested def is not itself a
+// method) -- so one guard covers both, and neither an early report-and-
+// return nor an exception between construction and the matching restore can
+// leave the flag stuck.
+class ClassBodyGuard {
+public:
+    ClassBodyGuard(bool& flag, bool new_value) : flag_(flag), previous_(flag) {
+        flag_ = new_value;
+    }
+    ~ClassBodyGuard() { flag_ = previous_; }
+
+    ClassBodyGuard(const ClassBodyGuard&) = delete;
+    ClassBodyGuard& operator=(const ClassBodyGuard&) = delete;
+
+private:
+    bool& flag_;
+    bool previous_;
+};
+
 } // namespace
 
 TypeChecker::TypeChecker(diagnostics::DiagnosticSink& sink)
@@ -145,6 +167,12 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
             Type return_type = function_def->has_return_annotation()
                                     ? resolver.resolve(function_def->return_annotation())
                                     : Type::unknown();
+            // Cached BEFORE the Binding below moves from it, so Task 18's
+            // visit(FunctionDef) can reuse this exact resolution rather than
+            // calling AnnotationResolver a second time on the same
+            // annotations (see top_level_signatures_'s own comment).
+            const Type signature_type = Type::callable(params, return_type);
+            top_level_signatures_.emplace(function_def, signature_type);
             // Fix round 1, Finding 2: the bool `bind` returns MUST be
             // checked -- `bind` itself has no sink and never reported
             // anything on its own, contrary to what the previous comment
@@ -160,8 +188,8 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
             // def-then-AnnAssign, is instead caught by bind_annotation's own
             // bool check below, since by the time that AnnAssign runs the def
             // already occupies the name.
-            const Binding signature{Type::callable(std::move(params), std::move(return_type)),
-                                    function_def->span().start_line, /*annotated=*/true};
+            const Binding signature{signature_type, function_def->span().start_line,
+                                    /*annotated=*/true};
             if (!scopes_.bind(function_def->name(), signature)) {
                 const Resolution existing = scopes_.resolve(function_def->name());
                 report(*function_def, "TypeError",
@@ -202,18 +230,60 @@ void TypeChecker::pre_bind_target(const ast::Expr& target, int line) {
     // binding a new name, so there is nothing to pre-bind.
 }
 
+void TypeChecker::pre_bind_function_body(const std::vector<ast::StmtPtr>& body) {
+    for (const ast::StmtPtr& statement : body) {
+        if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
+            pre_bind_target(assign->target(), assign->span().start_line);
+        } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
+            if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
+                if (!scopes_.bound_in_current_scope(target_name->identifier())) {
+                    scopes_.bind(target_name->identifier(),
+                                Binding{Type::unknown(), ann_assign->span().start_line,
+                                        /*annotated=*/false});
+                }
+            }
+        } else if (const auto* nested_def = dynamic_cast<const ast::FunctionDef*>(statement.get())) {
+            if (!scopes_.bound_in_current_scope(nested_def->name())) {
+                scopes_.bind(nested_def->name(),
+                            Binding{Type::unknown(), nested_def->span().start_line,
+                                    /*annotated=*/false});
+            }
+        }
+        // A ClassDef nested directly in a function body is out of this
+        // task's tested scope; it binds nothing into ScopeStack anywhere
+        // else either (see class_lookup/ClassTable), so there is nothing to
+        // placeholder-bind for one here.
+    }
+}
+
 TypeChecker::AnnotationBinding TypeChecker::bind_annotation(const ast::Name& target,
                                                             const ast::Expr& annotation, int line) {
     AnnotationResolver resolver(classes_, sink_);
     Type type = resolver.resolve(annotation);
     AnnotationBinding info{type, false};
-    if (!scopes_.bind(target.identifier(), Binding{type, line, /*annotated=*/true})) {
+    if (scopes_.bound_in_current_scope(target.identifier())) {
         const Resolution existing = scopes_.resolve(target.identifier());
+        if (existing.binding->declared_line == line) {
+            // Task 18: this exact statement's own still-unfilled placeholder
+            // from pre_bind_function_body (a nested AnnAssign inside a
+            // function body, placeholder-bound so an earlier same-scope
+            // read reports "used before definition" rather than "not
+            // defined") -- fill it in rather than reporting a
+            // self-redefinition. Unreachable for a module-level AnnAssign:
+            // nothing placeholder-binds one of those (Phase 2's
+            // collect_signatures binds the REAL type ahead of time instead),
+            // so this branch is new surface area with no existing caller to
+            // disturb.
+            scopes_.rebind(target.identifier(), Binding{type, line, /*annotated=*/true});
+            return info;
+        }
         report(target, "TypeError",
               "name \"" + target.identifier() + "\" already defined on line " +
                   std::to_string(existing.binding->declared_line));
         info.redefinition = true;
+        return info;
     }
+    scopes_.bind(target.identifier(), Binding{type, line, /*annotated=*/true});
     return info;
 }
 
@@ -388,22 +458,179 @@ void TypeChecker::visit(const ast::ExprStmt& node) {
 }
 
 void TypeChecker::visit(const ast::FunctionDef& node) {
-    // Fix round 1, Finding 1: push a Function scope before walking the body.
-    // Without this, the body is checked in whatever scope was already
-    // current (Module, at top level), so ExpressionTyper's Name arm sees
-    // in_own_scope == true for a global and wrongly order-checks it -- a
-    // function reading a module global assigned LATER in the file (mypy-
-    // clean, PEP 649) got a false "used before definition". With the scope
-    // pushed, the same read resolves outward (in_own_scope == false) and is
-    // exempt, per the ordering rule's own "outward reads are exempt" clause.
-    //
-    // Deliberately minimal: no parameter binding, no annotation resolution,
-    // no return-type checking, no __init__ carve-out. Task 18 fills in the
-    // rest of this arm.
+    // is_method is captured BEFORE in_class_body_guard resets the flag, so
+    // it doubles as "the value to restore when this FunctionDef is done" --
+    // ClassBodyGuard's own previous_ field mirrors this exact trick. A
+    // method's own nested def is not itself a method (in_class_body_ is
+    // false for the whole of this function's body), which is why the reset
+    // happens unconditionally rather than only when is_method is true.
+    const bool is_method = in_class_body_;
+    ClassBodyGuard in_class_body_guard(in_class_body_, false);
+
+    const int def_line = node.span().start_line;
+    const std::vector<ast::Parameter>& params = node.params();
+
+    if (is_method && params.empty()) {
+        // Verified against mypy 1.18.1: "Method must have at least one
+        // argument. Did you forget the "self" argument?", reported ONCE at
+        // the definition (mypy itself repeats it at every call site; we do
+        // not). No parameter/return annotation check makes sense without a
+        // self to exempt, so this is the function's ONLY diagnostic -- the
+        // body is still walked (Fix round 1, Finding 1's own Function scope
+        // still applies) so a read inside it is still checked.
+        report(node, "TypeError", "method must have at least one argument");
+        FunctionScopeGuard guard(scopes_);
+        pre_bind_function_body(node.body());
+        for (const ast::StmtPtr& statement : node.body()) {
+            statement->accept(*this);
+        }
+        return;
+    }
+
+    // Every parameter's type, and whether it counts toward "missing an
+    // annotation" -- self (a method's own first parameter) is exempt, per
+    // mypy's disallow-untyped-defs. A top-level FunctionDef was already
+    // resolved once by collect_signatures's Phase 2 (see
+    // top_level_signatures_'s own comment); reusing that here is what keeps
+    // AnnotationResolver from running -- and potentially double-reporting a
+    // bad annotation -- a second time on the exact same annotation
+    // expressions.
+    std::vector<Type> param_types;
+    Type return_type;
+    bool any_param_missing = false;
+    bool any_param_annotated = false;
+
+    const auto cached = top_level_signatures_.find(&node);
+    if (cached != top_level_signatures_.end()) {
+        const Type& signature = cached->second;
+        param_types.assign(signature.args.begin(), signature.args.end() - 1);
+        return_type = signature.args.back();
+        for (const ast::Parameter& parameter : params) {
+            if (parameter.annotation != nullptr) {
+                any_param_annotated = true;
+            } else {
+                // A top-level def is never a method, so no index-0 self
+                // exemption applies here.
+                any_param_missing = true;
+            }
+        }
+    } else {
+        AnnotationResolver resolver(classes_, sink_);
+        param_types.reserve(params.size());
+        for (std::size_t i = 0; i < params.size(); ++i) {
+            const ast::Parameter& parameter = params[i];
+            const bool is_self_param = is_method && i == 0;
+            if (parameter.annotation != nullptr) {
+                param_types.push_back(resolver.resolve(*parameter.annotation));
+                any_param_annotated = true;
+            } else if (is_self_param) {
+                param_types.push_back(Type::unknown());
+            } else {
+                param_types.push_back(Type::unknown());
+                any_param_missing = true;
+            }
+        }
+        return_type = node.has_return_annotation() ? resolver.resolve(node.return_annotation())
+                                                    : Type::unknown();
+    }
+
+    // Verified against mypy 1.18.1, and contradicting Spec 5a: __init__ does
+    // NOT need "-> None" when at least one parameter carries an explicit
+    // annotation (self included, on the rare def that annotates it) -- only
+    // a FULLY unannotated __init__ trips disallow-untyped-defs. Requiring
+    // "-> None" unconditionally is a false TypeError on a mypy-clean
+    // program.
+    const bool init_carveout = is_method && node.name() == "__init__" && any_param_annotated;
+    const bool return_missing = !node.has_return_annotation() && !init_carveout;
+    if (any_param_missing || return_missing) {
+        report(node, "TypeError", "function is missing a type annotation");
+    }
+
+    // A wrong-typed default is reported at the `def` line (mypy: code
+    // `assignment`, not `arg-type`), each mismatch its own diagnostic like
+    // every other N-bad-items rule in this checker. Defaults are typed in
+    // the ENCLOSING scope, matching Python's own evaluate-at-def-time
+    // semantics -- a default cannot see another parameter of the same def,
+    // so this runs entirely BEFORE the Function scope below is pushed.
+    typer_.set_statement_line(def_line);
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        const ast::Parameter& parameter = params[i];
+        if (parameter.default_value == nullptr) {
+            continue;
+        }
+        const Type default_type = typer_.type_of(*parameter.default_value, param_types[i]);
+        if (default_type.kind != TypeKind::Unknown && param_types[i].kind != TypeKind::Unknown &&
+            !is_subtype(default_type, param_types[i], &classes_)) {
+            report(node, "TypeError",
+                  "incompatible default for argument \"" + parameter.name +
+                      "\" (default has type \"" + type_name(default_type) +
+                      "\", argument has type \"" + type_name(param_types[i]) + "\")");
+        }
+    }
+
+    // The function's own name is bound BEFORE its body is checked, so
+    // direct recursion works. A top-level def is already bound by Phase 2;
+    // a method is NEVER bound into ScopeStack (ClassTable, Task 19, is the
+    // sole source of truth there, exactly like a class's own name -- see
+    // the class-level comment). What remains is a NESTED (non-method,
+    // non-top-level) def: it is bound into the CURRENT (enclosing) scope,
+    // at its own lexical position, no hoisting -- pre_bind_function_body
+    // already placed an Unknown placeholder for it (from the ENCLOSING
+    // function's own pre-bind pass, run before ITS body was walked
+    // statement by statement), so an earlier same-scope call already
+    // reported "used before definition" if it read this def too soon; this
+    // is that placeholder's one real fill-in, mirroring assign_name's own
+    // "still-unfilled placeholder" pattern.
+    if (!is_method && scopes_.current_kind() == ScopeKind::Function) {
+        const Type signature_type = Type::callable(param_types, return_type);
+        const Binding signature{signature_type, def_line, /*annotated=*/true};
+        if (scopes_.bound_in_current_scope(node.name())) {
+            const Resolution existing = scopes_.resolve(node.name());
+            if (existing.binding->declared_line == def_line) {
+                scopes_.rebind(node.name(), signature);
+            } else {
+                report(node, "TypeError",
+                      "name \"" + node.name() + "\" already defined on line " +
+                          std::to_string(existing.binding->declared_line));
+            }
+        } else {
+            scopes_.bind(node.name(), signature);
+        }
+    }
+
+    // Parameters bind into the NEW Function scope with the `def` line, per
+    // the brief -- a parameter's annotation is a declaration for the whole
+    // body (`def f(x: int)` then `x = "s"` inside is a TypeError, checked
+    // via assign_to/assign_name exactly like any other reassignment).
     FunctionScopeGuard guard(scopes_);
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        const ast::Parameter& parameter = params[i];
+        scopes_.bind(parameter.name, Binding{param_types[i], def_line,
+                                             /*annotated=*/parameter.annotation != nullptr});
+    }
+    // A nested `def` gets NO collect pass (verified: calling a nested
+    // function defined LATER in the same body is used-before-def) -- this
+    // pre-bind pass only places PLACEHOLDERS (Unknown) so the ordering
+    // check can tell "used before definition" apart from "not defined"; see
+    // pre_bind_function_body's own comment.
+    pre_bind_function_body(node.body());
     for (const ast::StmtPtr& statement : node.body()) {
         statement->accept(*this);
     }
+}
+
+void TypeChecker::visit(const ast::ClassDef& node) {
+    // ONLY tracks whether a FunctionDef sits directly in a class body, for
+    // self-exemption and the __init__ carve-out above -- see the class-level
+    // comment for why this is a plain bool rather than a ScopeKind::Class
+    // push. Delegating to the base implementation reuses the exact
+    // bases-then-body walk RecursiveVisitor::visit(ClassDef) already
+    // performs, unchanged, so a class body statement is still checked in
+    // whatever scope was already current (Module, until Task 19 pushes a
+    // real Class scope) -- this override changes NO existing behaviour
+    // besides setting/restoring the flag.
+    ClassBodyGuard in_class_body_guard(in_class_body_, true);
+    ast::RecursiveVisitor::visit(node);
 }
 
 bool TypeChecker::is_bare_empty_container(const ast::Expr& value) {

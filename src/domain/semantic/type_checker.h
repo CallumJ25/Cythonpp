@@ -46,13 +46,25 @@ namespace cythonpp::domain::semantic {
 // a construct only Task 19-20 will add real rules for is silently
 // under-checked rather than wrongly flagged.
 //
-// FunctionDef IS overridden, but ONLY to push a Function scope before walking
-// the body (fix round 1, Finding 1) -- without it, a function body walked in
-// the still-current Module scope makes a global read inside it compare as
-// in_own_scope == true, so a global assigned LATER in the module (mypy-clean,
-// PEP 649) falsely reports "used before definition". No parameter binding, no
-// annotation resolution, no return-type checking, no __init__ carve-out --
-// Task 18 fills in the rest of this arm.
+// FunctionDef (Task 18) is now fully checked: every parameter (except a
+// method's `self`) and the return both need an annotation, a wrong-typed
+// default is reported at the `def` line, the function's own name is bound
+// before its body is checked (so direct recursion works), and a NESTED def
+// is bound at its lexical position -- no hoisting -- via the SAME
+// placeholder-then-fill pattern pre_bind_assignment_targets/assign_name use
+// at module scope, extended in pre_bind_function_body to also cover a
+// nested def's own name and a nested AnnAssign target (bind_annotation grew
+// the matching "own still-unfilled placeholder" case to support it).
+//
+// ClassDef is overridden ONLY to track whether a FunctionDef sits directly
+// in a class body -- self-exemption and the __init__ carve-out both need
+// that, and nothing else currently does -- via in_class_body_, a plain bool
+// rather than a ScopeKind::Class push. Task 19 owns the real Class scope,
+// the order-sensitive class body, and attribute collection; this override
+// pushes NOTHING onto ScopeStack and declares NOTHING into ClassTable, so
+// it changes no existing behaviour of its own. A method's name is never
+// bound into ScopeStack (ClassTable is Task 19's sole source of truth for
+// method names, exactly like a class's own name).
 class TypeChecker : public ast::RecursiveVisitor {
 public:
     explicit TypeChecker(diagnostics::DiagnosticSink& sink);
@@ -67,6 +79,7 @@ public:
     void visit(const ast::AnnAssign& node) override;
     void visit(const ast::ExprStmt& node) override;
     void visit(const ast::FunctionDef& node) override;
+    void visit(const ast::ClassDef& node) override;
 
 private:
     // What resolving (and possibly binding) an AnnAssign's annotation
@@ -129,6 +142,27 @@ private:
     void pre_bind_assignment_targets(const ast::Module& module);
     void pre_bind_target(const ast::Expr& target, int line);
 
+    // The Function-scope analogue of pre_bind_assignment_targets, run once a
+    // FunctionDef's own Function scope is current and its parameters are
+    // bound, over that SAME FunctionDef's own body list directly (not
+    // recursively into a nested block, matching pre_bind_assignment_targets'
+    // own module.body()-only scope). Task 18's twist, absent at module
+    // scope: a Function scope gets no Phase-2 equivalent AT ALL, so BOTH an
+    // Assign target AND a nested def's own name need a placeholder here --
+    // a nested `def` is bound at its lexical position, never hoisted, but
+    // the ordering check still needs a Binding to exist (even an Unknown
+    // one) before the def's own line is reached, or an early same-scope read
+    // would report "not defined" instead of "used before definition". A
+    // nested AnnAssign target is placeholder-bound too, for the identical
+    // reason (see bind_annotation's own "still-unfilled placeholder" case,
+    // added alongside this) -- module scope needs no such placeholder for
+    // AnnAssign because collect_signatures's Phase 2 already binds every
+    // module-level AnnAssign with its REAL resolved type ahead of time, an
+    // eager pass this function deliberately does not attempt to replicate
+    // (that would re-invoke AnnotationResolver on the same annotation twice,
+    // once here and once when the statement is actually visited).
+    void pre_bind_function_body(const std::vector<ast::StmtPtr>& body);
+
     // Extracts a base's name for ClassTable::declare. Only a bare Name is
     // handled -- a subscripted or attribute base (`Generic[T]`, `a.B`) is
     // outside this task's tested scope and is simply omitted, which only
@@ -187,6 +221,26 @@ private:
     // than calling AnnotationResolver a second time -- doing so twice would
     // double-report a bad annotation.
     std::map<const ast::AnnAssign*, AnnotationBinding> module_level_annotations_;
+
+    // Phase 2's resolved Callable for every top-level FunctionDef collect_
+    // signatures actually processed (i.e. NOT one collided_top_level_
+    // skipped), keyed by node address -- Task 18's visit(FunctionDef) reuses
+    // it exactly like module_level_annotations_ above, so a top-level def's
+    // parameter/return annotations are resolved through AnnotationResolver
+    // exactly ONCE. args()[0..N-1] are the parameter types, args().back()
+    // the return type, per Type::callable's own "return last" convention --
+    // deliberately reusing that shape instead of a bespoke struct. A def
+    // collect_signatures skipped (collided_top_level_) or never saw at all
+    // (a NESTED def, or a method) has no entry here and is resolved fresh,
+    // directly in visit(FunctionDef), the only time it is ever resolved.
+    std::map<const ast::FunctionDef*, Type> top_level_signatures_;
+
+    // Set only by visit(ClassDef) around walking that class's OWN body list,
+    // and reset to false for the duration of a FunctionDef's own body (a
+    // method's nested def is not itself a method) -- see the class-level
+    // comment. False at every point outside a class body statement list,
+    // including the outermost module scope.
+    bool in_class_body_ = false;
 };
 
 } // namespace cythonpp::domain::semantic
