@@ -2,7 +2,6 @@
 #define CYTHONPP_TESTS_DOMAIN_SEMANTIC_FAKE_CLASS_LOOKUP_H
 
 #include <map>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -10,7 +9,6 @@
 #include "domain/semantic/builtin_type_names.h"
 #include "domain/semantic/class_lookup.h"
 #include "domain/semantic/type.h"
-#include "domain/semantic/type_compatibility.h"
 
 namespace cythonpp::domain::semantic {
 namespace semantic_test_support {
@@ -47,23 +45,21 @@ public:
     std::string canonical_name(const std::string& name) const override { return name; }
 
 private:
-    // Converts each base's bare source-level NAME to a Type, the same
-    // classification ClassTable's own seeding and TypeChecker::base_types
-    // both perform: a name this model represents as a builtin KIND becomes
-    // that kind's bare Type; anything else is an ordinary Class. Kept here,
-    // at construction time, rather than pushed onto every call site, so every
-    // existing FakeClassLookup({...}) literal across the semantic tests keeps
-    // naming bases as plain strings -- this constructor's signature is
-    // unchanged.
+    // Converts each base's bare source-level NAME to a Type via
+    // base_type_for_name, the same classification ClassTable's own seeding
+    // and TypeChecker::base_types both perform: a name this model represents
+    // as a builtin KIND becomes that kind's bare Type; anything else is an
+    // ordinary Class. Kept here, at construction time, rather than pushed
+    // onto every call site, so every existing FakeClassLookup({...}) literal
+    // across the semantic tests keeps naming bases as plain strings -- this
+    // constructor's signature is unchanged.
     static std::map<std::string, std::vector<Type>> to_typed(
         std::map<std::string, std::vector<std::string>> classes) {
         std::map<std::string, std::vector<Type>> typed;
         for (auto& [name, bases] : classes) {
             std::vector<Type> types;
             for (const std::string& base : bases) {
-                const std::optional<TypeKind> kind = builtin_type_kind(base);
-                types.push_back(kind.has_value() ? builtin_base_type(*kind)
-                                                 : Type::class_of(base));
+                types.push_back(base_type_for_name(base));
             }
             typed.emplace(name, std::move(types));
         }

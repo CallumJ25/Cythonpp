@@ -717,12 +717,12 @@ private:
     // once here and once when the statement is actually visited).
     void pre_bind_function_body(const std::vector<ast::StmtPtr>& body);
 
-    // Each base expression as a Type, for ClassTable::declare. THIS TASK'S
-    // VERSION IS DELIBERATELY NAME-ONLY -- a subscripted or attribute base is
-    // still dropped, exactly as base_names dropped it -- so that switching
-    // the storage from names to Types changes nothing observable. Resolving a
-    // base expression properly (which is what makes `class
-    // IntList(list[int])` work) is a separate change with its own tests.
+    // Each base expression as a Type, for ClassTable::declare. Deliberately
+    // NAME-ONLY -- a subscripted or attribute base (`list[int]`, `mod.Base`)
+    // is still dropped from the recorded base list entirely, with no trace,
+    // rather than resolved. Resolving a base expression properly (which is
+    // what makes `class IntList(list[int])` work) is a separate change with
+    // its own tests.
     static std::vector<Type> base_types(const std::vector<ast::ExprPtr>& bases);
 
     // How many of `params` carry a default value, for Type::callable's

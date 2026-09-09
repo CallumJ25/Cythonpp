@@ -273,11 +273,10 @@ std::vector<Type> TypeChecker::base_types(const std::vector<ast::ExprPtr>& bases
             continue;
         }
         // A bare base NAME denoting a model kind becomes that kind (the same
-        // classification ClassTable's own seeding performs); anything else is
-        // an ordinary Class.
-        const std::optional<TypeKind> kind = builtin_type_kind(name->identifier());
-        types.push_back(kind.has_value() ? builtin_base_type(*kind)
-                                         : Type::class_of(name->identifier()));
+        // classification ClassTable's own seeding, and the test fake
+        // FakeClassLookup, both perform via the same base_type_for_name);
+        // anything else is an ordinary Class.
+        types.push_back(base_type_for_name(name->identifier()));
     }
     return types;
 }

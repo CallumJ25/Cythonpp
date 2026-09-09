@@ -461,5 +461,28 @@ TEST(BuiltinBaseOfClass, SurvivesACycleInTheBaseChain) {
     EXPECT_FALSE(builtin_base_of_class(classes, "A").has_value());
 }
 
+// Pins the root's OWN builtin identity: class_ancestor_chain always builds
+// index 0 as Type::class_of(root), so a caller asking "what builtin does
+// this NAME denote or inherit" about a name that is itself a builtin
+// spelling must still get that builtin back, not nullopt, exactly as it did
+// before the base-chain walk moved from names to Types. Uses the real
+// ClassTable, not the fake, because "bool"/"int"/"str"/"list" are the
+// actual seeded builtin classes this matters for.
+TEST(BuiltinBaseOfClass, ARootThatIsItselfABuiltinSpellingReachesItself) {
+    const ClassTable classes;
+
+    ASSERT_TRUE(builtin_base_of_class(classes, "bool").has_value());
+    EXPECT_EQ(*builtin_base_of_class(classes, "bool"), Type::bool_());
+
+    ASSERT_TRUE(builtin_base_of_class(classes, "int").has_value());
+    EXPECT_EQ(*builtin_base_of_class(classes, "int"), Type::int_());
+
+    ASSERT_TRUE(builtin_base_of_class(classes, "str").has_value());
+    EXPECT_EQ(*builtin_base_of_class(classes, "str"), Type::str());
+
+    ASSERT_TRUE(builtin_base_of_class(classes, "list").has_value());
+    EXPECT_EQ(builtin_base_of_class(classes, "list")->kind, TypeKind::List);
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

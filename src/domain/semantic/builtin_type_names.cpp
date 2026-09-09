@@ -76,4 +76,53 @@ std::optional<std::string> builtin_type_spelling(TypeKind kind) {
     return std::nullopt;
 }
 
+Type builtin_base_type(TypeKind kind) {
+    switch (kind) {
+    case TypeKind::Unknown:
+        return Type::unknown();
+    case TypeKind::NoneType:
+        return Type::none();
+    case TypeKind::Bool:
+        return Type::bool_();
+    case TypeKind::Int:
+        return Type::int_();
+    case TypeKind::Float:
+        return Type::float_();
+    case TypeKind::Complex:
+        return Type::complex_();
+    case TypeKind::Str:
+        return Type::str();
+    case TypeKind::Bytes:
+        return Type::bytes();
+    case TypeKind::ByteArray:
+        return Type::bytearray_();
+    case TypeKind::Ellipsis:
+        return Type::ellipsis();
+    case TypeKind::Range:
+        return Type::range_();
+    case TypeKind::Object:
+        return Type::object();
+    case TypeKind::List:
+    case TypeKind::Dict:
+    case TypeKind::Set:
+    case TypeKind::FrozenSet:
+    case TypeKind::Tuple:
+    case TypeKind::Union:
+    case TypeKind::Callable:
+    case TypeKind::Class: {
+        Type type;
+        type.kind = kind;
+        return type;
+    }
+    }
+    // Unreachable: exhaustive above, with no default, so adding a kind warns
+    // here rather than silently mis-modelling it.
+    return Type::unknown();
+}
+
+Type base_type_for_name(const std::string& name) {
+    const std::optional<TypeKind> kind = builtin_type_kind(name);
+    return kind.has_value() ? builtin_base_type(*kind) : Type::class_of(name);
+}
+
 } // namespace cythonpp::domain::semantic

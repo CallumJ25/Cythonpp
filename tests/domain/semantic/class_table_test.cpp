@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include "domain/semantic/builtin_type_names.h"
 #include "domain/semantic/class_table.h"
 #include "domain/semantic/type.h"
 #include "domain/semantic/type_compatibility.h"

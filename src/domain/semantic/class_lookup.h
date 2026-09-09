@@ -32,12 +32,22 @@ public:
     // A base is a TYPE, not a name, because a base can be PARAMETRIC:
     // `class IntList(list[int])` has one base and its element type is
     // load-bearing -- it is what makes `x: list[int] = IntList()` clean,
-    // `IntList()[0]` an `int`, and `for v in IntList()` yield `int`, all
-    // verified against mypy 1.18.1. Storing the name alone dropped the
-    // element type on the floor, which is the root cause of a false
-    // TypeError on every use of a parametric builtin subclass. A base that is
-    // an ordinary class is TypeKind::Class carrying its name; a base that is
-    // a builtin is that builtin's own Type.
+    // `IntList()[0]` an `int`, and `for v in IntList()` yield `int`. Verified
+    // against mypy 1.18.1 with:
+    //
+    //   class IntList(list[int]):
+    //       pass
+    //   x: list[int] = IntList()
+    //   reveal_type(IntList()[0])
+    //   for v in IntList():
+    //       reveal_type(v)
+    //
+    // which mypy --strict accepts ("Success: no issues found in 1 source
+    // file") and reveals `builtins.int` for both `reveal_type` calls. Storing
+    // the name alone dropped the element type on the floor, which is the
+    // root cause of a false TypeError on every use of a parametric builtin
+    // subclass. A base that is an ordinary class is TypeKind::Class carrying
+    // its name; a base that is a builtin is that builtin's own Type.
     //
     // Returns BY VALUE, not by const reference: a reference return forces
     // every implementation, the test fake included, to own a persistent empty

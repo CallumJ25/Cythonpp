@@ -16,10 +16,16 @@ bool is_invariant_container(TypeKind kind) {
            kind == TypeKind::FrozenSet;
 }
 
-// The ClassLookup key a chain step is looked up under. The exact analogue of
-// ClassTable::base_key, kept separate only because that one is a private of
-// the concrete table and this one works through the abstract lookup; keep the
-// two in step.
+// The ClassLookup key a chain step is looked up under. Structurally parallel
+// to ClassTable::base_key, but NOT an exact analogue of it: base_key returns
+// a Class step's name RAW, because it runs inside ClassTable itself, where a
+// base is looked up by whatever spelling it was declared under before
+// canonicalisation ever applies. This function runs a step later, over a
+// chain that class_ancestor_chain has already canonicalised on the way in
+// (see its own loop below), so a Class step's name here calls
+// classes.canonical_name(step.name) instead of returning it raw -- both are
+// correct for the caller they serve, and collapsing them into one function
+// would force one of the two to canonicalise (or not) at the wrong time.
 std::optional<std::string> chain_key(const ClassLookup& classes, const Type& step) {
     if (step.kind == TypeKind::Class) {
         return classes.canonical_name(step.name);
@@ -253,60 +259,29 @@ Type canonicalised(Type type, const ClassLookup* classes) {
 
 } // namespace
 
-Type builtin_base_type(TypeKind kind) {
-    switch (kind) {
-    case TypeKind::Unknown:
-        return Type::unknown();
-    case TypeKind::NoneType:
-        return Type::none();
-    case TypeKind::Bool:
-        return Type::bool_();
-    case TypeKind::Int:
-        return Type::int_();
-    case TypeKind::Float:
-        return Type::float_();
-    case TypeKind::Complex:
-        return Type::complex_();
-    case TypeKind::Str:
-        return Type::str();
-    case TypeKind::Bytes:
-        return Type::bytes();
-    case TypeKind::ByteArray:
-        return Type::bytearray_();
-    case TypeKind::Ellipsis:
-        return Type::ellipsis();
-    case TypeKind::Range:
-        return Type::range_();
-    case TypeKind::Object:
-        return Type::object();
-    case TypeKind::List:
-    case TypeKind::Dict:
-    case TypeKind::Set:
-    case TypeKind::FrozenSet:
-    case TypeKind::Tuple:
-    case TypeKind::Union:
-    case TypeKind::Callable:
-    case TypeKind::Class: {
-        Type type;
-        type.kind = kind;
-        return type;
-    }
-    }
-    // Unreachable: exhaustive above, with no default, so adding a kind warns
-    // here rather than silently mis-modelling it.
-    return Type::unknown();
-}
-
 std::optional<Type> builtin_base_of_class(const ClassLookup& classes, const std::string& name) {
-    // The whole chain including index 0, unlike class_reaches, which asks
-    // only about PROPER ancestors: a caller passing a name that is itself a
-    // builtin spelling should get that builtin back rather than nothing,
-    // since "what builtin does this name denote or inherit" is one question.
-    //
-    // `object` is skipped for the reason inherits_builtin's own comment
-    // gives: every class conceptually derives from it, and treating it as
-    // "the inherited builtin" would answer this question `true` for every
-    // class in the program.
+    // The root's OWN builtin identity, checked before the loop rather than
+    // inside it: class_ancestor_chain always builds index 0 as
+    // Type::class_of(root) (see its own comment above), so a loop that walks
+    // chain entries and skips every Class step -- as the one below must, to
+    // avoid re-answering "is a Class a builtin" for every ordinary ancestor
+    // -- can never recognise the root itself even when the root's NAME is a
+    // builtin spelling. A caller passing a name that is itself a builtin
+    // spelling ("bool", "int", "list", ...) should get that builtin back
+    // rather than nothing, since "what builtin does this name denote or
+    // inherit" is one question, not two. `object` is excluded here for the
+    // same reason it is excluded from the loop below.
+    const std::string root = classes.canonical_name(name);
+    if (const std::optional<TypeKind> root_kind = builtin_type_kind(root)) {
+        if (*root_kind != TypeKind::Object) {
+            return builtin_base_type(*root_kind);
+        }
+    }
+
+    // Proper ancestors only from here: `object` is skipped for the reason
+    // inherits_builtin's own comment gives: every class conceptually derives
+    // from it, and treating it as "the inherited builtin" would answer this
+    // question `true` for every class in the program.
     //
     // The step is returned AS RECORDED, type arguments and all, which is what
     // makes `class IntList(list[int])` subscript and iterate as `int` rather
@@ -315,9 +290,15 @@ std::optional<Type> builtin_base_of_class(const ClassLookup& classes, const std:
         if (step.kind == TypeKind::Class || step.kind == TypeKind::Object) {
             continue;
         }
-        if (builtin_type_spelling(step.kind).has_value()) {
-            return step;
-        }
+        // No `builtin_type_spelling(step.kind).has_value()` guard here: every
+        // non-index-0, non-Class entry that reaches this loop already passed
+        // through class_ancestor_chain's own chain_key projection, which for
+        // a non-Class step IS builtin_type_spelling(step.kind) -- a
+        // std::nullopt there ends that branch inside the chain walk itself,
+        // so a spelling-less kind never survives to be seen here at all. A
+        // second check of the same condition would always be true and never
+        // false, which is a dead guard reading as a live one.
+        return step;
     }
     return std::nullopt;
 }

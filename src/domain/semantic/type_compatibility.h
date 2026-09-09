@@ -4,35 +4,12 @@
 #include <optional>
 #include <string>
 
+#include "builtin_type_names.h"
 #include "class_lookup.h"
 #include "type.h"
 #include "type_kind.h"
 
 namespace cythonpp::domain::semantic {
-
-// Builds the Type a builtin base-name KIND denotes. Shared by two callers
-// that both need to turn a bare builtin spelling back into a real Type: the
-// class table's own seeding (a seeded base like `bool`'s `int` is a bare
-// NAME, exactly like a user `class Sub(int):`) and the ancestor-chain walk
-// below, which needs the same conversion for a base recorded this way. One
-// function keeps the two from drifting into different answers for the same
-// kind.
-//
-// Exhaustive switch, no default, per project rule: adding a TypeKind forces a
-// decision here rather than silently falling through.
-//
-// The parametric kinds (List, Dict, Set, FrozenSet, Tuple) cannot carry
-// arguments as a bare base name -- `class Sub(list): ...` has no syntax for
-// list's element type -- so they are modelled as an argument-less container
-// (empty `args`). That is a RECORDED imprecision, not a silent one: the
-// invariant-container arm in is_subtype requires equal-length args, so a
-// class modelled this way is never equal to, say, `list[int]` -- an honest
-// consequence of the bare spelling carrying no element type.
-//
-// Union, Callable and Class can never be a bare base-name spelling --
-// builtin_type_kind() never returns them -- so their cases exist only to keep
-// this switch exhaustive.
-Type builtin_base_type(TypeKind kind);
 
 // The builtin Type a user class's base chain reaches -- Int for
 // `class Sub(int)`, Str for `class Name(str)` -- or nullopt when the chain
