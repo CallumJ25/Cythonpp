@@ -42,9 +42,10 @@
 // OVERSIGHT. The half of the union rule this harness enforces automatically
 // is one-directional: "# mypy: clean" + a TypeError/NameError from cythonpp
 // is checked right here, on every `ctest` run, with no Python involved,
-// UNLESS the sample also carries a "# cpython: error ..." label -- i.e.
-// unless the second oracle is on record as rejecting the program, which makes
-// rejecting it correct rather than a violation. There is no equivalent
+// UNLESS the sample also carries a "# cpython: error ..." label naming an
+// exception in the NameError family -- i.e. unless the second oracle is on
+// record as rejecting the program FOR THE SAME REASON, which makes rejecting
+// it correct rather than a violation. There is no equivalent
 // automatic check for the OTHER direction -- a sample labelled
 // "# mypy: error ..." that mypy --strict actually accepts, or a
 // "# cpython:" label that CPython does not actually produce. Nothing here can
@@ -341,6 +342,32 @@ std::string describe(const diagnostics::Diagnostic& diagnostic) {
     return describe(diagnostic.code, diagnostic.line, diagnostic.column, diagnostic.message);
 }
 
+// Does CPython raising `exception` justify cythonpp reporting a NameError on
+// the SAME program? True only for NameError itself and the one subclass of it
+// this subset can produce, UnboundLocalError -- CPython raises that (not a
+// bare NameError) when the unbound name is a function local, which is exactly
+// the shape a base class written above its own definition inside a `def`
+// takes.
+//
+// WHY THIS EXISTS AT ALL, since the obvious gate is just "does CPython
+// reject". Because that gate can be satisfied by an UNRELATED failure. Append
+// `print(1 // 0)` to any program, label it
+// "# cpython: error ZeroDivisionError: division by zero", and a bare
+// does-CPython-reject test would then exempt an entirely different NameError
+// elsewhere in the file -- a genuine over-rejection laundered into a passing
+// sample, with both this suite and --check-corpus green, because every
+// individual claim in the header is true. Requiring the FAMILY to match makes
+// the exemption say what it means: CPython rejects this program for the same
+// reason cythonpp does.
+//
+// This is a family check, not a whole-diagnostic match: the wording and
+// position of CPython's message do not line up with ours (UnboundLocalError
+// says "cannot access local variable ... where it is not associated with a
+// value"), so demanding equality would reject the legitimate cases too.
+bool cpython_exception_justifies_name_error(const std::string& exception) {
+    return exception == "NameError" || exception == "UnboundLocalError";
+}
+
 fs::path corpus_dir() {
     return fs::path(CYTHONPP_TEST_FILES_DIR) / "semantic";
 }
@@ -391,6 +418,13 @@ void check_sample(const fs::path& path) {
     // the sample and fails if the label is not what CPython actually
     // produces.
     //
+    // AND THE EXEMPTION MUST MATCH THE DIAGNOSTIC IT EXEMPTS. "CPython
+    // rejects this file somehow" is not enough -- an unrelated failure
+    // appended to the bottom of a file would otherwise launder a genuine
+    // over-rejection above it into a passing sample. CPython's exception must
+    // be in the NameError family; see
+    // cpython_exception_justifies_name_error for the full argument.
+    //
     // AND IT IS NARROWED TO NameError. The only known shape where mypy and
     // CPython disagree in this subset is a name unbound at run time (a base
     // class written above its own definition), which is a NameError. No
@@ -399,12 +433,14 @@ void check_sample(const fs::path& path) {
     // TypeError stays an unconditional failure; widen this only with a
     // measurement in hand.
     if (labels.mypy_clean) {
-        const bool cpython_rejects = labels.cpython.kind == CPythonLabel::Kind::Error;
+        const bool cpython_rejects_for_the_same_reason =
+            labels.cpython.kind == CPythonLabel::Kind::Error &&
+            cpython_exception_justifies_name_error(labels.cpython.exception);
         for (const ExpectedDiagnostic& diagnostic : labels.expected) {
             if (diagnostic.code != "TypeError" && diagnostic.code != "NameError") {
                 continue;
             }
-            if (cpython_rejects && diagnostic.code == "NameError") {
+            if (cpython_rejects_for_the_same_reason && diagnostic.code == "NameError") {
                 continue;
             }
             ADD_FAILURE()
@@ -415,7 +451,9 @@ void check_sample(const fs::path& path) {
                 << "cythonpp must report no TypeError and no NameError. Either the "
                 << "'# mypy: clean' label is wrong, or CPython does reject this program and "
                 << "the sample is missing a '# cpython: error <ExceptionType>: <message>' "
-                << "label (a NameError is then exempt from this guard), or cythonpp reporting "
+                << "label naming a NameError or UnboundLocalError (a cythonpp NameError is "
+                << "then exempt from this guard; an unrelated exception type does NOT exempt "
+                << "it, however true the label is), or cythonpp reporting "
                 << "a " << diagnostic.code << " here is a genuine bug. Re-verify both labels "
                 << "with `python scripts/verify_corpus_labels.py --check-corpus`, which runs "
                 << "real mypy and real CPython -- fix whichever claim is false, do not just "

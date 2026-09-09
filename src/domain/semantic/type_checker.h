@@ -339,11 +339,10 @@ private:
     // ClassDef node. A top-level ClassDef scan_top_level_names already
     // reported as a collided redefinition is SKIPPED here: declaring it
     // anyway silently overwrote the winning
-    // same-named class's ClassTable entry. THEN -- once every class is
-    // declared -- validate each base, reporting NameError for a bare-Name
-    // base that does not resolve (e.g. `class C(Generic):`, since Generic
-    // cannot be imported in this subset) and for one that resolves to a class
-    // declared below the subclass itself (see validate_class_bases).
+    // same-named class's ClassTable entry. Declaration only -- base
+    // VALIDATION is a separate step visit(Module) runs later, once the
+    // module's names are bound too; see that call site and
+    // validate_class_bases.
     void collect_classes(const ast::Module& module);
 
     // One class ClassTable holds an entry for, paired with the exact
@@ -361,25 +360,27 @@ private:
     // The recursive half of collect_classes: declares `class_def` under
     // `qualified_prefix + "." + class_def.name()` (or just its own name, at
     // the top level, where `qualified_prefix` is empty), appends it to
-    // `all_classes` for the base-validation loop collect_classes runs once
+    // `all_classes` for the base-validation loop that runs once
     // every class -- at every nesting depth -- is declared, then recurses
     // into `class_def`'s own body for a nested ClassDef, passing ITS OWN
     // qualified name down as the next prefix.
     void declare_class_recursive(const ast::ClassDef& class_def, const std::string& qualified_prefix,
                                  std::vector<ClassDeclaration>& all_classes);
 
-    // The base-validation half of collect_classes, extracted
+    // The base-validation step, in its own function
     // so declare_isolated_class below can reuse it for a class ClassTable
     // never saw during Phase 1. Two rules, both applied to the NAME at the
     // root of a base expression (a bare `Parent`, or the `Outer` of a dotted
     // `Outer.Inner`):
     //
-    //   1. UNRESOLVED. A BARE-NAME base that does not resolve through
-    //      ClassTable at all is a NameError (e.g. `class C(Generic):`, since
-    //      Generic cannot be imported in this subset). Deliberately NOT
-    //      applied to a DOTTED base's root, whose likeliest reading is an
-    //      ordinary binding holding a class object -- see the function's own
-    //      body for the measurement.
+    //   1. UNRESOLVED. A base whose root name resolves through NEITHER
+    //      ClassTable NOR ScopeStack is a NameError -- `class C(Generic):`
+    //      (Generic cannot be imported in this subset) or
+    //      `class D(mod.Thing):`, both of which mypy and CPython reject. A
+    //      DOTTED base whose root IS bound is exempt, since its likeliest
+    //      reading is an ordinary binding holding a class object; see the
+    //      function's own body for the measurement and for exactly what that
+    //      exemption trades away.
     //   2. ORDER, only when `check_order`. A base that DOES resolve but was
     //      bound (see class_declaration_lines_) LATER in source position than
     //      the subclass statement is a NameError, because CPython raises
@@ -394,7 +395,9 @@ private:
     // function body is a different context from the module body. See that
     // function's call site for the measured false positive it prevents.
     //
-    // Checked only once every declaration in `all_classes` exists.
+    // Checked only once every declaration in `all_classes` exists, and (on
+    // the module path) only once the module's own names are bound, since
+    // rule 1 asks ScopeStack whether a dotted root is bound at all.
     void validate_class_bases(const std::vector<ClassDeclaration>& all_classes, bool check_order);
 
     // Declares `node` (and, recursively, every

@@ -3016,8 +3016,10 @@ TEST(TypeChecker, AFunctionLocalBaseDeclaredBelowInTheSameFunctionIsANameError) 
 // A DOTTED base whose root is an ordinary binding holding a class object.
 // `h` is defined -- it just is not something ClassTable can see, since class
 // names are never bound into ScopeStack and ClassTable is keyed by class
-// name, not by the values bindings hold. Measured:
-//   mypy --strict: Success
+// name, not by the values bindings hold. The exemption is gated on `h` being
+// BOUND somewhere in scope, which is what keeps it from swallowing the
+// undefined-root case below. Measured:
+//   mypy --strict: Success: no issues found in 1 source file
 //   CPython:       runs, printing the D instance
 TEST(TypeChecker, ADottedBaseWhoseRootIsAValueBindingIsClean) {
     expect_clean("class Holder:\n"
@@ -3027,6 +3029,76 @@ TEST(TypeChecker, ADottedBaseWhoseRootIsAValueBindingIsClean) {
                  "class D(h.Inner):\n"
                  "    pass\n"
                  "print(D())\n");
+}
+
+// ... and a DOTTED base whose root is bound NOWHERE is still a NameError.
+// This is the other side of the exemption above: `mod` is neither a class nor
+// a binding, so there is no value it could be holding and nothing to give the
+// benefit of the doubt to. Measured:
+//   mypy --strict: Name "mod" is not defined  [name-defined]
+//   CPython:       NameError: name 'mod' is not defined, raised from the
+//                  class statement itself
+// Both oracles reject, so silence here would be a program compiled that
+// cannot run. The reported column is the ROOT name's, not the whole base
+// expression's, because the root is the only part that can fail to resolve.
+TEST(TypeChecker, ADottedBaseWhoseRootIsBoundNowhereIsANameError) {
+    const Checked checked = check_module("class D(mod.Thing):\n"
+                                         "    pass\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'mod' is not defined");
+    EXPECT_EQ(error.line, 1);
+    EXPECT_EQ(error.column, 9);
+}
+
+// KNOWN WRONG. THIS TEST RECORDS A BUG, NOT DESIRED BEHAVIOUR. Whoever fixes
+// the over-fire it pins should DELETE this test, not make the fix satisfy it.
+//
+// The program below is accepted by both oracles and must therefore compile,
+// but the base-order rule reports it. Measured:
+//   mypy --strict: Success: no issues found in 1 source file
+//   CPython:       runs, printing the Child instance
+//   cythonpp:      NameError: name 'Parent' is not defined, at 4:21
+// It is clean at run time because the `class Child(Parent)` statement is
+// guarded by `ready`, which is only true on the SECOND iteration -- by which
+// point the `class Parent` statement below it has already executed once.
+//
+// Why it is left in place rather than papered over: the order rule compares
+// SOURCE LINES, which proxy execution order correctly only in straight-line
+// code, and a loop makes a later line run before an earlier one. Every
+// syntactic refinement tried relocates the hole instead of closing it -- in
+// particular, suppressing the rule for two classes in the same loop body
+// would silently compile this near-identical program, which CPython kills on
+// its first iteration (measured: NameError: name 'Parent' is not defined):
+//   for i in [1]:
+//       class Child(Parent):
+//           pass
+//       class Parent:
+//           pass
+//   print(Child())
+// Telling the two apart needs reaching-definitions over a control-flow graph,
+// and this compiler builds no CFG at all. Reporting is also the safe
+// direction of the two: a false NameError is a visible, fixable complaint,
+// while the alternative emits C++ for a module CPython refuses to import.
+//
+// This cannot live in the labelled corpus: the corpus guard correctly refuses
+// a "# mypy: clean" sample that expects a NameError, and the "# cpython:
+// error" exemption does not apply because CPython accepts this program too.
+TEST(TypeChecker, KnownWrongLoopReentryMakesAValidForwardBaseAFalseNameError) {
+    const Checked checked = check_module("ready = False\n"
+                                         "for i in [1, 2]:\n"
+                                         "    if ready:\n"
+                                         "        class Child(Parent):\n"
+                                         "            pass\n"
+                                         "    class Parent:\n"
+                                         "        pass\n"
+                                         "    ready = True\n"
+                                         "print(Child())\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'Parent' is not defined");
+    EXPECT_EQ(error.line, 4);
+    EXPECT_EQ(error.column, 21);
 }
 
 } // namespace

@@ -167,6 +167,23 @@ void TypeChecker::visit(const ast::Module& node) {
     }
     collect_signatures(node);
     pre_bind_assignment_targets(node);
+    // BASE VALIDATION, once every class at every nesting depth is declared
+    // AND every module-level name is bound: a bare-Name base that does not
+    // resolve at all is a NameError (e.g. `class C(Generic):`, since Generic
+    // cannot be imported in this subset), and so is one that resolves to a
+    // class declared BELOW the subclass.
+    //
+    // Deferred to here rather than run inside collect_classes for TWO
+    // reasons, both load-bearing. Every class must already be declared, so a
+    // base naming a class declared LATER in the same module, or in a
+    // different class's body, resolves -- the order rule is then applied by
+    // comparing recorded lines, not by whether the lookup happened to succeed
+    // yet. And every module-level binding must already exist, because a
+    // DOTTED base's root is exonerated by being bound at all (see
+    // validate_class_bases): running before pre_bind_assignment_targets would
+    // make `h = Holder` then `class D(h.Inner):` a false NameError purely
+    // because `h` had not been bound yet.
+    validate_class_bases(declared_classes_, /*check_order=*/true);
     for (const ast::StmtPtr& statement : node.body()) {
         statement->accept(*this);
     }
@@ -301,16 +318,6 @@ void TypeChecker::collect_classes(const ast::Module& module) {
         }
     });
 
-    // THEN -- once every class at every nesting depth is declared -- validate
-    // each base: a bare-Name base that does not resolve at all is a NameError
-    // (e.g. `class C(Generic):`, since Generic cannot be imported in this
-    // subset), and so is one that resolves to a class declared BELOW the
-    // subclass. Deferred until here (rather than folded into
-    // declare_class_recursive) so a base naming a class declared LATER in the
-    // same module, or in a different class's body, already resolves -- the
-    // order rule is then applied by comparing recorded lines, not by whether
-    // the lookup happened to succeed yet.
-    validate_class_bases(declared_classes_, /*check_order=*/true);
 }
 
 void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_classes,
@@ -339,25 +346,39 @@ void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_
                 continue;
             }
             if (!classes_.is_class(name->identifier())) {
-                if (via_attribute) {
-                    // A DOTTED base whose root is not a known class is far
-                    // more likely an ORDINARY BINDING holding a class object
-                    // -- `h = Holder` then `class D(h.Inner):` -- than an
-                    // undeclared name. Both oracles accept that program
-                    // (mypy: Success; CPython: runs), and this model cannot
-                    // see it: class names are deliberately never bound into
-                    // ScopeStack, and ClassTable is keyed by class NAME, not
-                    // by the values ordinary bindings hold. Reporting here
+                if (via_attribute && scopes_.resolve(name->identifier()).binding != nullptr) {
+                    // A DOTTED base whose root is not a known class but IS an
+                    // ordinary binding is most likely a binding holding a
+                    // class object -- `h = Holder` then `class D(h.Inner):`.
+                    // Both oracles accept that program (measured: mypy
+                    // --strict "Success: no issues found in 1 source file";
+                    // CPython runs it and prints a D instance), and this model
+                    // cannot see it: class names are deliberately never bound
+                    // into ScopeStack, and ClassTable is keyed by class NAME,
+                    // not by the values ordinary bindings hold. Reporting here
                     // would therefore be a false NameError on a program the
-                    // union rule requires this compiler to accept. The case
-                    // this silence gives up -- a genuinely undeclared dotted
-                    // root, `class D(mod.Thing):` -- needs an import to
-                    // write, and this subset has none, so it is unreachable.
+                    // union rule requires this compiler to accept.
+                    //
+                    // What this silence trades away, stated exactly: a bound
+                    // root whose VALUE is not a class, or is a class without
+                    // that attribute, goes unreported -- including
+                    // `def f(h: type) -> None: class D(h.Inner): ...`, which
+                    // mypy rejects (measured: `Name "h.Inner" is not defined`)
+                    // while CPython runs it happily when a real class is
+                    // passed in. Missing an error mypy alone raises is the
+                    // safe direction; inventing one on the `h = Holder` shape
+                    // above would not be. An UNBOUND root falls through to the
+                    // report below instead, so `class D(mod.Thing):` -- which
+                    // both oracles reject -- is still caught.
                     continue;
                 }
-                // e.g. `class C(Generic):` -- Generic cannot be imported in
-                // this subset, so this is the correct outcome for a program
-                // nobody can legally write.
+                // A root that is neither a known class nor bound anywhere in
+                // scope: `class C(Generic):` (Generic cannot be imported in
+                // this subset) or `class D(mod.Thing):`. Measured on the
+                // latter: mypy --strict says `Name "mod" is not defined`,
+                // CPython raises `NameError: name 'mod' is not defined` from
+                // the class statement -- both oracles reject, so reporting is
+                // required, and the message matches CPython's.
                 report(*name, "NameError", "name '" + name->identifier() + "' is not defined");
                 continue;
             }
