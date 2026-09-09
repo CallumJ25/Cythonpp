@@ -339,10 +339,11 @@ private:
     // ClassDef node. A top-level ClassDef scan_top_level_names already
     // reported as a collided redefinition is SKIPPED here: declaring it
     // anyway silently overwrote the winning
-    // same-named class's ClassTable entry. Declaration only -- base
-    // VALIDATION is a separate step visit(Module) runs later, once the
-    // module's names are bound too; see that call site and
-    // validate_class_bases.
+    // same-named class's ClassTable entry. THEN -- once every class is
+    // declared -- validate that each bare-Name base actually resolves,
+    // reporting NameError for one that does not (e.g. `class C(Generic):`,
+    // since Generic cannot be imported in this subset) and for one declared
+    // below the subclass that names it; see validate_class_bases.
     void collect_classes(const ast::Module& module);
 
     // One class ClassTable holds an entry for, paired with the exact
@@ -360,27 +361,23 @@ private:
     // The recursive half of collect_classes: declares `class_def` under
     // `qualified_prefix + "." + class_def.name()` (or just its own name, at
     // the top level, where `qualified_prefix` is empty), appends it to
-    // `all_classes` for the base-validation loop that runs once
+    // `all_classes` for the base-validation loop collect_classes runs once
     // every class -- at every nesting depth -- is declared, then recurses
     // into `class_def`'s own body for a nested ClassDef, passing ITS OWN
     // qualified name down as the next prefix.
     void declare_class_recursive(const ast::ClassDef& class_def, const std::string& qualified_prefix,
                                  std::vector<ClassDeclaration>& all_classes);
 
-    // The base-validation step, in its own function
+    // The base-validation half of collect_classes, extracted
     // so declare_isolated_class below can reuse it for a class ClassTable
-    // never saw during Phase 1. Two rules, both applied to the NAME at the
-    // root of a base expression (a bare `Parent`, or the `Outer` of a dotted
-    // `Outer.Inner`):
+    // never saw during Phase 1. Two rules, both applied ONLY to a BARE-NAME
+    // base -- a dotted, subscripted or otherwise non-Name base is skipped
+    // entirely, which the function's own body records as two measured missed
+    // errors and explains:
     //
-    //   1. UNRESOLVED. A base whose root name resolves through NEITHER
-    //      ClassTable NOR ScopeStack is a NameError -- `class C(Generic):`
-    //      (Generic cannot be imported in this subset) or
-    //      `class D(mod.Thing):`, both of which mypy and CPython reject. A
-    //      DOTTED base whose root IS bound is exempt, since its likeliest
-    //      reading is an ordinary binding holding a class object; see the
-    //      function's own body for the measurement and for exactly what that
-    //      exemption trades away.
+    //   1. UNRESOLVED. A base whose name does not resolve through ClassTable
+    //      at all is a NameError -- `class C(Generic):`, since Generic cannot
+    //      be imported in this subset.
     //   2. ORDER, only when `check_order`. A base that DOES resolve but was
     //      bound (see class_declaration_lines_) LATER in source position than
     //      the subclass statement is a NameError, because CPython raises
@@ -395,9 +392,9 @@ private:
     // function body is a different context from the module body. See that
     // function's call site for the measured false positive it prevents.
     //
-    // Checked only once every declaration in `all_classes` exists, and (on
-    // the module path) only once the module's own names are bound, since
-    // rule 1 asks ScopeStack whether a dotted root is bound at all.
+    // Checked only once every declaration in `all_classes` exists. It needs
+    // nothing from ScopeStack, so it does not have to wait for the
+    // name-binding phases.
     void validate_class_bases(const std::vector<ClassDeclaration>& all_classes, bool check_order);
 
     // Declares `node` (and, recursively, every
@@ -671,7 +668,7 @@ private:
     // function's own definition for how the two are told apart.
     void collect_signatures(const ast::Module& module);
 
-    // Phase 2.5: every module-level Assign's target name(s) that are not yet
+    // Phase 2.5: every top-level Assign's target name(s) that are not yet
     // bound (i.e. not a FunctionDef/AnnAssign name from Phase 2) get a
     // PLACEHOLDER binding -- Type::unknown(), at the statement's own line --
     // so a module-level "used before definition" read (`y = x` before
@@ -683,27 +680,27 @@ private:
     // replaces it (via ScopeStack::rebind) with the real inferred type
     // exactly once -- see assign_name.
     //
-    // RECURSED THROUGH CONTROL FLOW (see for_each_flat_statement), matching
-    // the three phases above: Python introduces no scope for an
-    // `if`/`while`/`for` block, so an assignment written inside one binds in
-    // module scope exactly like a flat one. Load-bearing for
-    // validate_class_bases, whose dotted-base-root rule ASKS ScopeStack
-    // whether a name is bound at all -- see that function for the measured
-    // program a flat-only walk turned into a false NameError.
+    // Walks `module.body()` DIRECTLY, not recursively into a control-flow
+    // block, so an assignment written inside an `if`/`while`/`for` gets no
+    // placeholder. The consequence, measured: `print(x)` above
+    // `if FLAG: x = 5` reports `name 'x' is not defined` where mypy reports
+    // `Name "x" is used before definition  [used-before-def]` and CPython
+    // raises `NameError: name 'x' is not defined`. All three reject the
+    // program, so that is a wording gap, not a compliance one. Recursing here
+    // was tried and reverted: nothing in this pass needed it once
+    // validate_class_bases stopped asking ScopeStack about a dotted base's
+    // root, and the wider traversal made an ordinary loop read
+    // (`for line in [...]:` above a later `if True: line = "z"`) a false
+    // NameError on a program BOTH oracles accept (measured: mypy --strict
+    // "Success: no issues found in 1 source file"; CPython prints `2 z`).
     void pre_bind_assignment_targets(const ast::Module& module);
     void pre_bind_target(const ast::Expr& target, int line);
 
     // The Function-scope analogue of pre_bind_assignment_targets, run once a
     // FunctionDef's own Function scope is current and its parameters are
-    // bound, over that SAME FunctionDef's own body list directly -- NOT
-    // recursively into a nested control-flow block, unlike
-    // pre_bind_assignment_targets, which does recurse. The consequence,
-    // measured: a read above a CONDITIONAL assignment inside a function body
-    // (`def f(flag: bool): print(x); if flag: x = 5`) reports
-    // `name 'x' is not defined` where mypy reports `Name "x" is used before
-    // definition` and CPython raises `UnboundLocalError`. All three reject the
-    // program, so this is a wording gap, not a compliance one, and closing it
-    // is the same one-line change made at module scope. Task 18's twist, absent at module
+    // bound, over that SAME FunctionDef's own body list directly (not
+    // recursively into a nested block, matching pre_bind_assignment_targets'
+    // own module.body()-only scope). Task 18's twist, absent at module
     // scope: a Function scope gets no Phase-2 equivalent AT ALL, so BOTH an
     // Assign target AND a nested def's own name need a placeholder here --
     // a nested `def` is bound at its lexical position, never hoisted, but
@@ -931,8 +928,12 @@ private:
     // statement's line. For a NESTED class it is the ENCLOSING `class`
     // statement's line, because that is the statement whose execution creates
     // the nested class object and binds the outer name through which it is
-    // reachable -- `class D(Outer.Inner)` is legal exactly when `class Outer`
-    // has already run, whatever line `class Inner` sits on. That rule is
+    // reachable -- a nested class exists exactly when the `class` statement
+    // containing it has finished running, whatever line it sits on itself.
+    // (validate_class_bases inspects BARE-NAME bases only, so a dotted
+    // `Outer.Inner` base never reaches this map; a bare name never
+    // canonicalises to a qualified one. What the enclosing-line rule still
+    // governs is a class NESTED inside the class it subclasses.) That rule is
     // DELIBERATELY CONSERVATIVE rather than exactly right: because a nested
     // class inherits its enclosing statement's line, `class C:` with
     // `class D(C):` inside its OWN body never compares as out of order, so

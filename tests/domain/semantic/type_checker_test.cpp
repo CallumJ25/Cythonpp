@@ -2518,37 +2518,36 @@ TEST(TypeChecker, ReadAboveAConditionalAnnAssignIsUsedBeforeDefinition) {
     EXPECT_EQ(error.message, "name 'y' is used before definition");
 }
 
-// The same, for a conditional PLAIN assignment, now that the assignment
-// pre-pass recurses through control flow too: the placeholder sits at the
-// assignment's own line, so a read above it is order-checked rather than
-// falling through to "not defined". Measured on this exact program:
+// A conditional PLAIN assignment is a different story from the AnnAssign
+// above, because the assignment pre-pass walks `module.body()` flat and so
+// installs no placeholder for one written inside an `if` -- the read falls
+// through to "not defined" instead of being order-checked. Measured on this
+// exact program:
 //   mypy --strict: Name "x" is used before definition  [used-before-def]
 //   CPython:       NameError: name 'x' is not defined
-//   cythonpp:      2:7: error: NameError: name 'x' is used before definition
-//                  (before the pre-pass recursed: "name 'x' is not defined")
-// Both tools error either way, so no program mypy accepts starts failing; the
-// wording now names the same defect mypy names.
-TEST(TypeChecker, ReadAboveAConditionalAssignIsUsedBeforeDefinition) {
+//   cythonpp:      2:7: error: NameError: name 'x' is not defined
+// All three reject the program, so this is a WORDING gap, not a compliance
+// one: nothing mypy accepts is refused, and nothing mypy refuses is accepted.
+// Recursing the pre-pass to close the wording gap was tried and reverted --
+// the wider traversal made an ordinary loop read a false NameError on a
+// program both oracles accept; see pre_bind_assignment_targets.
+TEST(TypeChecker, ReadAboveAConditionalAssignIsNotDefined) {
     const Checked checked = check_module("FLAG = True\n"
                                          "print(x)\n"
                                          "if FLAG:\n"
                                          "    x = 5\n");
     const diagnostics::Diagnostic error = only_error(checked);
     EXPECT_EQ(error.code, "NameError");
-    EXPECT_EQ(error.message, "name 'x' is used before definition");
+    EXPECT_EQ(error.message, "name 'x' is not defined");
     EXPECT_EQ(error.line, 2);
 }
 
-// A conditional plain assignment FILLS its own placeholder when the ordinary
-// walk reaches it, rather than being taken for a redefinition of the
-// placeholder the pre-pass installed -- the placeholder carries the
-// assignment's own line and is_unfilled_placeholder matches on line equality,
-// so recursing the pre-pass through control flow did not disturb the
-// placeholder-then-fill pattern. Also covers an if/else pair assigning one
+// A conditional plain assignment binds cleanly when the ordinary walk reaches
+// it, and a read BELOW it resolves. Also covers an if/else pair assigning one
 // name (first branch wins, second is an ordinary compatible reassignment) and
 // a conditional assignment of a name also assigned flat. All three measured
 // mypy-clean and CPython-clean.
-TEST(TypeChecker, AConditionalAssignmentFillsItsOwnPlaceholder) {
+TEST(TypeChecker, AConditionalAssignmentBindsAndReadsCleanly) {
     expect_clean("FLAG = True\n"
                  "if FLAG:\n"
                  "    x = 5\n"
@@ -2997,27 +2996,6 @@ TEST(TypeChecker, ABaseDeclaredInsideALaterIfIsANameError) {
     EXPECT_EQ(error.message, "name 'Parent' is not defined");
 }
 
-// A NESTED class used as a base by an outer-scope class: the binding happens
-// at the ENCLOSING `class Outer` statement, not at the nested statement, so
-// what matters is where `Outer` sits.
-TEST(TypeChecker, ANestedClassUsedAsABaseComparesAgainstItsEnclosingClassLine) {
-    expect_clean("class Outer:\n"
-                 "    class Inner:\n"
-                 "        pass\n"
-                 "class D(Outer.Inner):\n"
-                 "    pass\n");
-}
-
-TEST(TypeChecker, ANestedClassBaseDeclaredBelowIsANameError) {
-    const Checked checked = check_module("class D(Outer.Inner):\n"
-                                         "    pass\n"
-                                         "class Outer:\n"
-                                         "    class Inner:\n"
-                                         "        pass\n");
-    EXPECT_FALSE(checked.diagnostics.empty());
-    EXPECT_EQ(checked.diagnostics.front().code, "NameError");
-}
-
 // A function-local class used as a base inside the SAME function: ordinary
 // statement order within the function body.
 TEST(TypeChecker, AFunctionLocalBaseDeclaredAboveIsClean) {
@@ -3082,92 +3060,35 @@ TEST(TypeChecker, AFunctionLocalBaseDeclaredBelowInTheSameFunctionIsANameError) 
     EXPECT_EQ(error.line, 2);
 }
 
-// A DOTTED base whose root is an ordinary binding holding a class object.
-// `h` is defined -- it just is not something ClassTable can see, since class
-// names are never bound into ScopeStack and ClassTable is keyed by class
-// name, not by the values bindings hold. The exemption is gated on `h` being
-// BOUND somewhere in scope, which is what keeps it from swallowing the
-// undefined-root case below. Measured:
-//   mypy --strict: Success: no issues found in 1 source file
-//   CPython:       runs, printing the D instance
-TEST(TypeChecker, ADottedBaseWhoseRootIsAValueBindingIsClean) {
-    expect_clean("class Holder:\n"
-                 "    class Inner:\n"
-                 "        pass\n"
-                 "h = Holder\n"
-                 "class D(h.Inner):\n"
+// KNOWN MISSES, RECORDED. Base validation inspects BARE-NAME bases only, so a
+// dotted base is skipped entirely and these two programs draw nothing. Both
+// are errors this compiler does not report, which is the safe direction of the
+// two, and neither is unreachable -- each is two lines to write. Measured with
+// mypy 1.18.1 and CPython 3.14.2:
+//
+//   `class D(Outer.Inner)` above `class Outer` -- mypy --strict: "Success: no
+//   issues found in 1 source file"; CPython: `NameError: name 'Outer' is not
+//   defined` from the `class D(Outer.Inner):` statement itself, caret under
+//   `Outer` alone. One oracle rejects, so under the union rule this must not
+//   compile, and it does.
+//
+//   `class D(mod.Thing)` with `mod` bound nowhere -- mypy --strict:
+//   `Name "mod" is not defined  [name-defined]` plus `Class cannot subclass
+//   "Thing" (has type "Any")  [misc]`; CPython: `NameError: name 'mod' is not
+//   defined`. BOTH oracles reject, and this compiler is silent.
+//
+// Reporting either one requires asking whether a dotted base's ROOT is bound
+// in scope, and that question is what dragged base validation behind the name
+// pre-binding passes and those passes into control flow, which produced false
+// NameErrors on ordinary code both oracles accept. See validate_class_bases.
+TEST(TypeChecker, ADottedBaseIsNotOrderCheckedOrResolved) {
+    expect_clean("class D(Outer.Inner):\n"
                  "    pass\n"
-                 "print(D())\n");
-}
-
-// ... and the same thing with the binding written inside an `if`, which is the
-// variant that actually exercises the exemption's dependence on the
-// pre-binding pass RECURSING through control flow. The test above passes even
-// with a flat-only pre-pass, because its binding sits flat; this one does not.
-// Python introduces no scope for an `if`/`while`/`for` block, so `h` binds in
-// module scope either way. Measured on this exact program:
-//   mypy --strict: Success: no issues found in 1 source file
-//   CPython:       runs, printing the D instance
-//   cythonpp:      silent (before the pre-pass recursed:
-//                  6:9: error: NameError: name 'h' is not defined)
-// Reproduces identically with the binding in a `while` body, a `for` body and
-// an `else` branch, all four measured the same way.
-TEST(TypeChecker, ADottedBaseWhoseRootIsBoundUnderControlFlowIsClean) {
-    expect_clean("class Holder:\n"
+                 "class Outer:\n"
                  "    class Inner:\n"
-                 "        pass\n"
-                 "if True:\n"
-                 "    h = Holder\n"
-                 "class D(h.Inner):\n"
-                 "    pass\n"
-                 "print(D())\n");
-}
-
-// ORDER applies to a dotted base's root exactly as it does to a bare-Name
-// base: the root must be bound by the time the subclass statement RUNS. This
-// is the same shape as ABaseDeclaredBelowItsSubclassIsANameError one indirection
-// removed, and it is the one case in the exemption's territory where the union
-// rule requires a report. Measured on this exact program:
-//   mypy --strict: Success: no issues found in 1 source file
-//   CPython:       NameError: name 'h' is not defined, raised from the
-//                  `class D(h.Inner):` statement itself
-//   cythonpp:      4:9: error: NameError: name 'h' is not defined
-// mypy alone is not the oracle: a program compiles only when BOTH mypy and
-// CPython accept it, since emitting C++ for a module CPython refuses to import
-// would turn a diagnostic gap into a wrong-code bug.
-TEST(TypeChecker, ADottedBaseWhoseRootIsBoundBelowTheSubclassIsANameError) {
-    const Checked checked = check_module("class Holder:\n"
-                                         "    class Inner:\n"
-                                         "        pass\n"
-                                         "class D(h.Inner):\n"
-                                         "    pass\n"
-                                         "h = Holder\n"
-                                         "print(D())\n");
-    const diagnostics::Diagnostic error = only_error(checked);
-    EXPECT_EQ(error.code, "NameError");
-    EXPECT_EQ(error.message, "name 'h' is not defined");
-    EXPECT_EQ(error.line, 4);
-    EXPECT_EQ(error.column, 9);
-}
-
-// ... and a DOTTED base whose root is bound NOWHERE is still a NameError.
-// This is the other side of the exemption above: `mod` is neither a class nor
-// a binding, so there is no value it could be holding and nothing to give the
-// benefit of the doubt to. Measured:
-//   mypy --strict: Name "mod" is not defined  [name-defined]
-//   CPython:       NameError: name 'mod' is not defined, raised from the
-//                  class statement itself
-// Both oracles reject, so silence here would be a program compiled that
-// cannot run. The reported column is the ROOT name's, not the whole base
-// expression's, because the root is the only part that can fail to resolve.
-TEST(TypeChecker, ADottedBaseWhoseRootIsBoundNowhereIsANameError) {
-    const Checked checked = check_module("class D(mod.Thing):\n"
-                                         "    pass\n");
-    const diagnostics::Diagnostic error = only_error(checked);
-    EXPECT_EQ(error.code, "NameError");
-    EXPECT_EQ(error.message, "name 'mod' is not defined");
-    EXPECT_EQ(error.line, 1);
-    EXPECT_EQ(error.column, 9);
+                 "        pass\n");
+    expect_clean("class D(mod.Thing):\n"
+                 "    pass\n");
 }
 
 // KNOWN WRONG. THIS TEST RECORDS A BUG, NOT DESIRED BEHAVIOUR. Whoever fixes

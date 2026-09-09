@@ -167,23 +167,6 @@ void TypeChecker::visit(const ast::Module& node) {
     }
     collect_signatures(node);
     pre_bind_assignment_targets(node);
-    // BASE VALIDATION, once every class at every nesting depth is declared
-    // AND every module-level name is bound: a bare-Name base that does not
-    // resolve at all is a NameError (e.g. `class C(Generic):`, since Generic
-    // cannot be imported in this subset), and so is one that resolves to a
-    // class declared BELOW the subclass.
-    //
-    // Deferred to here rather than run inside collect_classes for TWO
-    // reasons, both load-bearing. Every class must already be declared, so a
-    // base naming a class declared LATER in the same module, or in a
-    // different class's body, resolves -- the order rule is then applied by
-    // comparing recorded lines, not by whether the lookup happened to succeed
-    // yet. And every module-level binding must already exist, because a
-    // DOTTED base's root is exonerated by being bound at all (see
-    // validate_class_bases): running before pre_bind_assignment_targets would
-    // make `h = Holder` then `class D(h.Inner):` a false NameError purely
-    // because `h` had not been bound yet.
-    validate_class_bases(declared_classes_, /*check_order=*/true);
     for (const ast::StmtPtr& statement : node.body()) {
         statement->accept(*this);
     }
@@ -323,6 +306,15 @@ void TypeChecker::collect_classes(const ast::Module& module) {
             declare_class_recursive(*class_def, "", declared_classes_);
         }
     });
+
+    // THEN -- once every class at every nesting depth is declared -- validate
+    // that each bare-Name base actually resolves, reporting NameError for one
+    // that does not (e.g. `class C(Generic):`, since Generic cannot be
+    // imported in this subset), and that it was not declared BELOW the
+    // subclass that names it. Deferred until here (rather than folded into
+    // declare_class_recursive) so a base naming a class declared LATER in the
+    // same module, or in a different class's body, already resolves.
+    validate_class_bases(declared_classes_, /*check_order=*/true);
 }
 
 void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_classes,
@@ -330,100 +322,59 @@ void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_
     for (const ClassDeclaration& declaration : all_classes) {
         const int subclass_line = declaration.node->span().start_line;
         for (const ast::ExprPtr& base : declaration.node->bases()) {
-            // Walk a DOTTED base (`Outer.Inner`, `A.B.C`) down to the NAME at
-            // its root. A dotted base is reachable by a name only through its
-            // ROOT identifier -- a nested class always exists by the time the
-            // `class Outer` statement containing it finishes executing -- so
-            // both rules below can only ever fire on that root, never on an
-            // attribute lookup along the way. A bare-Name base is already its
-            // own root, so the loop simply does not run for one, and the two
-            // shapes share the code that follows.
-            const ast::Expr* cursor = base.get();
-            bool via_attribute = false;
-            while (const auto* link = dynamic_cast<const ast::Attribute*>(cursor)) {
-                cursor = &link->value();
-                via_attribute = true;
-            }
-            const auto* name = dynamic_cast<const ast::Name*>(cursor);
+            const auto* name = dynamic_cast<const ast::Name*>(base.get());
             if (name == nullptr) {
-                // Anything other than a Name at the root (e.g. `f().Inner`)
-                // is not modelled here.
+                // BARE-NAME BASES ONLY. A dotted base (`Outer.Inner`,
+                // `mod.Thing`), a subscripted one, and anything else are
+                // skipped here entirely. That is a deliberate choice with a
+                // measured price, recorded below rather than left implicit.
+                //
+                // A dotted base WAS validated here for a while, by walking the
+                // chain down to its root Name and applying the two rules below
+                // to that root. The trouble is that a root which is not a known
+                // class may still legitimately hold a class object -- `h =
+                // Holder` then `class D(h.Inner):`, which both oracles accept
+                // (measured: mypy --strict "Success: no issues found in 1
+                // source file"; CPython prints a D instance) -- and this model
+                // cannot see that, because class names are deliberately never
+                // bound into ScopeStack and ClassTable is keyed by class NAME,
+                // not by the values ordinary bindings hold. Avoiding a false
+                // NameError there meant asking ScopeStack whether the root was
+                // bound at all, which forced base validation to run after the
+                // name pre-binding passes, which forced those passes to recurse
+                // through control flow, which turned an ordinary loop read into
+                // a false NameError on code both oracles accept. Every step was
+                // a fix for a real false positive and every step produced the
+                // next one, so the arm is dropped rather than gated again.
+                //
+                // THE TWO ACCEPTED MISSES, both measured (mypy 1.18.1,
+                // CPython 3.14.2), and neither unreachable -- each is two lines
+                // to write:
+                //
+                //   `class D(Outer.Inner): pass` above `class Outer:` /
+                //   `class Inner: pass`. mypy --strict: "Success: no issues
+                //   found in 1 source file". CPython: `NameError: name 'Outer'
+                //   is not defined` raised from the `class D(Outer.Inner):`
+                //   statement itself, caret under `Outer` alone. One oracle
+                //   rejects, so the union rule says this must not compile, and
+                //   it now does.
+                //
+                //   `class D(mod.Thing): pass` with `mod` bound nowhere. mypy
+                //   --strict: `Name "mod" is not defined  [name-defined]`
+                //   (plus `Class cannot subclass "Thing" (has type "Any")`).
+                //   CPython: `NameError: name 'mod' is not defined`. BOTH
+                //   oracles reject, and this compiler is silent.
+                //
+                // Both are MISSED errors, which is the safe direction of the
+                // two: a program that should have been refused compiles, rather
+                // than a program both oracles accept being refused. The
+                // alternatives on offer were the false positives above.
                 continue;
             }
             if (!classes_.is_class(name->identifier())) {
-                const Resolution root =
-                    via_attribute ? scopes_.resolve(name->identifier()) : Resolution{};
-                if (root.binding != nullptr) {
-                    // A DOTTED base whose root is not a known class but IS an
-                    // ordinary binding is most likely a binding holding a
-                    // class object -- `h = Holder` then `class D(h.Inner):`.
-                    // Both oracles accept that program (measured: mypy
-                    // --strict "Success: no issues found in 1 source file";
-                    // CPython runs it and prints a D instance), and this model
-                    // cannot see it: class names are deliberately never bound
-                    // into ScopeStack, and ClassTable is keyed by class NAME,
-                    // not by the values ordinary bindings hold. Reporting the
-                    // root as undefined here would therefore be a false
-                    // NameError on a program the union rule requires this
-                    // compiler to accept.
-                    //
-                    // What this silence trades away, stated exactly, since two
-                    // of the shapes it covers are rejected by BOTH oracles and
-                    // are therefore genuine misses rather than safe ones: a
-                    // bound root whose VALUE is not a class, or is a class
-                    // without the attribute named, goes unreported. Measured:
-                    // `a = A` then `class D(a.B.C):` draws `Name "a.B.C" is
-                    // not defined` from mypy AND `AttributeError: type object
-                    // 'A' has no attribute 'B'` from CPython; `def g() -> None`
-                    // then `class D(g.Inner):` draws `Name "g.Inner" is not
-                    // defined` from mypy AND `AttributeError: 'function'
-                    // object has no attribute 'Inner'` from CPython. Closing
-                    // those needs resolving an attribute chain through the
-                    // VALUE a binding holds, which this model cannot do at all
-                    // -- so they stay missed, and the alternative on offer
-                    // (reporting every bound root) would invent a false
-                    // NameError on the `h = Holder` shape above, which is
-                    // worse.
-                    //
-                    // The one genuinely acceptable miss in the set is a root
-                    // that is a function PARAMETER --
-                    // `def f(h: type) -> None: class D(h.Inner): ...` --
-                    // which mypy rejects (measured: `Name "h.Inner" is not
-                    // defined`) while CPython runs it happily when a real
-                    // class is passed in (measured: prints the D instance).
-                    // That one is mypy-only, and missing a mypy-only error is
-                    // the safe direction.
-                    //
-                    // An UNBOUND root falls through to the report below
-                    // instead, so `class D(mod.Thing):` -- which both oracles
-                    // reject -- is still caught.
-                    //
-                    // ORDER still applies to the root, for exactly the reason
-                    // it does to a bare-Name base below: the root must be
-                    // bound by the time the subclass statement RUNS.
-                    // `class D(h.Inner):` above `h = Holder` is mypy-clean
-                    // (measured: "Success: no issues found in 1 source file")
-                    // but CPython raises `NameError: name 'h' is not defined`
-                    // from the class statement itself (measured), so the union
-                    // rule requires reporting it. Same comparison against the
-                    // same recorded line data as the bare-Name rule, and the
-                    // same message CPython produces. Gated on check_order for
-                    // the timeline reason declare_isolated_class spells out: a
-                    // function-local class's line is not comparable with a
-                    // module-level binding's.
-                    if (check_order && root.binding->declared_line > subclass_line) {
-                        report(*name, "NameError",
-                               "name '" + name->identifier() + "' is not defined");
-                    }
-                    continue;
-                }
-                // A root that is neither a known class nor bound anywhere in
-                // scope: `class C(Generic):` (Generic cannot be imported in
-                // this subset) or `class D(mod.Thing):`. Measured on the
-                // latter: mypy --strict says `Name "mod" is not defined`,
-                // CPython raises `NameError: name 'mod' is not defined` from
-                // the class statement -- both oracles reject, so reporting is
-                // required, and the message matches CPython's.
+                // e.g. `class C(Generic):` -- Generic cannot be imported in
+                // this subset, so this is the correct outcome for a program
+                // nobody can legally write.
                 report(*name, "NameError", "name '" + name->identifier() + "' is not defined");
                 continue;
             }
@@ -645,38 +596,11 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
 }
 
 void TypeChecker::pre_bind_assignment_targets(const ast::Module& module) {
-    // Recursed through control flow (see for_each_flat_statement), matching
-    // this pass's three siblings above for the same reason they recurse:
-    // Python introduces no scope for an `if`/`while`/`for` block, so a
-    // module-level assignment inside one binds in module scope exactly as a
-    // flat one does.
-    //
-    // Load-bearing for validate_class_bases, which exonerates a DOTTED base's
-    // root by asking ScopeStack whether it is bound at all. Walking only the
-    // flat list asked that question without ever supplying the answer for a
-    // conditional binding, so `if True: h = Holder` above
-    // `class D(h.Inner):` reported a false NameError on a program BOTH
-    // oracles accept (measured: mypy --strict "Success: no issues found in 1
-    // source file"; CPython runs it and prints a D instance) -- identically
-    // for a `while` body, a `for` body and an `else` branch.
-    //
-    // It also gives a read ABOVE a conditional assignment a placeholder at
-    // that assignment's own line, so the ordering rule reports "used before
-    // definition" instead of falling through to "not defined" -- matching
-    // mypy, measured on `print(x)` above `if FLAG: x = 5`: `Name "x" is used
-    // before definition  [used-before-def]`.
-    //
-    // Safe with respect to the placeholder-then-fill pattern: a placeholder
-    // carries the assignment's OWN line and is_unfilled_placeholder matches on
-    // line equality, so the conditional assignment still fills its own
-    // placeholder when the ordinary walk reaches it rather than being taken
-    // for a redefinition.
-    for_each_flat_statement(module.body(), /*directly_in_body=*/true,
-                            [this](const ast::Stmt& statement, bool) {
-        if (const auto* assign = dynamic_cast<const ast::Assign*>(&statement)) {
+    for (const ast::StmtPtr& statement : module.body()) {
+        if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
             pre_bind_target(assign->target(), assign->span().start_line);
         }
-    });
+    }
 }
 
 void TypeChecker::pre_bind_target(const ast::Expr& target, int line) {
