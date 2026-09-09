@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -369,9 +370,21 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
     // definition" instead of falling through to "not defined" (matching mypy),
     // and a later same-name definition still reports against the right
     // statement.
+    // Names this pass has bound FROM A FunctionDef, so a later failed bind
+    // can tell a def-vs-def collision (mypy allows it when either side is
+    // conditional) apart from a def colliding with a variable binding of the
+    // same name (mypy always reports that one, conditional or not) -- a
+    // `Binding` cannot make that distinction on its own, since an annotated
+    // assignment and a def both bind with `annotated = true`, and inferring
+    // it from the existing binding's type would also wrongly suppress a
+    // genuine `f: Callable[[], int] = ...` followed by a conditional `def f`.
+    // Local to this pass rather than a `Binding` field: a field would have to
+    // be threaded through every other bind site in this file for the benefit
+    // of this one caller.
+    std::set<std::string> def_bound_names;
     for_each_flat_statement(
         module.body(), /*directly_in_body=*/true,
-        [this](const ast::Stmt& statement, bool at_flat_top_level) {
+        [this, &def_bound_names](const ast::Stmt& statement, bool at_flat_top_level) {
             if (const auto* function_def = dynamic_cast<const ast::FunctionDef*>(&statement)) {
                 if (collided_top_level_.count(function_def) != 0) {
                     return; // scan_top_level_names already reported this.
@@ -417,25 +430,39 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
                 const Binding signature{signature_type, function_def->span().start_line,
                                         /*annotated=*/true};
                 if (!scopes_.bind(function_def->name(), signature)) {
-                    if (!at_flat_top_level) {
-                        // A CONDITIONAL def whose name is already bound.
-                        // Measured against mypy 1.18.1: two defs of one name
-                        // in an if/else, and two in the same block, are BOTH
-                        // `Success` -- mypy allows a conditional function
-                        // redefinition. So reporting here would be a false
-                        // TypeError on code mypy accepts, which is the one
-                        // thing this pass must never do. The first binding
-                        // wins and this one is dropped silently; if the two
-                        // signatures genuinely disagree that is a MISSED
-                        // error, the safe direction, and the same choice the
-                        // top-level name scan already makes for its own
-                        // conditional-redefinition allowance.
+                    // Suppress only a def colliding with an EARLIER def, and
+                    // only when at least one side is conditional -- two FLAT
+                    // defs never reach this line at all, since
+                    // scan_top_level_names already caught and reported that
+                    // pair and the early return above already skipped the
+                    // losing one, so def_bound_names.count(...) here is only
+                    // ever consulted when at_flat_top_level is false for one
+                    // of the two. Measured against mypy 1.18.1: two defs of
+                    // one name in an if/else, and two in the same block, are
+                    // BOTH `Success` -- mypy allows a conditional function
+                    // redefinition. So reporting here would be a false
+                    // TypeError on code mypy accepts, which is the one thing
+                    // this pass must never do. The first binding wins and
+                    // this one is dropped silently; if the two signatures
+                    // genuinely disagree that is a MISSED error, the safe
+                    // direction, and the same choice the top-level name scan
+                    // already makes for its own conditional-redefinition
+                    // allowance.
+                    //
+                    // A def colliding with a VARIABLE binding (annotated or
+                    // not) is a different collision class entirely -- mypy
+                    // reports it regardless of either side's conditionality
+                    // (measured: `Incompatible redefinition`) -- so that case
+                    // must always fall through to the report below.
+                    if (!at_flat_top_level && def_bound_names.count(function_def->name()) != 0) {
                         return;
                     }
                     const Resolution existing = scopes_.resolve(function_def->name());
                     report(*function_def, "TypeError",
                           "name \"" + function_def->name() + "\" already defined on line " +
                               std::to_string(existing.binding->declared_line));
+                } else {
+                    def_bound_names.insert(function_def->name());
                 }
             } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(&statement)) {
                 if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {

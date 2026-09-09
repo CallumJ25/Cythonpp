@@ -2537,6 +2537,64 @@ TEST(TypeChecker, ConditionalAnnAssignCollidesWithLaterFlatDef) {
     EXPECT_EQ(error.line, 4);
 }
 
+// A conditional def colliding with an EARLIER conditional annotated
+// assignment of the same name must still report -- mypy's allowance for a
+// conditional function redefinition applies only when the earlier binding was
+// ALSO a def, and an annotated assignment is not one. Verified against mypy
+// 1.18.1: `Incompatible redefinition (redefinition with type "Callable[[],
+// int]", original type "int")  [misc]` at the def's own line (5). cythonpp
+// keeps its own settled wording rather than mypy's, but both tools error.
+TEST(TypeChecker, ConditionalAnnAssignCollidesWithLaterConditionalDef) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "if FLAG:\n"
+                                         "    y: int = 5\n"
+                                         "if FLAG:\n"
+                                         "    def y() -> int:\n"
+                                         "        return 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"y\" already defined on line 3");
+    EXPECT_EQ(error.line, 5);
+}
+
+// The same collision with a FLAT annotated assignment on the earlier side --
+// pinned separately from the conditional-earlier-side case above because a
+// flat AnnAssign followed by a conditional def is the shape a coarser
+// "either side conditional" suppression rule would wrongly swallow (the def
+// is the only conditional statement here). Verified against mypy 1.18.1:
+// the same `Incompatible redefinition` error, at the def's own line (4).
+TEST(TypeChecker, FlatAnnAssignCollidesWithLaterConditionalDef) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "y: int = 5\n"
+                                         "if FLAG:\n"
+                                         "    def y() -> int:\n"
+                                         "        return 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"y\" already defined on line 2");
+    EXPECT_EQ(error.line, 4);
+}
+
+// The reverse order: a conditional def followed by a colliding conditional
+// annotated assignment. Proves the rule is about the EARLIER binding's kind,
+// not just "one side is conditional" -- unlike the two-conditional-defs case,
+// which stays silent, this one must still report because the earlier
+// binding is a variable, not a def. Verified against mypy 1.18.1:
+// `Name "y" already defined on line 3  [no-redef]`, at the AnnAssign's own
+// line (6).
+TEST(TypeChecker, ConditionalDefCollidesWithLaterConditionalAnnAssign) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "if FLAG:\n"
+                                         "    def y() -> int:\n"
+                                         "        return 1\n"
+                                         "if FLAG:\n"
+                                         "    y: int = 5\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"y\" already defined on line 3");
+    EXPECT_EQ(error.line, 6);
+}
+
 // UNCHANGED GUARDS -- each is a row of the measured matrix that already worked,
 // and this task must not disturb any of them.
 

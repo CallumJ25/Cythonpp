@@ -571,14 +571,19 @@ private:
     // definition" instead of "not defined" (matching mypy), and what makes a
     // later same-name definition report against the right statement.
     //
-    // A conditional def's FAILED bind is dropped silently rather than
-    // reported: measured against mypy 1.18.1, two defs of one name in an
-    // if/else, and two in the same block, are both `Success` -- mypy allows a
-    // conditional function redefinition, so reporting one here would be a
-    // false TypeError on mypy-clean code. The first binding wins; a second,
-    // genuinely incompatible conditional def is a missed error, the safe
-    // direction, matching the allowance scan_top_level_names already makes
-    // for the identical case.
+    // A conditional def's FAILED bind is dropped silently only when the
+    // binding it collided with also came from a def: measured against mypy
+    // 1.18.1, two defs of one name in an if/else, and two in the same block,
+    // are both `Success` -- mypy allows a conditional function redefinition,
+    // so reporting one here would be a false TypeError on mypy-clean code.
+    // The first binding wins; a second, genuinely incompatible conditional
+    // def is a missed error, the safe direction, matching the allowance
+    // scan_top_level_names already makes for the identical case. A def
+    // colliding with a VARIABLE binding (an annotated assignment or not) is a
+    // different collision class mypy always reports, conditional or not --
+    // measured `Incompatible redefinition` -- so that failed bind still
+    // reports below; see the def-vs-def tracking set local to this
+    // function's own definition for how the two are told apart.
     void collect_signatures(const ast::Module& module);
 
     // Phase 2.5: every top-level Assign's target name(s) that are not yet
