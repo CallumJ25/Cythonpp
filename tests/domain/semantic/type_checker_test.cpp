@@ -2643,8 +2643,9 @@ TEST(TypeChecker, AConditionalDefInsideAFunctionStillWorks) {
 
 // A method body does not execute at class-definition time, so a class
 // referenced from ABOVE its own definition is fully usable -- verified
-// against mypy 1.18.1 (`Success`, with reveal_type(i) `Item` and
-// reveal_type(i.n) `builtins.int`), and correct at runtime too. Member
+// against mypy 1.18.1 (`Success`, with reveal_type(i) revealing
+// "<module>.Item" and reveal_type(i.n) revealing "builtins.int"), and
+// correct at runtime too. Member
 // collection used to happen only when the ordinary walk reached the
 // declaring ClassDef, so a reference from above saw a class with no members.
 TEST(TypeChecker, AClassReferencedAboveItsDefinitionHasItsMembers) {
@@ -2732,6 +2733,141 @@ TEST(TypeChecker, ASameClassReAnnotationIsStillARedefinitionAfterEagerCollection
                                          "    v: int\n"
                                          "    v: int\n");
     EXPECT_EQ(checked.diagnostics.size(), 1u);
+}
+
+// The eager placeholder for an ANNOTATED `self.x: T` carries the RESOLVED
+// annotation, not Type::unknown(). Unknown is absorbing, so installing it
+// stops every EARLIER `self.x = ...` in the same class from being checked
+// against the type the attribute actually has -- and the write above is
+// exactly such an earlier one. Verified against mypy 1.18.1 on this exact
+// source: `Incompatible types in assignment (expression has type "str",
+// variable has type "int")` at the `self.v = "s"` line.
+//
+// ORDER-DEPENDENT by construction, which is why both orders are pinned: with
+// the annotating method written FIRST, the write is checked against an entry
+// the ordinary walk has already filled in, so the error survives even an
+// Unknown placeholder. It is only the reader-or-writer-ABOVE order that the
+// placeholder's own type decides.
+TEST(TypeChecker, APlainSelfWriteAboveAnAnnotatedSelfDeclarationIsStillChecked) {
+    const Checked checked = check_module("class Base:\n"
+                                         "    v: int\n"
+                                         "class Child(Base):\n"
+                                         "    def a(self) -> None:\n"
+                                         "        self.v = \"s\"\n"
+                                         "    def b(self) -> None:\n"
+                                         "        self.v: int = 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 5);
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"str\", "
+              "variable has type \"int\")");
+}
+
+TEST(TypeChecker, APlainSelfWriteBelowAnAnnotatedSelfDeclarationIsStillChecked) {
+    const Checked checked = check_module("class Base:\n"
+                                         "    v: int\n"
+                                         "class Child(Base):\n"
+                                         "    def b(self) -> None:\n"
+                                         "        self.v: int = 1\n"
+                                         "    def a(self) -> None:\n"
+                                         "        self.v = \"s\"\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 7);
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"str\", "
+              "variable has type \"int\")");
+}
+
+// The same shape with the base declaring through an annotated `self.v: int`
+// in its own __init__ rather than a class-body annotation. Verified against
+// mypy 1.18.1: the identical message, at the `self.v = "s"` line.
+TEST(TypeChecker, APlainSelfWriteIsCheckedAgainstAnInheritedAnnotatedSelfDeclaration) {
+    const Checked checked = check_module("class Base:\n"
+                                         "    def __init__(self) -> None:\n"
+                                         "        self.v: int = 1\n"
+                                         "class Child(Base):\n"
+                                         "    def a(self) -> None:\n"
+                                         "        self.v = \"s\"\n"
+                                         "    def b(self) -> None:\n"
+                                         "        self.v: int = 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 6);
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"str\", "
+              "variable has type \"int\")");
+}
+
+// READS above the declaration are the other half of what an Unknown
+// placeholder swallowed. Verified against mypy 1.18.1 on this exact source:
+// `"Thing" has no attribute "nonexistent"` at the reading line.
+TEST(TypeChecker, ASelfReadAboveAnAnnotatedSelfDeclarationIsStillChecked) {
+    const Checked checked = check_module("class Thing:\n"
+                                         "    pass\n"
+                                         "class Base:\n"
+                                         "    v: Thing\n"
+                                         "class Child(Base):\n"
+                                         "    def a(self) -> None:\n"
+                                         "        self.v.nonexistent()\n"
+                                         "    def b(self) -> None:\n"
+                                         "        self.v: Thing = Thing()\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 7);
+    EXPECT_EQ(error.message, "\"Thing\" has no attribute \"nonexistent\"");
+}
+
+// Resolving the annotated self declaration eagerly must not resolve it
+// TWICE. The eager scan caches its resolution and the ordinary walk reuses
+// it, so a bad annotation draws exactly one diagnostic. Note the base
+// declares the same name, which is precisely the case the eager scan does
+// NOT skip (the annotated form declares over an inherited name), so this
+// really does take the resolve-and-cache path.
+TEST(TypeChecker, ABadAnnotatedSelfAnnotationOverAnInheritedNameIsReportedExactlyOnce) {
+    const Checked checked = check_module("class Base:\n"
+                                         "    v: int\n"
+                                         "class Child(Base):\n"
+                                         "    def b(self) -> None:\n"
+                                         "        self.v: Nope = 1\n");
+    EXPECT_EQ(checked.diagnostics.size(), 1u);
+    EXPECT_EQ(checked.diagnostics[0].code, "NameError");
+}
+
+// The other half of the cache contract: an annotated self declaration the
+// eager scan SKIPS (this class already declares the name, here through a
+// class-body annotation) is never cached, so the ordinary walk resolves it
+// for the first and only time. Still exactly one diagnostic.
+TEST(TypeChecker, ABadAnnotatedSelfAnnotationOverAnOwnNameIsReportedExactlyOnce) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    v: int\n"
+                                         "    def b(self) -> None:\n"
+                                         "        self.v: Nope = 1\n");
+    EXPECT_EQ(checked.diagnostics.size(), 1u);
+    EXPECT_EQ(checked.diagnostics[0].code, "NameError");
+}
+
+// The one input found that reaches the class-body annotation branch's
+// "a genuinely earlier same-class declaration" arm: two same-named nested
+// classes in one outer class are keyed identically in ClassTable, so the
+// second body's annotation finds the first body's install at a different
+// line. mypy 1.18.1 rejects this source for the duplicate name
+// (`Name "Inner" already defined on line 2`), which this model does not
+// report -- so the arm's own diagnostic lands on an already-rejected
+// program, never on one mypy accepts.
+TEST(TypeChecker, ARepeatedNestedClassBodyAnnotationChecksAgainstTheFirstBodysDeclaration) {
+    const Checked checked = check_module("class Outer:\n"
+                                         "    class Inner:\n"
+                                         "        x: int\n"
+                                         "    class Inner:\n"
+                                         "        x: str\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 5);
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"int\", "
+              "variable has type \"str\")");
 }
 
 } // namespace

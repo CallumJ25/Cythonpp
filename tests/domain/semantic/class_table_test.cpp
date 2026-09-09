@@ -109,6 +109,100 @@ TEST(ClassTable, OwnMemberTypeIgnoresTheBaseChain) {
     EXPECT_EQ(table.own_member_type("NeverDeclared", "v"), std::nullopt);
 }
 
+// own_member_declared_line is own_member_type's line half and must miss and
+// hit in exactly the same places -- a caller that reads the TYPE off the own
+// entry and the LINE off the chain-walking member_declared_line is comparing
+// two different classes' entries.
+TEST(ClassTable, OwnMemberDeclaredLineIgnoresTheBaseChainToo) {
+    ClassTable table;
+    table.declare("Base", {});
+    table.declare_member("Base", "v", Type::object(), 3);
+    table.declare("Child", {"Base"});
+    table.declare_member("Child", "w", Type::str(), 7);
+
+    EXPECT_EQ(table.member_declared_line("Child", "v"), 3) << "inherited, as before";
+    EXPECT_EQ(table.own_member_declared_line("Child", "v"), std::nullopt)
+        << "not declared on Child itself";
+    EXPECT_EQ(table.own_member_declared_line("Child", "w"), 7);
+    EXPECT_EQ(table.own_member_declared_line("Child", "absent"), std::nullopt);
+    EXPECT_EQ(table.own_member_declared_line("NeverDeclared", "v"), std::nullopt);
+}
+
+// The third member question: what does this class INHERIT, ignoring its own
+// entry? Needed because a class's own entry now exists before any body is
+// checked, so "member_type found nothing of mine" no longer separates
+// "brand new" from "overriding a base's declaration".
+TEST(ClassTable, InheritedMemberTypeSkipsTheClasssOwnEntry) {
+    ClassTable table;
+    table.declare("Base", {});
+    table.declare_member("Base", "v", Type::object(), 3);
+    table.declare("Child", {"Base"});
+    table.declare_member("Child", "v", Type::int_(), 7);
+    table.declare_member("Child", "w", Type::str(), 8);
+
+    EXPECT_EQ(table.member_type("Child", "v"), Type::int_()) << "own entry wins, as before";
+    EXPECT_EQ(table.inherited_member_type("Child", "v"), Type::object())
+        << "the base's declaration, past Child's own";
+    EXPECT_EQ(table.inherited_member_type("Child", "w"), std::nullopt)
+        << "declared only on Child itself";
+    EXPECT_EQ(table.inherited_member_type("Base", "v"), std::nullopt) << "no bases at all";
+    EXPECT_EQ(table.inherited_member_type("NeverDeclared", "v"), std::nullopt);
+}
+
+// Multi-level and multiple inheritance, depth-first left to right, matching
+// every other base-chain query here.
+TEST(ClassTable, InheritedMemberTypeWalksTheWholeChain) {
+    ClassTable table;
+    table.declare("Root", {});
+    table.declare_member("Root", "v", Type::object(), 1);
+    table.declare("Mid", {"Root"});
+    table.declare("Leaf", {"Mid"});
+    table.declare_member("Leaf", "v", Type::bool_(), 9);
+    EXPECT_EQ(table.inherited_member_type("Leaf", "v"), Type::object());
+
+    table.declare("Left", {});
+    table.declare("Right", {});
+    table.declare_member("Right", "w", Type::str(), 2);
+    table.declare("Both", {"Left", "Right"});
+    EXPECT_EQ(table.inherited_member_type("Both", "w"), Type::str())
+        << "a later base still counts";
+}
+
+// THE CYCLE GUARD, and why it has to seed the ROOT. A cyclic base chain
+// (`class A(B)` / `class B(A)`, which declare() cannot prevent) walks back
+// into the queried class's own entry -- and returning that entry is exactly
+// what this query exists NOT to do. mypy rejects a cyclic chain outright, so
+// this is unreachable through legal source, but a query whose whole contract
+// is "skip my own entry" must not hand it back under any input.
+TEST(ClassTable, InheritedMemberTypeDoesNotWalkBackIntoTheQueriedClass) {
+    ClassTable table;
+    table.declare("A", {"B"});
+    table.declare_member("A", "v", Type::int_(), 1);
+    table.declare("B", {"A"});
+    EXPECT_EQ(table.inherited_member_type("A", "v"), std::nullopt);
+
+    // The self-cycle a function-local `class L(L)` produces, once the local
+    // class is declared under its isolated name and the bare name is
+    // scope-aliased to it: the base spelling canonicalises straight back to
+    // the root.
+    table.declare("<local-class>#5#L", {"L"});
+    table.declare_member("<local-class>#5#L", "w", Type::str(), 2);
+    table.declare_scoped_alias("L", "<local-class>#5#L");
+    EXPECT_EQ(table.inherited_member_type("<local-class>#5#L", "w"), std::nullopt);
+}
+
+// An alias spelling as a BASE still resolves: a base is a source-level name
+// and gets member_type's own canonicalisation, even though the ROOT gets
+// own_member_type's (none), because the root is the key the caller is about
+// to declare into and a base is not.
+TEST(ClassTable, InheritedMemberTypeCanonicalisesABaseSpelling) {
+    ClassTable table;
+    table.declare_member("OSError", "v", Type::int_(), 1);
+    table.declare("Child", {"IOError"});
+    table.declare_member("Child", "v", Type::bool_(), 2);
+    EXPECT_EQ(table.inherited_member_type("Child", "v"), Type::int_());
+}
+
 // Depth-first, left to right. mypy lands here too, and additionally REJECTS
 // the conflict with code `misc` -- a check this spec puts out of scope as a
 // missed error rather than a false one.

@@ -138,6 +138,45 @@ public:
     std::optional<Type> own_member_type(const std::string& qualified_name,
                                         const std::string& member) const;
 
+    // own_member_type's line half, with own_member_type's exact lookup
+    // policy: no canonicalisation, no chain walk, no scoped-alias fallback.
+    //
+    // Exists so a caller that gates on own_member_type and then asks "was
+    // that entry written by the statement I am looking at right now?" gets
+    // both answers out of the SAME member map. Pairing own_member_type with
+    // the canonicalising, chain-walking member_declared_line instead reads
+    // the line off a potentially DIFFERENT class's entry than the type came
+    // from, so the two can disagree about which statement declared what.
+    std::optional<int> own_member_declared_line(const std::string& qualified_name,
+                                                const std::string& member) const;
+
+    // The third member question, distinct from both of the two above: "what
+    // does this class INHERIT for this member, ignoring whatever its own
+    // entry says?" member_type cannot answer it (the class's own entry wins
+    // first) and own_member_type cannot either (it never looks past that
+    // entry).
+    //
+    // It is a question worth asking because a re-declaration's rule depends
+    // on whether the type it is overriding is the class's OWN or a BASE's
+    // (see own_member_type above), and by the time type_checker.cpp reaches
+    // a re-declaration statement, that class's own entry already exists --
+    // it was installed eagerly, before any body was checked, precisely so a
+    // reader method written ABOVE the declaration sees the declared type.
+    // So "is there anything of mine yet?" no longer separates the two cases,
+    // and the inherited chain has to be queried directly.
+    //
+    // Lookup policy, deliberately split between the root and the bases: the
+    // ROOT is resolved exactly as own_member_type resolves it, since it is
+    // the same key its caller is about to declare_member into; each BASE is
+    // resolved as member_type resolves it, since a base is a source-level
+    // spelling that may be an alias. The root -- under both spellings -- is
+    // seeded into the cycle guard, so a cyclic base chain (`class A(B)` /
+    // `class B(A)`, or a function-local `class L(L)`) cannot walk back into
+    // the queried class's own entry and return the very value this query
+    // exists to bypass.
+    std::optional<Type> inherited_member_type(const std::string& qualified_name,
+                                              const std::string& member) const;
+
     // A method's declared signature, including its `self` parameter, found
     // transitively through the base chain. Callers that need the BOUND
     // signature drop args[0] themselves -- mypy numbers arguments from the

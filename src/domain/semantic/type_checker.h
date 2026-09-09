@@ -345,13 +345,6 @@ private:
     // since Generic cannot be imported in this subset).
     void collect_classes(const ast::Module& module);
 
-    // The recursive half of collect_classes: declares `class_def` under
-    // `qualified_prefix + "." + class_def.name()` (or just its own name, at
-    // the top level, where `qualified_prefix` is empty), appends it to
-    // `all_classes` for the base-validation loop collect_classes runs once
-    // every class -- at every nesting depth -- is declared, then recurses
-    // into `class_def`'s own body for a nested ClassDef, passing ITS OWN
-    // qualified name down as the next prefix.
     // One class ClassTable holds an entry for, paired with the exact
     // qualified name that entry is keyed under -- "Outer.Inner" for a nested
     // class, the bare name at the top level. Recorded by
@@ -364,6 +357,13 @@ private:
         std::string qualified_name;
     };
 
+    // The recursive half of collect_classes: declares `class_def` under
+    // `qualified_prefix + "." + class_def.name()` (or just its own name, at
+    // the top level, where `qualified_prefix` is empty), appends it to
+    // `all_classes` for the base-validation loop collect_classes runs once
+    // every class -- at every nesting depth -- is declared, then recurses
+    // into `class_def`'s own body for a nested ClassDef, passing ITS OWN
+    // qualified name down as the next prefix.
     void declare_class_recursive(const ast::ClassDef& class_def, const std::string& qualified_prefix,
                                  std::vector<ClassDeclaration>& all_classes);
 
@@ -474,8 +474,10 @@ private:
     //     If/While/For, matching pre_bind_function_body's own scope
     //     boundary: NOT into a nested def) for a `self.x = ...` assignment,
     //     via collect_self_attribute_placeholders -- so the attribute
-    //     exists (as an Unknown placeholder, at the line of its own FIRST
-    //     such assignment) before ANY method's body -- including one
+    //     exists (at the line of its own FIRST such assignment; as an
+    //     Unknown placeholder for the plain form, as the resolved
+    //     annotation for `self.x: T = ...`) before ANY method's body --
+    //     including one
     //     occurring EARLIER in the class body -- is actually walked. This is
     //     the whole point of the sub-pass: `def a(self): self.b()` reading a
     //     method `b` defined below `a`, or reading an attribute a later
@@ -527,13 +529,13 @@ private:
     // simply absent) looking for `self.x = ...` -- a plain Assign OR an
     // AnnAssign (`self.x: T = ...`, and the value-less `self.x: T` too)
     // whose target is an Attribute on a bare Name spelled "self". The
-    // annotated form is NOT resolved here, deliberately: its placeholder is
-    // Unknown at its own line exactly like the plain form's, since resolving
-    // it would double-report a bad annotation and would also lose the
-    // declared-line disambiguator below. The FIRST such
+    // ANNOTATED form IS resolved here, and the resolution is CACHED in
+    // self_annotation_types_ (see there) so visit(AnnAssign) reuses it
+    // instead of resolving a second time; the plain form has no annotation
+    // to resolve and stays Unknown. The FIRST such
     // occurrence for a given attribute name (in this same top-to-bottom scan
     // order) that names neither an existing member NOR an existing method is
-    // placeholder-declared: Type::unknown(), at ITS OWN line. This is what
+    // placeholder-declared at ITS OWN line. This is what
     // lets assign_attribute's real, later pass over that EXACT statement
     // recognise "this is my own placeholder, fill in the real type" (line
     // equality, exactly like is_unfilled_placeholder's ScopeStack analogue)
@@ -547,7 +549,26 @@ private:
     // its AnnAssign arm so the two forms cannot drift into recognising
     // different sets of targets. A no-op unless `target` is an Attribute on a
     // bare Name spelled "self" whose attribute name has neither a member nor
-    // a method already; otherwise declares Type::unknown() at `line`.
+    // a method already.
+    //
+    // `annotated_statement` is the AnnAssign for the annotated form and
+    // nullptr for the plain one -- the node itself rather than a bool,
+    // because the annotated form needs both halves of it: the annotation to
+    // resolve, and the node's own address to key the resolution cache under.
+    //
+    // WHAT TYPE gets declared follows from that. The plain form has no
+    // declared type to know yet, so it installs Type::unknown() and leaves
+    // the real one to the walk. The annotated form installs the RESOLVED
+    // ANNOTATION. Installing Unknown for it instead is not a harmless
+    // approximation: Unknown is absorbing, so every earlier `self.x = ...`
+    // in the same class stops being checked against the type the attribute
+    // actually has, and `class Base: v: int` / `class Child(Base)` with a
+    // method assigning `self.v = "s"` ABOVE a method declaring
+    // `self.v: int = 1` silently loses an incompatible-assignment error mypy
+    // reports. Resolving eagerly is safe for the same reason the class-body
+    // annotation sub-pass resolves eagerly: an annotation's type comes from
+    // the annotation expression alone, and every class is already declared.
+    // Resolving it TWICE is the hazard, and the cache is what prevents it.
     //
     // Note this does NOT resolve `self` through ScopeStack the way
     // self_attribute_receiver_type does -- it CANNOT, since no scope is
@@ -558,8 +579,8 @@ private:
     // filling any placeholder in, so a shadowed `self` still declares
     // nothing real.
     //
-    // WHICH GUARD, and it depends on `annotated` -- the two forms are not
-    // one rule. Measured against mypy 1.18.1:
+    // WHICH GUARD, and it depends on whether the form is annotated -- the
+    // two forms are not one rule. Measured against mypy 1.18.1:
     //
     //  - ANNOTATED (`self.v: int = 1`) IS a per-class declaration that
     //    narrows an inherited attribute, and it holds for the WHOLE class
@@ -583,7 +604,8 @@ private:
     // base's method name is genuinely taken, and nothing measured here says
     // otherwise.
     void declare_self_attribute_placeholder(const std::string& qualified_name,
-                                            const ast::Expr& target, int line, bool annotated);
+                                            const ast::Expr& target, int line,
+                                            const ast::AnnAssign* annotated_statement);
 
     // Phase 2: resolve every top-level FunctionDef signature and every
     // module-level AnnAssign's annotation, binding each name into ScopeStack
@@ -747,8 +769,9 @@ private:
     std::optional<Type> self_attribute_receiver_type(const ast::Attribute& target) const;
 
     // Which of three states a `self.x` store's attribute name is in --
-    // pre_collect_class_body placeholder-declares (Unknown, at ITS OWN line)
-    // the first `self.x = ...` AND the first `self.x: T = ...` it finds
+    // pre_collect_class_body placeholder-declares, at ITS OWN line, the
+    // first `self.x = ...` (as Unknown) AND the first `self.x: T = ...` (as
+    // the resolved T) it finds
     // scanning every method's body up front, so by the time this real,
     // single-pass walk reaches ANY of them ClassTable already has an entry
     // for practically every attribute and a bare "does a member/method exist
@@ -762,22 +785,6 @@ private:
     // treating the statement as this attribute's own first declaration.
     enum class SelfMemberState { BrandNew, OwnPlaceholder, ExistingDeclaration };
     SelfMemberState self_member_state(const std::string& attribute, int line) const;
-
-    // The type `member` has somewhere in `qualified_name`'s BASE CHAIN
-    // specifically, bypassing whatever `qualified_name` declares for
-    // itself -- the one question neither ClassTable::member_type (which
-    // hits `qualified_name`'s own entry first, if one exists) nor
-    // own_member_type (which never looks past it) can answer. Needed at
-    // every site where a narrowing (or widening) declaration is now the
-    // FIRST one installed directly onto `qualified_name` itself, by the
-    // eager member-collection phase in visit(Module) -- so by the time this
-    // walk reaches the installing statement, `qualified_name`'s own entry
-    // already exists and a plain member_type/own_member_type query can no
-    // longer reach the base's declaration to compare against. Depth-first,
-    // left to right through direct bases, matching every other base-chain
-    // query in this file ("first base wins").
-    std::optional<Type> inherited_member_type(const std::string& qualified_name,
-                                              const std::string& member) const;
 
     // The one place a Name target is bound or checked, for both a plain
     // Assign and each element of a tuple-unpacking Assign. See
@@ -929,6 +936,25 @@ private:
     // instead of invoking AnnotationResolver (and possibly double-reporting
     // a bad annotation) a second time.
     std::map<const ast::AnnAssign*, Type> class_body_annotation_types_;
+
+    // The same cache, for the METHOD-level `self.x: T` form, populated by
+    // declare_self_attribute_placeholder and consumed by visit(AnnAssign)'s
+    // non-Name-target path. Kept separate from class_body_annotation_types_
+    // because the two are populated by different sub-passes over different
+    // statement shapes and consumed on different branches -- and because
+    // only entries this map holds are safe to reuse on the non-Name path,
+    // which also serves `xs[0]: int` and `other.x: int` targets that are
+    // never pre-resolved at all.
+    //
+    // Its existence is what lets the eager scan install the REAL annotated
+    // type rather than an absorbing Unknown (see
+    // declare_self_attribute_placeholder): eager resolution alone would
+    // report a bad annotation once per pass, and the cache turns the second
+    // pass into a lookup. Only annotations the scan actually resolved are in
+    // here -- one it SKIPPED (the name is already declared on this class) is
+    // resolved by visit(AnnAssign) as before, so either way a bad annotation
+    // is resolved, and reported, exactly once.
+    std::map<const ast::AnnAssign*, Type> self_annotation_types_;
 
     // The QUALIFIED name of the class whose body is currently being walked --
     // "Outer.Inner" while inside Inner's own body, restored to whatever it

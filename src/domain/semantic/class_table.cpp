@@ -167,6 +167,65 @@ std::optional<Type> ClassTable::own_member_type(const std::string& qualified_nam
     return it->second.type;
 }
 
+std::optional<int> ClassTable::own_member_declared_line(const std::string& qualified_name,
+                                                        const std::string& member) const {
+    // own_member_type's lookup, verbatim -- see the header for why the two
+    // must share one policy.
+    const auto entry = classes_.find(qualified_name);
+    if (entry == classes_.end()) {
+        return std::nullopt;
+    }
+    const auto it = entry->second.members.find(member);
+    if (it == entry->second.members.end()) {
+        return std::nullopt;
+    }
+    return it->second.declared_line;
+}
+
+std::optional<Type> ClassTable::inherited_member_type(const std::string& qualified_name,
+                                                      const std::string& member) const {
+    const auto entry = classes_.find(qualified_name);
+    if (entry == classes_.end()) {
+        return std::nullopt;
+    }
+    // Both spellings of the root are seeded into the cycle guard before the
+    // walk starts: the exact key (which is what declare_member wrote under)
+    // and whatever it canonicalises to (which is what a base naming this
+    // same class would resolve to). Without that seed a cyclic base chain
+    // walks straight back into the root's own members and returns the entry
+    // this query exists to look PAST.
+    std::vector<std::string> visited{qualified_name};
+    const std::string canonical_root = canonical_name(qualified_name);
+    if (canonical_root != qualified_name) {
+        visited.push_back(canonical_root);
+    }
+    const auto extract = [&member](const std::string&,
+                                   const Entry& base_entry) -> std::optional<Type> {
+        const auto it = base_entry.members.find(member);
+        if (it == base_entry.members.end()) {
+            return std::nullopt;
+        }
+        return it->second.type;
+    };
+    for (const std::string& base : entry->second.bases) {
+        if (std::optional<Type> found = walk_chain<Type>(base, visited, extract)) {
+            return found;
+        }
+        // The scoped-alias MISS FALLBACK query_chain applies at its own root,
+        // applied here once per base -- a base is exactly the kind of
+        // source-level spelling that fallback exists for. The cycle guard is
+        // shared with the walk above rather than restarted, so the fallback
+        // cannot re-enter the root either.
+        const std::optional<std::string> shadowed = shadowed_name(base);
+        if (shadowed.has_value()) {
+            if (std::optional<Type> found = walk_resolved<Type>(*shadowed, visited, extract)) {
+                return found;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<int> ClassTable::member_declared_line(const std::string& qualified_name,
                                                     const std::string& member) const {
     // Shares member_type's fallback deliberately: a caller gates on this
