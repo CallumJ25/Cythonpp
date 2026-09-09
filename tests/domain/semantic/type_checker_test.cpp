@@ -2641,5 +2641,98 @@ TEST(TypeChecker, AConditionalDefInsideAFunctionStillWorks) {
                  "print(outer())\n");
 }
 
+// A method body does not execute at class-definition time, so a class
+// referenced from ABOVE its own definition is fully usable -- verified
+// against mypy 1.18.1 (`Success`, with reveal_type(i) `Item` and
+// reveal_type(i.n) `builtins.int`), and correct at runtime too. Member
+// collection used to happen only when the ordinary walk reached the
+// declaring ClassDef, so a reference from above saw a class with no members.
+TEST(TypeChecker, AClassReferencedAboveItsDefinitionHasItsMembers) {
+    expect_clean("class Cache:\n"
+                 "    def use(self) -> int:\n"
+                 "        i = Item()\n"
+                 "        return i.n\n"
+                 "class Item:\n"
+                 "    def __init__(self) -> None:\n"
+                 "        self.n = 0\n");
+}
+
+// A class-body annotation is the DECLARED type of that attribute for the
+// whole class body regardless of textual position, so a subclass's narrowing
+// annotation must be installed before ANY of its methods are walked.
+// Verified: mypy 1.18.1 says `Success` for the reader ABOVE the annotation.
+TEST(TypeChecker, AClassBodyAnnotationNarrowsForAReaderAboveIt) {
+    expect_clean("class Base:\n"
+                 "    v: object\n"
+                 "class Child(Base):\n"
+                 "    def use(self) -> int:\n"
+                 "        return self.v + 1\n"
+                 "    v: int\n");
+}
+
+// The ANNOTATED self form is a declaration too. Verified: `Success`.
+TEST(TypeChecker, AnAnnotatedSelfAttributeNarrowsForAReaderAboveIt) {
+    expect_clean("class Base:\n"
+                 "    def __init__(self) -> None:\n"
+                 "        self.v: object = 1\n"
+                 "class Child(Base):\n"
+                 "    def use(self) -> int:\n"
+                 "        return self.v + 1\n"
+                 "    def m(self) -> None:\n"
+                 "        self.v: int = 1\n");
+}
+
+// THE COUNTERPART that pins the guard split: a PLAIN `self.v = ...` in a
+// subclass method is NOT a narrowing declaration. Verified against mypy
+// 1.18.1, both halves:
+//   - `class Base: v: object` / Child reading `self.v + 1` and separately
+//     doing `self.v = 0` still reports
+//     `Unsupported operand types for + ("object" and "int")`;
+//   - `class Base: v: int` / Child doing `self.v = "s"` still reports
+//     `Incompatible types in assignment (expression has type "str", variable
+//     has type "int")`.
+// So the plain form's placeholder guard must keep walking the base chain. If
+// it did not, this test's error would silently disappear.
+TEST(TypeChecker, APlainSelfAssignmentDoesNotRedeclareAnInheritedAttribute) {
+    const Checked checked = check_module("class Base:\n"
+                                         "    v: int = 0\n"
+                                         "class Child(Base):\n"
+                                         "    def m(self) -> None:\n"
+                                         "        self.v = \"s\"\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"str\", "
+              "variable has type \"int\")");
+}
+
+// Eager collection must not resolve any annotation TWICE -- a bad one would
+// be reported once per pass. Exactly one diagnostic is the assertion.
+TEST(TypeChecker, ABadClassBodyAnnotationIsReportedExactlyOnce) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    v: Nope\n");
+    EXPECT_EQ(checked.diagnostics.size(), 1u);
+}
+
+TEST(TypeChecker, ABadMethodAnnotationIsReportedExactlyOnce) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def m(self, a: Nope) -> None:\n"
+                                         "        pass\n");
+    EXPECT_EQ(checked.diagnostics.size(), 1u);
+}
+
+// The declared-LINE disambiguator survives eager collection: a placeholder is
+// still declared at its own statement's line, so a same-class re-annotation
+// is still recognised as a genuine second declaration rather than as the
+// first one's own placeholder. Expectation taken from a mypy run on this
+// exact source, not from recall (mypy reports `Name "v" already defined on
+// line 2 [no-redef]`).
+TEST(TypeChecker, ASameClassReAnnotationIsStillARedefinitionAfterEagerCollection) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    v: int\n"
+                                         "    v: int\n");
+    EXPECT_EQ(checked.diagnostics.size(), 1u);
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

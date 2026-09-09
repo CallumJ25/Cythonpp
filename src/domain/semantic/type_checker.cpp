@@ -151,6 +151,31 @@ TypeMap TypeChecker::check(const ast::Module& module) {
 void TypeChecker::visit(const ast::Module& node) {
     scan_top_level_names(node);
     collect_classes(node);
+    // MEMBER COLLECTION, for EVERY class at every nesting depth, BEFORE any
+    // annotation is resolved and before any statement is checked. Previously
+    // a class's members were collected when the ordinary walk reached that
+    // class's own ClassDef, so any reference from ABOVE it saw a class with
+    // no members at all -- `class Cache: def use(self): return Item().n`
+    // above `class Item` was a false attr-defined TypeError on code mypy
+    // accepts and CPython runs (a method body does not execute at
+    // class-definition time). Running here rather than inside
+    // declare_class_recursive keeps the ordering that matters: every class in
+    // the module is DECLARED first, so an annotation inside any class body
+    // can name any other class regardless of textual order.
+    // MEMBER COLLECTION, for EVERY class at every nesting depth, BEFORE any
+    // annotation is resolved and before any statement is checked. Previously
+    // a class's members were collected when the ordinary walk reached that
+    // class's own ClassDef, so any reference from ABOVE it saw a class with
+    // no members at all -- `class Cache: def use(self): return Item().n`
+    // above `class Item` was a false attr-defined TypeError on code mypy
+    // accepts and CPython runs (a method body does not execute at
+    // class-definition time). Running here rather than inside
+    // declare_class_recursive keeps the ordering that matters: every class in
+    // the module is DECLARED first, so an annotation inside any class body
+    // can name any other class regardless of textual order.
+    for (const ClassDeclaration& declaration : declared_classes_) {
+        pre_collect_class_body(*declaration.node, declaration.qualified_name);
+    }
     collect_signatures(node);
     pre_bind_assignment_targets(node);
     for (const ast::StmtPtr& statement : node.body()) {
@@ -271,9 +296,8 @@ std::size_t TypeChecker::defaulted_param_count(const std::vector<ast::Parameter>
 }
 
 void TypeChecker::collect_classes(const ast::Module& module) {
-    std::vector<const ast::ClassDef*> all_classes;
     for_each_flat_statement(module.body(), /*directly_in_body=*/true,
-                            [&](const ast::Stmt& statement, bool) {
+                            [this](const ast::Stmt& statement, bool) {
         if (const auto* class_def = dynamic_cast<const ast::ClassDef*>(&statement)) {
             if (collided_top_level_.count(class_def) != 0) {
                 // scan_top_level_names already reported this ClassDef as a
@@ -284,7 +308,7 @@ void TypeChecker::collect_classes(const ast::Module& module) {
                 // the identical reason.
                 return;
             }
-            declare_class_recursive(*class_def, "", all_classes);
+            declare_class_recursive(*class_def, "", declared_classes_);
         }
     });
 
@@ -294,12 +318,12 @@ void TypeChecker::collect_classes(const ast::Module& module) {
     // imported in this subset). Deferred until here (rather than folded into
     // declare_class_recursive) so a base naming a class declared LATER in the
     // same module, or in a different class's body, already resolves.
-    validate_class_bases(all_classes);
+    validate_class_bases(declared_classes_);
 }
 
-void TypeChecker::validate_class_bases(const std::vector<const ast::ClassDef*>& all_classes) {
-    for (const ast::ClassDef* class_def : all_classes) {
-        for (const ast::ExprPtr& base : class_def->bases()) {
+void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_classes) {
+    for (const ClassDeclaration& declaration : all_classes) {
+        for (const ast::ExprPtr& base : declaration.node->bases()) {
             if (const auto* name = dynamic_cast<const ast::Name*>(base.get())) {
                 if (!classes_.is_class(name->identifier())) {
                     // e.g. `class C(Generic):` -- Generic cannot be imported
@@ -315,7 +339,7 @@ void TypeChecker::validate_class_bases(const std::vector<const ast::ClassDef*>& 
 std::string TypeChecker::declare_isolated_class(const ast::ClassDef& node,
                                                 const std::string& qualified_name) {
     classes_.declare(qualified_name, base_names(node.bases()));
-    std::vector<const ast::ClassDef*> all_classes{&node};
+    std::vector<ClassDeclaration> all_classes{ClassDeclaration{&node, qualified_name}};
     for_each_flat_statement(node.body(), /*directly_in_body=*/true,
                             [&](const ast::Stmt& statement, bool) {
         if (const auto* nested = dynamic_cast<const ast::ClassDef*>(&statement)) {
@@ -328,11 +352,11 @@ std::string TypeChecker::declare_isolated_class(const ast::ClassDef& node,
 
 void TypeChecker::declare_class_recursive(const ast::ClassDef& class_def,
                                           const std::string& qualified_prefix,
-                                          std::vector<const ast::ClassDef*>& all_classes) {
+                                          std::vector<ClassDeclaration>& all_classes) {
     const std::string qualified_name =
         qualified_prefix.empty() ? class_def.name() : qualified_prefix + "." + class_def.name();
     classes_.declare(qualified_name, base_names(class_def.bases()));
-    all_classes.push_back(&class_def);
+    all_classes.push_back(ClassDeclaration{&class_def, qualified_name});
 
     // A NESTED ClassDef (e.g. Inner inside Outer's body) is declared right
     // here, under ITS OWN qualified name -- "Outer.Inner" -- rather than
@@ -848,6 +872,16 @@ TypeChecker::SelfMemberState TypeChecker::self_member_state(const std::string& a
                                   : SelfMemberState::ExistingDeclaration;
 }
 
+std::optional<Type> TypeChecker::inherited_member_type(const std::string& qualified_name,
+                                                        const std::string& member) const {
+    for (const std::string& base : classes_.bases_of(qualified_name)) {
+        if (const std::optional<Type> found = classes_.member_type(base, member)) {
+            return found;
+        }
+    }
+    return std::nullopt;
+}
+
 void TypeChecker::assign_attribute(const ast::Attribute& target, const ast::Expr& value) {
     // THE TRAP's escape hatch (Task 19): `self.x = ...` inside a method
     // declares a NEW instance attribute the first time it is seen, checked
@@ -1004,27 +1038,39 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
             //     qualified name this call passes it.)
             const std::optional<Type> own_existing = classes_.own_member_type(
                 current_class_qualified_name_, target_name->identifier());
-            // Only consulted when the member is NOT this class's own, so a
-            // hit here is by construction an inherited one.
-            const std::optional<Type> inherited_existing =
-                own_existing.has_value()
-                    ? std::nullopt
-                    : classes_.member_type(current_class_qualified_name_,
-                                           target_name->identifier());
+            // own_existing alone no longer tells "this class already had a
+            // REAL declaration" apart from "the eager member-collection
+            // phase (visit(Module)) already installed THIS EXACT statement's
+            // own entry" -- pre_collect_class_body's annotation sub-pass now
+            // installs every direct class-body annotation's own entry up
+            // front (own_member_type gate, see its own comment), so by the
+            // time this real walk reaches the SAME node, own_existing always
+            // hits. The declared LINE is the disambiguator, exactly like
+            // is_unfilled_placeholder's ScopeStack analogue: it is THIS
+            // statement's own install only when the line matches, and a
+            // genuinely earlier same-class declaration (an earlier
+            // `self.x = ...` in a method above this annotation, or -- before
+            // a redefinition is reported and this whole block is skipped via
+            // info.redefinition -- a second class-body annotation) otherwise.
+            const std::optional<int> own_declared_line = classes_.member_declared_line(
+                current_class_qualified_name_, target_name->identifier());
+            const bool own_is_this_statement =
+                own_existing.has_value() && own_declared_line.has_value() &&
+                *own_declared_line == node.span().start_line;
             const bool already_method =
                 classes_.method_type(current_class_qualified_name_, target_name->identifier())
                     .has_value();
-            if (own_existing.has_value()) {
-                // For a DIRECT class-body AnnAssign this is a no-op:
-                // pre_collect_class_body's annotation sub-pass already
-                // declared this exact member with this exact type at this
-                // exact line (the case reaching this branch via the cache
-                // above), so both the comparison and the re-declaration are
-                // against themselves. The sub-pass handles only DIRECT
-                // class-body annotations, so the shape with something real to
-                // compare against is one NESTED inside an `if` within the
-                // class body, arriving here with an earlier `self.x = ...`
-                // already declared on this same class.
+            if (own_existing.has_value() && !own_is_this_statement) {
+                // A genuinely earlier SAME-CLASS declaration (see above) --
+                // this annotation is the declared type and the earlier
+                // declaration's type is the expression checked AGAINST it.
+                // `FLAG = True / class C: def m(self): self.x = True / if
+                // FLAG: x: int` is clean and reveal_type(self.x) is
+                // "builtins.int" in every method, while the same pair with
+                // `self.x = 5` above `if FLAG: x: str` reports `expression
+                // has type "int", variable has type "str"` -- mypy's exact
+                // wording, at our own line rather than mypy's self.x line (a
+                // recorded residual).
                 //
                 // Unknown on either side means there is nothing to compare:
                 // no report, and the annotation still installs below -- an
@@ -1040,25 +1086,51 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
                 }
                 classes_.declare_member(current_class_qualified_name_, target_name->identifier(),
                                         info.type, node.span().start_line);
-            } else if (inherited_existing.has_value()) {
-                // Unknown on either side, same handling and same reasoning as
-                // the same-class arm above, with one extra consequence worth
-                // naming: an Unknown annotation is installed OVER a known
-                // inherited type rather than leaving the base's in place,
-                // because mypy treats this class's own declaration as
-                // authoritative -- keeping the base's type would check a
-                // later write against a type the attribute no longer has,
-                // which is how a false TypeError gets made.
-                if (info.type.kind != TypeKind::Unknown &&
-                    inherited_existing->kind != TypeKind::Unknown &&
-                    !is_subtype(info.type, *inherited_existing, &classes_)) {
-                    report_incompatible_assignment(node, info.type, *inherited_existing, "variable");
+            } else {
+                // Either BRAND NEW, or exactly what the eager
+                // member-collection phase installed for THIS statement --
+                // either way, this class's own entry (if any) carries
+                // nothing to compare against, so check the INHERITED chain
+                // directly (bypassing this class's own entry entirely,
+                // rather than own_member_type/member_type, which would just
+                // find this same statement's own install again). `class
+                // Base: v: object` / `class Child(Base): v: int` reveals
+                // "builtins.int" in every Child method and "builtins.object"
+                // in Base, and a third level (`class Leaf(Mid): v: bool`)
+                // reads as bool/int/object per class -- so the annotation
+                // must be INSTALLED on the current class, or Child's own
+                // mypy-clean `self.v + 1` is a false TypeError. Widening IS
+                // reported, with the arguments the other way round: mypy
+                // says `expression has type "object", base class "Base"
+                // defined the type as "int"`, so the annotation is the
+                // `expression` and the inherited declaration is the
+                // `variable`.
+                const std::optional<Type> inherited_existing = inherited_member_type(
+                    current_class_qualified_name_, target_name->identifier());
+                if (inherited_existing.has_value()) {
+                    // Unknown on either side, same handling and same
+                    // reasoning as the same-class arm above, with one extra
+                    // consequence worth naming: an Unknown annotation is
+                    // installed OVER a known inherited type rather than
+                    // leaving the base's in place, because mypy treats this
+                    // class's own declaration as authoritative -- keeping the
+                    // base's type would check a later write against a type
+                    // the attribute no longer has, which is how a false
+                    // TypeError gets made.
+                    if (info.type.kind != TypeKind::Unknown &&
+                        inherited_existing->kind != TypeKind::Unknown &&
+                        !is_subtype(info.type, *inherited_existing, &classes_)) {
+                        report_incompatible_assignment(node, info.type, *inherited_existing,
+                                                       "variable");
+                    }
+                    classes_.declare_member(current_class_qualified_name_,
+                                            target_name->identifier(), info.type,
+                                            node.span().start_line);
+                } else if (!already_method) {
+                    classes_.declare_member(current_class_qualified_name_,
+                                            target_name->identifier(), info.type,
+                                            node.span().start_line);
                 }
-                classes_.declare_member(current_class_qualified_name_, target_name->identifier(),
-                                        info.type, node.span().start_line);
-            } else if (!already_method) {
-                classes_.declare_member(current_class_qualified_name_, target_name->identifier(),
-                                        info.type, node.span().start_line);
             }
             // A same-name METHOD collision is left unreported here -- a
             // combined method+attribute namespace is a pre-existing gap
@@ -1196,6 +1268,29 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
                 if (info.type.kind != TypeKind::Unknown && existing->kind != TypeKind::Unknown &&
                     !is_subtype(info.type, *existing, &classes_)) {
                     report_incompatible_assignment(node, info.type, *existing, "variable");
+                }
+            } else if (state != SelfMemberState::ExistingDeclaration) {
+                // BrandNew or OwnPlaceholder: self_member_state alone can no
+                // longer tell "genuinely brand new" from "narrowing a base's
+                // declaration" apart, now that the eager member-collection
+                // phase installs THIS class's own placeholder for the FIRST
+                // self.x: T of a name regardless of whether a base already
+                // has it (see declare_self_attribute_placeholder's own
+                // comment) -- so `existing` above, which only ever looks at
+                // state == ExistingDeclaration, misses the INHERITED case
+                // entirely once that placeholder exists. Check the base
+                // chain directly, bypassing this class's own (absent, or
+                // just-installed) entry, for the identical widening rule the
+                // INHERITED case above already states -- excluded when state
+                // IS ExistingDeclaration with no `existing` value, since that
+                // combination is method_name_collision, not a miss to fall
+                // back from.
+                const std::optional<Type> inherited_existing = inherited_member_type(
+                    current_class_qualified_name_, target_attribute->attribute());
+                if (inherited_existing.has_value() && info.type.kind != TypeKind::Unknown &&
+                    inherited_existing->kind != TypeKind::Unknown &&
+                    !is_subtype(info.type, *inherited_existing, &classes_)) {
+                    report_incompatible_assignment(node, info.type, *inherited_existing, "variable");
                 }
             }
             if (!method_name_collision && !keep_earlier_declaration) {
@@ -1644,7 +1739,10 @@ void TypeChecker::visit(const ast::ClassDef& node) {
     // Declares every method signature and
     // placeholder-declares every attribute BEFORE any of this class's own
     // body statements are walked for real -- see pre_collect_class_body's
-    // own comment for the full mechanism.
+    // own comment for the full mechanism. Now a no-op for an ordinary class
+    // (the module-wide member-collection phase in visit(Module) already ran
+    // it), and still the REAL pass for a function-local or collision-losing
+    // class, which that module-wide phase never sees.
     pre_collect_class_body(node, qualified_name);
     for (const ast::StmtPtr& statement : node.body()) {
         statement->accept(*this);
@@ -1653,6 +1751,16 @@ void TypeChecker::visit(const ast::ClassDef& node) {
 
 void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
                                          const std::string& qualified_name) {
+    if (!pre_collected_.insert(&node).second) {
+        // Already covered by the module-wide member-collection phase (see
+        // visit(Module)). Running the body again would re-invoke
+        // AnnotationResolver on every annotation in it and report each bad
+        // one a second time -- the same double-report hazard the
+        // class_body_annotation_types_ and class_method_signatures_ caches
+        // exist to prevent for the ordinary walk's own later visit.
+        return;
+    }
+
     // Every direct class-body AnnAssign is resolved
     // and declared in its OWN sub-pass, over the WHOLE body, strictly BEFORE
     // any method's self.x scan runs below -- verified against mypy 1.18.1:
@@ -1677,15 +1785,20 @@ void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
                 AnnotationResolver resolver(classes_, sink_);
                 const Type type = resolver.resolve(ann_assign->annotation());
                 class_body_annotation_types_.emplace(ann_assign, type);
-                // Guarded exactly like assign_attribute's
-                // own has_value() check -- a SECOND class-body AnnAssign
-                // under the same name (the only remaining way `already_member`
-                // can be true here, now that this sub-pass runs before any
-                // self.x placeholder ever could) is left as the first
-                // occurrence's declaration; declare_member has no collision
-                // detection of its own, so declaring over it unconditionally
-                // would silently re-type the attribute with zero diagnostics.
-                if (!classes_.member_type(qualified_name, target_name->identifier()).has_value() &&
+                // own_member_type, not the chain-walking member_type: a
+                // class-body annotation that NARROWS a base's declaration is
+                // itself this class's declaration and must be installed --
+                // verified against mypy 1.18.1, `class Base: v: object` /
+                // `class Child(Base): v: int` reveals `self.v` as
+                // `builtins.int` inside Child, including in a method written
+                // ABOVE the annotation. Gating on member_type skipped the
+                // install whenever a base already declared the name, so the
+                // reader saw the base's type and `self.v + 1` was a false
+                // TypeError. A SECOND class-body annotation of the same name
+                // in the SAME class is still skipped, which is what this
+                // guard was always for.
+                if (!classes_.own_member_type(qualified_name, target_name->identifier())
+                         .has_value() &&
                     !classes_.method_type(qualified_name, target_name->identifier()).has_value()) {
                     classes_.declare_member(qualified_name, target_name->identifier(), type,
                                             ann_assign->span().start_line);
@@ -1719,6 +1832,13 @@ void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
                 // itself reference another class-body name whose real,
                 // order-sensitive resolution must stay entirely within
                 // Phase 3's single pass.
+                //
+                // Deliberately still the chain-walking member_type, unlike
+                // the annotation sub-pass above: assign_to's class-body arm
+                // reaches its inherited-widening check only when no own
+                // declaration exists (`class Base: v: int` /
+                // `class Child(Base): v = "s"` is a real mypy error), so
+                // installing a placeholder here would silence it.
                 if (!classes_.member_type(qualified_name, target_name->identifier()).has_value() &&
                     !classes_.method_type(qualified_name, target_name->identifier()).has_value()) {
                     classes_.declare_member(qualified_name, target_name->identifier(), Type::unknown(),
@@ -1756,7 +1876,8 @@ Type TypeChecker::resolve_method_signature(const ast::FunctionDef& method,
 }
 
 void TypeChecker::declare_self_attribute_placeholder(const std::string& qualified_name,
-                                                     const ast::Expr& target, int line) {
+                                                     const ast::Expr& target, int line,
+                                                     bool annotated) {
     const auto* attribute = dynamic_cast<const ast::Attribute*>(&target);
     if (attribute == nullptr) {
         return;
@@ -1765,12 +1886,15 @@ void TypeChecker::declare_self_attribute_placeholder(const std::string& qualifie
     if (receiver == nullptr || receiver->identifier() != "self") {
         return;
     }
-    // The FIRST occurrence in this scan's own top-to-bottom order wins: a
-    // name that already has a member or a method is left alone, since
-    // declare_member has no collision detection of its own and declaring
-    // over it would silently re-type the attribute with zero diagnostics.
-    if (classes_.member_type(qualified_name, attribute->attribute()).has_value() ||
-        classes_.method_type(qualified_name, attribute->attribute()).has_value()) {
+    if (classes_.method_type(qualified_name, attribute->attribute()).has_value()) {
+        return;
+    }
+    // See the header: the annotated form declares over an INHERITED name, the
+    // plain form does not.
+    const bool already_declared =
+        annotated ? classes_.own_member_type(qualified_name, attribute->attribute()).has_value()
+                  : classes_.member_type(qualified_name, attribute->attribute()).has_value();
+    if (already_declared) {
         return;
     }
     classes_.declare_member(qualified_name, attribute->attribute(), Type::unknown(), line);
@@ -1781,7 +1905,7 @@ void TypeChecker::collect_self_attribute_placeholders(const std::string& qualifi
     for (const ast::StmtPtr& statement : body) {
         if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
             declare_self_attribute_placeholder(qualified_name, assign->target(),
-                                               assign->span().start_line);
+                                               assign->span().start_line, /*annotated=*/false);
         } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
             // The ANNOTATED form, `self.x: T = ...` (and the
             // value-less `self.x: T`), placeholder-declares through the exact
@@ -1804,7 +1928,7 @@ void TypeChecker::collect_self_attribute_placeholders(const std::string& qualifi
             // already does, and Unknown is absorbing, so the worst case is a
             // missed error, never a false one.
             declare_self_attribute_placeholder(qualified_name, ann_assign->target(),
-                                               ann_assign->span().start_line);
+                                               ann_assign->span().start_line, /*annotated=*/true);
         } else if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
             collect_self_attribute_placeholders(qualified_name, if_stmt->body());
             collect_self_attribute_placeholders(qualified_name, if_stmt->orelse());

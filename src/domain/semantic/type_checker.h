@@ -352,15 +352,27 @@ private:
     // every class -- at every nesting depth -- is declared, then recurses
     // into `class_def`'s own body for a nested ClassDef, passing ITS OWN
     // qualified name down as the next prefix.
+    // One class ClassTable holds an entry for, paired with the exact
+    // qualified name that entry is keyed under -- "Outer.Inner" for a nested
+    // class, the bare name at the top level. Recorded by
+    // declare_class_recursive while every class is being declared, and
+    // consumed twice afterwards: by validate_class_bases, and by the
+    // member-collection phase, which needs the SAME qualified name
+    // pre_collect_class_body would later have been called with.
+    struct ClassDeclaration {
+        const ast::ClassDef* node = nullptr;
+        std::string qualified_name;
+    };
+
     void declare_class_recursive(const ast::ClassDef& class_def, const std::string& qualified_prefix,
-                                 std::vector<const ast::ClassDef*>& all_classes);
+                                 std::vector<ClassDeclaration>& all_classes);
 
     // The base-validation half of collect_classes, extracted
     // so declare_isolated_class below can reuse it for a class ClassTable
     // never saw during Phase 1 -- same rule either way: a bare-Name base
     // that does not resolve is a NameError, checked only once every
     // declaration in `all_classes` exists.
-    void validate_class_bases(const std::vector<const ast::ClassDef*>& all_classes);
+    void validate_class_bases(const std::vector<ClassDeclaration>& all_classes);
 
     // Declares `node` (and, recursively, every
     // ClassDef nested in its own body) into ClassTable under `qualified_name`
@@ -545,8 +557,33 @@ private:
     // first parameter. The real walk re-checks the binding properly before
     // filling any placeholder in, so a shadowed `self` still declares
     // nothing real.
+    //
+    // WHICH GUARD, and it depends on `annotated` -- the two forms are not
+    // one rule. Measured against mypy 1.18.1:
+    //
+    //  - ANNOTATED (`self.v: int = 1`) IS a per-class declaration that
+    //    narrows an inherited attribute, and it holds for the WHOLE class
+    //    including a reader method ABOVE it (`class Base` declaring
+    //    `self.v: object`, `class Child(Base)` whose `use` reads `self.v + 1`
+    //    above its own `self.v: int = 1`, is `Success`). So this form must be
+    //    placeholder-declared even when a BASE already declares the name --
+    //    hence own_member_type, the direct-entry lookup, which is the only
+    //    query that can tell "this class already declares it" from "a base
+    //    does".
+    //  - PLAIN (`self.v = 0`) is NOT. `class Base: v: object` with a Child
+    //    that both reads `self.v + 1` and assigns `self.v = 0` still reports
+    //    `Unsupported operand types for + ("object" and "int")`, and
+    //    `class Base: v: int` with a Child doing `self.v = "s"` still
+    //    reports `Incompatible types in assignment`. So this form must keep
+    //    the chain-walking member_type guard: declaring a placeholder on the
+    //    subclass would make the assignment its own first declaration and
+    //    silence that second, CORRECT error for nothing in return.
+    //
+    // The METHOD half of the guard stays chain-walking for both forms: a
+    // base's method name is genuinely taken, and nothing measured here says
+    // otherwise.
     void declare_self_attribute_placeholder(const std::string& qualified_name,
-                                            const ast::Expr& target, int line);
+                                            const ast::Expr& target, int line, bool annotated);
 
     // Phase 2: resolve every top-level FunctionDef signature and every
     // module-level AnnAssign's annotation, binding each name into ScopeStack
@@ -726,6 +763,22 @@ private:
     enum class SelfMemberState { BrandNew, OwnPlaceholder, ExistingDeclaration };
     SelfMemberState self_member_state(const std::string& attribute, int line) const;
 
+    // The type `member` has somewhere in `qualified_name`'s BASE CHAIN
+    // specifically, bypassing whatever `qualified_name` declares for
+    // itself -- the one question neither ClassTable::member_type (which
+    // hits `qualified_name`'s own entry first, if one exists) nor
+    // own_member_type (which never looks past it) can answer. Needed at
+    // every site where a narrowing (or widening) declaration is now the
+    // FIRST one installed directly onto `qualified_name` itself, by the
+    // eager member-collection phase in visit(Module) -- so by the time this
+    // walk reaches the installing statement, `qualified_name`'s own entry
+    // already exists and a plain member_type/own_member_type query can no
+    // longer reach the base's declaration to compare against. Depth-first,
+    // left to right through direct bases, matching every other base-chain
+    // query in this file ("first base wins").
+    std::optional<Type> inherited_member_type(const std::string& qualified_name,
+                                              const std::string& member) const;
+
     // The one place a Name target is bound or checked, for both a plain
     // Assign and each element of a tuple-unpacking Assign. See
     // pre_bind_assignment_targets for what "my own still-unfilled
@@ -815,6 +868,21 @@ private:
     // Populated by scan_top_level_names; see its comment.
     std::map<std::string, TopLevelDefinition> top_level_definitions_;
     std::set<const ast::Node*> collided_top_level_;
+
+    // Every MODULE-and-CLASS-level class the declaration pass declared, in
+    // declaration order. The member-collection phase walks this to
+    // pre-collect every class's members before the first statement is
+    // checked; a function-local or collision-losing class is NOT here
+    // (declare_isolated_class owns those, and each is pre-collected by its
+    // own visit(ClassDef) when the walk reaches it).
+    std::vector<ClassDeclaration> declared_classes_;
+
+    // Which ClassDefs pre_collect_class_body has already run for, so
+    // visit(ClassDef) does not run it a SECOND time for a class the
+    // module-wide phase already covered -- doing so would re-resolve every
+    // annotation in the body through AnnotationResolver and report each bad
+    // one twice.
+    std::set<const ast::ClassDef*> pre_collected_;
 
     // Phase 2's resolution for every module-level AnnAssign, keyed by node
     // address so Phase 3's visit(AnnAssign&) sees the SAME resolution rather
