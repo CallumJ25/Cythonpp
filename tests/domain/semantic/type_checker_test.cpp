@@ -2518,6 +2518,75 @@ TEST(TypeChecker, ReadAboveAConditionalAnnAssignIsUsedBeforeDefinition) {
     EXPECT_EQ(error.message, "name 'y' is used before definition");
 }
 
+// The same, for a conditional PLAIN assignment, now that the assignment
+// pre-pass recurses through control flow too: the placeholder sits at the
+// assignment's own line, so a read above it is order-checked rather than
+// falling through to "not defined". Measured on this exact program:
+//   mypy --strict: Name "x" is used before definition  [used-before-def]
+//   CPython:       NameError: name 'x' is not defined
+//   cythonpp:      2:7: error: NameError: name 'x' is used before definition
+//                  (before the pre-pass recursed: "name 'x' is not defined")
+// Both tools error either way, so no program mypy accepts starts failing; the
+// wording now names the same defect mypy names.
+TEST(TypeChecker, ReadAboveAConditionalAssignIsUsedBeforeDefinition) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "print(x)\n"
+                                         "if FLAG:\n"
+                                         "    x = 5\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'x' is used before definition");
+    EXPECT_EQ(error.line, 2);
+}
+
+// A conditional plain assignment FILLS its own placeholder when the ordinary
+// walk reaches it, rather than being taken for a redefinition of the
+// placeholder the pre-pass installed -- the placeholder carries the
+// assignment's own line and is_unfilled_placeholder matches on line equality,
+// so recursing the pre-pass through control flow did not disturb the
+// placeholder-then-fill pattern. Also covers an if/else pair assigning one
+// name (first branch wins, second is an ordinary compatible reassignment) and
+// a conditional assignment of a name also assigned flat. All three measured
+// mypy-clean and CPython-clean.
+TEST(TypeChecker, AConditionalAssignmentFillsItsOwnPlaceholder) {
+    expect_clean("FLAG = True\n"
+                 "if FLAG:\n"
+                 "    x = 5\n"
+                 "print(x + 1)\n");
+    expect_clean("FLAG = True\n"
+                 "if FLAG:\n"
+                 "    x = 5\n"
+                 "else:\n"
+                 "    x = 6\n"
+                 "print(x + 1)\n");
+    expect_clean("FLAG = True\n"
+                 "if FLAG:\n"
+                 "    x = 5\n"
+                 "x = 6\n"
+                 "print(x + 1)\n");
+}
+
+// ... and the branches disagreeing on type is still a reported incompatible
+// assignment, at the SECOND branch, matching mypy exactly (measured:
+// `p.py:5: error: Incompatible types in assignment (expression has type
+// "str", variable has type "int")  [assignment]`). The first branch's
+// inferred type is sticky, which is what makes the second a check rather than
+// a silent rebind.
+TEST(TypeChecker, IfElseBranchesAssigningIncompatibleTypesIsATypeError) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "if FLAG:\n"
+                                         "    x = 5\n"
+                                         "else:\n"
+                                         "    x = \"s\"\n"
+                                         "print(x)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"str\", variable has type "
+              "\"int\")");
+    EXPECT_EQ(error.line, 5);
+}
+
 // A conditional annotated assignment now collides with a LATER flat def of the
 // same name, reported at the def and pointing back to the annotation's own
 // line -- because the annotation binds during this same pre-pass, before the
@@ -3029,6 +3098,56 @@ TEST(TypeChecker, ADottedBaseWhoseRootIsAValueBindingIsClean) {
                  "class D(h.Inner):\n"
                  "    pass\n"
                  "print(D())\n");
+}
+
+// ... and the same thing with the binding written inside an `if`, which is the
+// variant that actually exercises the exemption's dependence on the
+// pre-binding pass RECURSING through control flow. The test above passes even
+// with a flat-only pre-pass, because its binding sits flat; this one does not.
+// Python introduces no scope for an `if`/`while`/`for` block, so `h` binds in
+// module scope either way. Measured on this exact program:
+//   mypy --strict: Success: no issues found in 1 source file
+//   CPython:       runs, printing the D instance
+//   cythonpp:      silent (before the pre-pass recursed:
+//                  6:9: error: NameError: name 'h' is not defined)
+// Reproduces identically with the binding in a `while` body, a `for` body and
+// an `else` branch, all four measured the same way.
+TEST(TypeChecker, ADottedBaseWhoseRootIsBoundUnderControlFlowIsClean) {
+    expect_clean("class Holder:\n"
+                 "    class Inner:\n"
+                 "        pass\n"
+                 "if True:\n"
+                 "    h = Holder\n"
+                 "class D(h.Inner):\n"
+                 "    pass\n"
+                 "print(D())\n");
+}
+
+// ORDER applies to a dotted base's root exactly as it does to a bare-Name
+// base: the root must be bound by the time the subclass statement RUNS. This
+// is the same shape as ABaseDeclaredBelowItsSubclassIsANameError one indirection
+// removed, and it is the one case in the exemption's territory where the union
+// rule requires a report. Measured on this exact program:
+//   mypy --strict: Success: no issues found in 1 source file
+//   CPython:       NameError: name 'h' is not defined, raised from the
+//                  `class D(h.Inner):` statement itself
+//   cythonpp:      4:9: error: NameError: name 'h' is not defined
+// mypy alone is not the oracle: a program compiles only when BOTH mypy and
+// CPython accept it, since emitting C++ for a module CPython refuses to import
+// would turn a diagnostic gap into a wrong-code bug.
+TEST(TypeChecker, ADottedBaseWhoseRootIsBoundBelowTheSubclassIsANameError) {
+    const Checked checked = check_module("class Holder:\n"
+                                         "    class Inner:\n"
+                                         "        pass\n"
+                                         "class D(h.Inner):\n"
+                                         "    pass\n"
+                                         "h = Holder\n"
+                                         "print(D())\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'h' is not defined");
+    EXPECT_EQ(error.line, 4);
+    EXPECT_EQ(error.column, 9);
 }
 
 // ... and a DOTTED base whose root is bound NOWHERE is still a NameError.

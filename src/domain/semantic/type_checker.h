@@ -671,7 +671,7 @@ private:
     // function's own definition for how the two are told apart.
     void collect_signatures(const ast::Module& module);
 
-    // Phase 2.5: every top-level Assign's target name(s) that are not yet
+    // Phase 2.5: every module-level Assign's target name(s) that are not yet
     // bound (i.e. not a FunctionDef/AnnAssign name from Phase 2) get a
     // PLACEHOLDER binding -- Type::unknown(), at the statement's own line --
     // so a module-level "used before definition" read (`y = x` before
@@ -682,14 +682,28 @@ private:
     // Binding's declared_line to the statement it is currently checking, and
     // replaces it (via ScopeStack::rebind) with the real inferred type
     // exactly once -- see assign_name.
+    //
+    // RECURSED THROUGH CONTROL FLOW (see for_each_flat_statement), matching
+    // the three phases above: Python introduces no scope for an
+    // `if`/`while`/`for` block, so an assignment written inside one binds in
+    // module scope exactly like a flat one. Load-bearing for
+    // validate_class_bases, whose dotted-base-root rule ASKS ScopeStack
+    // whether a name is bound at all -- see that function for the measured
+    // program a flat-only walk turned into a false NameError.
     void pre_bind_assignment_targets(const ast::Module& module);
     void pre_bind_target(const ast::Expr& target, int line);
 
     // The Function-scope analogue of pre_bind_assignment_targets, run once a
     // FunctionDef's own Function scope is current and its parameters are
-    // bound, over that SAME FunctionDef's own body list directly (not
-    // recursively into a nested block, matching pre_bind_assignment_targets'
-    // own module.body()-only scope). Task 18's twist, absent at module
+    // bound, over that SAME FunctionDef's own body list directly -- NOT
+    // recursively into a nested control-flow block, unlike
+    // pre_bind_assignment_targets, which does recurse. The consequence,
+    // measured: a read above a CONDITIONAL assignment inside a function body
+    // (`def f(flag: bool): print(x); if flag: x = 5`) reports
+    // `name 'x' is not defined` where mypy reports `Name "x" is used before
+    // definition` and CPython raises `UnboundLocalError`. All three reject the
+    // program, so this is a wording gap, not a compliance one, and closing it
+    // is the same one-line change made at module scope. Task 18's twist, absent at module
     // scope: a Function scope gets no Phase-2 equivalent AT ALL, so BOTH an
     // Assign target AND a nested def's own name need a placeholder here --
     // a nested `def` is bound at its lexical position, never hoisted, but
