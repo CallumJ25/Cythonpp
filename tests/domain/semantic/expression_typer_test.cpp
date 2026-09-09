@@ -706,6 +706,140 @@ TEST(ExpressionTyper, TypesSubscriptThroughTheRuleTable) {
         << "a variable index still yields the union";
 }
 
+// --- Which index SPELLINGS count as a literal ------------------------------
+//
+// One test per form, deliberately, rather than one combined case: the
+// extractor's failure mode is SILENT -- a wrong parse selects the wrong
+// element with no diagnostic at all -- so every form needs its own pinned
+// expectation. The fixture is a three-element tuple throughout so that 0, 1
+// and -1 are three DIFFERENT answers; on a pair, `t[--1]` and `t[+-1]` would
+// agree by accident.
+//
+// Every expectation below is what mypy 1.18.1 reveals for the same index on
+// `t: tuple[int, str, float]`.
+
+const std::map<std::string, Type> kTriple = {
+    {"t", Type::tuple_of({Type::int_(), Type::str(), Type::float_()})}};
+
+// reveal_type(t[0x1]) and reveal_type(t[0X1]) are both `builtins.str`.
+TEST(ExpressionTyper, AHexadecimalLiteralIndexSelectsOneTupleElement) {
+    EXPECT_EQ(typed_name("t[0x1]", kTriple), "str");
+    EXPECT_EQ(typed_name("t[0X2]", kTriple), "float");
+}
+
+// reveal_type(t[0o1]) and reveal_type(t[0O1]) are both `builtins.str`.
+// Base 8 is read explicitly: C's strtoll with base 0 would take `0o1` as the
+// decimal 0 followed by junk.
+TEST(ExpressionTyper, AnOctalLiteralIndexSelectsOneTupleElement) {
+    EXPECT_EQ(typed_name("t[0o1]", kTriple), "str");
+    EXPECT_EQ(typed_name("t[0O2]", kTriple), "float");
+}
+
+// reveal_type(t[0b1]) and reveal_type(t[0B1]) are both `builtins.str`.
+TEST(ExpressionTyper, ABinaryLiteralIndexSelectsOneTupleElement) {
+    EXPECT_EQ(typed_name("t[0b1]", kTriple), "str");
+    EXPECT_EQ(typed_name("t[0b10]", kTriple), "float");
+}
+
+// A plain leading zero is NOT octal in Python -- `00` is zero, and `010` is a
+// syntax error the lexer/parser never hands here. This pins that the base
+// detection keys on the letter, not on the leading zero, so `00` stays 0.
+TEST(ExpressionTyper, ALeadingZeroIsNotReadAsOctal) {
+    EXPECT_EQ(typed_name("t[00]", kTriple), "int");
+}
+
+// Digit separators are stripped: reveal_type(t[0x_1]) is `builtins.str`, and
+// reveal_type(t[1_0]) on an eleven-element tuple is that element -- so `1_0`
+// is ten, not one.
+TEST(ExpressionTyper, DigitSeparatorsAreStrippedFromALiteralIndex) {
+    EXPECT_EQ(typed_name("t[0x_1]", kTriple), "str");
+    EXPECT_EQ(typed_name("t[0b1_0]", kTriple), "float");
+}
+
+// A BARE bool is a literal index: reveal_type(t[True]) is `builtins.str` and
+// reveal_type(t[False]) is `builtins.int`. `bool` is an `int` subtype and
+// `True`/`False` carry a Literal type of their own.
+TEST(ExpressionTyper, ABareBooleanIndexSelectsOneTupleElement) {
+    EXPECT_EQ(typed_name("t[True]", kTriple), "str");
+    EXPECT_EQ(typed_name("t[False]", kTriple), "int");
+}
+
+// A bool under ANY unary operator loses its literalness. Measured: `t[-True]`,
+// `t[+True]`, `t[-False]`, `t[+False]` and `t[--True]` ALL reveal
+// `builtins.int | builtins.str | builtins.float`, so the union is mypy's own
+// answer here and matching it means declining.
+TEST(ExpressionTyper, ABooleanUnderAUnaryOperatorIsNotALiteralIndex) {
+    EXPECT_EQ(typed_name("t[-True]", kTriple), "int | str | float");
+    EXPECT_EQ(typed_name("t[+True]", kTriple), "int | str | float");
+    EXPECT_EQ(typed_name("t[-False]", kTriple), "int | str | float");
+    EXPECT_EQ(typed_name("t[--True]", kTriple), "int | str | float");
+}
+
+// Unary PLUS, not only unary minus: reveal_type(t[+0]) is `builtins.int` and
+// reveal_type(t[+1]) is `builtins.str`.
+TEST(ExpressionTyper, AUnaryPlusLiteralIndexSelectsOneTupleElement) {
+    EXPECT_EQ(typed_name("t[+0]", kTriple), "int");
+    EXPECT_EQ(typed_name("t[+1]", kTriple), "str");
+}
+
+// NESTED unary operators fold arithmetically. Measured: reveal_type(t[--1])
+// and reveal_type(t[++1]) are `builtins.str`; reveal_type(t[+-1]),
+// reveal_type(t[-+1]) and reveal_type(t[---1]) are `builtins.float`.
+TEST(ExpressionTyper, NestedUnaryOperatorsFoldInALiteralIndex) {
+    EXPECT_EQ(typed_name("t[--1]", kTriple), "str");
+    EXPECT_EQ(typed_name("t[++1]", kTriple), "str");
+    EXPECT_EQ(typed_name("t[+-1]", kTriple), "float");
+    EXPECT_EQ(typed_name("t[-+1]", kTriple), "float");
+    EXPECT_EQ(typed_name("t[---1]", kTriple), "float");
+    // A negated hexadecimal, so the two mechanisms compose: -0x1 is -1.
+    EXPECT_EQ(typed_name("t[-0x1]", kTriple), "float");
+}
+
+// `~` is DECLINED, and that is the one index form the union is right for:
+// reveal_type(t[~0]) is `builtins.int | builtins.str | builtins.float`,
+// because `~` yields a plain `int` rather than a `Literal`.
+TEST(ExpressionTyper, ABitwiseNotIndexIsNotALiteralIndex) {
+    EXPECT_EQ(typed_name("t[~0]", kTriple), "int | str | float");
+}
+
+// Reading a separator-bearing literal also makes an OUT OF RANGE one
+// reportable, where declining it left us silent. mypy agrees: `t[1_0]` on a
+// tuple[int, str, float] is `error: Tuple index out of range  [misc]`, and
+// CPython raises `IndexError: tuple index out of range`.
+TEST(ExpressionTyper, AnOutOfRangeSeparatedLiteralIndexIsReported) {
+    const Typed typed = type_expression("t[1_0]", kTriple);
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "tuple index out of range");
+}
+
+// An EMPTY tuple with a literal index gets the OUT OF RANGE wording, not the
+// index-type wording: `int` is the right KIND for a tuple index, and the real
+// fault is that every index is out of range in a zero-length tuple. mypy:
+// `error: Tuple index out of range  [misc]`; CPython: `IndexError: tuple
+// index out of range`.
+TEST(ExpressionTyper, AnEmptyTupleWithALiteralIndexIsReportedAsOutOfRange) {
+    const Typed typed = type_expression("t[0]", {{"t", Type::tuple_of({})}});
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "tuple index out of range");
+}
+
+// ...but a VARIABLE index on the empty tuple keeps the index-type wording.
+// Measured: mypy is CLEAN there (`reveal_type(e[j])` for `j: int` is
+// `Never`), so this report is this compiler's own stricter call, and the
+// out-of-range claim would be a claim mypy does not make.
+TEST(ExpressionTyper, AnEmptyTupleWithAVariableIndexKeepsTheIndexTypeWording) {
+    const Typed typed = type_expression("t[i]", {{"t", Type::tuple_of({})},
+                                                 {"i", Type::int_()}});
+
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "invalid index type \"int\" for \"tuple[()]\"");
+}
+
 TEST(ExpressionTyper, ReportsABadIndexType) {
     const Typed typed =
         type_expression("d[1]", {{"d", Type::dict_of(Type::str(), Type::int_())}});

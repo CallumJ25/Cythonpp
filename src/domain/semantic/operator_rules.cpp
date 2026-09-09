@@ -425,11 +425,17 @@ RuleResult subscript_result(const Type& container, const Type& index, const Clas
                 // here means a non-subscriptable builtin base (`class
                 // Sub(int)`), and that may not become a TypeError, because
                 // the class is free to define its own __getitem__ on top of
-                // what it inherits. literal_index is forwarded too -- a
-                // literal-indexed subscript of a class whose base is a
-                // heterogeneous tuple (were that base representable) must
-                // resolve element-wise exactly like a plain tuple would, not
-                // silently fall back to the union one level down.
+                // what it inherits. literal_index is forwarded too, and that
+                // path is LIVE, not hypothetical: `class MyPair(tuple[int,
+                // str])` reports NotImplementedError for the BASE DECLARATION
+                // but is still declared, so builtin_base_of_class resolves it
+                // and this recursive call resolves `p[0]` element-wise
+                // exactly like a plain tuple would, instead of falling back
+                // to the union one level down. Verified against mypy 1.18.1,
+                // which reveals `p[0]` as `builtins.int` and `p[1]` as
+                // `builtins.str`. An out-of-range literal through the class
+                // stays safe: NotApplicable is not returned from here, so it
+                // falls through to Unsupported below.
                 const RuleResult inherited =
                     subscript_result(*base, index, classes, literal_index);
                 if (inherited.status == RuleResult::Status::Ok) {
@@ -494,12 +500,18 @@ RuleResult subscript_result(const Type& container, const Type& index, const Clas
             // code `misc`, not `index`), so reporting it cannot break the
             // hard invariant. The caller supplies the wording; see
             // ExpressionTyper::type_of_subscript.
+            //
+            // Range-checked BEFORE normalising, not after: `*literal_index +
+            // size` is signed overflow (undefined) for an index near
+            // LLONG_MIN, which `t[-9223372036854775808]` reaches exactly.
+            // Comparing against -size first costs nothing and makes the
+            // addition below unreachable unless it is already in range.
             const long long size = static_cast<long long>(container.args.size());
-            const long long normalised =
-                *literal_index < 0 ? *literal_index + size : *literal_index;
-            if (normalised < 0 || normalised >= size) {
+            if (*literal_index < -size || *literal_index >= size) {
                 return RuleResult::not_applicable();
             }
+            const long long normalised =
+                *literal_index < 0 ? *literal_index + size : *literal_index;
             return RuleResult::ok(container.args[static_cast<std::size_t>(normalised)]);
         }
         // The union of every member. mypy selects the one member a LITERAL

@@ -3432,6 +3432,46 @@ TEST(TypeChecker, ATupleBaseIsNotImplemented) {
     EXPECT_EQ(error.message, "a tuple base class is not supported");
 }
 
+// ...and the class is still DECLARED, tuple base and all, so a literal index
+// through an instance of it resolves ELEMENT-WISE rather than falling back to
+// the union. The deferral above covers the base DECLARATION only. Verified
+// against mypy 1.18.1 on `p = MyPair((1, "a"))`: reveal_type(p[0]) is
+// `builtins.int` and reveal_type(p[1]) is `builtins.str`, and the whole
+// program is mypy-clean and prints `1 a` under CPython.
+//
+// Pinned as "exactly ONE diagnostic": if the base were dropped at
+// declaration, `p[0]` would land on the user-class arm and add a second
+// NotImplementedError, and if the literal index were declined, `n: int =
+// p[0]` would add a TypeError naming `int | str`.
+TEST(TypeChecker, ALiteralIndexThroughATupleBaseSelectsOneElement) {
+    const Checked checked = check_module("class MyPair(tuple[int, str]):\n"
+                                         "    pass\n"
+                                         "def f() -> None:\n"
+                                         "    p = MyPair()\n"
+                                         "    n: int = p[0]\n"
+                                         "    s: str = p[1]\n"
+                                         "    print(n, s)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.message, "a tuple base class is not supported");
+}
+
+// The same shape with the elements SWAPPED draws the assignment error, which
+// is what makes the test above mean `int` and `str` specifically rather than
+// merely "something assignable".
+TEST(TypeChecker, AMismatchedLiteralIndexThroughATupleBaseIsReported) {
+    const Checked checked = check_module("class MyPair(tuple[int, str]):\n"
+                                         "    pass\n"
+                                         "def f() -> None:\n"
+                                         "    p = MyPair()\n"
+                                         "    s: str = p[0]\n"
+                                         "    print(s)\n");
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics.back().code, "TypeError");
+    EXPECT_EQ(checked.diagnostics.back().message,
+              "incompatible types in assignment (expression has type \"int\", "
+              "variable has type \"str\")");
+}
+
 // A BARE generic base is a real mypy error, so reporting is invariant-safe.
 // Verified: `Missing type parameters for generic type "list" [type-arg]`.
 // The exact code and wording come from whatever AnnotationResolver already

@@ -1,6 +1,12 @@
+#include <limits>
+
 #include <gtest/gtest.h>
 
 #include "domain/lexer/token_type.h"
+// The real ClassTable, not fake_class_lookup.h's FakeClassLookup, for the two
+// tuple-base tests below: a base is spelled as a bare NAME in the fake, so a
+// PARAMETRIC base (`tuple[int, str]`) is out of its reach by construction.
+#include "domain/semantic/class_table.h"
 #include "domain/semantic/operator_rules.h"
 #include "domain/semantic/rule_result.h"
 #include "domain/semantic/type.h"
@@ -754,6 +760,56 @@ TEST(SubscriptResult, ALiteralIndexIsIgnoredForANonTupleContainer) {
         subscript_result(Type::list_of(Type::str()), Type::int_(), nullptr, 7);
     EXPECT_EQ(result.status, RuleResult::Status::Ok);
     EXPECT_EQ(result.type, Type::str());
+}
+
+// A LITERAL index forwarded through a user class whose base is a
+// heterogeneous tuple resolves element-wise, exactly as the plain tuple
+// would. This path is live rather than hypothetical: `class MyPair(tuple[int,
+// str])` draws NotImplementedError for its BASE DECLARATION but is still
+// declared, so builtin_base_of_class finds the base and this recursion runs.
+// Verified against mypy 1.18.1: for `p = MyPair((1, "a"))`, reveal_type(p[0])
+// is `builtins.int` and reveal_type(p[1]) is `builtins.str`.
+TEST(SubscriptResult, ALiteralIndexSelectsOneElementThroughATupleBaseClass) {
+    ClassTable classes;
+    classes.declare("MyPair", {Type::tuple_of({Type::int_(), Type::str()})});
+
+    const RuleResult first = subscript_result(Type::class_of("MyPair"), Type::int_(), &classes, 0);
+    ASSERT_EQ(first.status, RuleResult::Status::Ok);
+    EXPECT_EQ(first.type, Type::int_());
+
+    const RuleResult second = subscript_result(Type::class_of("MyPair"), Type::int_(), &classes, 1);
+    ASSERT_EQ(second.status, RuleResult::Status::Ok);
+    EXPECT_EQ(second.type, Type::str());
+}
+
+// Out of range THROUGH the class is Unsupported, not NotApplicable: the
+// recursion only adopts an Ok, so the out-of-range NotApplicable falls
+// through to the user-class arm. Safe by construction -- the class is free to
+// define its own __getitem__ on top of what it inherits, and mypy is clean on
+// the class as declared.
+TEST(SubscriptResult, AnOutOfRangeLiteralThroughATupleBaseClassIsUnsupported) {
+    ClassTable classes;
+    classes.declare("MyPair", {Type::tuple_of({Type::int_(), Type::str()})});
+
+    const RuleResult result = subscript_result(Type::class_of("MyPair"), Type::int_(), &classes, 2);
+    ASSERT_EQ(result.status, RuleResult::Status::Unsupported);
+    EXPECT_EQ(result.reason, UnsupportedReason::UserClassOperator);
+}
+
+// The most negative long long normalises without signed overflow. The range
+// check runs BEFORE `*literal_index + size`, which would be undefined here.
+// mypy reports it too: `t[-9223372036854775808]` on a tuple[int, str] is
+// `error: Tuple index out of range  [misc]`.
+TEST(SubscriptResult, TheMostNegativeLiteralIndexIsOutOfRangeWithoutOverflow) {
+    const Type pair = Type::tuple_of({Type::int_(), Type::str()});
+    EXPECT_EQ(subscript_result(pair, Type::int_(), nullptr,
+                               std::numeric_limits<long long>::min())
+                  .status,
+              RuleResult::Status::NotApplicable);
+    EXPECT_EQ(subscript_result(pair, Type::int_(), nullptr,
+                               std::numeric_limits<long long>::max())
+                  .status,
+              RuleResult::Status::NotApplicable);
 }
 
 // An EMPTY tuple stays NotApplicable whether or not an index was written --

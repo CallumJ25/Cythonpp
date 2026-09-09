@@ -1,7 +1,7 @@
 #include "expression_typer.h"
 
 #include <cstddef>
-#include <cstdlib>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -72,40 +72,163 @@ private:
 };
 
 // The integer VALUE of an index expression written as an integer literal --
-// `t[0]`, and `t[-1]`, which the AST represents as a UnaryOp(-) over a
-// Constant, since the sign lives in the operator and never in the lexeme
-// (the same split type_of_constant's own `negated` parameter exists for).
+// `t[0]`, `t[0x1]`, `t[1_0]`, `t[True]`, and `t[-1]`, which the AST
+// represents as a UnaryOp(-) over a Constant, since the sign lives in the
+// operator and never in the lexeme (the same split type_of_constant's own
+// `negated` parameter exists for).
+//
+// WHICH FORMS, and why the list is this long rather than decimal-digits-only:
+// mypy selects one tuple element whenever the index's own TYPE is a
+// `Literal[n]`, and neither a literal's base, nor its digit separators, nor
+// `bool` being an `int` subtype changes that. Measured, mypy 1.18.1, for
+// `t: tuple[int, str]` unless noted:
+//
+//   reveal_type(t[0x1]) reveal_type(t[0X1]) reveal_type(t[0o1])
+//   reveal_type(t[0b1]) reveal_type(t[0x_1]) reveal_type(t[True])
+//                                            -> builtins.str
+//   reveal_type(t[+0])  reveal_type(t[False]) -> builtins.int
+//   t[1_0]                                    -> error: Tuple index out of
+//                                                range  [misc]
+//   on `t: tuple[int, str, float]`:
+//   reveal_type(t[--1]) reveal_type(t[++1])   -> builtins.str
+//   reveal_type(t[+-1]) reveal_type(t[-+1])   -> builtins.float
+//
+// So declining any of them is NOT free: handing back the union of every
+// member is a FALSE TypeError the moment the result meets one member's type,
+// and `s: str = t[0x1]` is accepted by mypy --strict AND prints `a` under
+// CPython.
 //
 // std::nullopt for every other shape: a name, a call, an arithmetic
-// expression, a non-integer literal, or a literal whose magnitude does not
-// fit 64 bits. DECIMAL DIGITS ONLY -- `0x10`, `0o7`, `0b1` and `1_0` are all
-// legal Python integer literals this deliberately declines to read, because
-// the only consumer is a tuple index (whose useful range is single digits)
-// and a wrong parse there would silently select the wrong element. Declining
-// costs the union, which is always a safe answer.
+// expression, a non-integer literal, or a magnitude that does not fit 64
+// bits. Two of the declines are measured decisions rather than gaps:
+//
+//   t[~0]      -- mypy reveals `builtins.int | builtins.str`. `~` yields a
+//                 plain `int`, not a `Literal`, so the union genuinely IS
+//                 mypy's answer here.
+//   t[-True]   -- mypy reveals the whole union too (as do `t[+True]`,
+//                 `t[-False]`, `t[+False]` and `t[--True]`, all measured on
+//                 the three-element tuple). A bool is a literal index only
+//                 while BARE; any unary operator over it erases the
+//                 literalness. That is why the bool arm below runs BEFORE a
+//                 single unary operator has been stripped.
 std::optional<long long> literal_integer_index(const ast::Expr& index) {
+    // 2^63, the magnitude bound: a negated index may reach exactly this
+    // (-2^63 is representable), an unnegated one may not.
+    constexpr unsigned long long TWO_TO_63 = 9223372036854775808ULL;
+
+    // A BARE bool, before any unary stripping -- see the measurement above.
+    if (const auto* boolean = dynamic_cast<const ast::Constant*>(&index)) {
+        if (boolean->type() == lexer::token_type::BOOL_TRUE) {
+            return 1;
+        }
+        if (boolean->type() == lexer::token_type::BOOL_FALSE) {
+            return 0;
+        }
+    }
+
+    // A CHAIN, not a single operator: `--1` is 1 and `+-1` is -1, and mypy
+    // folds both. Anything other than `+`/`-` (`~`, `not`) declines.
     const ast::Expr* operand = &index;
     bool negated = false;
-    if (const auto* unary = dynamic_cast<const ast::UnaryOp*>(&index)) {
-        if (unary->op() != lexer::token_type::OP_MINUS) {
+    while (const auto* unary = dynamic_cast<const ast::UnaryOp*>(operand)) {
+        if (unary->op() == lexer::token_type::OP_MINUS) {
+            negated = !negated;
+        } else if (unary->op() != lexer::token_type::OP_PLUS) {
             return std::nullopt;
         }
-        negated = true;
         operand = &unary->operand();
     }
+
     const auto* constant = dynamic_cast<const ast::Constant*>(operand);
     if (constant == nullptr || constant->type() != lexer::token_type::LITERAL_INT) {
         return std::nullopt;
     }
-    const std::string& lexeme = constant->lexeme();
-    if (lexeme.empty() || lexeme.find_first_not_of("0123456789") != std::string::npos) {
+
+    // Separators stripped first, then the base read explicitly. NOT strtoll
+    // with base 0: C's auto-detection understands `0x` and LEADING-ZERO
+    // octal, and Python's rules are neither -- its octal marker is `0o`, it
+    // has `0b` as well, and a plain leading zero is not octal at all (`00` is
+    // zero, `010` is a syntax error). strtoll also signals overflow by
+    // CLAMPING to LLONG_MAX with errno set, which would hand back an
+    // in-range-looking value for a magnitude nobody wrote; the accumulation
+    // below rejects an overflowing magnitude outright, so there is no errno
+    // to check and no clamped value can escape. Placement of the separators
+    // is not validated -- the lexer already accepted the token.
+    std::string digits;
+    digits.reserve(constant->lexeme().size());
+    for (const char character : constant->lexeme()) {
+        if (character != '_') {
+            digits.push_back(character);
+        }
+    }
+
+    unsigned long long base = 10;
+    std::size_t position = 0;
+    if (digits.size() >= 2 && digits[0] == '0') {
+        switch (digits[1]) {
+        case 'x':
+        case 'X':
+            base = 16;
+            position = 2;
+            break;
+        case 'o':
+        case 'O':
+            base = 8;
+            position = 2;
+            break;
+        case 'b':
+        case 'B':
+            base = 2;
+            position = 2;
+            break;
+        default:
+            break;
+        }
+    }
+    if (position >= digits.size()) {
         return std::nullopt;
     }
-    if (!integer_literal_fits_64_bits(lexeme, /*allow_two_to_63=*/negated)) {
-        return std::nullopt;
+
+    const unsigned long long limit = negated ? TWO_TO_63 : TWO_TO_63 - 1;
+    unsigned long long value = 0;
+    for (; position < digits.size(); ++position) {
+        const char character = digits[position];
+        unsigned long long digit = 0;
+        if (character >= '0' && character <= '9') {
+            digit = static_cast<unsigned long long>(character - '0');
+        } else if (character >= 'a' && character <= 'f') {
+            digit = static_cast<unsigned long long>(character - 'a') + 10;
+        } else if (character >= 'A' && character <= 'F') {
+            digit = static_cast<unsigned long long>(character - 'A') + 10;
+        } else {
+            // Not a digit at all. Declining is right here, unlike in
+            // literal_type.cpp's bound check, whose job is to avoid a false
+            // OverflowError report: this function reports nothing, and a
+            // lexeme it cannot read is a lexeme whose value it must not
+            // claim to know.
+            return std::nullopt;
+        }
+        if (digit >= base) {
+            return std::nullopt;
+        }
+        // The exact overflow test, in the same shape literal_type.cpp uses:
+        // value * base + digit > limit would itself overflow before the
+        // comparison ran.
+        if (value > limit / base || (value == limit / base && digit > limit % base)) {
+            return std::nullopt;
+        }
+        value = value * base + digit;
     }
-    const long long magnitude = std::strtoll(lexeme.c_str(), nullptr, 10);
-    return negated ? -magnitude : magnitude;
+
+    if (!negated) {
+        return static_cast<long long>(value);
+    }
+    // -2^63 cannot be formed by negating a long long, so it is named
+    // directly rather than computed.
+    if (value == TWO_TO_63) {
+        return std::numeric_limits<long long>::min();
+    }
+    return -static_cast<long long>(value);
 }
 
 } // namespace
@@ -467,13 +590,22 @@ Type ExpressionTyper::type_of_subscript(const ast::Subscript& subscript) {
     // WHICH MESSAGE, decided here because this is the only place with the
     // rendered types and the diagnostic wording -- subscript_result, like
     // every rule table in this project, reports nothing itself. A
-    // NotApplicable from a heterogeneous tuple indexed by a LITERAL means the
-    // index was out of range, not that its type was wrong (an `int` index is
-    // always the right KIND for a tuple), and mypy's own message for it says
-    // exactly that.
+    // NotApplicable from a tuple indexed by a LITERAL means the index was out
+    // of range, not that its type was wrong (an `int` index is always the
+    // right KIND for a tuple), and mypy's own message for it says exactly
+    // that.
+    //
+    // The EMPTY tuple is included, not carved out: `t: tuple[()] = ()` then
+    // `t[0]` draws `error: Tuple index out of range  [misc]` from mypy 1.18.1
+    // and `IndexError: tuple index out of range` from CPython, so out-of-range
+    // is the diagnosis for a zero-length tuple too -- every index is out of
+    // range in one. Only a literal index gets it: measured, `e: tuple[()]`
+    // subscripted by an `int` VARIABLE is mypy-clean (`reveal_type(e[j])` is
+    // `Never`), and NotApplicable there is this compiler's own stricter call,
+    // which the index-type wording still describes.
     std::string message = "invalid index type \"" + type_name(index) + "\" for \"" +
                           type_name(container) + "\"";
-    if (container.kind == TypeKind::Tuple && !container.args.empty() && literal.has_value()) {
+    if (container.kind == TypeKind::Tuple && literal.has_value()) {
         message = "tuple index out of range";
     }
     return apply(result, subscript, std::move(message));
