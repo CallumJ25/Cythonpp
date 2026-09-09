@@ -921,25 +921,20 @@ private:
     // own visit(ClassDef) when the walk reaches it).
     std::vector<ClassDeclaration> declared_classes_;
 
-    // Qualified name -> the source line of the statement that BINDS that
-    // name, for the execution-order base check in validate_class_bases.
-    //
-    // For a top-level or control-flow-nested class that is its own `class`
-    // statement's line. For a NESTED class it is the ENCLOSING `class`
-    // statement's line, because that is the statement whose execution creates
-    // the nested class object and binds the outer name through which it is
-    // reachable -- a nested class exists exactly when the `class` statement
-    // containing it has finished running, whatever line it sits on itself.
-    // (validate_class_bases inspects BARE-NAME bases only, so a dotted
-    // `Outer.Inner` base never reaches this map; a bare name never
-    // canonicalises to a qualified one. What the enclosing-line rule still
-    // governs is a class NESTED inside the class it subclasses.) That rule is
-    // DELIBERATELY CONSERVATIVE rather than exactly right: because a nested
-    // class inherits its enclosing statement's line, `class C:` with
-    // `class D(C):` inside its OWN body never compares as out of order, so
-    // the check stays silent there even though CPython raises `NameError:
-    // name 'C' is not defined` at that inner statement. A missed error, in
-    // the safe direction.
+    // Qualified name -> the source line of the CLASS STATEMENT ITSELF, for
+    // the execution-order base check in validate_class_bases. Every entry,
+    // at every nesting depth, is its own `class` statement's `start_line` --
+    // there is no enclosing-statement indirection, because none is ever
+    // read: validate_class_bases resolves a base through
+    // `classes_.canonical_name(name->identifier())`, and that call is given
+    // only a BARE identifier (a dotted `Outer.Inner` base is filtered out
+    // before this map is ever consulted -- see the `name == nullptr` arm
+    // there) and can only ever return a bare identifier itself (an exact
+    // spelling, a builtin alias's canonical spelling, or a scoped alias's
+    // target, none of which is ever dot-qualified). A dotted or `#`-bearing
+    // key in this map -- which is exactly the key a NESTED or isolated
+    // class is recorded under -- is therefore written but never looked up;
+    // only a bare top-level (or control-flow-nested) key is ever read back.
     //
     // "Execution order" is approximated by SOURCE POSITION. Two limits on
     // that, both recorded rather than hidden, since the check's whole

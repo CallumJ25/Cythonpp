@@ -447,14 +447,9 @@ void TypeChecker::declare_class_recursive(const ast::ClassDef& class_def,
     classes_.declare(qualified_name, base_names(class_def.bases()));
     all_classes.push_back(ClassDeclaration{&class_def, qualified_name});
 
-    // See class_declaration_lines_: a nested class is bound by its ENCLOSING
-    // class statement, so it inherits that statement's line rather than
-    // carrying its own.
-    const auto enclosing = class_declaration_lines_.find(qualified_prefix);
-    const int binding_line = enclosing == class_declaration_lines_.end()
-                                 ? class_def.span().start_line
-                                 : enclosing->second;
-    class_declaration_lines_[qualified_name] = binding_line;
+    // See class_declaration_lines_: every entry, at every nesting depth, is
+    // this statement's own line.
+    class_declaration_lines_[qualified_name] = class_def.span().start_line;
 
     // A NESTED ClassDef (e.g. Inner inside Outer's body) is declared right
     // here, under ITS OWN qualified name -- "Outer.Inner" -- rather than
