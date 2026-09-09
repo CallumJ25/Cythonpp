@@ -199,19 +199,57 @@ def _is_mypy_error_line(line: str) -> bool:
     return line == "# mypy: error" or line.startswith("# mypy: error ")
 
 
-def parse_header(lines):
-    """Returns (mypy_clean, header_line_count) for a sample's leading lines.
+# One sample's parsed "# cpython:" claim. `kind` is "clean" or "error"; for
+# "clean" the other two fields are None. Mirrors semantic_corpus_test.cpp's
+# CPythonLabel -- except that THIS side actually re-derives it by running the
+# sample, which is the whole point of the label existing.
+CPythonLabel = collections.namedtuple("CPythonLabel", "kind exception message")
+
+Header = collections.namedtuple("Header", "mypy_clean cpython header_count")
+
+
+def _parse_cpython_label(stripped: str) -> CPythonLabel:
+    """Parses '# cpython: clean' or '# cpython: error <Exc>: <message>'.
+
+    Mirrors semantic_corpus_test.cpp's parse_cpython_line. This is the label
+    that EXEMPTS a '# mypy: clean' sample from the C++ harness's invariant
+    guard, so a typo must fail loudly rather than quietly half-apply.
+    """
+    rest = stripped[len("# cpython:") :].lstrip(" ")
+    if not rest:
+        raise ValueError(f"'# cpython:' line has nothing after the prefix: {stripped}")
+    if rest == "clean":
+        return CPythonLabel("clean", None, None)
+    if not rest.startswith("error "):
+        raise ValueError(
+            "expected '# cpython: clean' or '# cpython: error <ExceptionType>: <message>', "
+            f"got: {stripped}"
+        )
+    detail = rest[len("error ") :]
+    exception, separator, message = detail.partition(": ")
+    if not separator or not exception or not message:
+        raise ValueError(
+            f"'# cpython: error' needs '<ExceptionType>: <message>' after it, got: {stripped}"
+        )
+    return CPythonLabel("error", exception, message)
+
+
+def parse_header(lines) -> Header:
+    """Returns (mypy_clean, cpython, header_line_count) for a sample's header.
 
     Mirrors semantic_corpus_test.cpp's parse_labels: the header is line 1
     ("# mypy: clean" or "# mypy: error ...") plus every contiguous
-    "# cythonpp: ..." line right after it. Raises ValueError for anything
+    "# cythonpp: ..." line and at most one "# cpython: ..." line right after
+    it. `cpython` is None for a sample that makes no claim about CPython,
+    which is almost all of them. Raises ValueError for anything
     that doesn't match -- a label this cannot parse must fail loudly, not be
     silently skipped.
 
-    Once the header ends (the first line that is neither), the REST of the
-    lines are still scanned -- not ignored -- purely to catch a
-    "# cythonpp:" line placed below the header by mistake. Silently dropping
-    such a line would shrink the expected-diagnostics list without a trace,
+    Once the header ends (the first line that is none of those), the REST of
+    the lines are still scanned -- not ignored -- purely to catch a
+    "# cythonpp:"/"# cpython:" line placed below the header by mistake.
+    Silently dropping such a line would shrink the expected-diagnostics list
+    without a trace, or drop a CPython claim entirely,
     which is exactly the "must fail loudly, not be skipped" doctrine this
     parser claims to follow, so a detached label is a parse error, not a
     no-op. Mirrors the C++ `in_header` flag exactly.
@@ -233,25 +271,35 @@ def parse_header(lines):
 
     header_count = 1
     in_header = True
+    cpython = None
     for line in lines[1:]:
         stripped = line.rstrip("\r\n")
         is_cythonpp_line = stripped.startswith("# cythonpp:")
+        is_cpython_line = stripped.startswith("# cpython:")
         if in_header and is_cythonpp_line:
+            header_count += 1
+            continue
+        if in_header and is_cpython_line:
+            if cpython is not None:
+                raise ValueError(
+                    "more than one '# cpython:' line; a sample states CPython's verdict at "
+                    f"most once: {stripped}"
+                )
+            cpython = _parse_cpython_label(stripped)
             header_count += 1
             continue
         if in_header:
             in_header = False  # First non-header line: the header is over.
-        # Past the header now (possibly as of this very line). A
-        # "# cythonpp:" line here is detached from the header block and
-        # would otherwise vanish from the expected-diagnostics list without
-        # a trace.
-        if is_cythonpp_line:
+        # Past the header now (possibly as of this very line). Such a line
+        # here is detached from the header block and would otherwise vanish
+        # without a trace.
+        if is_cythonpp_line or is_cpython_line:
             raise ValueError(
-                "'# cythonpp:' line found below the header, detached from the leading "
-                "'# mypy:'/'# cythonpp:' block -- move it up next to the other label "
-                f"lines: {stripped}"
+                "label line found below the header, detached from the leading "
+                "'# mypy:'/'# cythonpp:'/'# cpython:' block -- move it up next to the other "
+                f"label lines: {stripped}"
             )
-    return mypy_clean, header_count
+    return Header(mypy_clean, cpython, header_count)
 
 
 def strip_header(lines, header_count):
@@ -268,17 +316,77 @@ def strip_header(lines, header_count):
     return ["\n"] * header_count + lines[header_count:]
 
 
+def _check_cpython_label(sample_name: str, tmp_file: pathlib.Path, tmpdir: str, label):
+    """Runs the sample under CPython and compares the result to its label.
+
+    Returns (status, detail): status is "OK", "MISMATCH" or "CRASHED", and
+    detail is a human-readable explanation for the two failing ones.
+
+    Why this exists at all: a '# cpython: error ...' label is what exempts a
+    '# mypy: clean' sample from the C++ harness's invariant guard, and that
+    harness cannot run Python (ctest must pass on a machine with no Python
+    installed). So the CPython claim -- the ONLY load-bearing assertion in
+    such a sample -- would otherwise be the one thing nothing ever verifies.
+
+    Run one file per invocation with cwd set to the same throwaway temp
+    directory mypy uses, so a sample that writes files cannot touch the repo,
+    and against the HEADER-STRIPPED copy so a traceback's line numbers still
+    match the original file. Matching is on the traceback's LAST non-empty
+    stderr line, which is exactly '<ExceptionType>: <message>' for an
+    uncaught exception.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, str(tmp_file)],
+            cwd=tmpdir,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return "CRASHED", f"{sample_name}: running it under CPython timed out after 60s"
+
+    last_line = ""
+    for line in reversed(result.stderr.splitlines()):
+        if line.strip():
+            last_line = line.strip()
+            break
+
+    if label.kind == "clean":
+        if result.returncode == 0:
+            return "OK", ""
+        return "MISMATCH", (
+            f"labelled '# cpython: clean' but CPython exited {result.returncode}:\n"
+            f"{result.stdout}{result.stderr}"
+        )
+
+    expected = f"{label.exception}: {label.message}"
+    if result.returncode == 0:
+        return "MISMATCH", (
+            f"labelled '# cpython: error {expected}' but CPython ran it cleanly "
+            f"(exit 0):\n{result.stdout}"
+        )
+    if last_line != expected:
+        return "MISMATCH", (
+            f"labelled '# cpython: error {expected}' but CPython raised "
+            f"{last_line!r}:\n{result.stderr}"
+        )
+    return "OK", ""
+
+
 def check_corpus() -> int:
-    """Runs mypy --strict on every test_files/semantic/*.py sample and
-    reports whether each one's '# mypy:' header matches reality.
+    """Runs mypy --strict on every test_files/semantic/*.py sample, and
+    CPython on every sample carrying a '# cpython:' label, then reports
+    whether each header matches reality.
 
     Developer-run only -- NEVER invoked by ctest, which must stay hermetic
     (no Python, no network, no shelling out). This is the only thing in the
-    project that actually confirms a '# mypy: clean' label is true rather
-    than asserted from belief.
+    project that actually confirms a '# mypy: clean' or '# cpython: ...'
+    label is true rather than asserted from belief.
 
-    mypy is run with its cwd set to a fresh TemporaryDirectory, so any
-    .mypy_cache it writes never touches the repository at all.
+    Both tools are run with their cwd set to a fresh TemporaryDirectory, so
+    any .mypy_cache, __pycache__ or file a sample writes never touches the
+    repository at all.
     """
     samples = sorted(corpus_dir().glob("*.py"))
     if not samples:
@@ -286,19 +394,37 @@ def check_corpus() -> int:
         return 1
 
     failures = []
+    cpython_checked = 0
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = pathlib.Path(tmpdir)
         for sample in samples:
             lines = sample.read_text(encoding="utf-8").splitlines(keepends=True)
             try:
-                mypy_clean, header_count = parse_header(lines)
+                header = parse_header(lines)
             except ValueError as exc:
                 print(f"MALFORMED  {sample.name}: {exc}")
                 failures.append(f"{sample}: {exc}")
                 continue
+            mypy_clean = header.mypy_clean
 
             tmp_file = tmpdir_path / sample.name
-            tmp_file.write_text("".join(strip_header(lines, header_count)), encoding="utf-8")
+            tmp_file.write_text(
+                "".join(strip_header(lines, header.header_count)), encoding="utf-8"
+            )
+
+            # The CPython half, for the samples that claim anything about it.
+            # Checked BEFORE mypy and reported separately, so a sample can
+            # fail one half and still have the other half's verdict printed.
+            if header.cpython is not None:
+                cpython_checked += 1
+                status, detail = _check_cpython_label(
+                    sample.name, tmp_file, tmpdir, header.cpython
+                )
+                if status == "OK":
+                    print(f"OK         {sample.name}  (cpython label: {header.cpython.kind})")
+                else:
+                    print(f"{status:<10} {sample.name}  (cpython label: {header.cpython.kind})")
+                    failures.append(f"{sample}: {detail}")
 
             try:
                 result = subprocess.run(
@@ -334,9 +460,9 @@ def check_corpus() -> int:
             label = "clean" if mypy_clean else "error"
             actual = "clean" if mypy_actually_clean else "error"
             if mypy_actually_clean == mypy_clean:
-                print(f"OK         {sample.name}  (label: {label})")
+                print(f"OK         {sample.name}  (mypy label: {label})")
             else:
-                print(f"MISMATCH   {sample.name}  (label: {label}, mypy says: {actual})")
+                print(f"MISMATCH   {sample.name}  (mypy label: {label}, mypy says: {actual})")
                 failures.append(
                     f"{sample}: labelled '# mypy: {label}' but mypy --strict says "
                     f"'{actual}':\n{result.stdout}{result.stderr}"
@@ -348,7 +474,10 @@ def check_corpus() -> int:
             print(f"  - {failure}", file=sys.stderr)
         return 1
 
-    print(f"\nAll {len(samples)} sample(s) match their '# mypy:' header.")
+    print(
+        f"\nAll {len(samples)} sample(s) match their '# mypy:' header, and all "
+        f"{cpython_checked} sample(s) carrying a '# cpython:' header match that too."
+    )
     return 0
 
 
@@ -364,7 +493,9 @@ def main() -> int:
         "--check-corpus",
         action="store_true",
         help="Run mypy --strict on every test_files/semantic sample and confirm its "
-        "'# mypy:' header matches. Developer-run only -- never part of ctest.",
+        "'# mypy:' header matches, and run CPython on every sample carrying a "
+        "'# cpython:' header to confirm that half too. Developer-run only -- never "
+        "part of ctest.",
     )
     args = parser.parse_args()
     if args.generate_class_table:

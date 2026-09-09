@@ -2870,8 +2870,10 @@ TEST(TypeChecker, ARepeatedNestedClassBodyAnnotationChecksAgainstTheFirstBodysDe
               "variable has type \"str\")");
 }
 
-// THE FIRST DELIBERATE DIVERGENCE FROM mypy in this pass, and the reason the
-// project's arbiter is CPython rather than mypy. Measured, all three:
+// A program compiles here only when BOTH mypy --strict and CPython accept it;
+// if either rejects it, this compiler must not silently accept it, because a
+// compiled script has to produce what the same script run normally produces.
+// This is a case where only the second oracle objects. Measured, all three:
 //   cythonpp before this change: silent
 //   mypy --strict:               Success -- it resolves a forward-declared
 //                                base fully, inherited __init__ and all, and
@@ -2879,9 +2881,9 @@ TEST(TypeChecker, ARepeatedNestedClassBodyAnnotationChecksAgainstTheFirstBodysDe
 //   CPython:                     NameError: name 'Parent' is not defined,
 //                                raised at IMPORT, from the `class Child`
 //                                statement itself
-// A compiler that emits C++ for a program CPython refuses to import has not
-// preserved the bug, it has converted a diagnostic bug into a wrong-code
-// bug. So this reports the message CPython produces.
+// So mypy's silence is a gap in mypy, not a licence to compile: emitting C++
+// for a program CPython refuses to import would turn a diagnostic gap into a
+// wrong-code bug. This reports the message CPython produces.
 TEST(TypeChecker, ABaseDeclaredBelowItsSubclassIsANameError) {
     const Checked checked = check_module("class Child(Parent):\n"
                                          "    pass\n"
@@ -2956,6 +2958,75 @@ TEST(TypeChecker, AFunctionLocalBaseDeclaredAboveIsClean) {
                  "    class Sub(Local):\n"
                  "        pass\n"
                  "    print(Sub())\n");
+}
+
+// A function body is a DIFFERENT EXECUTION CONTEXT from the module body: it
+// runs when the function is called, by which time every module-level `class`
+// statement has already executed, however far below the def it is written.
+// Both oracles accept this, so the order check must not fire. Measured:
+//   mypy --strict: Success
+//   CPython:       runs, printing the Sub instance
+TEST(TypeChecker, AFunctionLocalClassMayNameAModuleBaseDeclaredBelowTheFunction) {
+    expect_clean("def f() -> None:\n"
+                 "    class Sub(P):\n"
+                 "        pass\n"
+                 "    print(Sub())\n"
+                 "class P:\n"
+                 "    pass\n"
+                 "f()\n");
+}
+
+// Same rule, same reason, for a class inside a METHOD body. Measured:
+//   mypy --strict: Success
+//   CPython:       runs, printing the Sub instance
+TEST(TypeChecker, AMethodLocalClassMayNameAModuleBaseDeclaredBelowTheClass) {
+    expect_clean("class Holder:\n"
+                 "    def make(self) -> None:\n"
+                 "        class Sub(P):\n"
+                 "            pass\n"
+                 "        print(Sub())\n"
+                 "class P:\n"
+                 "    pass\n"
+                 "Holder().make()\n");
+}
+
+// The in-function REVERSE order is still caught, and this is what makes the
+// exemption above narrow rather than a blanket hole: a function-local class
+// is reachable only through the scope-limited alias visit(ClassDef) installs
+// when the walk reaches its own statement, so `Local` is not a known class
+// yet when `Sub` is validated. Measured, CPython:
+//   UnboundLocalError: cannot access local variable 'Local' where it is not
+//   associated with a value
+// (UnboundLocalError is a NameError subclass; the wording differs from ours,
+// the code does not, and the point is that this is not silently compiled.)
+TEST(TypeChecker, AFunctionLocalBaseDeclaredBelowInTheSameFunctionIsANameError) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    class Sub(Local):\n"
+                                         "        pass\n"
+                                         "    class Local:\n"
+                                         "        pass\n"
+                                         "    print(Sub())\n"
+                                         "f()\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'Local' is not defined");
+    EXPECT_EQ(error.line, 2);
+}
+
+// A DOTTED base whose root is an ordinary binding holding a class object.
+// `h` is defined -- it just is not something ClassTable can see, since class
+// names are never bound into ScopeStack and ClassTable is keyed by class
+// name, not by the values bindings hold. Measured:
+//   mypy --strict: Success
+//   CPython:       runs, printing the D instance
+TEST(TypeChecker, ADottedBaseWhoseRootIsAValueBindingIsClean) {
+    expect_clean("class Holder:\n"
+                 "    class Inner:\n"
+                 "        pass\n"
+                 "h = Holder\n"
+                 "class D(h.Inner):\n"
+                 "    pass\n"
+                 "print(D())\n");
 }
 
 } // namespace

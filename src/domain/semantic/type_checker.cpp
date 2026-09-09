@@ -302,59 +302,79 @@ void TypeChecker::collect_classes(const ast::Module& module) {
     });
 
     // THEN -- once every class at every nesting depth is declared -- validate
-    // that each bare-Name base actually resolves, reporting NameError for one
-    // that does not (e.g. `class C(Generic):`, since Generic cannot be
-    // imported in this subset). Deferred until here (rather than folded into
+    // each base: a bare-Name base that does not resolve at all is a NameError
+    // (e.g. `class C(Generic):`, since Generic cannot be imported in this
+    // subset), and so is one that resolves to a class declared BELOW the
+    // subclass. Deferred until here (rather than folded into
     // declare_class_recursive) so a base naming a class declared LATER in the
-    // same module, or in a different class's body, already resolves.
-    validate_class_bases(declared_classes_);
+    // same module, or in a different class's body, already resolves -- the
+    // order rule is then applied by comparing recorded lines, not by whether
+    // the lookup happened to succeed yet.
+    validate_class_bases(declared_classes_, /*check_order=*/true);
 }
 
-void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_classes) {
+void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_classes,
+                                       bool check_order) {
     for (const ClassDeclaration& declaration : all_classes) {
         const int subclass_line = declaration.node->span().start_line;
         for (const ast::ExprPtr& base : declaration.node->bases()) {
-            const ast::Name* name = dynamic_cast<const ast::Name*>(base.get());
+            // Walk a DOTTED base (`Outer.Inner`, `A.B.C`) down to the NAME at
+            // its root. A dotted base is reachable by a name only through its
+            // ROOT identifier -- a nested class always exists by the time the
+            // `class Outer` statement containing it finishes executing -- so
+            // both rules below can only ever fire on that root, never on an
+            // attribute lookup along the way. A bare-Name base is already its
+            // own root, so the loop simply does not run for one, and the two
+            // shapes share the code that follows.
+            const ast::Expr* cursor = base.get();
+            bool via_attribute = false;
+            while (const auto* link = dynamic_cast<const ast::Attribute*>(cursor)) {
+                cursor = &link->value();
+                via_attribute = true;
+            }
+            const auto* name = dynamic_cast<const ast::Name*>(cursor);
             if (name == nullptr) {
-                // A DOTTED base (`Outer.Inner`) is bound to a NAME only
-                // through its ENCLOSING top-level identifier -- a nested
-                // class always exists by the time the `class Outer`
-                // statement that contains it finishes executing, so the
-                // ordering question can only ever fail on the chain's ROOT,
-                // never on the attribute lookup itself. Walk down to that
-                // root and apply the identical bare-Name rule below to it;
-                // anything other than a Name at the root (e.g. `f().Inner`)
-                // is outside this task's tested scope and simply skipped.
-                const auto* attribute = dynamic_cast<const ast::Attribute*>(base.get());
-                if (attribute == nullptr) {
-                    continue;
-                }
-                const ast::Expr* cursor = &attribute->value();
-                while (const auto* link = dynamic_cast<const ast::Attribute*>(cursor)) {
-                    cursor = &link->value();
-                }
-                name = dynamic_cast<const ast::Name*>(cursor);
-                if (name == nullptr) {
-                    continue;
-                }
+                // Anything other than a Name at the root (e.g. `f().Inner`)
+                // is not modelled here.
+                continue;
             }
             if (!classes_.is_class(name->identifier())) {
+                if (via_attribute) {
+                    // A DOTTED base whose root is not a known class is far
+                    // more likely an ORDINARY BINDING holding a class object
+                    // -- `h = Holder` then `class D(h.Inner):` -- than an
+                    // undeclared name. Both oracles accept that program
+                    // (mypy: Success; CPython: runs), and this model cannot
+                    // see it: class names are deliberately never bound into
+                    // ScopeStack, and ClassTable is keyed by class NAME, not
+                    // by the values ordinary bindings hold. Reporting here
+                    // would therefore be a false NameError on a program the
+                    // union rule requires this compiler to accept. The case
+                    // this silence gives up -- a genuinely undeclared dotted
+                    // root, `class D(mod.Thing):` -- needs an import to
+                    // write, and this subset has none, so it is unreachable.
+                    continue;
+                }
                 // e.g. `class C(Generic):` -- Generic cannot be imported in
                 // this subset, so this is the correct outcome for a program
                 // nobody can legally write.
                 report(*name, "NameError", "name '" + name->identifier() + "' is not defined");
                 continue;
             }
+            if (!check_order) {
+                continue;
+            }
             // ORDER. A base must be bound by the time the subclass statement
-            // RUNS. mypy disagrees -- it resolves a forward-declared base
-            // fully and reports nothing -- but CPython raises
-            // `NameError: name 'Parent' is not defined` from the `class
-            // Child(Parent)` statement itself at import time, and this
-            // compiler emits code that has to run. Emitting C++ for a module
-            // CPython refuses to import would convert a diagnostic bug into a
-            // wrong-code bug, which is strictly worse and much harder to
-            // find. Same message CPython produces, reported at the base
-            // expression.
+            // RUNS. This is NOT a divergence from mypy: mypy is merely silent
+            // here (it resolves a forward-declared base fully and is
+            // order-insensitive), while CPython raises `NameError: name
+            // 'Parent' is not defined` from the `class Child(Parent)`
+            // statement itself at import time. A program compiles only when
+            // BOTH oracles accept it, because a compiled script must produce
+            // what the same script run normally produces -- emitting C++ for
+            // a module CPython refuses to import would convert a diagnostic
+            // gap into a wrong-code bug. Same message CPython produces,
+            // reported at the base expression.
             //
             // A base whose name resolves through ClassTable but which this
             // map never recorded is a SEEDED BUILTIN (Exception, OSError,
@@ -381,7 +401,24 @@ std::string TypeChecker::declare_isolated_class(const ast::ClassDef& node,
             declare_class_recursive(*nested, qualified_name, all_classes);
         }
     });
-    validate_class_bases(all_classes);
+    // check_order=false. SOURCE POSITION is only a proxy for EXECUTION ORDER
+    // WITHIN ONE EXECUTION CONTEXT, and a function body is a different one
+    // from the module body: it runs when the function is CALLED, which is
+    // after every module-level `class` statement below the def has already
+    // executed. Comparing a function-local class's own line against a
+    // module-level base's line therefore compares two unrelated timelines and
+    // reports a false NameError on a program both oracles accept (mypy:
+    // Success; CPython: runs) -- measured for both `def f(): class Sub(P)`
+    // and a method body, with `class P` below.
+    //
+    // Nothing is lost by skipping it here. The in-function REVERSE order --
+    // `class Sub(Local):` above `class Local:` inside the SAME def, which
+    // CPython does reject -- is still caught, by the is_class arm above: a
+    // function-local class is declared under an isolated qualified name and
+    // reached through a scope-limited alias that visit(ClassDef) installs
+    // only when the walk reaches its own statement, so when Sub is validated
+    // the name `Local` is not a known class yet.
+    validate_class_bases(all_classes, /*check_order=*/false);
     return qualified_name;
 }
 

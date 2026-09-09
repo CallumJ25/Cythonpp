@@ -340,9 +340,10 @@ private:
     // reported as a collided redefinition is SKIPPED here: declaring it
     // anyway silently overwrote the winning
     // same-named class's ClassTable entry. THEN -- once every class is
-    // declared -- validate that each bare-Name base actually resolves,
-    // reporting NameError for one that does not (e.g. `class C(Generic):`,
-    // since Generic cannot be imported in this subset).
+    // declared -- validate each base, reporting NameError for a bare-Name
+    // base that does not resolve (e.g. `class C(Generic):`, since Generic
+    // cannot be imported in this subset) and for one that resolves to a class
+    // declared below the subclass itself (see validate_class_bases).
     void collect_classes(const ast::Module& module);
 
     // One class ClassTable holds an entry for, paired with the exact
@@ -369,18 +370,32 @@ private:
 
     // The base-validation half of collect_classes, extracted
     // so declare_isolated_class below can reuse it for a class ClassTable
-    // never saw during Phase 1. Two rules, both against a bare-Name base:
-    // one that does not resolve through ClassTable at all is a NameError
-    // (e.g. `class C(Generic):`, since Generic cannot be imported in this
-    // subset); one that DOES resolve but was bound (see
-    // class_declaration_lines_) LATER in source position than the subclass
-    // statement itself is also a NameError -- CPython raises `NameError`
-    // from the subclass statement at import time for a forward-declared
-    // base, and this compiler emits code that has to run under CPython, so
-    // it reports the same diagnostic CPython does even though mypy resolves
-    // a forward-declared base fully and stays silent. Checked only once
-    // every declaration in `all_classes` exists.
-    void validate_class_bases(const std::vector<ClassDeclaration>& all_classes);
+    // never saw during Phase 1. Two rules, both applied to the NAME at the
+    // root of a base expression (a bare `Parent`, or the `Outer` of a dotted
+    // `Outer.Inner`):
+    //
+    //   1. UNRESOLVED. A BARE-NAME base that does not resolve through
+    //      ClassTable at all is a NameError (e.g. `class C(Generic):`, since
+    //      Generic cannot be imported in this subset). Deliberately NOT
+    //      applied to a DOTTED base's root, whose likeliest reading is an
+    //      ordinary binding holding a class object -- see the function's own
+    //      body for the measurement.
+    //   2. ORDER, only when `check_order`. A base that DOES resolve but was
+    //      bound (see class_declaration_lines_) LATER in source position than
+    //      the subclass statement is a NameError, because CPython raises
+    //      exactly that from the subclass statement at import time. mypy
+    //      accepts such a program, but a program compiles here only when BOTH
+    //      mypy and CPython accept it, so mypy's silence does not license
+    //      emitting code for a module CPython refuses to import.
+    //
+    // `check_order` is false on the declare_isolated_class path, and that is
+    // a correctness requirement rather than an optimisation: source position
+    // only proxies execution order within ONE execution context, and a
+    // function body is a different context from the module body. See that
+    // function's call site for the measured false positive it prevents.
+    //
+    // Checked only once every declaration in `all_classes` exists.
+    void validate_class_bases(const std::vector<ClassDeclaration>& all_classes, bool check_order);
 
     // Declares `node` (and, recursively, every
     // ClassDef nested in its own body) into ClassTable under `qualified_name`
@@ -900,14 +915,39 @@ private:
     // statement's line, because that is the statement whose execution creates
     // the nested class object and binds the outer name through which it is
     // reachable -- `class D(Outer.Inner)` is legal exactly when `class Outer`
-    // has already run, whatever line `class Inner` sits on.
+    // has already run, whatever line `class Inner` sits on. That rule is
+    // DELIBERATELY CONSERVATIVE rather than exactly right: because a nested
+    // class inherits its enclosing statement's line, `class C:` with
+    // `class D(C):` inside its OWN body never compares as out of order, so
+    // the check stays silent there even though CPython raises `NameError:
+    // name 'C' is not defined` at that inner statement. A missed error, in
+    // the safe direction.
     //
-    // "Execution order" is approximated by SOURCE POSITION. That is faithful
-    // for this grammar because the only conditional binding it can express is
-    // `if`/`while`/`for`, none of which can move a `class` statement's
-    // execution earlier than its own position, and there are no imports, no
-    // `del`, and no runtime rebinding of a class name. State the assumption
-    // here because the check rests on it.
+    // "Execution order" is approximated by SOURCE POSITION. Two limits on
+    // that, both recorded rather than hidden, since the check's whole
+    // soundness argument is written here:
+    //
+    //   - It holds only WITHIN ONE EXECUTION CONTEXT. A function body runs at
+    //     CALL time, so a class inside a def may legitimately name a
+    //     module-level base written below the def. validate_class_bases is
+    //     therefore called with check_order=false on the
+    //     declare_isolated_class path; see that call site.
+    //   - Within the module body it is sound for straight-line code and for
+    //     the FIRST pass through an `if`/`while`/`for`, none of which can
+    //     move a `class` statement's execution earlier than its own position,
+    //     and there are no imports, no `del`, and no runtime rebinding of a
+    //     class name. It is NOT sound on a LOOP'S SECOND ITERATION, where a
+    //     class statement above can run after one below it ran on the first
+    //     pass. Measured: a `for` whose body guards `class Child(Parent):`
+    //     behind a flag first set at the bottom of the body, with
+    //     `class Parent:` below the guard, is mypy-clean and runs fine under
+    //     CPython, and this check reports a NameError for it anyway -- a
+    //     known unsound over-fire on a contrived shape. Suppressing the check
+    //     whenever subclass and base share a loop body was considered and
+    //     rejected: it would silently accept the far likelier `for ...:
+    //     class Child(Parent): ... class Parent: ...`, which CPython fails on
+    //     its FIRST iteration, trading a rare false diagnostic for a common
+    //     wrong-code bug.
     std::map<std::string, int> class_declaration_lines_;
 
     // Which ClassDefs pre_collect_class_body has already run for, so
