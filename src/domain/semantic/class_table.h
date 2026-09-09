@@ -202,6 +202,48 @@ public:
     // themselves when that distinction matters.
     Type constructor_type(const std::string& qualified_name) const;
 
+    // "Should a call to this class's constructor skip its arity and argument
+    // checks entirely?" -- true for a class whose base chain reaches
+    // BaseException and which declares no __init__ anywhere in that chain,
+    // for a class whose base chain reaches a name builtin_type_kind()
+    // recognises (see inherits_builtin below) and which declares no __init__
+    // anywhere in that chain, and for a class that declares __new__ but no
+    // __init__.
+    //
+    // A CAPABILITY answer, not a signature, and deliberately separate from
+    // constructor_type for that reason. Verified against mypy 1.18.1:
+    // reveal_type of `class MyError(Exception): pass` is
+    // `def (*args: builtins.object) -> MyError`, so MyError(),
+    // MyError("boom") and MyError("boom", 42) are ALL clean -- via that one
+    // `*args: object`, not via a dedicated overload -- and so are
+    // ValueError("bad", 1, 2) and OSError(2, "no such file"). This model has
+    // no variadic Callable and inventing one for this alone is not
+    // warranted, so the honest thing is to say "do not check" rather than to
+    // hand back a signature that is a lie in one direction or the other. The
+    // same reasoning gave the integer-overflow diagnostic its own code
+    // instead of folding it into TypeError.
+    //
+    // The builtin-base half is the identical reasoning applied to a class
+    // whose base chain reaches a builtin KIND rather than BaseException:
+    // `class MyInt(int): pass` then `MyInt(3)`, and `class C(str): pass` then
+    // `C("abc")`, are both mypy `Success` and both run fine under CPython
+    // (measured), because int/str/list/... are overload sets this model does
+    // not represent -- the same capability gap, just reached through a
+    // different seeded base rather than BaseException.
+    //
+    // The __new__ half is a deliberate FALLBACK, not a model of __new__.
+    // Measured: __new__ participates fully when no __init__ exists (a class
+    // declaring only `__new__(cls, a: int)` reveals as `def (a: int) -> N`)
+    // and loses outright to __init__ when both exist, with no complaint about
+    // the contradiction. Rather than model that, a class with __new__ and no
+    // __init__ is treated as any-arity, so the failure mode is a MISSED error
+    // instead of a false "too few arguments" on every construction of it.
+    //
+    // Its DECLARED __init__ always wins: an exception or builtin-based
+    // subclass that defines its own constructor is checked against it exactly
+    // like any other class.
+    bool constructor_accepts_any_arity(const std::string& qualified_name) const;
+
     // Whether the base chain (excluding `object`, and excluding a seeded
     // exception class, which is an ordinary Class rather than a modelled
     // kind) reaches a name builtin_type_kind() recognises -- i.e. whether an

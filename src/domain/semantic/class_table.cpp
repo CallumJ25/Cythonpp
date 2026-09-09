@@ -321,6 +321,58 @@ Type ClassTable::constructor_type(const std::string& qualified_name) const {
     return Type::callable(std::move(params), Type::class_of(resolved), defaulted);
 }
 
+bool ClassTable::constructor_accepts_any_arity(const std::string& qualified_name) const {
+    const std::string resolved = canonical_name(qualified_name);
+
+    // A DECLARED __init__ anywhere in the chain settles it: that signature is
+    // the constructor and it is checked. Reuses constructor_type's own
+    // declared-__init__ search shape rather than a second copy, so the two
+    // can never disagree about which classes have one.
+    std::vector<std::string> init_visited;
+    if (walk_chain<Type>(resolved, init_visited,
+                         [](const std::string&, const Entry& entry) -> std::optional<Type> {
+                             const auto it = entry.methods.find("__init__");
+                             return it == entry.methods.end() ? std::nullopt
+                                                              : std::optional<Type>(it->second);
+                         })
+            .has_value()) {
+        return false;
+    }
+
+    std::vector<std::string> new_visited;
+    if (walk_chain<Type>(resolved, new_visited,
+                         [](const std::string&, const Entry& entry) -> std::optional<Type> {
+                             const auto it = entry.methods.find("__new__");
+                             return it == entry.methods.end() ? std::nullopt
+                                                              : std::optional<Type>(it->second);
+                         })
+            .has_value()) {
+        return true;
+    }
+
+    std::vector<std::string> exception_visited;
+    const std::optional<bool> is_exception = walk_chain<bool>(
+        resolved, exception_visited,
+        [](const std::string& canonical, const Entry&) -> std::optional<bool> {
+            return canonical == "BaseException" ? std::optional<bool>(true) : std::nullopt;
+        });
+    if (is_exception.has_value() && *is_exception) {
+        return true;
+    }
+
+    // The builtin-base half of the rule (see the header comment): a base
+    // chain reaching a name builtin_type_kind() recognises -- int, str,
+    // list, ... -- has a real constructor this model cannot represent
+    // (an overload set), so the same capability answer applies. Measured
+    // against mypy 1.18.1 and CPython: `class MyInt(int): pass` then
+    // `MyInt(3)`, and `class C(str): pass` then `C("abc")`, are both
+    // `Success` and both run cleanly, where this compiler used to report a
+    // false "too many arguments" for both. inherits_builtin already
+    // excludes `object` and a seeded exception class (an ordinary Class,
+    // not a modelled kind), so it cannot fire for MyError above.
+    return inherits_builtin(resolved);
+}
+
 bool ClassTable::inherits_builtin(const std::string& qualified_name) const {
     // Fallback included: nullopt here means "no builtin in this chain", which
     // is exactly the miss that lets the attr-defined check fire. Effectively

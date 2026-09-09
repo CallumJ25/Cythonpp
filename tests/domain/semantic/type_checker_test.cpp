@@ -418,6 +418,75 @@ TEST(TypeChecker, AMethodAndAConstructorDefaultMayBeOmittedAtTheCall) {
                  "print(G(\"ann\").greet(\"?\"))\n");
 }
 
+// Verified against mypy 1.18.1: all four of these are `Success`.
+TEST(TypeChecker, AnExceptionSubclassAcceptsAnyConstructorArity) {
+    expect_clean("class MyError(Exception):\n"
+                 "    pass\n"
+                 "def f() -> None:\n"
+                 "    print(MyError())\n"
+                 "    print(MyError(\"boom\"))\n"
+                 "    print(MyError(\"boom\", 42))\n"
+                 "    print(ValueError(\"bad\", 1, 2))\n");
+}
+
+// Unchanged: a plain class still checks its arity. Verified against mypy
+// 1.18.1: `Too many arguments for "Plain" [call-arg]`.
+TEST(TypeChecker, APlainClassStillChecksConstructorArity) {
+    const Checked checked = check_module("class Plain:\n"
+                                         "    pass\n"
+                                         "p = Plain(\"x\")\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "too many arguments for \"Plain\"");
+}
+
+// An inherited __init__ is the subclass's constructor, with the parameter and
+// the return both rebound to the subclass. Verified against mypy 1.18.1:
+// reveal_type(Child) is `def (n: builtins.int) -> Child`,
+// `Child()` is `Missing positional argument "n" in call to "Child"` and
+// `Child("s")` is `Argument 1 to "Child" has incompatible type "str";
+// expected "int"`. This ALREADY works -- the guard is here so a later change
+// to the chain walk cannot silently take it away.
+TEST(TypeChecker, AnInheritedConstructorIsCheckedAgainstItsParameters) {
+    const Checked checked = check_module("class Parent:\n"
+                                         "    def __init__(self, n: int) -> None:\n"
+                                         "        self.n = n\n"
+                                         "class Child(Parent):\n"
+                                         "    pass\n"
+                                         "a: Child = Child(1)\n"
+                                         "b: Child = Child(\"s\")\n"
+                                         "print(a, b)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "argument 1 to \"Child\" has incompatible type \"str\"; expected \"int\"");
+}
+
+// The extension beyond the exception rule (see
+// ClassTable::constructor_accepts_any_arity): a class based on a builtin KIND
+// with no __init__ of its own also accepts any arity. Measured against mypy
+// 1.18.1 and CPython: both are clean / run without error, where this
+// compiler used to report a false "too many arguments" for both.
+TEST(TypeChecker, ABuiltinBasedSubclassAcceptsAnyConstructorArity) {
+    expect_clean("class MyInt(int):\n"
+                 "    pass\n"
+                 "print(MyInt(3))\n");
+    expect_clean("class C(str):\n"
+                 "    pass\n"
+                 "print(C(\"abc\"))\n");
+}
+
+// A parametric builtin base reaches the same rule: the base is recorded as
+// `list[int]`, but ClassTable::base_key still keys it under the bare "list"
+// spelling for the chain walk, so inherits_builtin -- and now
+// constructor_accepts_any_arity -- see straight through the type argument.
+// Measured against mypy 1.18.1 and CPython: `Success` and a clean run.
+TEST(TypeChecker, AParametricBuiltinBasedSubclassAcceptsAnyConstructorArity) {
+    expect_clean("class IntList(list[int]):\n"
+                 "    pass\n"
+                 "print(IntList([1, 2]))\n");
+}
+
 // The other direction must NOT be lost: too MANY arguments is still an error,
 // and so is omitting a parameter that has no default. Verified against mypy
 // 1.18.1, which reports both.
@@ -3278,10 +3347,10 @@ TEST(TypeChecker, ANonParametricBuiltinBaseStillWorks) {
 //
 // The body is deliberately never CALLED here. Calling it would index the
 // EMPTY string `C()` returns and raise IndexError under CPython (measured) --
-// a runtime data condition, nothing to do with the rule under test -- and
-// `C("abc")`, the obvious fix, trips the separate, pre-existing
-// inherited-constructor arity bug (measured: cythonpp says `too many
-// arguments for "C"` where mypy is Success).
+// a runtime data condition, nothing to do with the rule under test.
+// (`C("abc")` used to trip a separate, now-fixed, false "too many arguments"
+// -- see TypeChecker.ABuiltinBasedSubclassAcceptsAnyConstructorArity -- but
+// the empty-string IndexError concern stands on its own regardless.)
 TEST(TypeChecker, ANonParametricBuiltinSubclassSubscriptsAsItsBaseElement) {
     expect_clean("class C(str):\n"
                  "    pass\n"

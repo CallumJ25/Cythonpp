@@ -309,6 +309,112 @@ TEST(ClassTable, ConstructorTypeOwnInitBeatsInherited) {
               type_name(Type::callable({Type::str()}, Type::class_of("D"))));
 }
 
+// A class whose base chain reaches BaseException and which declares no
+// __init__ of its own accepts ANY arity. Verified against mypy 1.18.1:
+// reveal_type(MyError) for `class MyError(Exception): pass` is
+// `def (*args: builtins.object) -> MyError`, and MyError(), MyError("boom")
+// and MyError("boom", 42) are all clean. This model has no variadic
+// Callable, and inventing one for this alone is not warranted -- so this is
+// a CAPABILITY answer ("do not check the arity of this constructor"), not a
+// signature. Same reasoning that gave the integer-overflow diagnostic its own
+// code rather than folding it into TypeError.
+TEST(ClassTable, AnExceptionSubclassWithNoInitAcceptsAnyArity) {
+    ClassTable table;
+    table.declare("MyError", {Type::class_of("Exception")});
+    EXPECT_TRUE(table.constructor_accepts_any_arity("MyError"));
+}
+
+TEST(ClassTable, ASeededExceptionAcceptsAnyArity) {
+    const ClassTable table;
+    EXPECT_TRUE(table.constructor_accepts_any_arity("ValueError"));
+    EXPECT_TRUE(table.constructor_accepts_any_arity("OSError"));
+    // Reached through the alias spelling too, like every other read query.
+    EXPECT_TRUE(table.constructor_accepts_any_arity("IOError"));
+}
+
+// An ordinary class does NOT. Verified: `Plain("x")` really is
+// `Too many arguments for "Plain" [call-arg]`, and an explicit `object` base
+// is byte-identically the same.
+TEST(ClassTable, APlainClassDoesNotAcceptAnyArity) {
+    ClassTable table;
+    table.declare("Plain", {});
+    EXPECT_FALSE(table.constructor_accepts_any_arity("Plain"));
+}
+
+// A DECLARED __init__ wins over the any-arity rule: an exception subclass
+// that defines its own constructor is checked against it.
+TEST(ClassTable, AnExceptionSubclassWithItsOwnInitIsCheckedNormally) {
+    ClassTable table;
+    table.declare("MyError", {Type::class_of("Exception")});
+    table.declare_method("MyError", "__init__",
+                         Type::callable({Type::class_of("MyError"), Type::str()}, Type::none()));
+    EXPECT_FALSE(table.constructor_accepts_any_arity("MyError"));
+    EXPECT_EQ(type_name(table.constructor_type("MyError")), "Callable[[str], MyError]");
+}
+
+// __new__ WITH NO __init__ is treated as any-arity too. Measured: __new__
+// participates fully when no __init__ exists (mypy reveals
+// `def (a: builtins.int) -> N` for a class declaring only
+// `__new__(cls, a: int)`), and loses outright to __init__ when both exist.
+// Modelling it properly is out of scope, so the fallback deliberately errs
+// toward a MISSED error rather than a false "too few arguments" on every
+// construction.
+TEST(ClassTable, AClassDeclaringOnlyNewAcceptsAnyArity) {
+    ClassTable table;
+    table.declare("N", {});
+    table.declare_method("N", "__new__",
+                         Type::callable({Type::class_of("type"), Type::int_()},
+                                        Type::class_of("N")));
+    EXPECT_TRUE(table.constructor_accepts_any_arity("N"));
+}
+
+// The extension beyond the exception rule: a class whose base chain reaches a
+// builtin KIND (int, str, list, ...) has a real constructor this model
+// cannot represent either -- an overload set, same as BaseException's
+// *args: object. Measured against mypy 1.18.1 and CPython: `class MyInt(int):
+// pass` then `MyInt(3)`, and `class C(str): pass` then `C("abc")`, are both
+// `Success` / a clean run, where this compiler used to report a false "too
+// many arguments" for both.
+TEST(ClassTable, AClassInheritingABuiltinKindWithNoInitAcceptsAnyArity) {
+    ClassTable table;
+    table.declare("MyInt", {Type::int_()});
+    EXPECT_TRUE(table.constructor_accepts_any_arity("MyInt"));
+
+    ClassTable table2;
+    table2.declare("C", {Type::str()});
+    EXPECT_TRUE(table2.constructor_accepts_any_arity("C"));
+}
+
+// REGRESSION GUARDS for behaviour that is already correct and was untested:
+// with multiple inheritance where only the SECOND base declares __init__,
+// that one is used -- an implicit object.__init__ does not shadow it, so the
+// walk must look for a class that DECLARES __init__, not one whose __init__
+// merely resolves. Verified against mypy 1.18.1: reveal_type(C) is
+// `def (n: builtins.int) -> C`.
+TEST(ClassTable, ConstructorResolutionFindsASecondBasesInit) {
+    ClassTable table;
+    table.declare("A", {});
+    table.declare("B", {});
+    table.declare_method("B", "__init__",
+                         Type::callable({Type::class_of("B"), Type::int_()}, Type::none()));
+    table.declare("C", {Type::class_of("A"), Type::class_of("B")});
+    EXPECT_EQ(type_name(table.constructor_type("C")), "Callable[[int], C]");
+}
+
+// Where two bases BOTH declare one, the LEFT base wins, and mypy reports no
+// LSP complaint. Verified against mypy 1.18.1.
+TEST(ClassTable, ConstructorResolutionPrefersTheLeftBasesInit) {
+    ClassTable table;
+    table.declare("A", {});
+    table.declare_method("A", "__init__",
+                         Type::callable({Type::class_of("A"), Type::str()}, Type::none()));
+    table.declare("B", {});
+    table.declare_method("B", "__init__",
+                         Type::callable({Type::class_of("B"), Type::int_()}, Type::none()));
+    table.declare("C", {Type::class_of("A"), Type::class_of("B")});
+    EXPECT_EQ(type_name(table.constructor_type("C")), "Callable[[str], C]");
+}
+
 TEST(ClassTable, MethodTypeFoundOnTheDeclaringClass) {
     ClassTable table;
     table.declare("Widget", {});

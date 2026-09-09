@@ -44,6 +44,24 @@ bool is_bare_container_constructor(const std::string& name, std::size_t arg_coun
 
 } // namespace
 
+Type ExpressionTyper::type_of_unchecked_construction(const Type& constructor,
+                                                      const ast::Call& call) {
+    // See ClassTable::constructor_accepts_any_arity: an exception subclass or
+    // a builtin-based subclass with no declared __init__ has a real
+    // constructor this model cannot represent, so there is no arity to check
+    // and nothing to check each argument against. Every argument is still
+    // typed -- a root cause inside one (an unbound name, say) must still
+    // report exactly once, the same rule every other arm in this file
+    // follows.
+    for (const ast::ExprPtr& arg : call.args()) {
+        type_of(*arg, Type::unknown());
+    }
+    // constructor.args is [param..., return], return LAST -- see
+    // type_of_positional_call's own comment for why this is in practice
+    // never empty, and why it is guarded anyway rather than trusted.
+    return constructor.args.empty() ? Type::unknown() : constructor.args.back();
+}
+
 Type ExpressionTyper::type_of_call(const ast::Call& call, const Type& expected) {
     if (const auto* callee_name = dynamic_cast<const ast::Name*>(&call.callee())) {
         return type_of_name_call(*callee_name, call, expected);
@@ -80,6 +98,9 @@ Type ExpressionTyper::type_of_call(const ast::Call& call, const Type& expected) 
                 // choice for a bare `C` used as a callee (reveal_type(C) is
                 // `def (...) -> C`, not `type[C]`).
                 types_.insert(attribute, constructor);
+                if (classes_.constructor_accepts_any_arity(dotted)) {
+                    return type_of_unchecked_construction(constructor, call);
+                }
                 return type_of_positional_call(constructor, call, "\"" + dotted + "\"");
             }
         }
@@ -211,6 +232,9 @@ Type ExpressionTyper::type_of_name_call(const ast::Name& callee, const ast::Call
         // comment explains.
         const Type constructor = classes_.constructor_type(identifier);
         types_.insert(&callee, constructor);
+        if (classes_.constructor_accepts_any_arity(identifier)) {
+            return type_of_unchecked_construction(constructor, call);
+        }
         return type_of_positional_call(constructor, call, "\"" + identifier + "\"");
     }
 

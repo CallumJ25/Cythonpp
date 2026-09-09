@@ -250,6 +250,18 @@ private:
     Type type_of_positional_call(const Type& callable, const ast::Call& call,
                                  const std::string& label);
 
+    // A constructor call whose arity and arguments are deliberately
+    // unchecked -- see ClassTable::constructor_accepts_any_arity. Shared by
+    // type_of_name_call's bare-`C()` branch and type_of_call's nested-class
+    // `Outer.Inner()` branch, so the two can never drift apart. Types every
+    // argument against Type::unknown() (one root cause inside an argument,
+    // one diagnostic -- the same rule every other arm in this file follows)
+    // and returns the instance type `constructor` itself already carries as
+    // its return (constructor.args.back()), or Type::unknown() on the
+    // unreachable-today empty-args shape type_of_positional_call also
+    // guards against.
+    Type type_of_unchecked_construction(const Type& constructor, const ast::Call& call);
+
     // The shared tail for every callee shape ONCE ITS OWN TYPE IS KNOWN --
     // a bound Name, an Attribute (already correctly self-bound or
     // self-unbound per THE self CONTRACT above), or anything else: Callable
