@@ -454,13 +454,24 @@ std::string TypeChecker::declare_isolated_class(const ast::ClassDef& node,
     // long after Phase 1 declared every module-level class, so `P` resolves.
     //
     // The in-function REVERSE order -- `class Sub(Local):` above
-    // `class Local:` inside the SAME def, which CPython does reject -- is
-    // still caught, and for the same emergent reason as the module-level
-    // case: a function-local class is declared under an isolated qualified
-    // name and reached only through a scope-limited alias that
-    // visit(ClassDef) installs when the walk reaches its own statement, so
-    // when Sub's base is RESOLVED the name `Local` is not a known class yet
-    // and AnnotationResolver reports it.
+    // `class Local:` inside the SAME def -- is still caught, and for the same
+    // emergent reason as the module-level case: a function-local class is
+    // declared under an isolated qualified name and reached only through a
+    // scope-limited alias that visit(ClassDef) installs when the walk
+    // reaches its own statement, so when Sub's base is RESOLVED the name
+    // `Local` is not a known class yet and AnnotationResolver reports it.
+    // Whether that report is correct depends on whether `f` is ever CALLED,
+    // and this check cannot see that far: measured, once `f()` runs, CPython
+    // rejects it (UnboundLocalError: cannot access local variable 'Local'
+    // where it is not associated with a value -- a NameError subclass) while
+    // mypy still says Success, so under the union rule cythonpp reporting
+    // NameError here is correct. But with `f` never called, the body never
+    // runs, so CPython exits clean with no output and mypy still says
+    // Success -- both oracles accept, and cythonpp reports the same
+    // NameError regardless, over-firing on that program. This is the same
+    // control-flow-insensitivity as the loop-reentry case recorded as a
+    // known-wrong test below: the check has no way to tell "will run" from
+    // "might never run".
     validate_class_bases(all_classes);
     return qualified_name;
 }

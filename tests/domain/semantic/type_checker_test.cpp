@@ -3081,7 +3081,7 @@ TEST(TypeChecker, AFunctionLocalBaseDeclaredBelowInTheSameFunctionIsANameError) 
 // in scope, and that question is what dragged base validation behind the name
 // pre-binding passes and those passes into control flow, which produced false
 // NameErrors on ordinary code both oracles accept. See validate_class_bases.
-TEST(TypeChecker, ADottedBaseIsNotOrderCheckedOrResolved) {
+TEST(TypeChecker, ADottedBaseIsNotResolved) {
     expect_clean("class D(Outer.Inner):\n"
                  "    pass\n"
                  "class Outer:\n"
