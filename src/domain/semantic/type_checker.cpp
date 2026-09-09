@@ -10,7 +10,6 @@
 
 #include "annotation_resolver.h"
 #include "builtin_call_table.h"
-#include "builtin_type_names.h"
 #include "domain/ast/attribute.h"
 #include "domain/ast/break.h"
 #include "domain/ast/call.h"
@@ -269,21 +268,55 @@ std::vector<Type> TypeChecker::base_types(const std::vector<ast::ExprPtr>& bases
     types.reserve(bases.size());
     for (const ast::ExprPtr& base : bases) {
         if (dynamic_cast<const ast::Attribute*>(base.get()) != nullptr) {
-            // A dotted base (`Outer.Inner`, `mod.Thing`) is deliberately NOT
-            // resolved -- see validate_class_bases' own long comment on this
-            // exact choice, reverted after producing false positives on code
-            // both oracles accept (a root that is not a known class name may
-            // still legitimately hold a class object, which this model
-            // cannot see, since class names are never bound into
-            // ScopeStack). AnnotationResolver's resolve_attribute does not
-            // know that history and would report a NameError for exactly the
-            // two accepted-miss cases documented there, so the base is
-            // skipped BEFORE it ever reaches the resolver -- one choke point
-            // for the decision, not a second copy of it in
-            // validate_class_bases. Unknown keeps this entry aligned
-            // index-for-index with base_exprs for the lockstep walk below,
-            // and validate_class_bases' own Unknown arm already treats that
-            // as "already handled, do not report again".
+            // A plain dotted base (`Outer.Inner`, `mod.Thing`) is
+            // deliberately NOT resolved. This is the ONE choke point for that
+            // decision; the reasoning lives here rather than being repeated
+            // at the validation loop.
+            //
+            // A dotted base WAS validated for a while, by walking the chain
+            // down to its root Name and checking that root. The trouble is
+            // that a root which is not a known class may still legitimately
+            // hold a class object -- `h = Holder` then `class D(h.Inner):`,
+            // which both oracles accept (measured: mypy --strict "Success: no
+            // issues found in 1 source file"; CPython prints a D instance) --
+            // and this model cannot see that, because class names are
+            // deliberately never bound into ScopeStack and ClassTable is
+            // keyed by class NAME, not by the values ordinary bindings hold.
+            // Avoiding a false NameError there meant asking ScopeStack
+            // whether the root was bound at all, which forced base validation
+            // to run after the name pre-binding passes, which forced those
+            // passes to recurse through control flow, which turned an
+            // ordinary loop read into a false NameError on code both oracles
+            // accept. Every step was a fix for a real false positive and
+            // every step produced the next one, so the arm was dropped rather
+            // than gated again -- and AnnotationResolver's resolve_attribute,
+            // which does not know that history, must not be allowed to
+            // reintroduce it one level down.
+            //
+            // THE TWO ACCEPTED MISSES, both measured (mypy 1.18.1, CPython
+            // 3.14.2), and neither unreachable -- each is two lines to write:
+            //
+            //   `class D(Outer.Inner): pass` above `class Outer:` /
+            //   `class Inner: pass`. mypy --strict: "Success: no issues found
+            //   in 1 source file". CPython: `NameError: name 'Outer' is not
+            //   defined` raised from the `class D(Outer.Inner):` statement
+            //   itself, caret under `Outer` alone. One oracle rejects, so the
+            //   union rule says this must not compile, and it does.
+            //
+            //   `class D(mod.Thing): pass` with `mod` bound nowhere. mypy
+            //   --strict: `Name "mod" is not defined  [name-defined]` (plus
+            //   `Class cannot subclass "Thing" (has type "Any")`). CPython:
+            //   `NameError: name 'mod' is not defined`. BOTH oracles reject,
+            //   and this compiler is silent.
+            //
+            // Both are MISSED errors, which is the safe direction of the two:
+            // a program that should have been refused compiles, rather than a
+            // program both oracles accept being refused. The alternatives on
+            // offer were the false positives above.
+            //
+            // Unknown (rather than skipping the push) keeps this entry
+            // aligned index-for-index with the base expression list, which
+            // validate_class_bases walks in lockstep.
             types.push_back(Type::unknown());
             continue;
         }
@@ -325,20 +358,20 @@ void TypeChecker::collect_classes(const ast::Module& module) {
         }
     });
 
-    // THEN -- once every class at every nesting depth is declared -- validate
-    // that each bare-Name base actually resolves, reporting NameError for one
-    // that does not (e.g. `class C(Generic):`, since Generic cannot be
-    // imported in this subset), and that it was not declared BELOW the
-    // subclass that names it. Deferred until here (rather than folded into
-    // declare_class_recursive) so a base naming a class declared LATER in the
-    // same module, or in a different class's body, already resolves.
-    validate_class_bases(declared_classes_, /*check_order=*/true);
+    // THEN -- once every class at every nesting depth is declared -- walk the
+    // resolved bases for the one shape that has to be refused as a whole
+    // rather than reported by the resolver: a `tuple` base.
+    //
+    // Base RESOLUTION itself already happened, per class, inside the loop
+    // above: declare_class_recursive calls base_types while it declares, so a
+    // base naming a class that is not declared YET is reported right there,
+    // by AnnotationResolver, and lands here as Unknown. That timing is what
+    // gives execution order for free -- see validate_class_bases.
+    validate_class_bases(declared_classes_);
 }
 
-void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_classes,
-                                       bool check_order) {
+void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_classes) {
     for (const ClassDeclaration& declaration : all_classes) {
-        const int subclass_line = declaration.node->span().start_line;
         const std::vector<ast::ExprPtr>& base_exprs = declaration.node->bases();
         // One resolved Type per base expression, in the same order, by
         // construction -- both came from the SAME base_types(...) call at
@@ -363,98 +396,38 @@ void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_
                 // program may well be one mypy accepts; naming the construct
                 // is the honest answer.
                 report(*base, "NotImplementedError", "a tuple base class is not supported");
-                continue;
             }
-            if (resolved_type.kind == TypeKind::Unknown) {
-                // AnnotationResolver already reported this base (an
-                // unresolved name, a bare generic missing its type
-                // parameters, ...) while base_types resolved it -- a second
-                // diagnostic for one root cause is exactly what every other
-                // Unknown path in this pass exists to avoid.
-                continue;
-            }
-            const auto* name = dynamic_cast<const ast::Name*>(base.get());
-            if (name == nullptr) {
-                // BARE-NAME BASES ONLY. A dotted base (`Outer.Inner`,
-                // `mod.Thing`), a subscripted one, and anything else are
-                // skipped here entirely. That is a deliberate choice with a
-                // measured price, recorded below rather than left implicit.
-                //
-                // A dotted base WAS validated here for a while, by walking the
-                // chain down to its root Name and applying the two rules below
-                // to that root. The trouble is that a root which is not a known
-                // class may still legitimately hold a class object -- `h =
-                // Holder` then `class D(h.Inner):`, which both oracles accept
-                // (measured: mypy --strict "Success: no issues found in 1
-                // source file"; CPython prints a D instance) -- and this model
-                // cannot see that, because class names are deliberately never
-                // bound into ScopeStack and ClassTable is keyed by class NAME,
-                // not by the values ordinary bindings hold. Avoiding a false
-                // NameError there meant asking ScopeStack whether the root was
-                // bound at all, which forced base validation to run after the
-                // name pre-binding passes, which forced those passes to recurse
-                // through control flow, which turned an ordinary loop read into
-                // a false NameError on code both oracles accept. Every step was
-                // a fix for a real false positive and every step produced the
-                // next one, so the arm is dropped rather than gated again.
-                //
-                // THE TWO ACCEPTED MISSES, both measured (mypy 1.18.1,
-                // CPython 3.14.2), and neither unreachable -- each is two lines
-                // to write:
-                //
-                //   `class D(Outer.Inner): pass` above `class Outer:` /
-                //   `class Inner: pass`. mypy --strict: "Success: no issues
-                //   found in 1 source file". CPython: `NameError: name 'Outer'
-                //   is not defined` raised from the `class D(Outer.Inner):`
-                //   statement itself, caret under `Outer` alone. One oracle
-                //   rejects, so the union rule says this must not compile, and
-                //   it now does.
-                //
-                //   `class D(mod.Thing): pass` with `mod` bound nowhere. mypy
-                //   --strict: `Name "mod" is not defined  [name-defined]`
-                //   (plus `Class cannot subclass "Thing" (has type "Any")`).
-                //   CPython: `NameError: name 'mod' is not defined`. BOTH
-                //   oracles reject, and this compiler is silent.
-                //
-                // Both are MISSED errors, which is the safe direction of the
-                // two: a program that should have been refused compiles, rather
-                // than a program both oracles accept being refused. The
-                // alternatives on offer were the false positives above.
-                continue;
-            }
-            if (!classes_.is_class(name->identifier())) {
-                // e.g. `class C(Generic):` -- Generic cannot be imported in
-                // this subset, so this is the correct outcome for a program
-                // nobody can legally write.
-                report(*name, "NameError", "name '" + name->identifier() + "' is not defined");
-                continue;
-            }
-            if (!check_order) {
-                continue;
-            }
-            // ORDER. A base must be bound by the time the subclass statement
-            // RUNS. This is NOT a divergence from mypy: mypy is merely silent
-            // here (it resolves a forward-declared base fully and is
-            // order-insensitive), while CPython raises `NameError: name
-            // 'Parent' is not defined` from the `class Child(Parent)`
-            // statement itself at import time. A program compiles only when
-            // BOTH oracles accept it, because a compiled script must produce
-            // what the same script run normally produces -- emitting C++ for
-            // a module CPython refuses to import would convert a diagnostic
-            // gap into a wrong-code bug. Same message CPython produces,
-            // reported at the base expression.
+            // AND NOTHING ELSE. Every other way a base can be wrong is
+            // already reported, by AnnotationResolver, at the moment
+            // base_types resolved it -- an unresolved name, a bare generic
+            // missing its type parameters, a bad subscript -- and lands here
+            // as Unknown. Reporting again from this loop would be a second
+            // diagnostic for one root cause.
             //
-            // A base whose name resolves through ClassTable but which this
-            // map never recorded is a SEEDED BUILTIN (Exception, OSError,
-            // int, ...) or a scope-aliased function-local class declared
-            // elsewhere -- neither has a source line here and neither can be
-            // forward-declared, so a miss is silence, not an error.
-            const std::string resolved = classes_.canonical_name(name->identifier());
-            const auto declared_at = class_declaration_lines_.find(resolved);
-            if (declared_at != class_declaration_lines_.end() &&
-                declared_at->second > subclass_line) {
-                report(*name, "NameError", "name '" + name->identifier() + "' is not defined");
-            }
+            // In particular EXECUTION ORDER is now EMERGENT rather than
+            // explicit, and that is the property to preserve if this loop is
+            // ever touched. A base must be bound by the time the `class`
+            // statement RUNS: CPython raises `NameError: name 'Parent' is not
+            // defined` from `class Child(Parent):` written above
+            // `class Parent:`, while mypy is order-insensitive and silent, so
+            // the union rule says the program must not compile. It does not,
+            // for free: declare_class_recursive resolves each class's bases
+            // DURING the declaration walk, in source order, so `Parent` is
+            // simply not in ClassTable yet when `Child`'s base is resolved and
+            // the resolver reports it there. Measured (mypy 1.18.1, CPython
+            // 3.14.2): mypy "Success: no issues found in 1 source file";
+            // CPython `NameError: name 'Parent' is not defined`; this compiler
+            // reports exactly one NameError, at the base expression.
+            //
+            // An EXPLICIT order rule -- comparing the base's declaration line
+            // against the subclass's -- lived here and was deleted: with the
+            // resolver already catching the real case, the only inputs still
+            // reaching it were builtin SHADOWINGS (`class Sub(Exception):`
+            // above a later `class Exception:`, and the `int` equivalent),
+            // where the base resolves through the SEEDED builtin entry that
+            // the class statement below merely shadows afterwards. Measured:
+            // both are mypy "Success" and both run clean under CPython, so the
+            // rule's whole remaining output was a false NameError.
         }
     }
 }
@@ -471,24 +444,24 @@ std::string TypeChecker::declare_isolated_class(const ast::ClassDef& node,
             declare_class_recursive(*nested, qualified_name, all_classes);
         }
     });
-    // check_order=false. SOURCE POSITION is only a proxy for EXECUTION ORDER
-    // WITHIN ONE EXECUTION CONTEXT, and a function body is a different one
-    // from the module body: it runs when the function is CALLED, which is
-    // after every module-level `class` statement below the def has already
-    // executed. Comparing a function-local class's own line against a
-    // module-level base's line therefore compares two unrelated timelines and
-    // reports a false NameError on a program both oracles accept (mypy:
-    // Success; CPython: runs) -- measured for both `def f(): class Sub(P)`
-    // and a method body, with `class P` below.
+    // A function body runs at CALL time, which is after every module-level
+    // `class` statement below the def has already executed, so a
+    // function-local class may legitimately name a module-level base written
+    // BELOW its own def. Nothing here compares source lines, and that is what
+    // keeps `def f(): class Sub(P): ...` above `class P:` clean -- measured,
+    // both oracles accept it (mypy: Success; CPython: runs). The base_types
+    // call above is what makes that work: it runs during the ORDINARY walk,
+    // long after Phase 1 declared every module-level class, so `P` resolves.
     //
-    // Nothing is lost by skipping it here. The in-function REVERSE order --
-    // `class Sub(Local):` above `class Local:` inside the SAME def, which
-    // CPython does reject -- is still caught, by the is_class arm above: a
-    // function-local class is declared under an isolated qualified name and
-    // reached through a scope-limited alias that visit(ClassDef) installs
-    // only when the walk reaches its own statement, so when Sub is validated
-    // the name `Local` is not a known class yet.
-    validate_class_bases(all_classes, /*check_order=*/false);
+    // The in-function REVERSE order -- `class Sub(Local):` above
+    // `class Local:` inside the SAME def, which CPython does reject -- is
+    // still caught, and for the same emergent reason as the module-level
+    // case: a function-local class is declared under an isolated qualified
+    // name and reached only through a scope-limited alias that
+    // visit(ClassDef) installs when the walk reaches its own statement, so
+    // when Sub's base is RESOLVED the name `Local` is not a known class yet
+    // and AnnotationResolver reports it.
+    validate_class_bases(all_classes);
     return qualified_name;
 }
 
@@ -500,10 +473,6 @@ void TypeChecker::declare_class_recursive(const ast::ClassDef& class_def,
     std::vector<Type> resolved_bases = base_types(class_def.bases());
     classes_.declare(qualified_name, resolved_bases);
     all_classes.push_back(ClassDeclaration{&class_def, qualified_name, std::move(resolved_bases)});
-
-    // See class_declaration_lines_: every entry, at every nesting depth, is
-    // this statement's own line.
-    class_declaration_lines_[qualified_name] = class_def.span().start_line;
 
     // A NESTED ClassDef (e.g. Inner inside Outer's body) is declared right
     // here, under ITS OWN qualified name -- "Outer.Inner" -- rather than

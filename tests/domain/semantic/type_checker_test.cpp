@@ -3095,7 +3095,7 @@ TEST(TypeChecker, ADottedBaseIsNotOrderCheckedOrResolved) {
 // the over-fire it pins should DELETE this test, not make the fix satisfy it.
 //
 // The program below is accepted by both oracles and must therefore compile,
-// but the base-order rule reports it. Measured:
+// but this compiler reports it. Measured (mypy 1.18.1, CPython 3.14.2):
 //   mypy --strict: Success: no issues found in 1 source file
 //   CPython:       runs, printing the Child instance
 //   cythonpp:      NameError: name 'Parent' is not defined, at 4:21
@@ -3103,13 +3103,22 @@ TEST(TypeChecker, ADottedBaseIsNotOrderCheckedOrResolved) {
 // guarded by `ready`, which is only true on the SECOND iteration -- by which
 // point the `class Parent` statement below it has already executed once.
 //
-// Why it is left in place rather than papered over: the order rule compares
-// SOURCE LINES, which proxy execution order correctly only in straight-line
-// code, and a loop makes a later line run before an earlier one. Every
-// syntactic refinement tried relocates the hole instead of closing it -- in
-// particular, suppressing the rule for two classes in the same loop body
-// would silently compile this near-identical program, which CPython kills on
-// its first iteration (measured: NameError: name 'Parent' is not defined):
+// WHAT REPORTS IT is AnnotationResolver, from inside TypeChecker::base_types:
+// the declaration pass walks classes in SOURCE order and resolves each one's
+// bases as it declares it, so when `Child`'s base is resolved at line 4 the
+// name `Parent` is not in ClassTable yet. There is no explicit order rule any
+// more -- there was one, comparing declaration lines, and it was deleted once
+// the resolver's declaration-time timing subsumed it. The over-fire survived
+// the deletion unchanged, because both mechanisms proxy execution order by
+// SOURCE POSITION, which is correct only in straight-line code, and a loop
+// makes a later line run before an earlier one.
+//
+// Why it is left in place rather than papered over: every syntactic
+// refinement tried relocates the hole instead of closing it -- in particular,
+// suppressing the check for two classes in the same loop body would silently
+// compile this near-identical program, which CPython kills on its first
+// iteration (measured: NameError: name 'Parent' is not defined, and this
+// compiler does report it, at 2:17):
 //   for i in [1]:
 //       class Child(Parent):
 //           pass

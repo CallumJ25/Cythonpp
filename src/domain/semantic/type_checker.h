@@ -339,11 +339,11 @@ private:
     // ClassDef node. A top-level ClassDef scan_top_level_names already
     // reported as a collided redefinition is SKIPPED here: declaring it
     // anyway silently overwrote the winning
-    // same-named class's ClassTable entry. THEN -- once every class is
-    // declared -- validate that each bare-Name base actually resolves,
-    // reporting NameError for one that does not (e.g. `class C(Generic):`,
-    // since Generic cannot be imported in this subset) and for one declared
-    // below the subclass that names it; see validate_class_bases.
+    // same-named class's ClassTable entry. Each class's bases are RESOLVED as
+    // that class is declared, so a base naming a class not declared yet is
+    // reported right there by AnnotationResolver. THEN -- once every class is
+    // declared -- validate_class_bases walks the resolved bases for the one
+    // shape the resolver cannot judge on its own, a `tuple` base.
     void collect_classes(const ast::Module& module);
 
     // One class ClassTable holds an entry for, paired with the exact
@@ -356,8 +356,8 @@ private:
     //
     // `base_types` is the SAME resolution that fed ClassTable::declare for
     // this class, recorded again here rather than re-derived, so
-    // validate_class_bases can check a resolved base's Type (a `tuple` base
-    // deferral, an Unknown base skip) without invoking AnnotationResolver a
+    // validate_class_bases can check a resolved base's Type (the `tuple` base
+    // deferral) without invoking AnnotationResolver a
     // second time -- which would double-report a bad base. One entry per
     // base expression, in the same order, by construction: both are built
     // from a single `base_types(...)` call.
@@ -379,32 +379,27 @@ private:
 
     // The base-validation half of collect_classes, extracted
     // so declare_isolated_class below can reuse it for a class ClassTable
-    // never saw during Phase 1. Two rules, both applied ONLY to a BARE-NAME
-    // base -- a dotted, subscripted or otherwise non-Name base is skipped
-    // entirely, which the function's own body records as two measured missed
-    // errors and explains:
+    // never saw during Phase 1. ONE rule: a base whose resolved Type is a
+    // `tuple` draws a NotImplementedError, because mypy and CPython disagree
+    // about what a tuple subclass IS (see the body for the measurement) and
+    // this compiler has to emit code that runs.
     //
-    //   1. UNRESOLVED. A base whose name does not resolve through ClassTable
-    //      at all is a NameError -- `class C(Generic):`, since Generic cannot
-    //      be imported in this subset.
-    //   2. ORDER, only when `check_order`. A base that DOES resolve but was
-    //      bound (see class_declaration_lines_) LATER in source position than
-    //      the subclass statement is a NameError, because CPython raises
-    //      exactly that from the subclass statement at import time. mypy
-    //      accepts such a program, but a program compiles here only when BOTH
-    //      mypy and CPython accept it, so mypy's silence does not license
-    //      emitting code for a module CPython refuses to import.
+    // Everything else a base can get wrong is reported EARLIER, by
+    // AnnotationResolver, at the moment base_types resolved it, and reaches
+    // this loop as Unknown. That includes EXECUTION ORDER, which used to be
+    // an explicit rule here and is now emergent: bases are resolved during
+    // the declaration walk, in source order, so `class Child(Parent):`
+    // written above `class Parent:` cannot resolve and is reported at the
+    // base expression -- which is what the union rule demands, since CPython
+    // raises NameError there while mypy is order-insensitive. The explicit
+    // rule was deleted once the resolver subsumed it: its only remaining
+    // output was a false NameError on a builtin shadowing both oracles
+    // accept.
     //
-    // `check_order` is false on the declare_isolated_class path, and that is
-    // a correctness requirement rather than an optimisation: source position
-    // only proxies execution order within ONE execution context, and a
-    // function body is a different context from the module body. See that
-    // function's call site for the measured false positive it prevents.
-    //
-    // Checked only once every declaration in `all_classes` exists. It needs
+    // Runs only once every declaration in `all_classes` exists. It needs
     // nothing from ScopeStack, so it does not have to wait for the
     // name-binding phases.
-    void validate_class_bases(const std::vector<ClassDeclaration>& all_classes, bool check_order);
+    void validate_class_bases(const std::vector<ClassDeclaration>& all_classes);
 
     // Declares `node` (and, recursively, every
     // ClassDef nested in its own body) into ClassTable under `qualified_name`
@@ -741,21 +736,40 @@ private:
     // simply skips (see ClassTable::base_key) -- one root cause, one
     // diagnostic, reported by the resolver itself.
     //
-    // ONE EXCEPTION: a dotted base (`Outer.Inner`, `mod.Thing`) is skipped
-    // BEFORE it reaches the resolver, pushing Unknown with no diagnostic at
-    // all. AnnotationResolver's own attribute handling would report a
-    // NameError for cases validate_class_bases deliberately leaves alone
-    // (see its long comment on the same choice, reverted once already for
-    // false positives on code both oracles accept) -- resolving it here
-    // would reproduce that mistake one level down.
+    // ONE EXCEPTION: a base that is ITSELF, at the top level, an ast::
+    // Attribute -- a plain dotted base like `Outer.Inner` or `mod.Thing` --
+    // is skipped BEFORE it reaches the resolver, pushing Unknown with no
+    // diagnostic at all. AnnotationResolver's own attribute handling would
+    // report a NameError for cases this compiler deliberately leaves alone;
+    // the body's own comment records that history and the two measured
+    // missed errors it accepts.
     //
-    // Called during the DECLARATION pass, which runs before every class is
-    // declared. That is safe for exactly the reason a class-body annotation
-    // is safe to resolve eagerly and a plain assignment's value is not: a
-    // base expression names types, and nothing in it depends on an inferred
-    // value. It is NOT safe for a base naming a class declared later -- and
-    // that is not a limitation but the intended behaviour, since a base
-    // declared below its subclass is a NameError (see validate_class_bases).
+    // The exception is exactly that shape and no wider. A base whose top
+    // level is something else goes through the resolver even when a dot
+    // appears INSIDE it: `class D(mod.Thing[int]): pass` is a Subscript, and
+    // it reports -- measured, `TypeError: not a valid type annotation` at the
+    // base, against mypy's `Name "mod" is not defined` plus `Class cannot
+    // subclass value of type "Any"` and CPython's `NameError: name 'mod' is
+    // not defined`, so both oracles reject it too.
+    //
+    // Called TWICE, from two different phases, and the difference matters:
+    //
+    //   - From declare_class_recursive, during the DECLARATION pass, as each
+    //     module-or-class-level class is declared -- so a base naming a class
+    //     declared LOWER in the module has not been declared yet and the
+    //     resolver reports it. That is not a limitation but the intended
+    //     behaviour: CPython raises NameError from such a `class` statement,
+    //     so the union rule refuses the program. Resolving eagerly is safe
+    //     here for the same reason a class-body annotation is: a base
+    //     expression names types, and nothing in it depends on an inferred
+    //     value.
+    //   - From declare_isolated_class, during the ORDINARY walk, for a
+    //     function-local or collision-losing class. That later timing is
+    //     load-bearing rather than incidental: by then Phase 1 has declared
+    //     every module-level class, so `def f(): class Local(Later): ...`
+    //     written above `class Later:` resolves and stays clean -- which is
+    //     correct, because the function body runs at CALL time, after the
+    //     module-level `class Later:` statement has executed.
     std::vector<Type> base_types(const std::vector<ast::ExprPtr>& bases);
 
     // How many of `params` carry a default value, for Type::callable's
@@ -955,48 +969,6 @@ private:
     // (declare_isolated_class owns those, and each is pre-collected by its
     // own visit(ClassDef) when the walk reaches it).
     std::vector<ClassDeclaration> declared_classes_;
-
-    // Qualified name -> the source line of the CLASS STATEMENT ITSELF, for
-    // the execution-order base check in validate_class_bases. Every entry,
-    // at every nesting depth, is its own `class` statement's `start_line` --
-    // there is no enclosing-statement indirection, because none is ever
-    // read: validate_class_bases resolves a base through
-    // `classes_.canonical_name(name->identifier())`, and that call is given
-    // only a BARE identifier (a dotted `Outer.Inner` base is filtered out
-    // before this map is ever consulted -- see the `name == nullptr` arm
-    // there) and can only ever return a bare identifier itself (an exact
-    // spelling, a builtin alias's canonical spelling, or a scoped alias's
-    // target, none of which is ever dot-qualified). A dotted or `#`-bearing
-    // key in this map -- which is exactly the key a NESTED or isolated
-    // class is recorded under -- is therefore written but never looked up;
-    // only a bare top-level (or control-flow-nested) key is ever read back.
-    //
-    // "Execution order" is approximated by SOURCE POSITION. Two limits on
-    // that, both recorded rather than hidden, since the check's whole
-    // soundness argument is written here:
-    //
-    //   - It holds only WITHIN ONE EXECUTION CONTEXT. A function body runs at
-    //     CALL time, so a class inside a def may legitimately name a
-    //     module-level base written below the def. validate_class_bases is
-    //     therefore called with check_order=false on the
-    //     declare_isolated_class path; see that call site.
-    //   - Within the module body it is sound for straight-line code and for
-    //     the FIRST pass through an `if`/`while`/`for`, none of which can
-    //     move a `class` statement's execution earlier than its own position,
-    //     and there are no imports, no `del`, and no runtime rebinding of a
-    //     class name. It is NOT sound on a LOOP'S SECOND ITERATION, where a
-    //     class statement above can run after one below it ran on the first
-    //     pass. Measured: a `for` whose body guards `class Child(Parent):`
-    //     behind a flag first set at the bottom of the body, with
-    //     `class Parent:` below the guard, is mypy-clean and runs fine under
-    //     CPython, and this check reports a NameError for it anyway -- a
-    //     known unsound over-fire on a contrived shape. Suppressing the check
-    //     whenever subclass and base share a loop body was considered and
-    //     rejected: it would silently accept the far likelier `for ...:
-    //     class Child(Parent): ... class Parent: ...`, which CPython fails on
-    //     its FIRST iteration, trading a rare false diagnostic for a common
-    //     wrong-code bug.
-    std::map<std::string, int> class_declaration_lines_;
 
     // Which ClassDefs pre_collect_class_body has already run for, so
     // visit(ClassDef) does not run it a SECOND time for a class the
