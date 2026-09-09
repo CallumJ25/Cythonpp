@@ -3478,5 +3478,39 @@ TEST(TypeChecker, ANonParametricBuiltinSubclassSubscriptsAsItsBaseElement) {
                  "    print(s)\n");
 }
 
+// Verified against mypy 1.18.1: `Success`.
+TEST(TypeChecker, AConstantTupleIndexSelectsTheElementType) {
+    expect_clean("def f() -> None:\n"
+                 "    t: tuple[int, str] = (1, \"a\")\n"
+                 "    a: int = t[0]\n"
+                 "    b: str = t[1]\n"
+                 "    c: str = t[-1]\n"
+                 "    print(a, b, c)\n");
+}
+
+// Verified against mypy 1.18.1: `Tuple index out of range [misc]`.
+TEST(TypeChecker, AnOutOfRangeConstantTupleIndexIsReported) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    t: tuple[int, str] = (1, \"a\")\n"
+                                         "    print(t[5])\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "tuple index out of range");
+}
+
+// A VARIABLE index still yields the union, so this stays a genuine error --
+// and mypy agrees, since it gives `builtins.int | builtins.str` there too.
+TEST(TypeChecker, AVariableTupleIndexStillYieldsTheUnion) {
+    const Checked checked = check_module("def f(i: int) -> None:\n"
+                                         "    t: tuple[int, str] = (1, \"a\")\n"
+                                         "    a: int = t[i]\n"
+                                         "    print(a)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"int | str\", "
+              "variable has type \"int\")");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

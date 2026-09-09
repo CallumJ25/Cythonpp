@@ -1,6 +1,7 @@
 #include "expression_typer.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <utility>
@@ -69,6 +70,43 @@ public:
 private:
     ScopeStack& scopes_;
 };
+
+// The integer VALUE of an index expression written as an integer literal --
+// `t[0]`, and `t[-1]`, which the AST represents as a UnaryOp(-) over a
+// Constant, since the sign lives in the operator and never in the lexeme
+// (the same split type_of_constant's own `negated` parameter exists for).
+//
+// std::nullopt for every other shape: a name, a call, an arithmetic
+// expression, a non-integer literal, or a literal whose magnitude does not
+// fit 64 bits. DECIMAL DIGITS ONLY -- `0x10`, `0o7`, `0b1` and `1_0` are all
+// legal Python integer literals this deliberately declines to read, because
+// the only consumer is a tuple index (whose useful range is single digits)
+// and a wrong parse there would silently select the wrong element. Declining
+// costs the union, which is always a safe answer.
+std::optional<long long> literal_integer_index(const ast::Expr& index) {
+    const ast::Expr* operand = &index;
+    bool negated = false;
+    if (const auto* unary = dynamic_cast<const ast::UnaryOp*>(&index)) {
+        if (unary->op() != lexer::token_type::OP_MINUS) {
+            return std::nullopt;
+        }
+        negated = true;
+        operand = &unary->operand();
+    }
+    const auto* constant = dynamic_cast<const ast::Constant*>(operand);
+    if (constant == nullptr || constant->type() != lexer::token_type::LITERAL_INT) {
+        return std::nullopt;
+    }
+    const std::string& lexeme = constant->lexeme();
+    if (lexeme.empty() || lexeme.find_first_not_of("0123456789") != std::string::npos) {
+        return std::nullopt;
+    }
+    if (!integer_literal_fits_64_bits(lexeme, /*allow_two_to_63=*/negated)) {
+        return std::nullopt;
+    }
+    const long long magnitude = std::strtoll(lexeme.c_str(), nullptr, 10);
+    return negated ? -magnitude : magnitude;
+}
 
 } // namespace
 
@@ -423,10 +461,22 @@ Type ExpressionTyper::type_of_tuple(const ast::TupleExpr& tuple, const Type& exp
 Type ExpressionTyper::type_of_subscript(const ast::Subscript& subscript) {
     const Type container = type_of(subscript.value(), Type::unknown());
     const Type index = type_of(subscript.index(), Type::unknown());
-    const RuleResult result = subscript_result(container, index, &classes_);
-    return apply(result, subscript,
-                 "invalid index type \"" + type_name(index) + "\" for \"" + type_name(container) +
-                     "\"");
+    const std::optional<long long> literal = literal_integer_index(subscript.index());
+    const RuleResult result = subscript_result(container, index, &classes_, literal);
+
+    // WHICH MESSAGE, decided here because this is the only place with the
+    // rendered types and the diagnostic wording -- subscript_result, like
+    // every rule table in this project, reports nothing itself. A
+    // NotApplicable from a heterogeneous tuple indexed by a LITERAL means the
+    // index was out of range, not that its type was wrong (an `int` index is
+    // always the right KIND for a tuple), and mypy's own message for it says
+    // exactly that.
+    std::string message = "invalid index type \"" + type_name(index) + "\" for \"" +
+                          type_name(container) + "\"";
+    if (container.kind == TypeKind::Tuple && !container.args.empty() && literal.has_value()) {
+        message = "tuple index out of range";
+    }
+    return apply(result, subscript, std::move(message));
 }
 
 Type ExpressionTyper::type_of_attribute(const ast::Attribute& attribute) {

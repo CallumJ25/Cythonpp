@@ -407,7 +407,8 @@ RuleResult comparison_result(lexer::token_type op, const Type& left, const Type&
     }
 }
 
-RuleResult subscript_result(const Type& container, const Type& index, const ClassLookup* classes) {
+RuleResult subscript_result(const Type& container, const Type& index, const ClassLookup* classes,
+                            std::optional<long long> literal_index) {
     if (container.kind == TypeKind::Unknown || index.kind == TypeKind::Unknown) {
         return RuleResult::ok(Type::unknown());
     }
@@ -424,8 +425,13 @@ RuleResult subscript_result(const Type& container, const Type& index, const Clas
                 // here means a non-subscriptable builtin base (`class
                 // Sub(int)`), and that may not become a TypeError, because
                 // the class is free to define its own __getitem__ on top of
-                // what it inherits.
-                const RuleResult inherited = subscript_result(*base, index, classes);
+                // what it inherits. literal_index is forwarded too -- a
+                // literal-indexed subscript of a class whose base is a
+                // heterogeneous tuple (were that base representable) must
+                // resolve element-wise exactly like a plain tuple would, not
+                // silently fall back to the union one level down.
+                const RuleResult inherited =
+                    subscript_result(*base, index, classes, literal_index);
                 if (inherited.status == RuleResult::Status::Ok) {
                     return inherited;
                 }
@@ -480,6 +486,21 @@ RuleResult subscript_result(const Type& container, const Type& index, const Clas
         // this one. NotApplicable is the caller's cue to report instead.
         if (container.args.empty()) {
             return RuleResult::not_applicable();
+        }
+        if (literal_index.has_value()) {
+            // Element-wise, negatives normalised from the end. Out of range
+            // in either direction is NotApplicable -- i.e. a TypeError from
+            // the caller, which mypy reports too (`Tuple index out of range`,
+            // code `misc`, not `index`), so reporting it cannot break the
+            // hard invariant. The caller supplies the wording; see
+            // ExpressionTyper::type_of_subscript.
+            const long long size = static_cast<long long>(container.args.size());
+            const long long normalised =
+                *literal_index < 0 ? *literal_index + size : *literal_index;
+            if (normalised < 0 || normalised >= size) {
+                return RuleResult::not_applicable();
+            }
+            return RuleResult::ok(container.args[static_cast<std::size_t>(normalised)]);
         }
         // The union of every member. mypy selects the one member a LITERAL
         // index names, which needs literal types; the union is the sound

@@ -702,6 +702,68 @@ TEST(SubscriptResult, IndexingAnEmptyTupleDoesNotApply) {
     expect_no_subscript(Type::tuple_of({}), Type::int_());
 }
 
+// A heterogeneous tuple indexed by an integer LITERAL yields that element.
+// Verified against mypy 1.18.1: reveal_type(t[0]) for
+// `t: tuple[int, str]` is `builtins.int` and t[-1] is `builtins.str`.
+TEST(SubscriptResult, ALiteralIndexSelectsOneTupleElement) {
+    const Type pair = Type::tuple_of({Type::int_(), Type::str()});
+    const RuleResult first = subscript_result(pair, Type::int_(), nullptr, 0);
+    EXPECT_EQ(first.status, RuleResult::Status::Ok);
+    EXPECT_EQ(first.type, Type::int_());
+
+    const RuleResult second = subscript_result(pair, Type::int_(), nullptr, 1);
+    EXPECT_EQ(second.status, RuleResult::Status::Ok);
+    EXPECT_EQ(second.type, Type::str());
+}
+
+// Negative indices resolve from the END. Verified: t[-1] is `builtins.str`
+// and t[-2] is `builtins.int`.
+TEST(SubscriptResult, ANegativeLiteralIndexResolvesFromTheEnd) {
+    const Type pair = Type::tuple_of({Type::int_(), Type::str()});
+    EXPECT_EQ(subscript_result(pair, Type::int_(), nullptr, -1).type, Type::str());
+    EXPECT_EQ(subscript_result(pair, Type::int_(), nullptr, -2).type, Type::int_());
+}
+
+// Out of range in either direction is NotApplicable -- the caller reports.
+// mypy reports it too (`Tuple index out of range [misc]`), so reporting is
+// invariant-safe, and TypeError is the closest of the four codes to a static
+// index violation.
+TEST(SubscriptResult, AnOutOfRangeLiteralIndexIsNotApplicable) {
+    const Type pair = Type::tuple_of({Type::int_(), Type::str()});
+    EXPECT_EQ(subscript_result(pair, Type::int_(), nullptr, 2).status,
+              RuleResult::Status::NotApplicable);
+    EXPECT_EQ(subscript_result(pair, Type::int_(), nullptr, -3).status,
+              RuleResult::Status::NotApplicable);
+}
+
+// EVERY OTHER INDEX SHAPE keeps the union, which is already correct: mypy
+// gives `builtins.int | builtins.str` for a variable index, INCLUDING one
+// assigned a literal on the line above, because what drives element-wise
+// resolution is the index's TYPE being literal and this grammar has no
+// Literal/Final to express that. This is a subset of mypy's rule, on purpose.
+TEST(SubscriptResult, ANonLiteralTupleIndexStillYieldsTheUnion) {
+    const Type pair = Type::tuple_of({Type::int_(), Type::str()});
+    const RuleResult result = subscript_result(pair, Type::int_(), nullptr, std::nullopt);
+    EXPECT_EQ(result.status, RuleResult::Status::Ok);
+    EXPECT_EQ(result.type, Type::union_of({Type::int_(), Type::str()}));
+}
+
+// A literal index changes nothing for any other container.
+TEST(SubscriptResult, ALiteralIndexIsIgnoredForANonTupleContainer) {
+    const RuleResult result =
+        subscript_result(Type::list_of(Type::str()), Type::int_(), nullptr, 7);
+    EXPECT_EQ(result.status, RuleResult::Status::Ok);
+    EXPECT_EQ(result.type, Type::str());
+}
+
+// An EMPTY tuple stays NotApplicable whether or not an index was written --
+// there is no element to select and nothing upstream reported it, so handing
+// back the absorbing Unknown would mask every later error.
+TEST(SubscriptResult, AnEmptyTupleIsStillNotApplicableWithALiteralIndex) {
+    EXPECT_EQ(subscript_result(Type::tuple_of({}), Type::int_(), nullptr, 0).status,
+              RuleResult::Status::NotApplicable);
+}
+
 TEST(SubscriptResult, UnknownIsAbsorbingOnEitherSide) {
     expect_subscript(Type::unknown(), Type::int_(), Type::unknown());
     expect_subscript(Type::list_of(Type::str()), Type::unknown(), Type::unknown());

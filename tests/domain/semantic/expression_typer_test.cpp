@@ -691,9 +691,19 @@ TEST(ExpressionTyper, TypesSubscriptThroughTheRuleTable) {
     EXPECT_EQ(typed_name("xs[0]", {{"xs", Type::list_of(Type::str())}}), "str");
     EXPECT_EQ(typed_name("bs[0]", {{"bs", Type::bytes()}}), "int") << "bytes[int] is int";
     EXPECT_EQ(typed_name("d[\"k\"]", {{"d", Type::dict_of(Type::str(), Type::int_())}}), "int");
-    EXPECT_EQ(typed_name("t[0]", {{"t", Type::tuple_of({Type::int_(), Type::str()})}}),
+    // An integer LITERAL index resolves a heterogeneous tuple element-wise.
+    // Verified against mypy 1.18.1: reveal_type(t[0]) for `t: tuple[int, str]`
+    // is `builtins.int`.
+    EXPECT_EQ(typed_name("t[0]", {{"t", Type::tuple_of({Type::int_(), Type::str()})}}), "int")
+        << "a literal index selects that one element";
+    // A VARIABLE index still yields the union -- mypy's element-wise rule
+    // depends on the index's TYPE being literal, which this grammar has no
+    // way to express for anything but the literal syntax itself. Verified:
+    // reveal_type(t[i]) for `i: int` is `builtins.int | builtins.str`.
+    EXPECT_EQ(typed_name("t[i]", {{"t", Type::tuple_of({Type::int_(), Type::str()})},
+                                  {"i", Type::int_()}}),
               "int | str")
-        << "a heterogeneous tuple yields the union";
+        << "a variable index still yields the union";
 }
 
 TEST(ExpressionTyper, ReportsABadIndexType) {

@@ -1,6 +1,7 @@
 #ifndef CYTHONPP_DOMAIN_SEMANTIC_OPERATOR_RULES_H
 #define CYTHONPP_DOMAIN_SEMANTIC_OPERATOR_RULES_H
 
+#include <optional>
 #include <vector>
 
 #include "class_lookup.h"
@@ -60,8 +61,26 @@ RuleResult comparison_result(lexer::token_type op, const Type& left, const Type&
 // `classes` is forwarded to is_subtype for the dict key check, so a dict
 // keyed by a base class accepts a subclass index. It may be null, in which
 // case two differently-named classes are simply unrelated.
+//
+// `literal_index` is the integer VALUE of the index when it was written as an
+// integer literal, and std::nullopt for every other index shape. Consulted by
+// the Tuple arm alone.
+//
+// It exists because mypy resolves a tuple subscript ELEMENT-WISE when the
+// index's TYPE is literal, and yields the union of every member otherwise --
+// verified against mypy 1.18.1: for `t: tuple[int, str]`, `t[0]` is
+// `builtins.int`, `t[-1]` is `builtins.str`, and `t[i]` for `i: int` is
+// `builtins.int | builtins.str` EVEN WHEN `i` was assigned 0 on the line
+// above. This grammar has no Literal/Final, so "the index's type is literal"
+// reduces here to "the index expression is an integer literal" -- a SUBSET of
+// mypy's rule, deliberately. Do not later "fix" the variable-index case into
+// an error; the union is what mypy produces for it.
+//
+// A caller that cannot see the index EXPRESSION (a rule-table test, say) omits
+// it and gets today's union behaviour.
 RuleResult subscript_result(const Type& container, const Type& index,
-                            const ClassLookup* classes = nullptr);
+                            const ClassLookup* classes = nullptr,
+                            std::optional<long long> literal_index = std::nullopt);
 
 // What iterating `iterable` yields, for `for` and for comprehensions.
 // Iterating a dict yields its KEYS, not its items.
