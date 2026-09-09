@@ -3265,5 +3265,31 @@ TEST(TypeChecker, ANonParametricBuiltinBaseStillWorks) {
                  "print(x)\n");
 }
 
+// Subscripting a subclass of a NON-parametric builtin resolves through the
+// inherited base, exactly as the parametric cases above do -- it is the same
+// widened rule, not a parametric-only one, and it moved too: this used to be
+// a NotImplementedError deferral.
+//
+// Verified against mypy 1.18.1: for `class C(str)` and `c = C()`,
+// reveal_type(c) is "C" and reveal_type(c[0]) is "builtins.str", and the
+// program below is "Success: no issues found in 1 source file". So
+// `s: str = c[0]` must be accepted, and the deferral this used to produce was
+// a NotImplementedError on a program mypy takes.
+//
+// The body is deliberately never CALLED here. Calling it would index the
+// EMPTY string `C()` returns and raise IndexError under CPython (measured) --
+// a runtime data condition, nothing to do with the rule under test -- and
+// `C("abc")`, the obvious fix, trips the separate, pre-existing
+// inherited-constructor arity bug (measured: cythonpp says `too many
+// arguments for "C"` where mypy is Success).
+TEST(TypeChecker, ANonParametricBuiltinSubclassSubscriptsAsItsBaseElement) {
+    expect_clean("class C(str):\n"
+                 "    pass\n"
+                 "def f() -> None:\n"
+                 "    c = C()\n"
+                 "    s: str = c[0]\n"
+                 "    print(s)\n");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic
