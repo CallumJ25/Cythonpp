@@ -321,24 +321,54 @@ Type ClassTable::constructor_type(const std::string& qualified_name) const {
     return Type::callable(std::move(params), Type::class_of(resolved), defaulted);
 }
 
-bool ClassTable::constructor_accepts_any_arity(const std::string& qualified_name) const {
+ClassTable::ConstructorCheck
+ClassTable::constructor_check(const std::string& qualified_name) const {
     const std::string resolved = canonical_name(qualified_name);
 
-    // A DECLARED __init__ anywhere in the chain settles it: that signature is
-    // the constructor and it is checked. Reuses constructor_type's own
-    // declared-__init__ search shape rather than a second copy, so the two
-    // can never disagree about which classes have one.
-    std::vector<std::string> init_visited;
-    if (walk_chain<Type>(resolved, init_visited,
-                         [](const std::string&, const Entry& entry) -> std::optional<Type> {
-                             const auto it = entry.methods.find("__init__");
-                             return it == entry.methods.end() ? std::nullopt
-                                                              : std::optional<Type>(it->second);
-                         })
-            .has_value()) {
-        return false;
+    // What the ONE walk below can find, in the order the walk itself reaches
+    // it -- never in a fixed priority order, which is the whole point (see
+    // the header's POSITION MATTERS paragraph). Three separate whole-chain
+    // walks, one per question, answered "is there an __init__ ANYWHERE" and
+    // so could never see that a builtin or BaseException base to the LEFT
+    // gets there first.
+    enum class Reached {
+        DeclaredInit,
+        BaseExceptionBase,
+        BuiltinKindBase,
+    };
+
+    std::vector<std::string> visited;
+    const std::optional<Reached> reached = walk_chain<Reached>(
+        resolved, visited,
+        [](const std::string& canonical, const Entry& entry) -> std::optional<Reached> {
+            // A DECLARED __init__, not one that merely resolves: an implicit
+            // object.__init__ must not shadow a base further along. Matches
+            // constructor_type's own declared-__init__ search, so the two
+            // cannot disagree about which classes have one.
+            if (entry.methods.find("__init__") != entry.methods.end()) {
+                return Reached::DeclaredInit;
+            }
+            if (canonical == "BaseException") {
+                return Reached::BaseExceptionBase;
+            }
+            // object is excluded for inherits_builtin's reason: every class
+            // conceptually derives from it, so counting it would make every
+            // constructor unmodellable. A seeded exception class is an
+            // ordinary Class rather than a modelled kind, so it reaches
+            // BaseException above rather than here.
+            if (canonical != "object" && builtin_type_kind(canonical).has_value()) {
+                return Reached::BuiltinKindBase;
+            }
+            return std::nullopt;
+        });
+
+    if (reached.has_value() && *reached == Reached::DeclaredInit) {
+        return ConstructorCheck::Checked;
     }
 
+    // The __new__ fallback, deliberately a WHOLE-CHAIN question rather than a
+    // positional one (see the header): this model does not represent __new__
+    // at all, so there is no signature whose position could matter.
     std::vector<std::string> new_visited;
     if (walk_chain<Type>(resolved, new_visited,
                          [](const std::string&, const Entry& entry) -> std::optional<Type> {
@@ -347,30 +377,14 @@ bool ClassTable::constructor_accepts_any_arity(const std::string& qualified_name
                                                               : std::optional<Type>(it->second);
                          })
             .has_value()) {
-        return true;
+        return ConstructorCheck::Unchecked;
     }
 
-    std::vector<std::string> exception_visited;
-    const std::optional<bool> is_exception = walk_chain<bool>(
-        resolved, exception_visited,
-        [](const std::string& canonical, const Entry&) -> std::optional<bool> {
-            return canonical == "BaseException" ? std::optional<bool>(true) : std::nullopt;
-        });
-    if (is_exception.has_value() && *is_exception) {
-        return true;
+    if (!reached.has_value()) {
+        return ConstructorCheck::Checked;
     }
-
-    // The builtin-base half of the rule (see the header comment): a base
-    // chain reaching a name builtin_type_kind() recognises -- int, str,
-    // list, ... -- has a real constructor this model cannot represent
-    // (an overload set), so the same capability answer applies. Measured
-    // against mypy 1.18.1 and CPython: `class MyInt(int): pass` then
-    // `MyInt(3)`, and `class C(str): pass` then `C("abc")`, are both
-    // `Success` and both run cleanly, where this compiler used to report a
-    // false "too many arguments" for both. inherits_builtin already
-    // excludes `object` and a seeded exception class (an ordinary Class,
-    // not a modelled kind), so it cannot fire for MyError above.
-    return inherits_builtin(resolved);
+    return *reached == Reached::BaseExceptionBase ? ConstructorCheck::Unchecked
+                                                  : ConstructorCheck::Unmodellable;
 }
 
 bool ClassTable::inherits_builtin(const std::string& qualified_name) const {

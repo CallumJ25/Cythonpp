@@ -310,7 +310,7 @@ TEST(ClassTable, ConstructorTypeOwnInitBeatsInherited) {
 }
 
 // A class whose base chain reaches BaseException and which declares no
-// __init__ of its own accepts ANY arity. Verified against mypy 1.18.1:
+// __init__ of its own is UNCHECKED. Verified against mypy 1.18.1:
 // reveal_type(MyError) for `class MyError(Exception): pass` is
 // `def (*args: builtins.object) -> MyError`, and MyError(), MyError("boom")
 // and MyError("boom", 42) are all clean. This model has no variadic
@@ -318,71 +318,134 @@ TEST(ClassTable, ConstructorTypeOwnInitBeatsInherited) {
 // a CAPABILITY answer ("do not check the arity of this constructor"), not a
 // signature. Same reasoning that gave the integer-overflow diagnostic its own
 // code rather than folding it into TypeError.
-TEST(ClassTable, AnExceptionSubclassWithNoInitAcceptsAnyArity) {
+TEST(ClassTable, AnExceptionSubclassWithNoInitIsUnchecked) {
     ClassTable table;
     table.declare("MyError", {Type::class_of("Exception")});
-    EXPECT_TRUE(table.constructor_accepts_any_arity("MyError"));
+    EXPECT_EQ(table.constructor_check("MyError"), ClassTable::ConstructorCheck::Unchecked);
 }
 
-TEST(ClassTable, ASeededExceptionAcceptsAnyArity) {
+TEST(ClassTable, ASeededExceptionIsUnchecked) {
     const ClassTable table;
-    EXPECT_TRUE(table.constructor_accepts_any_arity("ValueError"));
-    EXPECT_TRUE(table.constructor_accepts_any_arity("OSError"));
+    EXPECT_EQ(table.constructor_check("ValueError"), ClassTable::ConstructorCheck::Unchecked);
+    EXPECT_EQ(table.constructor_check("OSError"), ClassTable::ConstructorCheck::Unchecked);
     // Reached through the alias spelling too, like every other read query.
-    EXPECT_TRUE(table.constructor_accepts_any_arity("IOError"));
+    EXPECT_EQ(table.constructor_check("IOError"), ClassTable::ConstructorCheck::Unchecked);
 }
 
-// An ordinary class does NOT. Verified: `Plain("x")` really is
-// `Too many arguments for "Plain" [call-arg]`, and an explicit `object` base
-// is byte-identically the same.
-TEST(ClassTable, APlainClassDoesNotAcceptAnyArity) {
+// An ordinary class is checked. Verified against mypy 1.18.1: `Plain("x")`
+// really is `Too many arguments for "Plain"  [call-arg]`, and an explicit
+// `object` base produces byte-identical mypy output (diffed; CPython says
+// `TypeError: Plain() takes no arguments` for both).
+TEST(ClassTable, APlainClassIsChecked) {
     ClassTable table;
     table.declare("Plain", {});
-    EXPECT_FALSE(table.constructor_accepts_any_arity("Plain"));
+    EXPECT_EQ(table.constructor_check("Plain"), ClassTable::ConstructorCheck::Checked);
 }
 
-// A DECLARED __init__ wins over the any-arity rule: an exception subclass
-// that defines its own constructor is checked against it.
+// A DECLARED __init__ wins: an exception subclass that defines its own
+// constructor is checked against it.
 TEST(ClassTable, AnExceptionSubclassWithItsOwnInitIsCheckedNormally) {
     ClassTable table;
     table.declare("MyError", {Type::class_of("Exception")});
     table.declare_method("MyError", "__init__",
                          Type::callable({Type::class_of("MyError"), Type::str()}, Type::none()));
-    EXPECT_FALSE(table.constructor_accepts_any_arity("MyError"));
+    EXPECT_EQ(table.constructor_check("MyError"), ClassTable::ConstructorCheck::Checked);
     EXPECT_EQ(type_name(table.constructor_type("MyError")), "Callable[[str], MyError]");
 }
 
-// __new__ WITH NO __init__ is treated as any-arity too. Measured: __new__
-// participates fully when no __init__ exists (mypy reveals
-// `def (a: builtins.int) -> N` for a class declaring only
-// `__new__(cls, a: int)`), and loses outright to __init__ when both exist.
+// __new__ WITH NO __init__ is unchecked too. Measured against mypy 1.18.1:
+// __new__ participates fully when no __init__ exists (a class declaring only
+// `__new__(cls, a: int)` reveals as `def (a: builtins.int) -> N`), and loses
+// outright to __init__ when both exist (a class declaring both
+// `__new__(cls, a: int)` and `__init__(self, b: str)` reveals as
+// `def (b: builtins.str) -> M`, with no complaint about the contradiction).
 // Modelling it properly is out of scope, so the fallback deliberately errs
 // toward a MISSED error rather than a false "too few arguments" on every
 // construction.
-TEST(ClassTable, AClassDeclaringOnlyNewAcceptsAnyArity) {
+TEST(ClassTable, AClassDeclaringOnlyNewIsUnchecked) {
     ClassTable table;
     table.declare("N", {});
     table.declare_method("N", "__new__",
                          Type::callable({Type::class_of("type"), Type::int_()},
                                         Type::class_of("N")));
-    EXPECT_TRUE(table.constructor_accepts_any_arity("N"));
+    EXPECT_EQ(table.constructor_check("N"), ClassTable::ConstructorCheck::Unchecked);
 }
 
-// The extension beyond the exception rule: a class whose base chain reaches a
-// builtin KIND (int, str, list, ...) has a real constructor this model
-// cannot represent either -- an overload set, same as BaseException's
-// *args: object. Measured against mypy 1.18.1 and CPython: `class MyInt(int):
-// pass` then `MyInt(3)`, and `class C(str): pass` then `C("abc")`, are both
-// `Success` / a clean run, where this compiler used to report a false "too
-// many arguments" for both.
-TEST(ClassTable, AClassInheritingABuiltinKindWithNoInitAcceptsAnyArity) {
+// A class whose base chain reaches a builtin KIND (int, str, list, ...) is
+// UNMODELLABLE, not unchecked -- the two answers differ because the
+// constructors do. Measured against mypy 1.18.1 and CPython:
+// `class MyInt(int): pass` makes MyInt(3) and MyInt("ff", 16) `Success` /
+// clean runs, but MyInt(1, 2, 3) is `No overload variant of "MyInt" matches
+// argument types "int", "int", "int"  [call-overload]` and CPython raises
+// `TypeError: int() takes at most 2 arguments (3 given)`. A bounded overload
+// set, unlike BaseException's genuine `*args: object` -- so silence would be
+// silent acceptance of a program both oracles reject, and the caller reports
+// NotImplementedError instead.
+TEST(ClassTable, AClassInheritingABuiltinKindWithNoInitIsUnmodellable) {
     ClassTable table;
     table.declare("MyInt", {Type::int_()});
-    EXPECT_TRUE(table.constructor_accepts_any_arity("MyInt"));
+    EXPECT_EQ(table.constructor_check("MyInt"), ClassTable::ConstructorCheck::Unmodellable);
 
     ClassTable table2;
     table2.declare("C", {Type::str()});
-    EXPECT_TRUE(table2.constructor_accepts_any_arity("C"));
+    EXPECT_EQ(table2.constructor_check("C"), ClassTable::ConstructorCheck::Unmodellable);
+}
+
+// The search is POSITION-AWARE, because Python and mypy resolve the
+// constructor by MRO: a builtin base to the LEFT of a plain base that
+// declares __init__ wins, and the plain base to the left wins right back.
+// Verified against mypy 1.18.1, with `class Mixin: def __init__(self, a: str)`:
+// `class MyInt(int, Mixin): pass` then MyInt(3) is `Success` (and CPython
+// prints 3), while `class MyInt(Mixin, int): pass` then MyInt(3) is
+// `Argument 1 to "MyInt" has incompatible type "int"; expected "str"
+// [arg-type]`.
+TEST(ClassTable, ABuiltinBaseLeftOfADeclaredInitWins) {
+    ClassTable table;
+    table.declare("Mixin", {});
+    table.declare_method("Mixin", "__init__",
+                         Type::callable({Type::class_of("Mixin"), Type::str()}, Type::none()));
+    table.declare("MyInt", {Type::int_(), Type::class_of("Mixin")});
+    EXPECT_EQ(table.constructor_check("MyInt"), ClassTable::ConstructorCheck::Unmodellable);
+}
+
+TEST(ClassTable, ADeclaredInitLeftOfABuiltinBaseWins) {
+    ClassTable table;
+    table.declare("Mixin", {});
+    table.declare_method("Mixin", "__init__",
+                         Type::callable({Type::class_of("Mixin"), Type::str()}, Type::none()));
+    table.declare("MyInt", {Type::class_of("Mixin"), Type::int_()});
+    EXPECT_EQ(table.constructor_check("MyInt"), ClassTable::ConstructorCheck::Checked);
+    EXPECT_EQ(type_name(table.constructor_type("MyInt")), "Callable[[str], MyInt]");
+}
+
+// The same rule for an exception base. Verified against mypy 1.18.1 with the
+// same Mixin: `class MyErr(Exception, Mixin): pass` then MyErr("boom", 42) is
+// `Success` and CPython prints `('boom', 42)`, where the whole-chain search
+// reported a false `too many arguments for "MyErr"`.
+TEST(ClassTable, AnExceptionBaseLeftOfADeclaredInitWins) {
+    ClassTable table;
+    table.declare("Mixin", {});
+    table.declare_method("Mixin", "__init__",
+                         Type::callable({Type::class_of("Mixin"), Type::str()}, Type::none()));
+    table.declare("MyErr", {Type::class_of("Exception"), Type::class_of("Mixin")});
+    EXPECT_EQ(table.constructor_check("MyErr"), ClassTable::ConstructorCheck::Unchecked);
+}
+
+// Position is about which base is reached FIRST, not about depth: a declared
+// __init__ two levels up the LEFTMOST base still beats an exception base to
+// its right. Verified against mypy 1.18.1: with `class Grand` declaring
+// `__init__(self, a: int)`, `class Mid(Grand)` and `class Leaf(Mid,
+// Exception)`, `Leaf("s")` is `Argument 1 to "Leaf" has incompatible type
+// "str"; expected "int"  [arg-type]`.
+TEST(ClassTable, ADeclaredInitTwoLevelsUpTheLeftBaseBeatsAnExceptionBase) {
+    ClassTable table;
+    table.declare("Grand", {});
+    table.declare_method("Grand", "__init__",
+                         Type::callable({Type::class_of("Grand"), Type::int_()}, Type::none()));
+    table.declare("Mid", {Type::class_of("Grand")});
+    table.declare("Leaf", {Type::class_of("Mid"), Type::class_of("Exception")});
+    EXPECT_EQ(table.constructor_check("Leaf"), ClassTable::ConstructorCheck::Checked);
+    EXPECT_EQ(type_name(table.constructor_type("Leaf")), "Callable[[int], Leaf]");
 }
 
 // REGRESSION GUARDS for behaviour that is already correct and was untested:

@@ -462,29 +462,146 @@ TEST(TypeChecker, AnInheritedConstructorIsCheckedAgainstItsParameters) {
               "argument 1 to \"Child\" has incompatible type \"str\"; expected \"int\"");
 }
 
-// The extension beyond the exception rule (see
-// ClassTable::constructor_accepts_any_arity): a class based on a builtin KIND
-// with no __init__ of its own also accepts any arity. Measured against mypy
-// 1.18.1 and CPython: both are clean / run without error, where this
-// compiler used to report a false "too many arguments" for both.
-TEST(TypeChecker, ABuiltinBasedSubclassAcceptsAnyConstructorArity) {
+// A class based on a builtin KIND with no __init__ of its own inherits a
+// BOUNDED overload set (see ClassTable::ConstructorCheck), so a call with
+// arguments is deferred rather than either checked or silently accepted.
+// Measured against mypy 1.18.1 and CPython: `class MyInt(int): pass` then
+// MyInt(3) is `Success` and prints 3, and MyInt("ff", 16) is `Success` and
+// prints 255 -- both of which an arity check on the modelled nullary
+// constructor called a false "too many arguments" -- while MyInt(1, 2, 3) is
+// `No overload variant of "MyInt" matches argument types "int", "int", "int"
+// [call-overload]` and dies with `TypeError: int() takes at most 2 arguments
+// (3 given)`. One diagnostic covers all three honestly; silence would accept
+// the third, which both oracles reject.
+TEST(TypeChecker, ABuiltinBasedSubclassDefersItsConstructorArguments) {
+    const Checked checked = check_module("class MyInt(int):\n"
+                                         "    pass\n"
+                                         "print(MyInt(3))\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message,
+              "calls to 'MyInt', which inherits an overloaded builtin constructor, are not "
+              "supported");
+
+    const Checked too_many = check_module("class MyInt(int):\n"
+                                          "    pass\n"
+                                          "print(MyInt(1, 2, 3))\n");
+    EXPECT_EQ(only_error(too_many).code, "NotImplementedError");
+
+    const Checked str_based = check_module("class C(str):\n"
+                                           "    pass\n"
+                                           "print(C(\"abc\"))\n");
+    EXPECT_EQ(only_error(str_based).code, "NotImplementedError");
+}
+
+// With NO arguments there is no overload set to be unable to spell, so the
+// modelled constructor is checked as usual and stays silent. Measured:
+// `class MyInt(int): pass` then MyInt() is mypy `Success` and prints 0.
+TEST(TypeChecker, ABuiltinBasedSubclassConstructedWithNoArgumentsIsClean) {
     expect_clean("class MyInt(int):\n"
                  "    pass\n"
-                 "print(MyInt(3))\n");
-    expect_clean("class C(str):\n"
-                 "    pass\n"
-                 "print(C(\"abc\"))\n");
+                 "print(MyInt())\n");
 }
 
 // A parametric builtin base reaches the same rule: the base is recorded as
 // `list[int]`, but ClassTable::base_key still keys it under the bare "list"
-// spelling for the chain walk, so inherits_builtin -- and now
-// constructor_accepts_any_arity -- see straight through the type argument.
-// Measured against mypy 1.18.1 and CPython: `Success` and a clean run.
-TEST(TypeChecker, AParametricBuiltinBasedSubclassAcceptsAnyConstructorArity) {
-    expect_clean("class IntList(list[int]):\n"
+// spelling for the chain walk, so the constructor question sees straight
+// through the type argument. Measured against mypy 1.18.1 and CPython:
+// `class IntList(list[int]): pass` then IntList([1, 2]) is `Success` and
+// prints [1, 2], while IntList(1, 2, 3) is `No overload variant of "IntList"
+// matches argument types "int", "int", "int"  [call-overload]` and dies with
+// `TypeError: list expected at most 1 argument, got 3`.
+TEST(TypeChecker, AParametricBuiltinBasedSubclassDefersItsConstructorArguments) {
+    const Checked checked = check_module("class IntList(list[int]):\n"
+                                         "    pass\n"
+                                         "print(IntList([1, 2]))\n");
+    EXPECT_EQ(only_error(checked).code, "NotImplementedError");
+
+    const Checked too_many = check_module("class IntList(list[int]):\n"
+                                          "    pass\n"
+                                          "print(IntList(1, 2, 3))\n");
+    EXPECT_EQ(only_error(too_many).code, "NotImplementedError");
+}
+
+// The constructor search follows base ORDER, as Python's MRO does. With a
+// builtin base to the LEFT of a plain base that declares __init__, the
+// builtin wins and the plain base's parameter types are never applied.
+// Measured against mypy 1.18.1 and CPython: this exact program is `Success`
+// and prints 3, where the whole-chain search reported a false
+// `argument 1 to "MyInt" has incompatible type "int"; expected "str"`.
+TEST(TypeChecker, ABuiltinBaseLeftOfADeclaredInitDefersTheConstructor) {
+    const Checked checked = check_module("class Mixin:\n"
+                                         "    def __init__(self, a: str) -> None:\n"
+                                         "        print(a)\n"
+                                         "class MyInt(int, Mixin):\n"
+                                         "    pass\n"
+                                         "print(MyInt(3))\n");
+    EXPECT_EQ(only_error(checked).code, "NotImplementedError");
+}
+
+// The complementary order still uses the plain base's __init__. Measured
+// against mypy 1.18.1: with the bases swapped, MyInt("s") is `Success` and
+// MyInt(3) is `Argument 1 to "MyInt" has incompatible type "int"; expected
+// "str"  [arg-type]`.
+TEST(TypeChecker, ADeclaredInitLeftOfABuiltinBaseStillChecksItsParameters) {
+    expect_clean("class Mixin:\n"
+                 "    def __init__(self, a: str) -> None:\n"
+                 "        print(a)\n"
+                 "class MyInt(Mixin, int):\n"
                  "    pass\n"
-                 "print(IntList([1, 2]))\n");
+                 "print(MyInt(\"s\"))\n");
+
+    const Checked checked = check_module("class Mixin:\n"
+                                         "    def __init__(self, a: str) -> None:\n"
+                                         "        print(a)\n"
+                                         "class MyInt(Mixin, int):\n"
+                                         "    pass\n"
+                                         "print(MyInt(3))\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "argument 1 to \"MyInt\" has incompatible type \"int\"; expected \"str\"");
+}
+
+// The same order rule with an exception base, where the answer is silence
+// rather than a deferral. Measured against mypy 1.18.1 and CPython: this
+// program is `Success` and prints ('boom', 42), where the whole-chain search
+// reported a false `too many arguments for "MyErr"`.
+TEST(TypeChecker, AnExceptionBaseLeftOfADeclaredInitAcceptsAnyArity) {
+    expect_clean("class Mixin:\n"
+                 "    def __init__(self, a: str) -> None:\n"
+                 "        print(a)\n"
+                 "class MyErr(Exception, Mixin):\n"
+                 "    pass\n"
+                 "print(MyErr(\"boom\", 42))\n");
+}
+
+// And the deeper case still CHECKS: a declared __init__ two levels up the
+// leftmost base is reached before anything reaches BaseException. Verified
+// against mypy 1.18.1: `Leaf("s")` is `Argument 1 to "Leaf" has incompatible
+// type "str"; expected "int"  [arg-type]`, and `Leaf(1)` is `Success`.
+TEST(TypeChecker, ADeclaredInitTwoLevelsUpBeatsAnExceptionBase) {
+    const Checked checked = check_module("class Grand:\n"
+                                         "    def __init__(self, a: int) -> None:\n"
+                                         "        print(a)\n"
+                                         "class Mid(Grand):\n"
+                                         "    pass\n"
+                                         "class Leaf(Mid, Exception):\n"
+                                         "    pass\n"
+                                         "print(Leaf(\"s\"))\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "argument 1 to \"Leaf\" has incompatible type \"str\"; expected \"int\"");
+
+    expect_clean("class Grand:\n"
+                 "    def __init__(self, a: int) -> None:\n"
+                 "        print(a)\n"
+                 "class Mid(Grand):\n"
+                 "    pass\n"
+                 "class Leaf(Mid, Exception):\n"
+                 "    pass\n"
+                 "print(Leaf(1))\n");
 }
 
 // The other direction must NOT be lost: too MANY arguments is still an error,
@@ -3348,9 +3465,10 @@ TEST(TypeChecker, ANonParametricBuiltinBaseStillWorks) {
 // The body is deliberately never CALLED here. Calling it would index the
 // EMPTY string `C()` returns and raise IndexError under CPython (measured) --
 // a runtime data condition, nothing to do with the rule under test.
-// (`C("abc")` used to trip a separate, now-fixed, false "too many arguments"
-// -- see TypeChecker.ABuiltinBasedSubclassAcceptsAnyConstructorArity -- but
-// the empty-string IndexError concern stands on its own regardless.)
+// (`C("abc")` is a separate question -- the inherited builtin overload set
+// this model cannot spell, see
+// TypeChecker.ABuiltinBasedSubclassDefersItsConstructorArguments -- but the
+// empty-string IndexError concern stands on its own regardless.)
 TEST(TypeChecker, ANonParametricBuiltinSubclassSubscriptsAsItsBaseElement) {
     expect_clean("class C(str):\n"
                  "    pass\n"

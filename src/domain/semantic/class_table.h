@@ -202,47 +202,89 @@ public:
     // themselves when that distinction matters.
     Type constructor_type(const std::string& qualified_name) const;
 
-    // "Should a call to this class's constructor skip its arity and argument
-    // checks entirely?" -- true for a class whose base chain reaches
-    // BaseException and which declares no __init__ anywhere in that chain,
-    // for a class whose base chain reaches a name builtin_type_kind()
-    // recognises (see inherits_builtin below) and which declares no __init__
-    // anywhere in that chain, and for a class that declares __new__ but no
-    // __init__.
+    // "How should a call to this class's constructor be checked?" -- a
+    // CAPABILITY answer, not a signature, and deliberately separate from
+    // constructor_type for that reason.
     //
-    // A CAPABILITY answer, not a signature, and deliberately separate from
-    // constructor_type for that reason. Verified against mypy 1.18.1:
-    // reveal_type of `class MyError(Exception): pass` is
-    // `def (*args: builtins.object) -> MyError`, so MyError(),
-    // MyError("boom") and MyError("boom", 42) are ALL clean -- via that one
-    // `*args: object`, not via a dedicated overload -- and so are
-    // ValueError("bad", 1, 2) and OSError(2, "no such file"). This model has
-    // no variadic Callable and inventing one for this alone is not
-    // warranted, so the honest thing is to say "do not check" rather than to
-    // hand back a signature that is a lie in one direction or the other. The
-    // same reasoning gave the integer-overflow diagnostic its own code
-    // instead of folding it into TypeError.
+    // THREE-VALUED, and an enum rather than a pair of bool predicates, for
+    // the reason RuleResult is three-valued rather than an optional and
+    // OutputMode is an enum rather than a second bool: the three answers are
+    // mutually exclusive, so two independent predicates would admit a
+    // meaningless "both true" state and force every call site to hard-code
+    // its own precedence between them. One value, one decision.
     //
-    // The builtin-base half is the identical reasoning applied to a class
-    // whose base chain reaches a builtin KIND rather than BaseException:
-    // `class MyInt(int): pass` then `MyInt(3)`, and `class C(str): pass` then
-    // `C("abc")`, are both mypy `Success` and both run fine under CPython
-    // (measured), because int/str/list/... are overload sets this model does
-    // not represent -- the same capability gap, just reached through a
-    // different seeded base rather than BaseException.
+    // The distinction that matters most here is between the two ways this
+    // model can fail to represent a constructor, which the two arms below
+    // answer DIFFERENTLY:
     //
-    // The __new__ half is a deliberate FALLBACK, not a model of __new__.
-    // Measured: __new__ participates fully when no __init__ exists (a class
-    // declaring only `__new__(cls, a: int)` reveals as `def (a: int) -> N`)
-    // and loses outright to __init__ when both exist, with no complaint about
-    // the contradiction. Rather than model that, a class with __new__ and no
-    // __init__ is treated as any-arity, so the failure mode is a MISSED error
-    // instead of a false "too few arguments" on every construction of it.
+    //  - Unchecked, for a constructor that is genuinely VARIADIC. Verified
+    //    against mypy 1.18.1: reveal_type of `class MyError(Exception): pass`
+    //    is `def (*args: builtins.object) -> MyError`, so MyError(),
+    //    MyError("boom") and MyError("boom", 42) are ALL clean -- via that
+    //    one `*args: object`, not via a dedicated overload -- and so are
+    //    ValueError("bad", 1, 2) and OSError(2, "no such file"). There is no
+    //    arity such a constructor rejects, so silence is not a guess: it is
+    //    the right answer, and there is no diagnostic to defer. This model
+    //    has no variadic Callable and inventing one for this alone is not
+    //    warranted, so the honest thing is to say "do not check" rather than
+    //    to hand back a signature that is a lie in one direction or the
+    //    other.
+    //  - Unmodellable, for a constructor that is a BOUNDED OVERLOAD SET this
+    //    model cannot spell -- a base chain reaching a builtin KIND (int,
+    //    str, list, ...). Measured against mypy 1.18.1 and CPython:
+    //    `class MyInt(int): pass` makes MyInt(3), MyInt("ff", 16) and
+    //    `class C(str): pass` C("abc") all `Success` / a clean run, but
+    //    MyInt(1, 2, 3) is `No overload variant of "MyInt" matches argument
+    //    types "int", "int", "int"` and dies under CPython with
+    //    `TypeError: int() takes at most 2 arguments (3 given)`. Both oracles
+    //    reject it, so going SILENT here would be silent acceptance of a
+    //    program neither oracle accepts. Not knowing which arity is legal is
+    //    exactly the "cannot model the construct" case, so the caller reports
+    //    NotImplementedError -- the same answer builtin_call_table already
+    //    gives for the identical gap one level down, where `int("ff", 16)`
+    //    is `calls to builtin 'int' with these argument types are not
+    //    supported`.
     //
-    // Its DECLARED __init__ always wins: an exception or builtin-based
-    // subclass that defines its own constructor is checked against it exactly
-    // like any other class.
-    bool constructor_accepts_any_arity(const std::string& qualified_name) const;
+    // Checked otherwise, including for every class whose constructor this
+    // model CAN spell: constructor_type's signature is checked as usual.
+    //
+    // POSITION MATTERS, because Python and mypy resolve the constructor by
+    // MRO, not by "anything in the chain wins". A single depth-first,
+    // left-to-right walk decides all three answers at once, stopping at the
+    // FIRST base that settles the question -- a declared __init__, a builtin
+    // kind, or BaseException -- so a leftward builtin or exception base beats
+    // a rightward plain one and vice versa. Verified against mypy 1.18.1,
+    // with `class Mixin: def __init__(self, a: str)`:
+    // `class MyInt(int, Mixin)` then MyInt(3) is `Success` (mypy takes
+    // int.__new__, the earlier MRO entry) and CPython prints 3, while
+    // `class MyInt(Mixin, int)` then MyInt(3) is
+    // `Argument 1 to "MyInt" has incompatible type "int"; expected "str"`.
+    // Three separate whole-chain walks -- one per question -- could not tell
+    // those two apart, and reported the second answer for both.
+    //
+    // The __new__ arm is a deliberate FALLBACK, not a model of __new__, and
+    // is deliberately NOT position-aware: it asks the whole chain. Measured
+    // against mypy 1.18.1: __new__ participates fully when no __init__ exists
+    // (a class declaring only `__new__(cls, a: int)` reveals as
+    // `def (a: builtins.int) -> N`) and loses outright to __init__ when both
+    // exist (`def (b: builtins.str) -> M`), with no complaint about the
+    // contradiction. Rather than model that, a class with __new__ and no
+    // __init__ is Unchecked, so the failure mode is a MISSED error instead of
+    // a false "too few arguments" on every construction of it.
+    //
+    // A DECLARED __init__ reached first always wins: an exception or
+    // builtin-based subclass that defines its own constructor is checked
+    // against it exactly like any other class.
+    enum class ConstructorCheck {
+        // constructor_type's signature is the constructor; check it.
+        Checked,
+        // Genuinely variadic; there is nothing to check and nothing to defer.
+        Unchecked,
+        // A bounded overload set this model cannot spell; defer to the caller,
+        // which reports NotImplementedError.
+        Unmodellable,
+    };
+    ConstructorCheck constructor_check(const std::string& qualified_name) const;
 
     // Whether the base chain (excluding `object`, and excluding a seeded
     // exception class, which is an ordinary Class rather than a modelled

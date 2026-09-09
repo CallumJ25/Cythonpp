@@ -250,16 +250,48 @@ private:
     Type type_of_positional_call(const Type& callable, const ast::Call& call,
                                  const std::string& label);
 
+    // A constructor call, dispatched on ClassTable::constructor_check's
+    // three-valued answer for `class_name`: Checked runs the ordinary
+    // type_of_positional_call, Unchecked skips the checks entirely, and
+    // Unmodellable reports NotImplementedError. Shared by type_of_name_call's
+    // bare-`C()` branch and type_of_call's nested-class `Outer.Inner()`
+    // branch, so the two can never drift apart -- `class_name` is the
+    // identifier for the first and the dotted `Outer.Inner` for the second,
+    // and is both the ClassTable key and (quoted) the diagnostic label.
+    //
+    // One exception to the dispatch, at the Unmodellable arm: a call with NO
+    // arguments falls through to Checked. There is no overload set to be
+    // unable to spell when nothing is passed -- `class Sub(int): pass` then
+    // `Sub()` is mypy `Success` and runs clean, and the modelled (usually
+    // nullary) constructor already answers it. Reporting there would be noise
+    // on a program both oracles accept, and would ALSO throw away the one
+    // diagnostic this shape does earn: with `class MyInt(int, Mixin)` where
+    // Mixin declares `__init__(self, a: str)`, `MyInt()` dies under CPython
+    // with `TypeError: Mixin.__init__() missing 1 required positional
+    // argument: 'a'` (measured), and the ordinary too-few-arguments check
+    // catches it.
+    Type type_of_construction(const std::string& class_name, const Type& constructor,
+                              const ast::Call& call);
+
     // A constructor call whose arity and arguments are deliberately
-    // unchecked -- see ClassTable::constructor_accepts_any_arity. Shared by
-    // type_of_name_call's bare-`C()` branch and type_of_call's nested-class
-    // `Outer.Inner()` branch, so the two can never drift apart. Types every
+    // unchecked -- see ClassTable::ConstructorCheck::Unchecked. Types every
     // argument against Type::unknown() (one root cause inside an argument,
     // one diagnostic -- the same rule every other arm in this file follows)
     // and returns the instance type `constructor` itself already carries as
     // its return (constructor.args.back()), or Type::unknown() on the
     // unreachable-today empty-args shape type_of_positional_call also
     // guards against.
+    //
+    // A KNOWN INCONSISTENCY in the --types dump, deliberately left alone:
+    // both callers record `constructor` -- the NULLARY callable
+    // constructor_type builds for a class with no modelled __init__ -- as the
+    // callee's type BEFORE reaching here, so a suppressed call dumps a callee
+    // typed `Callable[[], MyError]` applied to two arguments. mypy's own
+    // answer (`def (*args: builtins.object) -> MyError`) is not representable
+    // in this model, so there is no honest type to record instead; nothing
+    // consumes the entry, and omitting it would only trade a contradiction
+    // for a hole. Read it as "the constructor this model could spell", not as
+    // a claim about the call.
     Type type_of_unchecked_construction(const Type& constructor, const ast::Call& call);
 
     // The shared tail for every callee shape ONCE ITS OWN TYPE IS KNOWN --

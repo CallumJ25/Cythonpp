@@ -44,15 +44,43 @@ bool is_bare_container_constructor(const std::string& name, std::size_t arg_coun
 
 } // namespace
 
+Type ExpressionTyper::type_of_construction(const std::string& class_name,
+                                           const Type& constructor, const ast::Call& call) {
+    switch (classes_.constructor_check(class_name)) {
+    case ClassTable::ConstructorCheck::Unchecked:
+        return type_of_unchecked_construction(constructor, call);
+    case ClassTable::ConstructorCheck::Unmodellable:
+        // See the declaration: with no arguments there is no overload set to
+        // be unable to spell, so the modelled constructor is checked instead.
+        if (!call.args().empty()) {
+            for (const ast::ExprPtr& arg : call.args()) {
+                type_of(*arg, Type::unknown());
+            }
+            // Same wording idiom, and the same reason, as the builtin-call
+            // deferral in type_of_name_call ("calls to builtin 'int' with
+            // these argument types are not supported"): the real signature is
+            // an overload set this model has no way to write down, so it says
+            // so instead of guessing an arity in either direction.
+            return error(call, "NotImplementedError",
+                         "calls to '" + class_name +
+                             "', which inherits an overloaded builtin constructor, are not "
+                             "supported");
+        }
+        break;
+    case ClassTable::ConstructorCheck::Checked:
+        break;
+    }
+    return type_of_positional_call(constructor, call, "\"" + class_name + "\"");
+}
+
 Type ExpressionTyper::type_of_unchecked_construction(const Type& constructor,
-                                                      const ast::Call& call) {
-    // See ClassTable::constructor_accepts_any_arity: an exception subclass or
-    // a builtin-based subclass with no declared __init__ has a real
-    // constructor this model cannot represent, so there is no arity to check
-    // and nothing to check each argument against. Every argument is still
-    // typed -- a root cause inside one (an unbound name, say) must still
-    // report exactly once, the same rule every other arm in this file
-    // follows.
+                                                     const ast::Call& call) {
+    // See ClassTable::ConstructorCheck::Unchecked: an exception subclass with
+    // no declared __init__ has a genuinely variadic constructor, so there is
+    // no arity to check and nothing to check each argument against. Every
+    // argument is still typed -- a root cause inside one (an unbound name,
+    // say) must still report exactly once, the same rule every other arm in
+    // this file follows.
     for (const ast::ExprPtr& arg : call.args()) {
         type_of(*arg, Type::unknown());
     }
@@ -98,10 +126,7 @@ Type ExpressionTyper::type_of_call(const ast::Call& call, const Type& expected) 
                 // choice for a bare `C` used as a callee (reveal_type(C) is
                 // `def (...) -> C`, not `type[C]`).
                 types_.insert(attribute, constructor);
-                if (classes_.constructor_accepts_any_arity(dotted)) {
-                    return type_of_unchecked_construction(constructor, call);
-                }
-                return type_of_positional_call(constructor, call, "\"" + dotted + "\"");
+                return type_of_construction(dotted, constructor, call);
             }
         }
     }
@@ -232,10 +257,7 @@ Type ExpressionTyper::type_of_name_call(const ast::Name& callee, const ast::Call
         // comment explains.
         const Type constructor = classes_.constructor_type(identifier);
         types_.insert(&callee, constructor);
-        if (classes_.constructor_accepts_any_arity(identifier)) {
-            return type_of_unchecked_construction(constructor, call);
-        }
-        return type_of_positional_call(constructor, call, "\"" + identifier + "\"");
+        return type_of_construction(identifier, constructor, call);
     }
 
     // An ordinary unbound name. Routed through type_of() (which dispatches
