@@ -3141,5 +3141,120 @@ TEST(TypeChecker, KnownWrongLoopReentryMakesAValidForwardBaseAFalseNameError) {
     EXPECT_EQ(error.column, 21);
 }
 
+// A subclass of a PARAMETRIC builtin is nominal, but every inherited member
+// is substituted. Verified against mypy 1.18.1: `class IntList(list[int])`
+// gives reveal_type(a) `IntList`, reveal_type(a[0]) `builtins.int`,
+// reveal_type(x) for `for x in a` `builtins.int`, and
+// `b: list[int] = IntList()` clean. Recording the base as a bare name dropped
+// the element type, which made the assignment a false TypeError and both the
+// subscript and the iteration deferrals.
+TEST(TypeChecker, AParametricBuiltinSubclassIsAssignableToItsBase) {
+    expect_clean("class IntList(list[int]):\n"
+                 "    pass\n"
+                 "def f() -> None:\n"
+                 "    a = IntList()\n"
+                 "    b: list[int] = a\n"
+                 "    print(b)\n");
+}
+
+TEST(TypeChecker, AParametricBuiltinSubclassSubscriptsAsItsElement) {
+    expect_clean("class IntList(list[int]):\n"
+                 "    pass\n"
+                 "def f() -> int:\n"
+                 "    a = IntList()\n"
+                 "    return a[0] + 1\n");
+}
+
+TEST(TypeChecker, AParametricBuiltinSubclassIteratesAsItsElement) {
+    expect_clean("class IntList(list[int]):\n"
+                 "    pass\n"
+                 "def f() -> int:\n"
+                 "    total = 0\n"
+                 "    for v in IntList():\n"
+                 "        total = total + v\n"
+                 "    return total\n");
+}
+
+// Two levels: `class B(A)` where `A(list[int])`. Verified clean, with
+// `b[0]` an int and `c: list[int] = B()` clean.
+TEST(TypeChecker, AParametricBaseSubstitutesThroughTwoLevels) {
+    expect_clean("class A(list[int]):\n"
+                 "    pass\n"
+                 "class B(A):\n"
+                 "    pass\n"
+                 "def f() -> int:\n"
+                 "    b = B()\n"
+                 "    c: list[int] = b\n"
+                 "    print(c)\n"
+                 "    return b[0]\n");
+}
+
+// ASSIGNABILITY RUNS ONE WAY ONLY. Verified against mypy 1.18.1:
+// `Incompatible types in assignment (expression has type "list[int]",
+// variable has type "IntList")`. The base-chain walk is directional, so this
+// must stay an error after the change.
+TEST(TypeChecker, TheParametricBaseIsNotAssignableToItsSubclass) {
+    const Checked checked = check_module("class IntList(list[int]):\n"
+                                         "    pass\n"
+                                         "def f(xs: list[int]) -> None:\n"
+                                         "    a: IntList = xs\n"
+                                         "    print(a)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"list[int]\", "
+              "variable has type \"IntList\")");
+}
+
+// METHODS STAY DEFERRED, AND THAT IS THE POINT -- it is what keeps this
+// change cheap: no typeshed, no generic method substitution. `a.append`
+// misses in the class table (the subclass declares no such member) and the
+// base is a KIND, not a class, so it lands on the existing
+// "methods on builtin types" deferral. What matters is that a false
+// TypeError became a NotImplementedError, not that the call works.
+TEST(TypeChecker, AnInheritedMethodOnAParametricBaseIsDeferred) {
+    const Checked checked = check_module("class IntList(list[int]):\n"
+                                         "    pass\n"
+                                         "def f() -> None:\n"
+                                         "    IntList().append(1)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+}
+
+// A `tuple[...]` BASE IS DEFERRED, deliberately, and this is the second place
+// this compiler diverges from mypy on purpose. Measured: mypy accepts
+// `class MyPair(tuple[int, str])` and reveals `MyPair()[0]` as
+// `builtins.int` -- but at runtime `MyPair()` is `()`, `len()` is 0 and
+// `MyPair()[0]` raises IndexError. mypy models a tuple subclass as a tuple
+// type with a nominal fallback and never checks that construction produces
+// the claimed arity. A compiler emitting real code must not follow that, so
+// this is a NAMED deferral rather than a guess.
+TEST(TypeChecker, ATupleBaseIsNotImplemented) {
+    const Checked checked = check_module("class MyPair(tuple[int, str]):\n"
+                                         "    pass\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "a tuple base class is not supported");
+}
+
+// A BARE generic base is a real mypy error, so reporting is invariant-safe.
+// Verified: `Missing type parameters for generic type "list" [type-arg]`.
+// The exact code and wording come from whatever AnnotationResolver already
+// produces for a bare `list` annotation.
+TEST(TypeChecker, ABareGenericBaseIsReported) {
+    const Checked checked = check_module("class L(list):\n"
+                                         "    pass\n");
+    EXPECT_FALSE(checked.diagnostics.empty());
+}
+
+// Unchanged: a NON-parametric builtin base still works, and a bad base name
+// is still a NameError.
+TEST(TypeChecker, ANonParametricBuiltinBaseStillWorks) {
+    expect_clean("class Sub(int):\n"
+                 "    pass\n"
+                 "x: int = Sub()\n"
+                 "print(x)\n");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

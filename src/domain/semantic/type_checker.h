@@ -353,9 +353,18 @@ private:
     // consumed twice afterwards: by validate_class_bases, and by the
     // member-collection phase, which needs the SAME qualified name
     // pre_collect_class_body would later have been called with.
+    //
+    // `base_types` is the SAME resolution that fed ClassTable::declare for
+    // this class, recorded again here rather than re-derived, so
+    // validate_class_bases can check a resolved base's Type (a `tuple` base
+    // deferral, an Unknown base skip) without invoking AnnotationResolver a
+    // second time -- which would double-report a bad base. One entry per
+    // base expression, in the same order, by construction: both are built
+    // from a single `base_types(...)` call.
     struct ClassDeclaration {
         const ast::ClassDef* node = nullptr;
         std::string qualified_name;
+        std::vector<Type> base_types;
     };
 
     // The recursive half of collect_classes: declares `class_def` under
@@ -717,13 +726,37 @@ private:
     // once here and once when the statement is actually visited).
     void pre_bind_function_body(const std::vector<ast::StmtPtr>& body);
 
-    // Each base expression as a Type, for ClassTable::declare. Deliberately
-    // NAME-ONLY -- a subscripted or attribute base (`list[int]`, `mod.Base`)
-    // is still dropped from the recorded base list entirely, with no trace,
-    // rather than resolved. Resolving a base expression properly (which is
-    // what makes `class IntList(list[int])` work) is a separate change with
-    // its own tests.
-    static std::vector<Type> base_types(const std::vector<ast::ExprPtr>& bases);
+    // Each base expression as a Type, for ClassTable::declare, resolved
+    // through AnnotationResolver -- the SAME resolver an annotation goes
+    // through, so `list[int]` becomes list[int] here exactly as it does in
+    // `x: list[int]`, with one implementation and one set of diagnostics.
+    //
+    // This used to keep only a bare Name and drop every other base shape on
+    // the floor, which is the root cause of `class IntList(list[int])` being
+    // unusable: with the base discarded, the subclass reached no builtin at
+    // all, so `x: list[int] = IntList()` was a false TypeError and both
+    // `IntList()[0]` and iterating one were deferrals.
+    //
+    // A base that fails to resolve becomes Unknown, which the chain walk
+    // simply skips (see ClassTable::base_key) -- one root cause, one
+    // diagnostic, reported by the resolver itself.
+    //
+    // ONE EXCEPTION: a dotted base (`Outer.Inner`, `mod.Thing`) is skipped
+    // BEFORE it reaches the resolver, pushing Unknown with no diagnostic at
+    // all. AnnotationResolver's own attribute handling would report a
+    // NameError for cases validate_class_bases deliberately leaves alone
+    // (see its long comment on the same choice, reverted once already for
+    // false positives on code both oracles accept) -- resolving it here
+    // would reproduce that mistake one level down.
+    //
+    // Called during the DECLARATION pass, which runs before every class is
+    // declared. That is safe for exactly the reason a class-body annotation
+    // is safe to resolve eagerly and a plain assignment's value is not: a
+    // base expression names types, and nothing in it depends on an inferred
+    // value. It is NOT safe for a base naming a class declared later -- and
+    // that is not a limitation but the intended behaviour, since a base
+    // declared below its subclass is a NameError (see validate_class_bases).
+    std::vector<Type> base_types(const std::vector<ast::ExprPtr>& bases);
 
     // How many of `params` carry a default value, for Type::callable's
     // `defaulted` argument -- the count a call site needs in order NOT to

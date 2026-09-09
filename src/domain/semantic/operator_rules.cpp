@@ -412,6 +412,25 @@ RuleResult subscript_result(const Type& container, const Type& index, const Clas
         return RuleResult::ok(Type::unknown());
     }
     if (container.kind == TypeKind::Class) {
+        // Mirrors element_type's own Class arm exactly, for the identical
+        // reason: `class IntList(list[int])` subscripting as `int` is
+        // mypy-clean (verified: reveal_type(a[0]) is `builtins.int`), and a
+        // user class is never simply refused here -- only when no inherited
+        // builtin base pins an answer does this fall back to Unsupported.
+        if (classes != nullptr) {
+            if (const std::optional<Type> base = builtin_base_of_class(*classes, container.name)) {
+                // Recursive, so the builtin's own rules just above decide,
+                // rather than a second copy of them. Ok only: NotApplicable
+                // here means a non-subscriptable builtin base (`class
+                // Sub(int)`), and that may not become a TypeError, because
+                // the class is free to define its own __getitem__ on top of
+                // what it inherits.
+                const RuleResult inherited = subscript_result(*base, index, classes);
+                if (inherited.status == RuleResult::Status::Ok) {
+                    return inherited;
+                }
+            }
+        }
         return RuleResult::unsupported(UnsupportedReason::UserClassOperator);
     }
     if (container.kind == TypeKind::Union) {
@@ -505,13 +524,15 @@ RuleResult element_type(const Type& iterable, const ClassLookup* classes) {
                 // means a non-iterable builtin base (`class Sub(int)`), and
                 // that may not become a TypeError, because the class is free
                 // to define its own __iter__ on top of what it inherits.
-                // (`class IntList(list[int])` never reaches this branch at
-                // all: base_types drops a Subscript base entirely, so
-                // builtin_base_of_class(classes, "IntList") is nullopt and
-                // this `if` does not fire -- see builtin_base_of_class and
-                // TypeChecker::base_types. The only spelling that DOES record
-                // a bare container name here, `class L(list)`, is itself
-                // rejected by mypy --strict: "Missing type parameters for
+                // (`class IntList(list[int])` DOES reach this branch now --
+                // TypeChecker::base_types resolves a subscripted base through
+                // AnnotationResolver instead of dropping it, so
+                // builtin_base_of_class(classes, "IntList") returns
+                // list[int] and this `if` fires, which is what makes
+                // subscripting and iterating one resolve to `int` rather
+                // than deferring. A bare `class L(list)`, with no type
+                // argument, is a genuinely different base -- rejected by
+                // mypy --strict itself: "Missing type parameters for
                 // generic type \"list\"".)
                 const RuleResult inherited = element_type(*base, classes);
                 if (inherited.status == RuleResult::Status::Ok) {

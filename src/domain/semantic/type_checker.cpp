@@ -1,5 +1,6 @@
 #include "type_checker.h"
 
+#include <cassert>
 #include <cstddef>
 #include <optional>
 #include <set>
@@ -10,6 +11,7 @@
 #include "annotation_resolver.h"
 #include "builtin_call_table.h"
 #include "builtin_type_names.h"
+#include "domain/ast/attribute.h"
 #include "domain/ast/break.h"
 #include "domain/ast/call.h"
 #include "domain/ast/constant.h"
@@ -262,21 +264,30 @@ void TypeChecker::scan_top_level_names(const ast::Module& module) {
 }
 
 std::vector<Type> TypeChecker::base_types(const std::vector<ast::ExprPtr>& bases) {
+    AnnotationResolver resolver(classes_, sink_);
     std::vector<Type> types;
+    types.reserve(bases.size());
     for (const ast::ExprPtr& base : bases) {
-        const auto* name = dynamic_cast<const ast::Name*>(base.get());
-        if (name == nullptr) {
-            // A non-Name base (a subscript, an attribute chain) is outside
-            // this task's tested scope and is simply omitted from the
-            // recorded base list; that only matters once something walks the
-            // base chain looking for it.
+        if (dynamic_cast<const ast::Attribute*>(base.get()) != nullptr) {
+            // A dotted base (`Outer.Inner`, `mod.Thing`) is deliberately NOT
+            // resolved -- see validate_class_bases' own long comment on this
+            // exact choice, reverted after producing false positives on code
+            // both oracles accept (a root that is not a known class name may
+            // still legitimately hold a class object, which this model
+            // cannot see, since class names are never bound into
+            // ScopeStack). AnnotationResolver's resolve_attribute does not
+            // know that history and would report a NameError for exactly the
+            // two accepted-miss cases documented there, so the base is
+            // skipped BEFORE it ever reaches the resolver -- one choke point
+            // for the decision, not a second copy of it in
+            // validate_class_bases. Unknown keeps this entry aligned
+            // index-for-index with base_exprs for the lockstep walk below,
+            // and validate_class_bases' own Unknown arm already treats that
+            // as "already handled, do not report again".
+            types.push_back(Type::unknown());
             continue;
         }
-        // A bare base NAME denoting a model kind becomes that kind (the same
-        // classification ClassTable's own seeding, and the test fake
-        // FakeClassLookup, both perform via the same base_type_for_name);
-        // anything else is an ordinary Class.
-        types.push_back(base_type_for_name(name->identifier()));
+        types.push_back(resolver.resolve(*base));
     }
     return types;
 }
@@ -328,7 +339,40 @@ void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_
                                        bool check_order) {
     for (const ClassDeclaration& declaration : all_classes) {
         const int subclass_line = declaration.node->span().start_line;
-        for (const ast::ExprPtr& base : declaration.node->bases()) {
+        const std::vector<ast::ExprPtr>& base_exprs = declaration.node->bases();
+        // One resolved Type per base expression, in the same order, by
+        // construction -- both came from the SAME base_types(...) call at
+        // the declaration site. Asserted rather than assumed, since a future
+        // change desyncing the two would otherwise silently pair a base
+        // expression with the wrong resolved Type.
+        assert(base_exprs.size() == declaration.base_types.size());
+        for (std::size_t index = 0;
+             index < base_exprs.size() && index < declaration.base_types.size(); ++index) {
+            const ast::ExprPtr& base = base_exprs[index];
+            const Type& resolved_type = declaration.base_types[index];
+            if (resolved_type.kind == TypeKind::Tuple) {
+                // A tuple base is DEFERRED, not modelled. Measured: mypy
+                // accepts `class MyPair(tuple[int, str])` and reveals
+                // `MyPair()[0]` as `builtins.int`, but at runtime `MyPair()`
+                // is `()` with a length of 0 and `MyPair()[0]` raises
+                // IndexError -- mypy models a tuple subclass as a tuple type
+                // with a nominal fallback and never checks that construction
+                // produces the claimed arity. This compiler emits code that
+                // has to run, so following mypy here would be a wrong-code
+                // bug. NotImplementedError rather than TypeError because the
+                // program may well be one mypy accepts; naming the construct
+                // is the honest answer.
+                report(*base, "NotImplementedError", "a tuple base class is not supported");
+                continue;
+            }
+            if (resolved_type.kind == TypeKind::Unknown) {
+                // AnnotationResolver already reported this base (an
+                // unresolved name, a bare generic missing its type
+                // parameters, ...) while base_types resolved it -- a second
+                // diagnostic for one root cause is exactly what every other
+                // Unknown path in this pass exists to avoid.
+                continue;
+            }
             const auto* name = dynamic_cast<const ast::Name*>(base.get());
             if (name == nullptr) {
                 // BARE-NAME BASES ONLY. A dotted base (`Outer.Inner`,
@@ -417,8 +461,10 @@ void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_
 
 std::string TypeChecker::declare_isolated_class(const ast::ClassDef& node,
                                                 const std::string& qualified_name) {
-    classes_.declare(qualified_name, base_types(node.bases()));
-    std::vector<ClassDeclaration> all_classes{ClassDeclaration{&node, qualified_name}};
+    std::vector<Type> resolved_bases = base_types(node.bases());
+    classes_.declare(qualified_name, resolved_bases);
+    std::vector<ClassDeclaration> all_classes{
+        ClassDeclaration{&node, qualified_name, std::move(resolved_bases)}};
     for_each_flat_statement(node.body(), /*directly_in_body=*/true,
                             [&](const ast::Stmt& statement, bool) {
         if (const auto* nested = dynamic_cast<const ast::ClassDef*>(&statement)) {
@@ -451,8 +497,9 @@ void TypeChecker::declare_class_recursive(const ast::ClassDef& class_def,
                                           std::vector<ClassDeclaration>& all_classes) {
     const std::string qualified_name =
         qualified_prefix.empty() ? class_def.name() : qualified_prefix + "." + class_def.name();
-    classes_.declare(qualified_name, base_types(class_def.bases()));
-    all_classes.push_back(ClassDeclaration{&class_def, qualified_name});
+    std::vector<Type> resolved_bases = base_types(class_def.bases());
+    classes_.declare(qualified_name, resolved_bases);
+    all_classes.push_back(ClassDeclaration{&class_def, qualified_name, std::move(resolved_bases)});
 
     // See class_declaration_lines_: every entry, at every nesting depth, is
     // this statement's own line.
