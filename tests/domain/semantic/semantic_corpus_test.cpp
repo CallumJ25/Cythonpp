@@ -33,7 +33,10 @@
 // COVERAGE IS ASYMMETRIC, BY CONSTRUCTION, AND THAT IS A REAL LIMIT, NOT AN
 // OVERSIGHT. The hard invariant this harness enforces automatically is
 // one-directional: "# mypy: clean" + a TypeError/NameError from cythonpp is
-// checked right here, on every `ctest` run, with no Python involved. There is
+// checked right here, on every `ctest` run, with no Python involved -- with
+// one narrow, filename-gated exception (see is_recorded_divergence) for a
+// sample that records a case where mypy and CPython provably disagree and
+// this project's amended invariant makes CPython the arbiter. There is
 // no equivalent automatic check for the OTHER direction -- a sample labelled
 // "# mypy: error ..." that mypy --strict actually accepts. Nothing here can
 // tell a correctly-labelled "error" sample apart from one where the label was
@@ -270,6 +273,21 @@ std::vector<fs::path> corpus_files() {
     return files;
 }
 
+// True for a sample whose filename marks it as a DELIBERATE, RECORDED
+// divergence from mypy -- the amended form of the project's hard invariant
+// is "if a program runs correctly under CPython, cythonpp reports no
+// TypeError and no NameError"; mypy --strict is the practical oracle
+// everywhere else, but where the two provably disagree, CPython wins. A
+// sample under this prefix is exactly such a disagreement, made falsifiable
+// the same way every other sample is: paired "# mypy: clean" and
+// "# cythonpp: ..." labels plus a free-text explanation of why CPython, not
+// mypy, is right here. The prefix is what keeps this a narrow, auditable
+// carve-out rather than a silent hole in the guard below -- grep the corpus
+// for "divergence_" to see every sample that claims one.
+bool is_recorded_divergence(const fs::path& path) {
+    return path.filename().string().rfind("divergence_", 0) == 0;
+}
+
 // Checks ONE sample end-to-end via non-fatal EXPECT_*/ADD_FAILURE, so one bad
 // sample never hides a failure elsewhere in the corpus.
 void check_sample(const fs::path& path) {
@@ -282,14 +300,19 @@ void check_sample(const fs::path& path) {
     }
 
     // THE RULE THAT EARNS THE WHOLE DESIGN, checked BEFORE anything about
-    // what the checker actually produces. The project's hard invariant is
-    // "if mypy --strict reports nothing, cythonpp reports no TypeError or
-    // NameError". A sample labelled "# mypy: clean" that ALSO expects a
-    // TypeError or NameError from cythonpp is a direct contradiction of that
-    // invariant on the labels alone -- it must fail by construction, not by
-    // whatever the checker happens to produce, so the failure message names
-    // the invariant instead of showing a string diff.
-    if (labels.mypy_clean) {
+    // what the checker actually produces. The project's hard invariant, in
+    // its amended form, is "if a program runs correctly under CPython,
+    // cythonpp reports no TypeError and no NameError" -- mypy --strict is
+    // the practical oracle everywhere else, but where the two provably
+    // disagree, CPython wins. A sample labelled "# mypy: clean" that ALSO
+    // expects a TypeError or NameError from cythonpp is therefore a
+    // contradiction of the invariant UNLESS its filename marks it as a
+    // recorded divergence (see is_recorded_divergence) -- one where CPython
+    // itself, not just mypy, has been checked and disagrees. Anything else
+    // must fail by construction, not by whatever the checker happens to
+    // produce, so the failure message names the invariant instead of
+    // showing a string diff.
+    if (labels.mypy_clean && !is_recorded_divergence(path)) {
         for (const ExpectedDiagnostic& diagnostic : labels.expected) {
             if (diagnostic.code == "TypeError" || diagnostic.code == "NameError") {
                 ADD_FAILURE()

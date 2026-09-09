@@ -369,9 +369,17 @@ private:
 
     // The base-validation half of collect_classes, extracted
     // so declare_isolated_class below can reuse it for a class ClassTable
-    // never saw during Phase 1 -- same rule either way: a bare-Name base
-    // that does not resolve is a NameError, checked only once every
-    // declaration in `all_classes` exists.
+    // never saw during Phase 1. Two rules, both against a bare-Name base:
+    // one that does not resolve through ClassTable at all is a NameError
+    // (e.g. `class C(Generic):`, since Generic cannot be imported in this
+    // subset); one that DOES resolve but was bound (see
+    // class_declaration_lines_) LATER in source position than the subclass
+    // statement itself is also a NameError -- CPython raises `NameError`
+    // from the subclass statement at import time for a forward-declared
+    // base, and this compiler emits code that has to run under CPython, so
+    // it reports the same diagnostic CPython does even though mypy resolves
+    // a forward-declared base fully and stays silent. Checked only once
+    // every declaration in `all_classes` exists.
     void validate_class_bases(const std::vector<ClassDeclaration>& all_classes);
 
     // Declares `node` (and, recursively, every
@@ -883,6 +891,24 @@ private:
     // (declare_isolated_class owns those, and each is pre-collected by its
     // own visit(ClassDef) when the walk reaches it).
     std::vector<ClassDeclaration> declared_classes_;
+
+    // Qualified name -> the source line of the statement that BINDS that
+    // name, for the execution-order base check in validate_class_bases.
+    //
+    // For a top-level or control-flow-nested class that is its own `class`
+    // statement's line. For a NESTED class it is the ENCLOSING `class`
+    // statement's line, because that is the statement whose execution creates
+    // the nested class object and binds the outer name through which it is
+    // reachable -- `class D(Outer.Inner)` is legal exactly when `class Outer`
+    // has already run, whatever line `class Inner` sits on.
+    //
+    // "Execution order" is approximated by SOURCE POSITION. That is faithful
+    // for this grammar because the only conditional binding it can express is
+    // `if`/`while`/`for`, none of which can move a `class` statement's
+    // execution earlier than its own position, and there are no imports, no
+    // `del`, and no runtime rebinding of a class name. State the assumption
+    // here because the check rests on it.
+    std::map<std::string, int> class_declaration_lines_;
 
     // Which ClassDefs pre_collect_class_body has already run for, so
     // visit(ClassDef) does not run it a SECOND time for a class the

@@ -312,14 +312,60 @@ void TypeChecker::collect_classes(const ast::Module& module) {
 
 void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_classes) {
     for (const ClassDeclaration& declaration : all_classes) {
+        const int subclass_line = declaration.node->span().start_line;
         for (const ast::ExprPtr& base : declaration.node->bases()) {
-            if (const auto* name = dynamic_cast<const ast::Name*>(base.get())) {
-                if (!classes_.is_class(name->identifier())) {
-                    // e.g. `class C(Generic):` -- Generic cannot be imported
-                    // in this subset, so this is the correct outcome for a
-                    // program nobody can legally write.
-                    report(*name, "NameError", "name '" + name->identifier() + "' is not defined");
+            const ast::Name* name = dynamic_cast<const ast::Name*>(base.get());
+            if (name == nullptr) {
+                // A DOTTED base (`Outer.Inner`) is bound to a NAME only
+                // through its ENCLOSING top-level identifier -- a nested
+                // class always exists by the time the `class Outer`
+                // statement that contains it finishes executing, so the
+                // ordering question can only ever fail on the chain's ROOT,
+                // never on the attribute lookup itself. Walk down to that
+                // root and apply the identical bare-Name rule below to it;
+                // anything other than a Name at the root (e.g. `f().Inner`)
+                // is outside this task's tested scope and simply skipped.
+                const auto* attribute = dynamic_cast<const ast::Attribute*>(base.get());
+                if (attribute == nullptr) {
+                    continue;
                 }
+                const ast::Expr* cursor = &attribute->value();
+                while (const auto* link = dynamic_cast<const ast::Attribute*>(cursor)) {
+                    cursor = &link->value();
+                }
+                name = dynamic_cast<const ast::Name*>(cursor);
+                if (name == nullptr) {
+                    continue;
+                }
+            }
+            if (!classes_.is_class(name->identifier())) {
+                // e.g. `class C(Generic):` -- Generic cannot be imported in
+                // this subset, so this is the correct outcome for a program
+                // nobody can legally write.
+                report(*name, "NameError", "name '" + name->identifier() + "' is not defined");
+                continue;
+            }
+            // ORDER. A base must be bound by the time the subclass statement
+            // RUNS. mypy disagrees -- it resolves a forward-declared base
+            // fully and reports nothing -- but CPython raises
+            // `NameError: name 'Parent' is not defined` from the `class
+            // Child(Parent)` statement itself at import time, and this
+            // compiler emits code that has to run. Emitting C++ for a module
+            // CPython refuses to import would convert a diagnostic bug into a
+            // wrong-code bug, which is strictly worse and much harder to
+            // find. Same message CPython produces, reported at the base
+            // expression.
+            //
+            // A base whose name resolves through ClassTable but which this
+            // map never recorded is a SEEDED BUILTIN (Exception, OSError,
+            // int, ...) or a scope-aliased function-local class declared
+            // elsewhere -- neither has a source line here and neither can be
+            // forward-declared, so a miss is silence, not an error.
+            const std::string resolved = classes_.canonical_name(name->identifier());
+            const auto declared_at = class_declaration_lines_.find(resolved);
+            if (declared_at != class_declaration_lines_.end() &&
+                declared_at->second > subclass_line) {
+                report(*name, "NameError", "name '" + name->identifier() + "' is not defined");
             }
         }
     }
@@ -346,6 +392,15 @@ void TypeChecker::declare_class_recursive(const ast::ClassDef& class_def,
         qualified_prefix.empty() ? class_def.name() : qualified_prefix + "." + class_def.name();
     classes_.declare(qualified_name, base_names(class_def.bases()));
     all_classes.push_back(ClassDeclaration{&class_def, qualified_name});
+
+    // See class_declaration_lines_: a nested class is bound by its ENCLOSING
+    // class statement, so it inherits that statement's line rather than
+    // carrying its own.
+    const auto enclosing = class_declaration_lines_.find(qualified_prefix);
+    const int binding_line = enclosing == class_declaration_lines_.end()
+                                 ? class_def.span().start_line
+                                 : enclosing->second;
+    class_declaration_lines_[qualified_name] = binding_line;
 
     // A NESTED ClassDef (e.g. Inner inside Outer's body) is declared right
     // here, under ITS OWN qualified name -- "Outer.Inner" -- rather than

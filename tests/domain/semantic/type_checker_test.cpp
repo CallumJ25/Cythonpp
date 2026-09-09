@@ -2870,5 +2870,93 @@ TEST(TypeChecker, ARepeatedNestedClassBodyAnnotationChecksAgainstTheFirstBodysDe
               "variable has type \"str\")");
 }
 
+// THE FIRST DELIBERATE DIVERGENCE FROM mypy in this pass, and the reason the
+// project's arbiter is CPython rather than mypy. Measured, all three:
+//   cythonpp before this change: silent
+//   mypy --strict:               Success -- it resolves a forward-declared
+//                                base fully, inherited __init__ and all, and
+//                                is entirely order-insensitive here
+//   CPython:                     NameError: name 'Parent' is not defined,
+//                                raised at IMPORT, from the `class Child`
+//                                statement itself
+// A compiler that emits C++ for a program CPython refuses to import has not
+// preserved the bug, it has converted a diagnostic bug into a wrong-code
+// bug. So this reports the message CPython produces.
+TEST(TypeChecker, ABaseDeclaredBelowItsSubclassIsANameError) {
+    const Checked checked = check_module("class Child(Parent):\n"
+                                         "    pass\n"
+                                         "class Parent:\n"
+                                         "    pass\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'Parent' is not defined");
+    EXPECT_EQ(error.line, 1);
+}
+
+// A base declared ABOVE is of course fine, whether flat or inside an `if`:
+// Python executes an `if` block's `class` statement, so the name really is
+// bound by the time the subclass statement runs.
+TEST(TypeChecker, ABaseDeclaredAboveItsSubclassIsClean) {
+    expect_clean("class Parent:\n"
+                 "    pass\n"
+                 "class Child(Parent):\n"
+                 "    pass\n");
+}
+
+TEST(TypeChecker, ABaseDeclaredInsideAnIfAboveItsSubclassIsClean) {
+    expect_clean("FLAG = True\n"
+                 "if FLAG:\n"
+                 "    class Parent:\n"
+                 "        pass\n"
+                 "class Child(Parent):\n"
+                 "    pass\n");
+}
+
+// A base declared below, inside a LATER `if`, is still the error -- the rule
+// is about the source position of the binding statement, not about nesting.
+TEST(TypeChecker, ABaseDeclaredInsideALaterIfIsANameError) {
+    const Checked checked = check_module("FLAG = True\n"
+                                         "class Child(Parent):\n"
+                                         "    pass\n"
+                                         "if FLAG:\n"
+                                         "    class Parent:\n"
+                                         "        pass\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'Parent' is not defined");
+}
+
+// A NESTED class used as a base by an outer-scope class: the binding happens
+// at the ENCLOSING `class Outer` statement, not at the nested statement, so
+// what matters is where `Outer` sits.
+TEST(TypeChecker, ANestedClassUsedAsABaseComparesAgainstItsEnclosingClassLine) {
+    expect_clean("class Outer:\n"
+                 "    class Inner:\n"
+                 "        pass\n"
+                 "class D(Outer.Inner):\n"
+                 "    pass\n");
+}
+
+TEST(TypeChecker, ANestedClassBaseDeclaredBelowIsANameError) {
+    const Checked checked = check_module("class D(Outer.Inner):\n"
+                                         "    pass\n"
+                                         "class Outer:\n"
+                                         "    class Inner:\n"
+                                         "        pass\n");
+    EXPECT_FALSE(checked.diagnostics.empty());
+    EXPECT_EQ(checked.diagnostics.front().code, "NameError");
+}
+
+// A function-local class used as a base inside the SAME function: ordinary
+// statement order within the function body.
+TEST(TypeChecker, AFunctionLocalBaseDeclaredAboveIsClean) {
+    expect_clean("def f() -> None:\n"
+                 "    class Local:\n"
+                 "        pass\n"
+                 "    class Sub(Local):\n"
+                 "        pass\n"
+                 "    print(Sub())\n");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic
