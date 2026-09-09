@@ -366,9 +366,29 @@ ClassTable::constructor_check(const std::string& qualified_name) const {
         return ConstructorCheck::Checked;
     }
 
+    // A builtin-kind base decides Unmodellable OUTRIGHT, before the __new__
+    // fallback ever runs. The __new__ walk below is whole-chain, not
+    // positional, so if it ran unconditionally here it would find a __new__
+    // declared ANYWHERE in the chain -- including on a base to the RIGHT of
+    // the builtin base that already settled the question -- and answer
+    // Unchecked (silence) for a call neither oracle accepts. Verified against
+    // mypy 1.18.1 and CPython with `class Mixin: def __new__(cls, a: int) ->
+    // Marker: ...` / `def __init__(self, a: str) -> None: ...` and
+    // `class MyInt(int, Mixin): pass`: `MyInt(1, 2, 3)` is `No overload
+    // variant of "MyInt" matches argument types "int", "int", "int"` under
+    // mypy and `TypeError: int() takes at most 2 arguments (3 given)` under
+    // CPython -- both oracles reject it, so this must stay Unmodellable, not
+    // fall through to Mixin's unrelated __new__.
+    if (reached.has_value() && *reached == Reached::BuiltinKindBase) {
+        return ConstructorCheck::Unmodellable;
+    }
+
     // The __new__ fallback, deliberately a WHOLE-CHAIN question rather than a
     // positional one (see the header): this model does not represent __new__
-    // at all, so there is no signature whose position could matter.
+    // at all, so there is no signature whose position could matter. Reached
+    // here only when the positional walk above found no builtin base -- i.e.
+    // reached is either absent or BaseExceptionBase -- so this cannot
+    // override the builtin-base answer.
     std::vector<std::string> new_visited;
     if (walk_chain<Type>(resolved, new_visited,
                          [](const std::string&, const Entry& entry) -> std::optional<Type> {
@@ -383,8 +403,9 @@ ClassTable::constructor_check(const std::string& qualified_name) const {
     if (!reached.has_value()) {
         return ConstructorCheck::Checked;
     }
-    return *reached == Reached::BaseExceptionBase ? ConstructorCheck::Unchecked
-                                                  : ConstructorCheck::Unmodellable;
+    // Only BaseExceptionBase can still reach here: DeclaredInit returned
+    // above, and BuiltinKindBase returned above too.
+    return ConstructorCheck::Unchecked;
 }
 
 bool ClassTable::inherits_builtin(const std::string& qualified_name) const {

@@ -408,6 +408,31 @@ TEST(ClassTable, ABuiltinBaseLeftOfADeclaredInitWins) {
     EXPECT_EQ(table.constructor_check("MyInt"), ClassTable::ConstructorCheck::Unmodellable);
 }
 
+// PINS the precedence fix directly: the __new__ fallback is whole-chain, so
+// if it ran BEFORE the builtin-base decision it would find Mixin's __new__
+// (declared here alongside __init__) and answer Unchecked -- silence -- on a
+// call neither oracle accepts. Distinct from ABuiltinBaseLeftOfADeclaredInitWins
+// above, whose Mixin declares only __init__ and so never exercised the
+// __new__ walk at all. Verified against mypy 1.18.1 and CPython with
+// `class Marker: pass`, `class Mixin: def __new__(cls, a: int) -> Marker:
+// ...` / `def __init__(self, a: str) -> None: ...`, and
+// `class MyInt(int, Mixin): pass`: `MyInt(1, 2, 3)` is `No overload variant
+// of "MyInt" matches argument types "int", "int", "int"  [call-overload]`
+// under mypy and `TypeError: int() takes at most 2 arguments (3 given)`
+// under CPython -- both oracles reject it, so this must stay Unmodellable.
+TEST(ClassTable, ABuiltinBaseLeftOfAMixinDeclaringBothNewAndInitStaysUnmodellable) {
+    ClassTable table;
+    table.declare("Marker", {});
+    table.declare("Mixin", {});
+    table.declare_method(
+        "Mixin", "__new__",
+        Type::callable({Type::class_of("Mixin"), Type::int_()}, Type::class_of("Marker")));
+    table.declare_method("Mixin", "__init__",
+                         Type::callable({Type::class_of("Mixin"), Type::str()}, Type::none()));
+    table.declare("MyInt", {Type::int_(), Type::class_of("Mixin")});
+    EXPECT_EQ(table.constructor_check("MyInt"), ClassTable::ConstructorCheck::Unmodellable);
+}
+
 TEST(ClassTable, ADeclaredInitLeftOfABuiltinBaseWins) {
     ClassTable table;
     table.declare("Mixin", {});

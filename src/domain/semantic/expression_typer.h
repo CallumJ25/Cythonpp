@@ -270,6 +270,40 @@ private:
     // with `TypeError: Mixin.__init__() missing 1 required positional
     // argument: 'a'` (measured), and the ordinary too-few-arguments check
     // catches it.
+    //
+    // That is only one side of the ledger, though -- the carve-out also
+    // PRESERVES two false positives, pre-existing and unchanged by adding it
+    // (both binaries agree; this is not new). With
+    // `class Mixin: def __init__(self, a: str) -> None: ...` again,
+    // `class L(list[int], Mixin): pass` then `L()` is mypy `Success` and
+    // CPython prints `[]` and exits 0 (measured), but this arm's modelled
+    // (nullary) constructor answers `L()` with "too few arguments for L" --
+    // a false TypeError. `class D(dict[str, int], Mixin): pass` then `D()`
+    // is the same shape (mypy `Success`, CPython prints `{}`, cythonpp a
+    // false "too few arguments for D", measured). The reason this differs
+    // from the `int` case just above, and is worth writing down because it
+    // is not obvious: `list`, `dict` and `set` carry a REAL `__init__` in
+    // their own `__dict__` (unlike `int`, `str`, and the other immutable
+    // builtin kinds), so CPython's MRO finds `list.__init__`/`dict.__init__`
+    // before it ever reaches the mixin -- the mixin's `__init__` is simply
+    // never consulted for these three, no matter its arity. Without the
+    // carve-out, the positional walk here would have turned this shape into
+    // NotImplementedError instead (a miss, not a false positive), so the
+    // carve-out's net effect on THIS shape is trading a missed error for a
+    // false one -- unlike the `MyInt(int, Mixin)` shape above, where it is a
+    // straightforward win. Do not remove the carve-out over this: it is still
+    // the right call for the shape it was added for, and the two false
+    // positives here are a pre-existing, independently-tracked gap.
+    //
+    // The Unmodellable arm shares the SAME --types dump inconsistency
+    // documented on type_of_unchecked_construction below: both callers
+    // record `constructor` -- the nullary callable constructor_type builds --
+    // as the callee's type before this function ever runs, so a deferred call
+    // here dumps a callee typed `Callable[[], Counted]` applied to real
+    // arguments too (measured: `cythonpp --types` on
+    // `test_files/semantic/deferred_builtin_based_constructor.py` prints
+    // `(Call (Name Counted):Callable[[], Counted] (Constant 3):int):Unknown`).
+    // See that declaration's comment for why the entry is kept anyway.
     Type type_of_construction(const std::string& class_name, const Type& constructor,
                               const ast::Call& call);
 
@@ -292,6 +326,9 @@ private:
     // consumes the entry, and omitting it would only trade a contradiction
     // for a hole. Read it as "the constructor this model could spell", not as
     // a claim about the call.
+    //
+    // The identical artifact also occurs on type_of_construction's
+    // Unmodellable arm above, for the same reason -- see its comment.
     Type type_of_unchecked_construction(const Type& constructor, const ast::Call& call);
 
     // The shared tail for every callee shape ONCE ITS OWN TYPE IS KNOWN --

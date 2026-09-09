@@ -272,6 +272,20 @@ public:
     // __init__ is Unchecked, so the failure mode is a MISSED error instead of
     // a false "too few arguments" on every construction of it.
     //
+    // BUT a builtin-kind base decides Unmodellable BEFORE the __new__
+    // fallback ever runs, precisely because the fallback is whole-chain: a
+    // __new__ declared on some OTHER base -- one that never settles the
+    // question the positional walk already answered -- must not turn a
+    // bounded-overload-set call into silence. Verified against mypy 1.18.1
+    // and CPython with `class Mixin: def __new__(cls, a: int) -> Marker: ...`
+    // plus `def __init__(self, a: str) -> None: ...`, and
+    // `class MyInt(int, Mixin): pass`: `MyInt(1, 2, 3)` is `No overload
+    // variant of "MyInt" matches argument types "int", "int", "int"` under
+    // mypy and `TypeError: int() takes at most 2 arguments (3 given)` under
+    // CPython -- both oracles reject it, so the builtin-base answer
+    // (Unmodellable) must win over Mixin's unrelated __new__, which the
+    // whole-chain fallback would otherwise reach.
+    //
     // A DECLARED __init__ reached first always wins: an exception or
     // builtin-based subclass that defines its own constructor is checked
     // against it exactly like any other class.
