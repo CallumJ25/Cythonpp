@@ -9,6 +9,7 @@
 
 #include "annotation_resolver.h"
 #include "builtin_call_table.h"
+#include "builtin_type_names.h"
 #include "domain/ast/break.h"
 #include "domain/ast/call.h"
 #include "domain/ast/constant.h"
@@ -260,18 +261,25 @@ void TypeChecker::scan_top_level_names(const ast::Module& module) {
         });
 }
 
-std::vector<std::string> TypeChecker::base_names(const std::vector<ast::ExprPtr>& bases) {
-    std::vector<std::string> names;
+std::vector<Type> TypeChecker::base_types(const std::vector<ast::ExprPtr>& bases) {
+    std::vector<Type> types;
     for (const ast::ExprPtr& base : bases) {
-        if (const auto* name = dynamic_cast<const ast::Name*>(base.get())) {
-            names.push_back(name->identifier());
+        const auto* name = dynamic_cast<const ast::Name*>(base.get());
+        if (name == nullptr) {
+            // A non-Name base (a subscript, an attribute chain) is outside
+            // this task's tested scope and is simply omitted from the
+            // recorded base list; that only matters once something walks the
+            // base chain looking for it.
+            continue;
         }
-        // A non-Name base (a subscript, an attribute chain) is outside this
-        // task's tested scope and is simply omitted from the recorded base
-        // list; that only matters once something walks the base chain
-        // looking for it.
+        // A bare base NAME denoting a model kind becomes that kind (the same
+        // classification ClassTable's own seeding performs); anything else is
+        // an ordinary Class.
+        const std::optional<TypeKind> kind = builtin_type_kind(name->identifier());
+        types.push_back(kind.has_value() ? builtin_base_type(*kind)
+                                         : Type::class_of(name->identifier()));
     }
-    return names;
+    return types;
 }
 
 std::size_t TypeChecker::defaulted_param_count(const std::vector<ast::Parameter>& params) {
@@ -410,7 +418,7 @@ void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_
 
 std::string TypeChecker::declare_isolated_class(const ast::ClassDef& node,
                                                 const std::string& qualified_name) {
-    classes_.declare(qualified_name, base_names(node.bases()));
+    classes_.declare(qualified_name, base_types(node.bases()));
     std::vector<ClassDeclaration> all_classes{ClassDeclaration{&node, qualified_name}};
     for_each_flat_statement(node.body(), /*directly_in_body=*/true,
                             [&](const ast::Stmt& statement, bool) {
@@ -444,7 +452,7 @@ void TypeChecker::declare_class_recursive(const ast::ClassDef& class_def,
                                           std::vector<ClassDeclaration>& all_classes) {
     const std::string qualified_name =
         qualified_prefix.empty() ? class_def.name() : qualified_prefix + "." + class_def.name();
-    classes_.declare(qualified_name, base_names(class_def.bases()));
+    classes_.declare(qualified_name, base_types(class_def.bases()));
     all_classes.push_back(ClassDeclaration{&class_def, qualified_name});
 
     // See class_declaration_lines_: every entry, at every nesting depth, is

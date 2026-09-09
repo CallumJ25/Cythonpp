@@ -435,7 +435,7 @@ TEST(BuiltinBaseOfClass, IgnoresObject) {
 
 // This pins builtin_base_of_class's OWN contract given a bare base name in
 // the lookup -- it does not claim TypeChecker ever produces that input.
-// TypeChecker::base_names only records a base via a dynamic_cast to
+// TypeChecker::base_types only records a base via a dynamic_cast to
 // ast::Name, so a Subscript base like `list[int]` is dropped entirely with
 // no trace: `class IntList(list[int])` ends up with an EMPTY base list, and
 // builtin_base_of_class("IntList") answers nullopt, not an argument-less

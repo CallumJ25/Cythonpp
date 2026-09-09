@@ -1,4 +1,5 @@
 #include <optional>
+#include <string>
 
 #include <gtest/gtest.h>
 
@@ -54,6 +55,26 @@ TEST(BuiltinTypeArity, ReportsTheRequiredParameterCount) {
 
 TEST(BuiltinTypeArity, IsZeroForAnUnknownName) {
     EXPECT_EQ(builtin_type_arity("Widget"), 0);
+}
+
+// Derived from one table, so every spelling round-trips through both
+// directions. A hand-written second table is what would let them drift.
+TEST(BuiltinTypeNames, SpellingRoundTripsThroughKind) {
+    for (const char* spelling : {"bool", "bytearray", "bytes", "complex", "dict", "float",
+                                 "frozenset", "int", "list", "object", "range", "set", "str",
+                                 "tuple"}) {
+        const std::optional<TypeKind> kind = builtin_type_kind(spelling);
+        ASSERT_TRUE(kind.has_value()) << spelling;
+        EXPECT_EQ(builtin_type_spelling(*kind), std::optional<std::string>(spelling)) << spelling;
+    }
+}
+
+TEST(BuiltinTypeNames, NonBuiltinKindsHaveNoSpelling) {
+    EXPECT_FALSE(builtin_type_spelling(TypeKind::Unknown).has_value());
+    EXPECT_FALSE(builtin_type_spelling(TypeKind::Union).has_value());
+    EXPECT_FALSE(builtin_type_spelling(TypeKind::Callable).has_value());
+    EXPECT_FALSE(builtin_type_spelling(TypeKind::Class).has_value());
+    EXPECT_FALSE(builtin_type_spelling(TypeKind::Ellipsis).has_value());
 }
 
 } // namespace

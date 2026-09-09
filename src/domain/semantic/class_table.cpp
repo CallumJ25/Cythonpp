@@ -6,6 +6,7 @@
 
 #include "domain/semantic/builtin_class_table.h"
 #include "domain/semantic/builtin_type_names.h"
+#include "domain/semantic/type_compatibility.h"
 
 namespace cythonpp::domain::semantic {
 
@@ -31,11 +32,25 @@ ClassTable::ClassTable() {
         }
         Entry& entry = classes_[builtin.name];
         for (const char* base : builtin.bases) {
-            if (base != nullptr) {
-                entry.bases.emplace_back(base);
+            if (base == nullptr) {
+                continue;
             }
+            // A seeded base is a bare NAME, so it carries no type arguments.
+            // A name this model represents as a kind becomes that kind's bare
+            // Type (empty args, the recorded imprecision builtin_base_type
+            // already documents); anything else is an ordinary Class.
+            const std::optional<TypeKind> kind = builtin_type_kind(base);
+            entry.bases.push_back(kind.has_value() ? builtin_base_type(*kind)
+                                                   : Type::class_of(base));
         }
     }
+}
+
+std::optional<std::string> ClassTable::base_key(const Type& base) {
+    if (base.kind == TypeKind::Class) {
+        return base.name;
+    }
+    return builtin_type_spelling(base.kind);
 }
 
 std::string ClassTable::canonical_name(const std::string& name) const {
@@ -108,12 +123,12 @@ const ClassTable::Entry* ClassTable::find_entry(const std::string& name) const {
 
 bool ClassTable::is_class(const std::string& name) const { return find_entry(name) != nullptr; }
 
-std::vector<std::string> ClassTable::bases_of(const std::string& name) const {
+std::vector<Type> ClassTable::bases_of(const std::string& name) const {
     const Entry* entry = find_entry(name);
-    return entry == nullptr ? std::vector<std::string>{} : entry->bases;
+    return entry == nullptr ? std::vector<Type>{} : entry->bases;
 }
 
-void ClassTable::declare(std::string qualified_name, std::vector<std::string> bases) {
+void ClassTable::declare(std::string qualified_name, std::vector<Type> bases) {
     Entry& entry = classes_[std::move(qualified_name)];
     entry.bases = std::move(bases);
 }
@@ -207,8 +222,14 @@ std::optional<Type> ClassTable::inherited_member_type(const std::string& qualifi
         }
         return it->second.type;
     };
-    for (const std::string& base : entry->second.bases) {
-        if (std::optional<Type> found = walk_chain<Type>(base, visited, extract)) {
+    for (const Type& base : entry->second.bases) {
+        const std::optional<std::string> key = base_key(base);
+        if (!key.has_value()) {
+            // A base that denotes no ClassTable entry (Unknown, Union,
+            // Callable) -- see base_key's own comment. Ends this branch.
+            continue;
+        }
+        if (std::optional<Type> found = walk_chain<Type>(*key, visited, extract)) {
             return found;
         }
         // The scoped-alias MISS FALLBACK query_chain applies at its own root,
@@ -216,7 +237,7 @@ std::optional<Type> ClassTable::inherited_member_type(const std::string& qualifi
         // source-level spelling that fallback exists for. The cycle guard is
         // shared with the walk above rather than restarted, so the fallback
         // cannot re-enter the root either.
-        const std::optional<std::string> shadowed = shadowed_name(base);
+        const std::optional<std::string> shadowed = shadowed_name(*key);
         if (shadowed.has_value()) {
             if (std::optional<Type> found = walk_resolved<Type>(*shadowed, visited, extract)) {
                 return found;

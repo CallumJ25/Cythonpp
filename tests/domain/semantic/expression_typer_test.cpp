@@ -745,7 +745,7 @@ TEST(ExpressionTyper, ResolvesAnInheritedAttribute) {
     ClassTable table;
     table.declare("Base", {});
     table.declare_member("Base", "x", Type::str(), 2);
-    table.declare("Leaf", {"Base"});
+    table.declare("Leaf", {Type::class_of("Base")});
 
     const Typed typed =
         type_expression("w.x", {{"w", Type::class_of("Leaf")}}, Type::unknown(), &table);
@@ -920,7 +920,7 @@ TEST(ExpressionTyper, ReportsAMissingAttributeOnAUserClass) {
 // only.
 TEST(ExpressionTyper, AMissingAttributeOnABuiltinInheritingClassIsUnsupported) {
     ClassTable table;
-    table.declare("Sub", {"int"});
+    table.declare("Sub", {Type::int_()});
 
     const Typed typed = type_expression("s.bit_length", {{"s", Type::class_of("Sub")}},
                                         Type::unknown(), &table);
@@ -932,7 +932,7 @@ TEST(ExpressionTyper, AMissingAttributeOnABuiltinInheritingClassIsUnsupported) {
 // A DECLARED member still wins over the carve-out.
 TEST(ExpressionTyper, ADeclaredMemberOnABuiltinInheritingClassStillResolves) {
     ClassTable table;
-    table.declare("Sub", {"int"});
+    table.declare("Sub", {Type::int_()});
     table.declare_member("Sub", "label", Type::str(), 3);
 
     const Typed typed =

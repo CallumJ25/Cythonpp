@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "type.h"
+
 namespace cythonpp::domain::semantic {
 
 // What the type algebra needs to know about user-defined classes.
@@ -27,12 +29,22 @@ public:
     // Direct bases only; the transitive walk belongs to is_subtype, where it
     // is testable against a fake. Empty for a name that is not a class.
     //
+    // A base is a TYPE, not a name, because a base can be PARAMETRIC:
+    // `class IntList(list[int])` has one base and its element type is
+    // load-bearing -- it is what makes `x: list[int] = IntList()` clean,
+    // `IntList()[0]` an `int`, and `for v in IntList()` yield `int`, all
+    // verified against mypy 1.18.1. Storing the name alone dropped the
+    // element type on the floor, which is the root cause of a false
+    // TypeError on every use of a parametric builtin subclass. A base that is
+    // an ordinary class is TypeKind::Class carrying its name; a base that is
+    // a builtin is that builtin's own Type.
+    //
     // Returns BY VALUE, not by const reference: a reference return forces
     // every implementation, the test fake included, to own a persistent empty
     // vector to hand back for the unknown-name case -- a lifetime trap in
     // exactly the path easiest to get wrong. Base lists are two or three
-    // short strings, so the copy is free.
-    virtual std::vector<std::string> bases_of(const std::string& name) const = 0;
+    // short entries, so the copy is free.
+    virtual std::vector<Type> bases_of(const std::string& name) const = 0;
 
     // The name under which this class is actually known. An alias resolves to
     // its canonical spelling; every other name resolves to itself.

@@ -16,68 +16,15 @@ bool is_invariant_container(TypeKind kind) {
            kind == TypeKind::FrozenSet;
 }
 
-// Builds the Type a builtin base-name KIND denotes, for the base-chain walk
-// below. Task 6 made builtin_type_kind visible outside
-// annotation_resolver.cpp precisely so this becomes possible: a base spelled
-// "int" -- `class Sub(int): ...` -- can now be turned back into a real Type
-// and handed to the ordinary is_subtype rules, rather than being unreachable.
-//
-// Exhaustive switch, no default, per project rule: adding a TypeKind forces a
-// decision here rather than silently falling through.
-//
-// The parametric kinds (List, Dict, Set, FrozenSet, Tuple) cannot carry
-// arguments as a bare base name -- `class Sub(list): ...` has no syntax for
-// list's element type -- so they are modelled as an argument-less container
-// (empty `args`). That is a RECORDED imprecision, not a silent one: the
-// invariant-container arm below requires equal-length args, so a class
-// modelled this way is never equal to, say, `list[int]` -- an honest
-// consequence of the bare spelling carrying no element type.
-//
-// Union, Callable and Class can never be a bare base-name spelling --
-// builtin_type_kind() never returns them -- so their cases exist only to keep
-// this switch exhaustive.
-Type builtin_base_type(TypeKind kind) {
-    switch (kind) {
-    case TypeKind::Unknown:
-        return Type::unknown();
-    case TypeKind::NoneType:
-        return Type::none();
-    case TypeKind::Bool:
-        return Type::bool_();
-    case TypeKind::Int:
-        return Type::int_();
-    case TypeKind::Float:
-        return Type::float_();
-    case TypeKind::Complex:
-        return Type::complex_();
-    case TypeKind::Str:
-        return Type::str();
-    case TypeKind::Bytes:
-        return Type::bytes();
-    case TypeKind::ByteArray:
-        return Type::bytearray_();
-    case TypeKind::Ellipsis:
-        return Type::ellipsis();
-    case TypeKind::Range:
-        return Type::range_();
-    case TypeKind::Object:
-        return Type::object();
-    case TypeKind::List:
-    case TypeKind::Dict:
-    case TypeKind::Set:
-    case TypeKind::FrozenSet:
-    case TypeKind::Tuple:
-    case TypeKind::Union:
-    case TypeKind::Callable:
-    case TypeKind::Class: {
-        Type type;
-        type.kind = kind;
-        return type;
+// The ClassLookup key a chain step is looked up under. The exact analogue of
+// ClassTable::base_key, kept separate only because that one is a private of
+// the concrete table and this one works through the abstract lookup; keep the
+// two in step.
+std::optional<std::string> chain_key(const ClassLookup& classes, const Type& step) {
+    if (step.kind == TypeKind::Class) {
+        return classes.canonical_name(step.name);
     }
-    }
-    // Unreachable: exhaustive above, with no default, so adding a kind warns
-    // here rather than silently mis-modelling it.
-    return Type::unknown();
+    return builtin_type_spelling(step.kind);
 }
 
 // Every class canonically reachable from `start`, DEPTH-FIRST LEFT TO RIGHT,
@@ -91,42 +38,58 @@ Type builtin_base_type(TypeKind kind) {
 // join's nearest-common-base search below, which is deliberately left-biased
 // under multiple inheritance to match mypy.
 //
-// Iterative with an explicit worklist and a visited list (this vector,
-// `chain`, doubles as both) rather than recursive: a malformed class table
-// can contain a cycle -- `class A(B)` with `class B(A)` is rejected by
-// Python, but nothing here guarantees the table it is handed is
-// well-formed. To keep the LIFO worklist producing left-to-right preorder
-// despite popping from the back, each class's bases are pushed in REVERSE
-// order, so the leftmost base is pushed last and therefore popped first --
-// the standard iterative-preorder trick.
+// Entries are TYPES, not names, so a PARAMETRIC base survives the walk:
+// `class IntList(list[int])` yields `[Class("IntList"), list[int], object]`
+// and the element type is still there for is_subtype and for the element/
+// subscript rules to use. That is the whole point of the change -- with names
+// only, `list[int]` collapsed to "list" and every element type was lost.
+//
+// A step's ClassTable key is its own name for a Class, or the builtin
+// spelling for a builtin kind (so `list[int]` still reaches `list`'s seeded
+// entry and its `object` base). A step that denotes no key ends that branch.
+//
+// Iterative with an explicit worklist and `chain` doubling as the visited
+// list, for the same reason as before: a malformed class table can contain a
+// cycle. Bases are pushed in REVERSE so the leftmost is popped first --
+// the standard iterative-preorder trick -- and that left-to-right order is
+// load-bearing for nearest_common_base's deliberately left-biased search.
+//
+// Membership is by KEY, not by whole Type: two different parameterisations of
+// one base cannot both be walked, and comparing whole Types would let
+// `list[int]` and `list[str]` both enter the chain and defeat the cycle
+// guard.
 //
 // THE ONE guarded walk: class_reaches (below) is expressed in terms of this
 // function rather than repeating the cycle guard a second time.
-std::vector<std::string> class_ancestor_chain(const ClassLookup& classes, const std::string& start) {
-    std::vector<std::string> chain = {classes.canonical_name(start)};
-    std::vector<std::string> pending = classes.bases_of(chain.front());
+std::vector<Type> class_ancestor_chain(const ClassLookup& classes, const std::string& start) {
+    const std::string root = classes.canonical_name(start);
+    std::vector<Type> chain = {Type::class_of(root)};
+    std::vector<std::string> keys = {root};
+
+    std::vector<Type> pending = classes.bases_of(root);
     std::reverse(pending.begin(), pending.end());
 
     while (!pending.empty()) {
-        const std::string current = classes.canonical_name(pending.back());
+        Type current = std::move(pending.back());
         pending.pop_back();
-
-        bool already_seen = false;
-        for (const std::string& visited : chain) {
-            if (visited == current) {
-                already_seen = true;
-                break;
-            }
+        if (current.kind == TypeKind::Class) {
+            current.name = classes.canonical_name(current.name);
         }
-        if (already_seen) {
+
+        const std::optional<std::string> key = chain_key(classes, current);
+        if (!key.has_value()) {
             continue;
         }
+        if (std::find(keys.begin(), keys.end(), *key) != keys.end()) {
+            continue;
+        }
+        keys.push_back(*key);
         chain.push_back(current);
 
-        std::vector<std::string> bases = classes.bases_of(current);
+        std::vector<Type> bases = classes.bases_of(*key);
         std::reverse(bases.begin(), bases.end());
-        for (const std::string& next : bases) {
-            pending.push_back(next);
+        for (Type& next : bases) {
+            pending.push_back(std::move(next));
         }
     }
     return chain;
@@ -159,30 +122,30 @@ bool class_reaches(const ClassLookup& classes, const std::string& derived, const
     const std::string canonical_target =
         target.kind == TypeKind::Class ? classes.canonical_name(target.name) : std::string();
 
-    const std::vector<std::string> chain = class_ancestor_chain(classes, derived);
+    const std::vector<Type> chain = class_ancestor_chain(classes, derived);
     for (std::size_t index = 1; index < chain.size(); ++index) {
-        const std::string& current = chain[index];
+        const Type& current = chain[index];
 
-        if (target.kind == TypeKind::Class && current == canonical_target) {
-            return true;
-        }
-        if (const std::optional<TypeKind> kind = builtin_type_kind(current)) {
-            if (is_subtype(builtin_base_type(*kind), target, &classes)) {
+        if (current.kind == TypeKind::Class) {
+            // Compared by NAME rather than through is_subtype: recursing
+            // there for a Class step would come straight back into this
+            // function for the same chain and never terminate.
+            if (target.kind == TypeKind::Class && current.name == canonical_target) {
                 return true;
             }
+            continue;
+        }
+        // A builtin step, now carrying its type ARGUMENTS: `class
+        // IntList(list[int])` reaches list[int], so `x: list[int] =
+        // IntList()` is clean and the reverse direction correctly is not
+        // (is_subtype is asymmetric, and the invariant-container arm below
+        // handles it). Routing through the ordinary rules is also what makes
+        // the numeric tower apply for `class Sub(int)` without restating it.
+        if (is_subtype(current, target, &classes)) {
+            return true;
         }
     }
     return false;
-}
-
-// The Type an ancestor-chain entry denotes: a builtin base name
-// (`class Sub(int)`) turns back into that builtin Type via builtin_type_kind,
-// exactly as class_reaches does; anything else is an ordinary Class.
-Type ancestor_type(const std::string& ancestor) {
-    if (const std::optional<TypeKind> kind = builtin_type_kind(ancestor)) {
-        return builtin_base_type(*kind);
-    }
-    return Type::class_of(ancestor);
 }
 
 // The nearest common base of two Class types, for join's both-Class arm.
@@ -219,14 +182,12 @@ Type ancestor_type(const std::string& ancestor) {
 // genuinely unrelated classes fall off the end of both loops; the caller
 // supplies Object.
 Type nearest_common_base(const ClassLookup& classes, const Type& left, const Type& right) {
-    for (const std::string& ancestor : class_ancestor_chain(classes, left.name)) {
-        const Type candidate = ancestor_type(ancestor);
+    for (const Type& candidate : class_ancestor_chain(classes, left.name)) {
         if (is_subtype(right, candidate, &classes)) {
             return candidate;
         }
     }
-    for (const std::string& ancestor : class_ancestor_chain(classes, right.name)) {
-        const Type candidate = ancestor_type(ancestor);
+    for (const Type& candidate : class_ancestor_chain(classes, right.name)) {
         if (is_subtype(left, candidate, &classes)) {
             return candidate;
         }
@@ -292,17 +253,70 @@ Type canonicalised(Type type, const ClassLookup* classes) {
 
 } // namespace
 
+Type builtin_base_type(TypeKind kind) {
+    switch (kind) {
+    case TypeKind::Unknown:
+        return Type::unknown();
+    case TypeKind::NoneType:
+        return Type::none();
+    case TypeKind::Bool:
+        return Type::bool_();
+    case TypeKind::Int:
+        return Type::int_();
+    case TypeKind::Float:
+        return Type::float_();
+    case TypeKind::Complex:
+        return Type::complex_();
+    case TypeKind::Str:
+        return Type::str();
+    case TypeKind::Bytes:
+        return Type::bytes();
+    case TypeKind::ByteArray:
+        return Type::bytearray_();
+    case TypeKind::Ellipsis:
+        return Type::ellipsis();
+    case TypeKind::Range:
+        return Type::range_();
+    case TypeKind::Object:
+        return Type::object();
+    case TypeKind::List:
+    case TypeKind::Dict:
+    case TypeKind::Set:
+    case TypeKind::FrozenSet:
+    case TypeKind::Tuple:
+    case TypeKind::Union:
+    case TypeKind::Callable:
+    case TypeKind::Class: {
+        Type type;
+        type.kind = kind;
+        return type;
+    }
+    }
+    // Unreachable: exhaustive above, with no default, so adding a kind warns
+    // here rather than silently mis-modelling it.
+    return Type::unknown();
+}
+
 std::optional<Type> builtin_base_of_class(const ClassLookup& classes, const std::string& name) {
     // The whole chain including index 0, unlike class_reaches, which asks
     // only about PROPER ancestors: a caller passing a name that is itself a
     // builtin spelling should get that builtin back rather than nothing,
     // since "what builtin does this name denote or inherit" is one question.
-    for (const std::string& ancestor : class_ancestor_chain(classes, name)) {
-        if (ancestor == "object") {
+    //
+    // `object` is skipped for the reason inherits_builtin's own comment
+    // gives: every class conceptually derives from it, and treating it as
+    // "the inherited builtin" would answer this question `true` for every
+    // class in the program.
+    //
+    // The step is returned AS RECORDED, type arguments and all, which is what
+    // makes `class IntList(list[int])` subscript and iterate as `int` rather
+    // than deferring.
+    for (const Type& step : class_ancestor_chain(classes, name)) {
+        if (step.kind == TypeKind::Class || step.kind == TypeKind::Object) {
             continue;
         }
-        if (const std::optional<TypeKind> kind = builtin_type_kind(ancestor)) {
-            return builtin_base_type(*kind);
+        if (builtin_type_spelling(step.kind).has_value()) {
+            return step;
         }
     }
     return std::nullopt;

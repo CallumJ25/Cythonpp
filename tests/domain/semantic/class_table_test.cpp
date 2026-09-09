@@ -6,6 +6,7 @@
 
 #include "domain/semantic/class_table.h"
 #include "domain/semantic/type.h"
+#include "domain/semantic/type_compatibility.h"
 #include "domain/semantic/type_name.h"
 
 namespace cythonpp::domain::semantic {
@@ -25,8 +26,19 @@ TEST(ClassTable, SeedsItselfWithBuiltinClasses) {
 TEST(ClassTable, SeededClassesCarryTheirBases) {
     const ClassTable table;
 
-    EXPECT_EQ(table.bases_of("ValueError"), (std::vector<std::string>{"Exception"}));
+    EXPECT_EQ(table.bases_of("ValueError"), (std::vector<Type>{Type::class_of("Exception")}));
     EXPECT_TRUE(table.bases_of("BaseException").empty());
+}
+
+// A seeded base whose name this model represents as a KIND is stored as that
+// kind, not as Class("object") or Class("int") -- so the chain walk reaches
+// the numeric tower and the container rules for `class Sub(int)`. Verified
+// against src/domain/semantic/builtin_class_table.h: "bool" is seeded with
+// base "int" (the only seeded builtin-kind-named base in that table), so it
+// is the class this pins.
+TEST(ClassTable, ASeededBuiltinKindBaseIsStoredAsThatKind) {
+    const ClassTable table;
+    EXPECT_EQ(table.bases_of("bool"), (std::vector<Type>{Type::int_()}));
 }
 
 // print is a function, not a type. `x: print` must stay a NameError.
@@ -40,10 +52,10 @@ TEST(ClassTable, DoesNotSeedBuiltinFunctions) {
 TEST(ClassTable, DeclaredClassesAreFound) {
     ClassTable table;
     table.declare("Widget", {});
-    table.declare("Button", {"Widget"});
+    table.declare("Button", {Type::class_of("Widget")});
 
     EXPECT_TRUE(table.is_class("Widget"));
-    EXPECT_EQ(table.bases_of("Button"), (std::vector<std::string>{"Widget"}));
+    EXPECT_EQ(table.bases_of("Button"), (std::vector<Type>{Type::class_of("Widget")}));
     EXPECT_FALSE(table.is_class("Nonexistent"));
     EXPECT_TRUE(table.bases_of("Nonexistent").empty());
 }
@@ -76,8 +88,8 @@ TEST(ClassTable, MembersAreFoundThroughTheBaseChain) {
     ClassTable table;
     table.declare("Base", {});
     table.declare_member("Base", "x", Type::int_(), 2);
-    table.declare("Middle", {"Base"});
-    table.declare("Leaf", {"Middle"});
+    table.declare("Middle", {Type::class_of("Base")});
+    table.declare("Leaf", {Type::class_of("Middle")});
 
     const std::optional<Type> inherited = table.member_type("Leaf", "x");
     ASSERT_TRUE(inherited.has_value());
@@ -94,7 +106,7 @@ TEST(ClassTable, OwnMemberTypeIgnoresTheBaseChain) {
     ClassTable table;
     table.declare("Base", {});
     table.declare_member("Base", "v", Type::object(), 3);
-    table.declare("Child", {"Base"});
+    table.declare("Child", {Type::class_of("Base")});
     table.declare_member("Child", "w", Type::str(), 7);
 
     EXPECT_EQ(table.member_type("Child", "v"), Type::object()) << "inherited, as before";
@@ -117,7 +129,7 @@ TEST(ClassTable, OwnMemberDeclaredLineIgnoresTheBaseChainToo) {
     ClassTable table;
     table.declare("Base", {});
     table.declare_member("Base", "v", Type::object(), 3);
-    table.declare("Child", {"Base"});
+    table.declare("Child", {Type::class_of("Base")});
     table.declare_member("Child", "w", Type::str(), 7);
 
     EXPECT_EQ(table.member_declared_line("Child", "v"), 3) << "inherited, as before";
@@ -136,7 +148,7 @@ TEST(ClassTable, InheritedMemberTypeSkipsTheClasssOwnEntry) {
     ClassTable table;
     table.declare("Base", {});
     table.declare_member("Base", "v", Type::object(), 3);
-    table.declare("Child", {"Base"});
+    table.declare("Child", {Type::class_of("Base")});
     table.declare_member("Child", "v", Type::int_(), 7);
     table.declare_member("Child", "w", Type::str(), 8);
 
@@ -155,15 +167,15 @@ TEST(ClassTable, InheritedMemberTypeWalksTheWholeChain) {
     ClassTable table;
     table.declare("Root", {});
     table.declare_member("Root", "v", Type::object(), 1);
-    table.declare("Mid", {"Root"});
-    table.declare("Leaf", {"Mid"});
+    table.declare("Mid", {Type::class_of("Root")});
+    table.declare("Leaf", {Type::class_of("Mid")});
     table.declare_member("Leaf", "v", Type::bool_(), 9);
     EXPECT_EQ(table.inherited_member_type("Leaf", "v"), Type::object());
 
     table.declare("Left", {});
     table.declare("Right", {});
     table.declare_member("Right", "w", Type::str(), 2);
-    table.declare("Both", {"Left", "Right"});
+    table.declare("Both", {Type::class_of("Left"), Type::class_of("Right")});
     EXPECT_EQ(table.inherited_member_type("Both", "w"), Type::str())
         << "a later base still counts";
 }
@@ -176,16 +188,16 @@ TEST(ClassTable, InheritedMemberTypeWalksTheWholeChain) {
 // is "skip my own entry" must not hand it back under any input.
 TEST(ClassTable, InheritedMemberTypeDoesNotWalkBackIntoTheQueriedClass) {
     ClassTable table;
-    table.declare("A", {"B"});
+    table.declare("A", {Type::class_of("B")});
     table.declare_member("A", "v", Type::int_(), 1);
-    table.declare("B", {"A"});
+    table.declare("B", {Type::class_of("A")});
     EXPECT_EQ(table.inherited_member_type("A", "v"), std::nullopt);
 
     // The self-cycle a function-local `class L(L)` produces, once the local
     // class is declared under its isolated name and the bare name is
     // scope-aliased to it: the base spelling canonicalises straight back to
     // the root.
-    table.declare("<local-class>#5#L", {"L"});
+    table.declare("<local-class>#5#L", {Type::class_of("L")});
     table.declare_member("<local-class>#5#L", "w", Type::str(), 2);
     table.declare_scoped_alias("L", "<local-class>#5#L");
     EXPECT_EQ(table.inherited_member_type("<local-class>#5#L", "w"), std::nullopt);
@@ -198,7 +210,7 @@ TEST(ClassTable, InheritedMemberTypeDoesNotWalkBackIntoTheQueriedClass) {
 TEST(ClassTable, InheritedMemberTypeCanonicalisesABaseSpelling) {
     ClassTable table;
     table.declare_member("OSError", "v", Type::int_(), 1);
-    table.declare("Child", {"IOError"});
+    table.declare("Child", {Type::class_of("IOError")});
     table.declare_member("Child", "v", Type::bool_(), 2);
     EXPECT_EQ(table.inherited_member_type("Child", "v"), Type::int_());
 }
@@ -212,7 +224,7 @@ TEST(ClassTable, MultipleInheritanceTakesTheFirstBase) {
     table.declare_member("A", "v", Type::int_(), 2);
     table.declare("B", {});
     table.declare_member("B", "v", Type::str(), 5);
-    table.declare("D", {"A", "B"});
+    table.declare("D", {Type::class_of("A"), Type::class_of("B")});
 
     const std::optional<Type> resolved = table.member_type("D", "v");
     ASSERT_TRUE(resolved.has_value());
@@ -224,8 +236,8 @@ TEST(ClassTable, MultipleInheritanceTakesTheFirstBase) {
 // this test is the difference between a hang and a failure.
 TEST(ClassTable, ACycleInTheBaseChainTerminates) {
     ClassTable table;
-    table.declare("A", {"B"});
-    table.declare("B", {"A"});
+    table.declare("A", {Type::class_of("B")});
+    table.declare("B", {Type::class_of("A")});
 
     EXPECT_EQ(table.member_type("A", "missing"), std::nullopt);
     EXPECT_FALSE(table.inherits_builtin("A"));
@@ -270,7 +282,7 @@ TEST(ClassTable, ConstructorTypeFindsAnInheritedInit) {
     table.declare_method(
         "B", "__init__",
         Type::callable({Type::class_of("B"), Type::int_()}, Type::none()));
-    table.declare("D", {"B"});
+    table.declare("D", {Type::class_of("B")});
 
     // The returned instance type is D, the QUERIED class -- not B, the
     // declaring one.
@@ -287,7 +299,7 @@ TEST(ClassTable, ConstructorTypeOwnInitBeatsInherited) {
     table.declare_method(
         "B", "__init__",
         Type::callable({Type::class_of("B"), Type::int_()}, Type::none()));
-    table.declare("D", {"B"});
+    table.declare("D", {Type::class_of("B")});
     table.declare_method(
         "D", "__init__",
         Type::callable({Type::class_of("D"), Type::str()}, Type::none()));
@@ -315,8 +327,8 @@ TEST(ClassTable, MethodTypeFoundThroughTheBaseChain) {
     table.declare("Base", {});
     table.declare_method("Base", "greet",
                          Type::callable({Type::class_of("Base")}, Type::str()));
-    table.declare("Middle", {"Base"});
-    table.declare("Leaf", {"Middle"});
+    table.declare("Middle", {Type::class_of("Base")});
+    table.declare("Leaf", {Type::class_of("Middle")});
 
     const std::optional<Type> inherited = table.method_type("Leaf", "greet");
     ASSERT_TRUE(inherited.has_value());
@@ -328,8 +340,8 @@ TEST(ClassTable, MethodTypeFoundThroughTheBaseChain) {
 // itself in a second, independent implementation.
 TEST(ClassTable, MethodTypeTerminatesOnACycle) {
     ClassTable table;
-    table.declare("A", {"B"});
-    table.declare("B", {"A"});
+    table.declare("A", {Type::class_of("B")});
+    table.declare("B", {Type::class_of("A")});
 
     EXPECT_EQ(table.method_type("A", "missing"), std::nullopt);
 }
@@ -339,10 +351,10 @@ TEST(ClassTable, MethodTypeTerminatesOnACycle) {
 // attribute miss on Sub must not be a TypeError.
 TEST(ClassTable, InheritsBuiltinDetectsABuiltinInTheBaseChain) {
     ClassTable table;
-    table.declare("Sub", {"int"});
-    table.declare("Deep", {"Sub"});
+    table.declare("Sub", {Type::int_()});
+    table.declare("Deep", {Type::class_of("Sub")});
     table.declare("Plain", {});
-    table.declare("PlainChild", {"Plain"});
+    table.declare("PlainChild", {Type::class_of("Plain")});
 
     EXPECT_TRUE(table.inherits_builtin("Sub"));
     EXPECT_TRUE(table.inherits_builtin("Deep")) << "transitive";
@@ -356,7 +368,7 @@ TEST(ClassTable, InheritsBuiltinDetectsABuiltinInTheBaseChain) {
 // NotImplementedError and delete the attr-defined check entirely.
 TEST(ClassTable, InheritsBuiltinExcludesObject) {
     ClassTable table;
-    table.declare("Widget", {"object"});
+    table.declare("Widget", {Type::object()});
 
     EXPECT_FALSE(table.inherits_builtin("Widget"));
 }
@@ -367,7 +379,7 @@ TEST(ClassTable, InheritsBuiltinExcludesObject) {
 // is the ordinary user-class case.
 TEST(ClassTable, InheritsBuiltinIsFalseForASeededExceptionBase) {
     ClassTable table;
-    table.declare("MyError", {"Exception"});
+    table.declare("MyError", {Type::class_of("Exception")});
 
     EXPECT_FALSE(table.inherits_builtin("MyError"));
 }
@@ -452,10 +464,10 @@ TEST(ClassTable, InheritsBuiltinResolvesAnAliasName) {
 // false TypeError on its own (see the next test for that).
 TEST(ClassTable, DeclaredClassUnderAnAliasSpellingWinsOverTheBuiltin) {
     ClassTable table;
-    table.declare("IOError", {"Widget"});
+    table.declare("IOError", {Type::class_of("Widget")});
 
     EXPECT_TRUE(table.is_class("IOError"));
-    EXPECT_EQ(table.bases_of("IOError"), (std::vector<std::string>{"Widget"}));
+    EXPECT_EQ(table.bases_of("IOError"), (std::vector<Type>{Type::class_of("Widget")}));
     EXPECT_EQ(type_name(table.constructor_type("IOError")),
               type_name(Type::callable({}, Type::class_of("IOError"))));
 }
@@ -628,7 +640,7 @@ TEST(ClassTable, AScopedAliasShadowingNothingKeepsAGenuineMemberMissAMiss) {
 // carve-out, and `true` there only ever SUPPRESSES a diagnostic.
 TEST(ClassTable, TheScopedAliasFallbackCoversMethodsAndBuiltinInheritance) {
     ClassTable table;
-    table.declare("L", {"list"});
+    table.declare("L", {builtin_base_type(TypeKind::List)});
     table.declare_method("L", "b", Type::callable({Type::class_of("L")}, Type::int_()));
     table.declare_member("L", "a", Type::str(), 2);
     table.declare("<local-class>#5#L", {});

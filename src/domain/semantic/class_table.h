@@ -42,7 +42,7 @@ public:
 
     // Direct bases only, after canonicalising `name`. Empty for a name that
     // is not a class.
-    std::vector<std::string> bases_of(const std::string& name) const override;
+    std::vector<Type> bases_of(const std::string& name) const override;
 
     // The name every read query below actually looks up through, in
     // precedence order:
@@ -90,7 +90,7 @@ public:
     // direct bases. Bases are stored as given; a base that never gets its
     // own declare() call, or names a seeded builtin, is resolved lazily by
     // the transitive queries below.
-    void declare(std::string qualified_name, std::vector<std::string> bases);
+    void declare(std::string qualified_name, std::vector<Type> bases);
 
     void declare_member(const std::string& qualified_name, std::string member, Type type,
                          int declared_line);
@@ -216,13 +216,22 @@ private:
     };
 
     struct Entry {
-        std::vector<std::string> bases;
+        std::vector<Type> bases;
         std::map<std::string, Member> members;
         std::map<std::string, Type> methods;
     };
 
     // Canonicalises, then looks the entry up directly (no transitive walk).
     const Entry* find_entry(const std::string& name) const;
+
+    // The ClassTable KEY a base Type is looked up under during a chain walk:
+    // a Class base's own name, or the builtin spelling for a base that is a
+    // builtin kind (so a base recorded as list[int] still reaches `list`'s
+    // seeded entry and its `object` base). std::nullopt for a base that
+    // denotes no entry at all -- Unknown (a base whose annotation failed to
+    // resolve, already reported), Union, Callable -- which simply ends that
+    // branch of the walk.
+    static std::optional<std::string> base_key(const Type& base);
 
     // What `name` would have canonicalised to had the SCOPE-LIMITED aliases
     // not existed -- canonical_name's steps (2) and (3) only -- but ONLY
@@ -293,8 +302,15 @@ private:
         if (std::optional<Result> direct = extract(resolved, entry)) {
             return direct;
         }
-        for (const std::string& base : entry.bases) {
-            if (std::optional<Result> found = walk_chain<Result>(base, visited, extract)) {
+        for (const Type& base : entry.bases) {
+            const std::optional<std::string> key = base_key(base);
+            if (!key.has_value()) {
+                // A base that denotes no ClassTable entry -- Unknown from a
+                // failed annotation, or a Union/Callable a base can never
+                // really be. Ends this branch rather than aborting the walk.
+                continue;
+            }
+            if (std::optional<Result> found = walk_chain<Result>(*key, visited, extract)) {
                 return found;
             }
         }

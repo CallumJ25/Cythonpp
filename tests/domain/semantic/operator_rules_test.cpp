@@ -835,7 +835,7 @@ TEST(ElementType, IteratingAClassThatInheritsABuiltinYieldsTheBuiltinsElement) {
 // the only spelling that comes back argument-less here, and it also has no
 // element type to report -- Unsupported, never NotApplicable. (A genuinely
 // PARAMETRIC base, `class IntList(list[int])`, is not recorded at all:
-// base_names drops a Subscript base entirely, so builtin_base_of_class never
+// base_types drops a Subscript base entirely, so builtin_base_of_class never
 // sees it in the first place -- and mypy --strict rejects the bare spelling
 // anyway: "Missing type parameters for generic type \"list\"".)
 TEST(ElementType, AnInheritedBuiltinThatPinsNoElementTypeIsStillUnsupported) {

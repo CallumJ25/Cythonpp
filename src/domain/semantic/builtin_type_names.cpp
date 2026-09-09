@@ -67,4 +67,13 @@ int builtin_type_arity(const std::string& name) {
     return entry->arity;
 }
 
+std::optional<std::string> builtin_type_spelling(TypeKind kind) {
+    for (const BuiltinTypeName& entry : BUILTIN_TYPE_NAMES) {
+        if (entry.kind == kind) {
+            return std::string(entry.spelling);
+        }
+    }
+    return std::nullopt;
+}
+
 } // namespace cythonpp::domain::semantic
