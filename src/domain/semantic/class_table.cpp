@@ -36,12 +36,14 @@ ClassTable::ClassTable() {
                 continue;
             }
             // A seeded base is a bare NAME, so it carries no type arguments.
-            // base_type_for_name performs the same classification
-            // TypeChecker::base_types and the test fake FakeClassLookup both
-            // need: a name this model represents as a kind becomes that
-            // kind's bare Type (empty args, the recorded imprecision
-            // builtin_base_type's own comment documents); anything else is
-            // an ordinary Class.
+            // base_type_for_name performs the same classification the test
+            // fake FakeClassLookup needs for its own name-keyed bases: a name
+            // this model represents as a kind becomes that kind's bare Type
+            // (empty args, the recorded imprecision builtin_base_type's own
+            // comment documents); anything else is an ordinary Class. A
+            // SOURCE-level base does not come through here at all --
+            // TypeChecker::base_types resolves those through
+            // AnnotationResolver, so a parametric base keeps its arguments.
             entry.bases.push_back(base_type_for_name(base));
         }
     }

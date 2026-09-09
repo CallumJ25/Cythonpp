@@ -834,10 +834,14 @@ TEST(ElementType, IteratingAClassThatInheritsABuiltinYieldsTheBuiltinsElement) {
 // (`class IntList(list)`) -- ClassLookup deals in bare base NAMES, so that is
 // the only spelling that comes back argument-less here, and it also has no
 // element type to report -- Unsupported, never NotApplicable. (A genuinely
-// PARAMETRIC base, `class IntList(list[int])`, is not recorded at all:
-// base_types drops a Subscript base entirely, so builtin_base_of_class never
-// sees it in the first place -- and mypy --strict rejects the bare spelling
-// anyway: "Missing type parameters for generic type \"list\"".)
+// PARAMETRIC base, `class IntList(list[int])`, is a different case entirely
+// and is NOT deferred: base_types resolves a Subscript base through
+// AnnotationResolver, builtin_base_of_class hands back list[int] with its
+// argument intact, and element_type answers `int` -- see
+// TypeChecker.AParametricBuiltinSubclassIteratesAsItsElement. The bare
+// spelling this test feeds is the one with no element type to recover, and
+// mypy --strict rejects it anyway: "Missing type parameters for generic type
+// \"list\"" (measured).)
 TEST(ElementType, AnInheritedBuiltinThatPinsNoElementTypeIsStillUnsupported) {
     const semantic_test_support::FakeClassLookup classes(
         {{"Sub", {"int"}}, {"IntList", {"list"}}});

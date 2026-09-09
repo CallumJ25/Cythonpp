@@ -28,15 +28,23 @@ namespace cythonpp::domain::semantic {
 // question about a class NAME -- the signature is unchanged -- but the chain
 // it walks is now Type-based, so the Type it returns may be PARAMETRIC.
 //
-// A PARAMETRIC builtin base (`class IntList(list[int])`) is still not
-// recorded at all, today: TypeChecker::base_types only records a base via a
-// dynamic_cast to ast::Name, so a Subscript base like `list[int]` is dropped
-// entirely with no trace, leaving IntList with an EMPTY base list. This
-// function therefore still returns nullopt for it, the same answer as for a
-// class with no builtin base at all -- not an argument-less `List`. (The
-// bare-name spelling, `class L(list)`, IS recorded, but mypy --strict itself
-// rejects it: "Missing type parameters for generic type \"list\"".) Callers
-// must treat that nullopt as "unknown element type", never as an error.
+// A PARAMETRIC builtin base (`class IntList(list[int])`) comes back WITH its
+// arguments: builtin_base_of_class(classes, "IntList") is list[int], not an
+// argument-less `List` and not nullopt. TypeChecker::base_types resolves
+// every base expression through AnnotationResolver, so a Subscript base is
+// recorded as the parametric Type it denotes, and the chain walk returns the
+// step exactly as recorded. That is what lets `IntList()[0]` and iterating an
+// IntList answer `int` -- verified against mypy 1.18.1, which reveals both as
+// `builtins.int`. Callers must therefore be prepared for a returned container
+// Type to carry args, and must not assume an empty `args`.
+//
+// An ARGUMENT-LESS container still comes back for the BARE spelling,
+// `class L(list)`, which carries no element type to record -- but mypy
+// --strict rejects that spelling anyway ("Missing type parameters for generic
+// type \"list\"", measured), so no mypy-clean program produces it.
+//
+// nullopt still means "reaches no builtin at all", and callers must treat it
+// as "unknown element type", never as an error.
 std::optional<Type> builtin_base_of_class(const ClassLookup& classes, const std::string& name);
 
 // Position in Python's numeric tower -- Bool 1, Int 2, Float 3, Complex 4 --

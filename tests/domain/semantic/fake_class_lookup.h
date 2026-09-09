@@ -45,11 +45,19 @@ public:
     std::string canonical_name(const std::string& name) const override { return name; }
 
 private:
-    // Converts each base's bare source-level NAME to a Type via
-    // base_type_for_name, the same classification ClassTable's own seeding
-    // and TypeChecker::base_types both perform: a name this model represents
-    // as a builtin KIND becomes that kind's bare Type; anything else is an
-    // ordinary Class. Kept here, at construction time, rather than pushed
+    // Converts each base's bare NAME to a Type via base_type_for_name, the
+    // same classification ClassTable's own seeding performs on the bare names
+    // in the generated builtin class table: a name this model represents as a
+    // builtin KIND becomes that kind's bare Type; anything else is an
+    // ordinary Class.
+    //
+    // A bare name is all this fake can express, so a PARAMETRIC base
+    // (`list[int]`) is out of reach here. That is not what production does
+    // with a real source base: TypeChecker::base_types resolves the base
+    // EXPRESSION through AnnotationResolver and keeps its arguments. Reach
+    // for a TypeChecker-level test when the parametric case is the point.
+    //
+    // Kept here, at construction time, rather than pushed
     // onto every call site, so every existing FakeClassLookup({...}) literal
     // across the semantic tests keeps naming bases as plain strings -- this
     // constructor's signature is unchanged.

@@ -47,8 +47,8 @@ std::optional<std::string> builtin_type_spelling(TypeKind kind);
 
 // Builds the Type a builtin KIND denotes on its own, with no name attached.
 // `base_type_for_name` below is built directly on top of this and is what
-// `ClassTable`'s constructor seeding and `TypeChecker::base_types` actually
-// call; this function's own remaining direct callers are
+// `ClassTable`'s constructor seeding and the test fake `FakeClassLookup`
+// actually call; this function's own remaining direct callers are
 // `type_compatibility.cpp`'s `builtin_base_of_class`, which needs the
 // conversion for the chain root's own builtin identity once a NAME has
 // already been classified into a TypeKind, and tests that need to construct
@@ -73,15 +73,20 @@ Type builtin_base_type(TypeKind kind);
 
 // `name` classified into a Type the same way everywhere it is needed: a name
 // this model represents as a builtin KIND becomes that kind's bare Type
-// (via builtin_base_type); anything else is an ordinary Class. One function
-// rather than the three separate copies this rule used to have --
-// `ClassTable`'s constructor seeding, `TypeChecker::base_types`, and even
-// `FakeClassLookup::to_typed` in tests/domain/semantic/fake_class_lookup.h --
-// each writing out the identical two-line ternary. A test fake was one of
-// the three copies, which is precisely the danger: a future change to this
-// rule could land in the two production copies while the fake silently kept
-// the old belief, and the tests built on it would keep passing for the wrong
-// reason.
+// (via builtin_base_type); anything else is an ordinary Class.
+//
+// Two callers today -- `ClassTable`'s constructor seeding, which classifies
+// the bare base NAMES the generated builtin class table spells, and
+// `FakeClassLookup::to_typed` in tests/domain/semantic/fake_class_lookup.h,
+// whose constructor takes bare names for the same reason. `TypeChecker` used
+// to be a third, before `base_types` started resolving every base expression
+// through `AnnotationResolver` instead (which is what a PARAMETRIC base like
+// `list[int]` needs, and what a bare name cannot express).
+//
+// One function rather than a copy per caller. A test fake being one of them
+// is precisely the danger this collapses: a future change to the rule could
+// land in the production copy while the fake silently kept the old belief,
+// and the tests built on it would keep passing for the wrong reason.
 Type base_type_for_name(const std::string& name);
 
 } // namespace cythonpp::domain::semantic
