@@ -4300,5 +4300,209 @@ TEST(TypeChecker, AForTargetWithNoPriorBindingStaysCleanAfterTheLoop) {
                  "    return x + 1\n");
 }
 
+// `break` AND `continue` ARE TERMINATORS TOO, not just `return`. Both are
+// parsed, so both reach visit(If)'s join, and an edge kept from a branch
+// control never leaves widens the surviving branch's narrowing back to the
+// declared type -- a false TypeError on a program both oracles accept.
+// Verified against mypy 1.18.1 and CPython 3.14.2 for this exact source with
+// `print(m([1, 2], True))` / `print(m([1, 2], False))` appended: mypy
+// `Success`, CPython prints `16` then `0`.
+TEST(TypeChecker, AContinuingElseBranchContributesNoEdgeToTheJoin) {
+    expect_clean("def m(xs: list[int], f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    total: int = 0\n"
+                 "    for _ in xs:\n"
+                 "        if f:\n"
+                 "            n = 7\n"
+                 "        else:\n"
+                 "            continue\n"
+                 "        total = total + n + 1\n"
+                 "    return total\n");
+}
+
+// Same shape, `break` in place of `continue`. Separate test because the two
+// are separate AST nodes and a fix that handled only one would leave the
+// other reporting. Verified against mypy 1.18.1 and CPython 3.14.2 with the
+// same two driver lines: mypy `Success`, CPython prints `16` then `0`.
+TEST(TypeChecker, ABreakingElseBranchContributesNoEdgeToTheJoin) {
+    expect_clean("def m(xs: list[int], f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    total: int = 0\n"
+                 "    for _ in xs:\n"
+                 "        if f:\n"
+                 "            n = 7\n"
+                 "        else:\n"
+                 "            break\n"
+                 "        total = total + n + 1\n"
+                 "    return total\n");
+}
+
+// A `while` body rather than a `for` body: the enclosing loop is a different
+// visit() with its own walk, so neither test above pins this one. Verified
+// against mypy 1.18.1 and CPython 3.14.2 with `print(m(2, True))` /
+// `print(m(2, False))` appended: mypy `Success`, CPython prints `16` then `0`.
+TEST(TypeChecker, ABreakingElseBranchContributesNoEdgeToTheJoinInAWhileBody) {
+    expect_clean("def m(k: int, f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    total: int = 0\n"
+                 "    while k > 0:\n"
+                 "        k = k - 1\n"
+                 "        if f:\n"
+                 "            n = 7\n"
+                 "        else:\n"
+                 "            break\n"
+                 "        total = total + n + 1\n"
+                 "    return total\n");
+}
+
+// Whatever follows a `break` in the same suite is dead code, so the branch
+// still never falls through -- the terminator does not have to be the LAST
+// statement. Verified against mypy 1.18.1 and CPython 3.14.2 with the same
+// two driver lines as the `for` tests above: mypy `Success`, CPython prints
+// `16` then `0`.
+TEST(TypeChecker, DeadCodeAfterABreakDoesNotRestoreTheEdge) {
+    expect_clean("def m(xs: list[int], f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    total: int = 0\n"
+                 "    for _ in xs:\n"
+                 "        if f:\n"
+                 "            n = 7\n"
+                 "        else:\n"
+                 "            break\n"
+                 "            total = total + 1\n"
+                 "        total = total + n + 1\n"
+                 "    return total\n");
+}
+
+// The three terminators may be MIXED across a nested `if`'s two arms: an arm
+// that breaks and an arm that continues both leave, so the nested `if` leaves
+// and the branch containing it contributes no edge. Verified against mypy
+// 1.18.1 and CPython 3.14.2 with `print(m([1, 2], True, True))` /
+// `print(m([1, 2], False, False))` appended: mypy `Success`, CPython prints
+// `16` then `0`.
+TEST(TypeChecker, AnIfArmMixingBreakAndContinueLeavesTheBranch) {
+    expect_clean("def m(xs: list[int], f: bool, g: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    total: int = 0\n"
+                 "    for _ in xs:\n"
+                 "        if f:\n"
+                 "            n = 7\n"
+                 "        else:\n"
+                 "            if g:\n"
+                 "                break\n"
+                 "            else:\n"
+                 "                continue\n"
+                 "        total = total + n + 1\n"
+                 "    return total\n");
+}
+
+// One arm returning and the other breaking leaves NO edge to keep, the same
+// situation as both arms returning -- keeping both is the cheap, safe
+// fallback, and this pins that it neither crashes nor invents a diagnostic.
+// Verified against mypy 1.18.1 and CPython 3.14.2 with `print(m([1, 2],
+// True))` / `print(m([1, 2], False))` appended: mypy `Success`, CPython
+// prints `0` twice.
+TEST(TypeChecker, ABreakingBranchAndAReturningBranchKeepBothEdgesRatherThanNone) {
+    expect_clean("def m(xs: list[int], f: bool) -> int:\n"
+                 "    total: int = 0\n"
+                 "    for _ in xs:\n"
+                 "        if f:\n"
+                 "            break\n"
+                 "        else:\n"
+                 "            return 0\n"
+                 "        total = total + 1\n"
+                 "    return total\n");
+}
+
+// THE CONTROL that keeps the tests above from being satisfiable by treating
+// any TEXTUAL `break` as a terminator: a `break` guarded by a nested `if`
+// with no `else` is CONDITIONAL, so that branch can still fall through and
+// its edge must still contribute -- widening `n` back to `object` exactly as
+// mypy does. Verified against mypy 1.18.1: `Unsupported operand types for +
+// ("int" and "object")` on the `total = total + n + 1` line.
+TEST(TypeChecker, AConditionalBreakStillContributesItsEdge) {
+    const Checked checked = check_module("def m(xs: list[int], f: bool, g: bool) -> int:\n"
+                                         "    n: object = object()\n"
+                                         "    total: int = 0\n"
+                                         "    for _ in xs:\n"
+                                         "        if f:\n"
+                                         "            n = 7\n"
+                                         "        else:\n"
+                                         "            if g:\n"
+                                         "                break\n"
+                                         "        total = total + n + 1\n"
+                                         "    return total\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "unsupported operand types for + (\"int\" and \"object\")");
+    EXPECT_EQ(error.line, 10);
+}
+
+// THE SECOND CONTROL, and the distinction contains_reachable_break already
+// draws for its own question: a `continue` inside a NESTED loop belongs to
+// THAT loop, so it does not leave the branch the nested loop sits in, and
+// that branch's edge must still contribute. Verified against mypy 1.18.1:
+// `Unsupported operand types for + ("int" and "object")` on the
+// `total = total + n + 1` line.
+TEST(TypeChecker, ATerminatorInANestedLoopsBodyDoesNotLeaveTheBranch) {
+    const Checked checked = check_module("def m(xs: list[int], f: bool) -> int:\n"
+                                         "    n: object = object()\n"
+                                         "    total: int = 0\n"
+                                         "    for _ in xs:\n"
+                                         "        if f:\n"
+                                         "            n = 7\n"
+                                         "        else:\n"
+                                         "            for _y in xs:\n"
+                                         "                continue\n"
+                                         "        total = total + n + 1\n"
+                                         "    return total\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "unsupported operand types for + (\"int\" and \"object\")");
+    EXPECT_EQ(error.line, 10);
+}
+
+// The OPPOSITE half of that distinction: a nested loop's ORELSE runs outside
+// the nested loop's own break scope, so a `break` written there targets the
+// ENCLOSING loop and does leave the branch -- provided the nested loop's body
+// cannot break out, which is what makes its `else` always run. Verified
+// against mypy 1.18.1: `Success`.
+TEST(TypeChecker, ABreakInANestedLoopsOrelseLeavesTheBranch) {
+    expect_clean("def m(xs: list[int], f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    total: int = 0\n"
+                 "    for _ in xs:\n"
+                 "        if f:\n"
+                 "            n = 7\n"
+                 "        else:\n"
+                 "            for _y in xs:\n"
+                 "                pass\n"
+                 "            else:\n"
+                 "                break\n"
+                 "        total = total + n + 1\n"
+                 "    return total\n");
+}
+
+// THE GUARD ON THE OTHER PREDICATE: always_leaves_branch must stay SEPARATE
+// from always_returns, never a widening of it. A `break` is not a `return`,
+// so a `while True` whose every path breaks still falls out of the loop and
+// still needs a return after it -- widening always_returns to count `break`
+// would silence this. Verified against mypy 1.18.1: `Missing return
+// statement  [return]`.
+TEST(TypeChecker, ABreakingWhileTrueStillNeedsAReturnAfterIt) {
+    const Checked checked = check_module("def f(c: bool) -> int:\n"
+                                         "    while True:\n"
+                                         "        if c:\n"
+                                         "            break\n"
+                                         "        else:\n"
+                                         "            break\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "missing return statement");
+    EXPECT_EQ(error.line, 1);
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

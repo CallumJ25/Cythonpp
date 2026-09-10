@@ -978,6 +978,38 @@ private:
     // always still belongs to the enclosing loop).
     static bool contains_reachable_break(const std::vector<ast::StmtPtr>& body);
 
+    // "Does control ALWAYS leave this branch rather than falling through to
+    // the statement after the enclosing `if`?" -- used ONLY by visit(If)'s
+    // narrowing join, to decide whether a branch's end-of-branch state is a
+    // reachable edge at the merge.
+    //
+    // DELIBERATELY NOT always_returns, and the two must not be merged: they
+    // ask different questions and their SAFE directions are opposite.
+    // always_returns answers "does this function body guarantee a return",
+    // where answering false wrongly means a spurious "missing return
+    // statement" -- so a `break` must NOT count there, since `while True:`
+    // with a reachable break is exactly the shape that check treats as
+    // skippable. This predicate answers "is the merge reachable from here",
+    // where answering false wrongly keeps an UNREACHABLE edge, and an edge
+    // that never assigned a narrowed path contributes that path's DECLARED
+    // type -- widening a narrowing the surviving branch established into a
+    // false TypeError. A `break` and a `continue` both leave the branch just
+    // as surely as a `return`, so all three count here.
+    //
+    // Purely syntactic, non-recursive-into-nested-scopes, same shape as
+    // always_returns otherwise: a Return/Break/Continue in the list is a hit;
+    // an If counts only when orelse() is NON-EMPTY and BOTH branches leave
+    // (so the three terminators may be mixed across the arms); a While counts
+    // when its condition is the literal `True` and its body has no reachable
+    // break (it never falls through at all); a nested For/While's own BODY is
+    // NOT recursed into, because a `break`/`continue` written there belongs to
+    // THAT loop and cannot leave this branch, while its ORELSE IS recursed
+    // into whenever the nested loop's body has no reachable break, since that
+    // `else` then always runs and runs outside the nested loop's own break
+    // scope -- the same body-vs-orelse distinction contains_reachable_break
+    // draws, for the same reason.
+    static bool always_leaves_branch(const std::vector<ast::StmtPtr>& body);
+
     void report(const ast::Node& at, std::string code, std::string message);
     void report_incompatible_assignment(const ast::Node& at, const Type& value_type,
                                         const Type& target_type, const char* target_label);

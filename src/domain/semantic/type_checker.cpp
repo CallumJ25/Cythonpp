@@ -14,6 +14,7 @@
 #include "domain/ast/break.h"
 #include "domain/ast/call.h"
 #include "domain/ast/constant.h"
+#include "domain/ast/continue.h"
 #include "domain/ast/dict_expr.h"
 #include "domain/ast/function_def.h"
 #include "domain/ast/list_expr.h"
@@ -2298,7 +2299,7 @@ void TypeChecker::visit(const ast::If& node) {
     }
     const NarrowingState after_orelse = narrowings_.snapshot();
 
-    // A BRANCH THAT ALWAYS RETURNS CONTRIBUTES NO EDGE. Its end-of-branch
+    // A BRANCH CONTROL ALWAYS LEAVES CONTRIBUTES NO EDGE. Its end-of-branch
     // state is unreachable at the merge, and taking it anyway is not merely
     // imprecise -- it is a FALSE TypeError, because a branch that never
     // assigned the path contributes that path's DECLARED type and so widens
@@ -2318,13 +2319,26 @@ void TypeChecker::visit(const ast::If& node) {
     // the last line -- rejecting a program both oracles accept. The same
     // holds with the branches swapped, and for a `self.` attribute path in
     // place of the local. Keeping BOTH edges when dropping would leave none
-    // (a branch each way returns) costs nothing: the merge is unreachable, so
+    // (a branch each way leaves) costs nothing: the merge is unreachable, so
     // whatever state it carries is never read.
     //
-    // `always_returns` is the only terminator this sees, because `return` is
-    // the only one the parser admits today -- a `raise` in a branch would
-    // terminate it just as surely, so whoever lands `raise` must re-check
-    // this (`if f: ... else: raise ...` is masked purely by that parser gap).
+    // THREE TERMINATORS, and all three are handled here: `return`, `break`
+    // and `continue`. `break` and `continue` are both parsed, so both reach
+    // this join, and both produce the identical false TypeError -- measured
+    // against mypy 1.18.1 and CPython 3.14.2 on the loop-bodied form of the
+    // shape above (`for _ in xs: / if f: n = 7 / else: continue / total =
+    // total + n + 1`): mypy `Success`, CPython prints `16` then `0`, and
+    // taking the `continue` edge yields `unsupported operand types for +
+    // ("int" and "object")`. Identical with `break` in place of `continue`,
+    // and identical again with a `while` in place of the `for`. The fourth
+    // terminator, `raise`, is the one the parser genuinely does not admit
+    // yet -- `if f: ... else: raise ...` is masked purely by that gap, so
+    // whoever lands `raise` must add it to always_leaves_branch here.
+    //
+    // The predicate is always_leaves_branch and NOT always_returns, on
+    // purpose: see its declaration for why widening always_returns instead
+    // would break the missing-return check, which depends on a `break` not
+    // counting as a return.
     //
     // NOT EXTENDED TO THE LOOP JOINS BELOW, deliberately. The `while`/`for`
     // equivalent of this shape lands on `NotImplementedError: operations on a
@@ -2338,10 +2352,10 @@ void TypeChecker::visit(const ast::If& node) {
     // applied to it, turning otherwise-clean code into a false
     // NotImplementedError.
     std::vector<NarrowingState> edges;
-    if (!always_returns(node.body())) {
+    if (!always_leaves_branch(node.body())) {
         edges.push_back(after_body);
     }
-    if (!always_returns(node.orelse())) {
+    if (!always_leaves_branch(node.orelse())) {
         edges.push_back(after_orelse);
     }
     if (edges.empty()) {
@@ -2389,16 +2403,23 @@ void TypeChecker::visit(const ast::While& node) {
     // The `else` suite runs when the loop exits normally, so it sees the
     // joined state.
     //
-    // A `break` OR `continue` EDGE IS NOT MODELLED, and that is a MEASURED
-    // GAP, not merely an unexplored one. Against mypy 1.18.1 and CPython
-    // 3.13.5, on `self.n = 7` / `while f: self.n = "s"; if f: break;
-    // self.n = 8` / `return self.n + 1`: mypy reports `Unsupported operand
-    // types for + ("str" and "int")` with a left operand of `int | str`,
-    // CPython runs the file (printing `8`), and this checker is SILENT --
-    // because only the end-of-body state reaches the join, and the body ends
-    // on `self.n = 8`, agreeing with the pre-loop `int`. The same shape with
-    // `continue` in place of `break` measures identically. Both are missed
-    // errors: the safe direction, but still gaps.
+    // A MID-BODY `break` OR `continue` EDGE INTO THIS JOIN IS NOT MODELLED,
+    // and that is a MEASURED GAP, not merely an unexplored one. Against mypy
+    // 1.18.1 and CPython 3.14.2, on `self.n = 7` / `while f: self.n = "s";
+    // if f: break; self.n = 8` / `return self.n + 1` called with `f=False`:
+    // mypy reports `Unsupported operand types for + ("str" and "int")` with
+    // a left operand of `str | int`, CPython runs the file (printing `8`),
+    // and this checker is SILENT -- because only the end-of-body state
+    // reaches the join, and the body ends on `self.n = 8`, agreeing with the
+    // pre-loop `int`. The same shape with `continue` in place of `break`
+    // measures the same three ways, except that mypy spells the very same
+    // left operand `int | str` there rather than `str | int` -- its union
+    // member ORDER tracks the order the edges merge in and is not
+    // canonicalised, so quoting it is only ever safe per exact shape. Both
+    // are missed errors: the safe direction, but still gaps.
+    // (Note this gap is about the edge a mid-body jump carries INTO this
+    // loop join. It is unrelated to visit(If)'s own join, which does treat
+    // `break` and `continue` as branch terminators.)
     // `test_files/semantic/error_narrowing_misses_a_break_edge.py` pins the
     // silence so closing it is visible as a corpus change rather than as a
     // surprise. Also measured, and NOT gaps: the same shape written with a
@@ -2634,6 +2655,57 @@ bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
         // (false) -- the syntactic approximation the brief settles on. This
         // can only ever answer false where mypy answers true (a missed
         // error), never the reverse.
+    }
+    return false;
+}
+
+bool TypeChecker::always_leaves_branch(const std::vector<ast::StmtPtr>& body) {
+    for (const ast::StmtPtr& statement : body) {
+        // All three terminators count, and a hit anywhere in the list counts
+        // (not just at the end): whatever follows a `break` in the same suite
+        // is dead code, so the branch still never falls through.
+        if (dynamic_cast<const ast::Return*>(statement.get()) != nullptr ||
+            dynamic_cast<const ast::Break*>(statement.get()) != nullptr ||
+            dynamic_cast<const ast::Continue*>(statement.get()) != nullptr) {
+            return true;
+        }
+        if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
+            // An `if` with no `else` can always fall through, so it never
+            // counts -- that is what makes a `break` guarded by a nested `if`
+            // CONDITIONAL, and a conditional terminator must still contribute
+            // its edge.
+            if (!if_stmt->orelse().empty() && always_leaves_branch(if_stmt->body()) &&
+                always_leaves_branch(if_stmt->orelse())) {
+                return true;
+            }
+            continue;
+        }
+        if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
+            if (is_literal_true(while_stmt->condition()) &&
+                !contains_reachable_break(while_stmt->body())) {
+                // Never exits, so it never falls through to the merge either.
+                return true;
+            }
+            // Its `else` runs outside its own break scope, so a terminator
+            // there targets the ENCLOSING construct; the `else` itself always
+            // runs whenever the body cannot break out.
+            if (!contains_reachable_break(while_stmt->body()) &&
+                always_leaves_branch(while_stmt->orelse())) {
+                return true;
+            }
+            continue;
+        }
+        if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
+            if (!contains_reachable_break(for_stmt->body()) &&
+                always_leaves_branch(for_stmt->orelse())) {
+                return true;
+            }
+            continue;
+        }
+        // A nested loop's own BODY is never recursed into: a `break` or
+        // `continue` written there belongs to that loop, so it cannot leave
+        // this branch. FunctionDef/ClassDef bodies are new scopes no
+        // terminator can reach out of.
     }
     return false;
 }
