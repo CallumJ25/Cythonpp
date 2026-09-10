@@ -30,6 +30,7 @@
 #include "domain/ast/while.h"
 #include "domain/diagnostics/diagnostic_sink.h"
 #include "expression_typer.h"
+#include "narrowing_map.h"
 #include "scope_stack.h"
 #include "type.h"
 #include "type_map.h"
@@ -824,6 +825,35 @@ private:
     // genuine attr-defined TypeError (the set is closed there).
     void assign_attribute(const ast::Attribute& target, const ast::Expr& value);
 
+    // A path's DECLARED type -- the ceiling every narrowing layers over, and
+    // what a join uses for an edge that never assigned the path. std::nullopt
+    // when the path does not resolve at all, which is a path with nothing to
+    // narrow rather than an error (the read itself reports, if it is one).
+    //
+    // The root resolves through ScopeStack, so it is the CURRENT scope's
+    // reading of that name -- which is why the function-boundary reset must
+    // clear the map rather than merely shadow it: an entry surviving into a
+    // scope where its root means something else would be a narrowing of the
+    // wrong variable.
+    //
+    // Each subsequent link needs its receiver to be a Class, resolved through
+    // ClassTable's chain-walking member lookup, so an INHERITED attribute has
+    // a declared type here exactly as an own one does.
+    std::optional<Type> declared_type_of_path(const NarrowedPath& path) const;
+
+    // An annotation RE-declares a path, so anything known about that path
+    // (and about anything beneath it) is stale. Its value, when there is one
+    // and it checked out against the annotation, then narrows it: verified
+    // against mypy 1.18.1, `x: object = 5` reveals `builtins.int` on the next
+    // read.
+    //
+    // `narrowed` is std::nullopt for a value-less annotation (`x: int`) and
+    // for one whose value was already reported as incompatible -- in both
+    // cases the path is killed and left at its declared type, since narrowing
+    // to a type the annotation forbids is exactly what the declared-type
+    // ceiling exists to prevent.
+    void redeclare_narrowing(const ast::Expr& target, const std::optional<Type>& narrowed);
+
     // THE `self.x` GUARD, in ONE place: the Class type `self` is bound to
     // when `target` really is an attribute store on the enclosing class's
     // own instance, and std::nullopt otherwise. Shared -- literally, not by
@@ -946,6 +976,10 @@ private:
     ScopeStack scopes_;
     ClassTable classes_;
     TypeMap types_;
+    // The narrowing state of the code currently being checked -- driven here
+    // (assign, kill, join, reset) and read by ExpressionTyper. Declared ABOVE
+    // typer_ because typer_'s constructor takes a reference to it.
+    NarrowingMap narrowings_;
     ExpressionTyper typer_;
 
     // One recorded module-scope definition, for the collision rule

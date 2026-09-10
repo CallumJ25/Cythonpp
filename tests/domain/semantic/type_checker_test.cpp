@@ -3636,5 +3636,177 @@ TEST(TypeChecker, AnUnknownNameIsStillANameError) {
     EXPECT_EQ(error.message, "name 'nope' is not defined");
 }
 
+// Verified against mypy 1.18.1: `Success` -- assigning a narrower type to a
+// path makes the next READ of that path see the narrowed type.
+TEST(TypeChecker, AnAssignmentNarrowsASelfAttributeForLaterReads) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "    def m(self) -> None:\n"
+                 "        self.n = 7\n"
+                 "        print(self.n + 1)\n");
+}
+
+// `self` is not special. Verified: mypy narrows `b.n` for a plain parameter
+// exactly as it narrows `self.n`.
+TEST(TypeChecker, AnAssignmentNarrowsAPlainParametersAttribute) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "def m(b: Bag) -> None:\n"
+                 "    b.n = 7\n"
+                 "    print(b.n + 1)\n");
+}
+
+// A plain local narrows too, when its DECLARED type is wider than what was
+// assigned.
+TEST(TypeChecker, AnAssignmentNarrowsALocalWithAWiderAnnotation) {
+    expect_clean("def f() -> None:\n"
+                 "    x: object = object()\n"
+                 "    x = 7\n"
+                 "    print(x + 1)\n");
+}
+
+// A NESTED PATH narrows, and only the path assigned.
+TEST(TypeChecker, ANestedPathNarrowsIndependentlyOfItsSiblings) {
+    expect_clean("class Inner:\n"
+                 "    v: object = object()\n"
+                 "class Outer:\n"
+                 "    def __init__(self) -> None:\n"
+                 "        self.inner = Inner()\n"
+                 "    def m(self) -> None:\n"
+                 "        self.inner.v = 7\n"
+                 "        print(self.inner.v + 1)\n");
+}
+
+// KILL ON PREFIX: reassigning the receiver invalidates the narrowing on
+// everything under it, so the read falls back to the declared type and the
+// arithmetic is a genuine error. Confirmed against mypy 1.18.1: reported.
+TEST(TypeChecker, ReassigningAReceiverInvalidatesNarrowingsBeneathIt) {
+    const Checked checked = check_module("class Inner:\n"
+                                         "    v: object = object()\n"
+                                         "class Outer:\n"
+                                         "    def __init__(self) -> None:\n"
+                                         "        self.inner = Inner()\n"
+                                         "    def m(self) -> None:\n"
+                                         "        self.inner.v = 7\n"
+                                         "        self.inner = Inner()\n"
+                                         "        print(self.inner.v + 1)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+}
+
+// THE DECLARED TYPE IS A PERMANENT CEILING: narrowing never widens what may
+// be assigned next. `self.n` narrowed to int still accepts a str, because its
+// DECLARED type is object. Verified clean under mypy.
+TEST(TypeChecker, NarrowingDoesNotRestrictWhatMayBeAssignedNext) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "    def m(self) -> None:\n"
+                 "        self.n = 7\n"
+                 "        self.n = \"s\"\n"
+                 "        print(self.n)\n");
+}
+
+// NO CALL INVALIDATION -- the measurement that determines the whole design.
+// Verified against mypy 1.18.1: this reveals `builtins.int` even though
+// `other()` provably assigns a str to the same attribute. Narrowing survives
+// every call. Being SOUND here would mean rejecting a program mypy accepts.
+TEST(TypeChecker, NarrowingSurvivesACallThatInvalidatesIt) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "    def other(self) -> None:\n"
+                 "        self.n = \"reset\"\n"
+                 "    def m(self) -> None:\n"
+                 "        self.n = 7\n"
+                 "        self.other()\n"
+                 "        print(self.n + 1)\n");
+}
+
+// RESET AT EVERY FUNCTION BOUNDARY, and this is the ONE wall where getting it
+// wrong produces a FALSE NEGATIVE. Verified against mypy 1.18.1: the nested
+// def reveals `builtins.object` and `self.n + 1` there is a genuine
+// `Unsupported operand types for + ("object" and "int")`.
+TEST(TypeChecker, NarrowingResetsInsideANestedDef) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    n: object = object()\n"
+                                         "    def m(self) -> None:\n"
+                                         "        self.n = 7\n"
+                                         "        def inner() -> None:\n"
+                                         "            print(self.n + 1)\n"
+                                         "        inner()\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "unsupported operand types for + (\"object\" and \"int\")");
+}
+
+// Another method of the same class sees the declared type too.
+TEST(TypeChecker, NarrowingDoesNotLeakIntoAnotherMethod) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    n: object = object()\n"
+                                         "    def m(self) -> None:\n"
+                                         "        self.n = 7\n"
+                                         "    def p(self) -> None:\n"
+                                         "        print(self.n + 1)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+}
+
+// DO NOT FOLLOW ALIASES. Verified against mypy 1.18.1: `b = self; b.n = 7`
+// reveals `self.n` as `builtins.object` and `b.n` as `builtins.int`, so
+// reading `self.n` arithmetically here IS an error and reading `b.n` is not.
+TEST(TypeChecker, NarrowingDoesNotFollowAnAlias) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    n: object = object()\n"
+                                         "    def m(self) -> None:\n"
+                                         "        b = self\n"
+                                         "        b.n = 7\n"
+                                         "        print(b.n + 1)\n"
+                                         "        print(self.n + 1)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 7);
+}
+
+// A FAILED assignment leaves the entry untouched: the incompatible
+// assignment is reported and nothing is narrowed to a type the declared type
+// forbids.
+TEST(TypeChecker, AnIncompatibleAssignmentDoesNotNarrow) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    n: int = 0\n"
+                                         "    def m(self) -> None:\n"
+                                         "        self.n = \"s\"\n"
+                                         "        print(self.n + 1)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 4);
+}
+
+// A NAME target's own declaring AnnAssign does NOT narrow from its value --
+// verified against mypy 1.18.1: `x: object = 5` reveals `builtins.object` on
+// the very next line, not `builtins.int`, and `x + 1` there is a genuine
+// "Unsupported operand types" error. Narrowing a plain variable only ever
+// comes from a SEPARATE, later plain reassignment (assign_name's own rule),
+// never from the declaring annotation itself -- this is the asymmetry
+// redeclare_narrowing's Name-target branch exists to get right.
+TEST(TypeChecker, AnAnnAssignDoesNotNarrowANameFromItsOwnDeclaringValue) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    x: object = 5\n"
+                                         "    print(x + 1)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+}
+
+// An ATTRIBUTE target's own declaring AnnAssign DOES narrow from its value,
+// even for a BRAND NEW attribute never declared before -- verified against
+// mypy 1.18.1: `self.n: object = 5` (n not previously declared) reveals
+// `builtins.int` on the next line and is Success, matching how the plain
+// `self.n = 5` form already narrows.
+TEST(TypeChecker, AnAnnAssignNarrowsABrandNewSelfAttributeFromItsOwnDeclaringValue) {
+    expect_clean("class Bag:\n"
+                 "    def m(self) -> None:\n"
+                 "        self.n: object = 5\n"
+                 "        print(self.n + 1)\n");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

@@ -20,6 +20,7 @@
 #include "domain/ast/tuple_expr.h"
 #include "domain/ast/unary_op.h"
 #include "domain/diagnostics/diagnostic_sink.h"
+#include "narrowing_map.h"
 #include "rule_result.h"
 #include "scope_stack.h"
 #include "type.h"
@@ -43,7 +44,7 @@ namespace cythonpp::domain::semantic {
 class ExpressionTyper {
 public:
     ExpressionTyper(ScopeStack& scopes, const ClassTable& classes, TypeMap& types,
-                    diagnostics::DiagnosticSink& sink);
+                    NarrowingMap& narrowings, diagnostics::DiagnosticSink& sink);
 
     // Total and non-throwing. Returns Unknown after reporting, so callers need
     // no null check and no try/catch -- the same contract as
@@ -147,7 +148,18 @@ private:
     // mypy-clean). That check is now recursive over the whole dotted chain,
     // so a qualified nested-class receiver (`Outer.Inner.x`, `A.B.C`) is
     // handled too -- see class_object_receiver.
+    // The narrowing layer, and the ONLY place an attribute read consults it.
+    // Calls type_of_attribute_unnarrowed first, unconditionally: the receiver
+    // still needs its TypeMap entry, and an attr-defined miss on the path
+    // still needs reporting. A narrowed path's declared lookup cannot miss
+    // anyway -- nothing installs an entry for a path whose declared type does
+    // not resolve.
     Type type_of_attribute(const ast::Attribute& attribute);
+
+    // What the attribute read means with no narrowing applied: the whole of
+    // the previous type_of_attribute, renamed and otherwise untouched,
+    // including the class-object-receiver check and the self CONTRACT.
+    Type type_of_attribute_unnarrowed(const ast::Attribute& attribute);
 
     // The qualified class name a receiver expression denotes as a CLASS
     // OBJECT -- "Outer" for `Outer`, "Outer.Inner" for `Outer.Inner` -- or an
@@ -388,6 +400,13 @@ private:
     ScopeStack& scopes_;
     const ClassTable& classes_;
     TypeMap& types_;
+    // The narrowing state a READ consults: a path's entry if present, else
+    // its declared type. Held as a mutable reference because it is the exact
+    // NarrowingMap TypeChecker assigns, kills, and resets through elsewhere;
+    // this class only ever reads it (see type_of_name, type_of_attribute) --
+    // see type_of_list_comp for why a comprehension body is measured NOT to
+    // reset it, unlike a real function boundary.
+    NarrowingMap& narrowings_;
     diagnostics::DiagnosticSink& sink_;
 
     // The line of the statement currently being checked, for the ordering

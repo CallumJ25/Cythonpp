@@ -235,8 +235,8 @@ std::optional<long long> literal_integer_index(const ast::Expr& index) {
 } // namespace
 
 ExpressionTyper::ExpressionTyper(ScopeStack& scopes, const ClassTable& classes, TypeMap& types,
-                                 diagnostics::DiagnosticSink& sink)
-    : scopes_(scopes), classes_(classes), types_(types), sink_(sink) {}
+                                 NarrowingMap& narrowings, diagnostics::DiagnosticSink& sink)
+    : scopes_(scopes), classes_(classes), types_(types), narrowings_(narrowings), sink_(sink) {}
 
 Type ExpressionTyper::type_of(const ast::Expr& expr, const Type& expected) {
     Type result = Type::unknown();
@@ -416,6 +416,17 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
         resolution.binding->declared_line >= statement_line_) {
         return error(name, "NameError",
                      "name '" + name.identifier() + "' is used before definition");
+    }
+    // THE READ RULE: a narrowing entry for this path, if any, else the
+    // binding's declared type. Checked AFTER the ordering rule above, so a
+    // use-before-definition is still reported rather than answered with a
+    // stale narrowing -- and after the resolution itself, so a name that
+    // resolves OUTWARD (a closure reading an enclosing function's local) is
+    // not narrowed by an entry belonging to a different scope. The
+    // function-boundary reset is what makes that second point hold; see
+    // NarrowingMap::clear.
+    if (const std::optional<Type> narrowed = narrowings_.get(name.identifier())) {
+        return *narrowed;
     }
     return resolution.binding->type;
 }
@@ -644,6 +655,16 @@ Type ExpressionTyper::type_of_subscript(const ast::Subscript& subscript) {
 }
 
 Type ExpressionTyper::type_of_attribute(const ast::Attribute& attribute) {
+    const Type declared = type_of_attribute_unnarrowed(attribute);
+    if (const std::optional<NarrowedPath> path = narrowing_path_of(attribute)) {
+        if (const std::optional<Type> narrowed = narrowings_.get(*path)) {
+            return *narrowed;
+        }
+    }
+    return declared;
+}
+
+Type ExpressionTyper::type_of_attribute_unnarrowed(const ast::Attribute& attribute) {
     // CLASS-OBJECT RECEIVER, checked syntactically and BEFORE the receiver
     // is ever typed: `C.x` / `C.m`. Verified against mypy 1.18.1: both are
     // mypy-clean (`reveal_type(C.x)` is `builtins.int`, `reveal_type(C.m)` is
@@ -880,6 +901,14 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
 // file's header comment for why this particular block was the seam.
 
 Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
+    // A comprehension body is NOT a function boundary. Measured against mypy
+    // 1.18.1: with `self.n` narrowed to int, `[self.n + 1 for _ in range(3)]`
+    // reveals `builtins.list[builtins.int]` and is clean -- narrowing crosses
+    // into the comprehension body. Clearing here would read `self.n` as its
+    // declared `object` and make `object + 1` a false TypeError on a program
+    // both oracles accept. So type_of_list_comp does NOT touch the narrowing
+    // map; it pushes only its own Comprehension SCOPE, exactly as before.
+    //
     // Constructed on the FIRST clause only, right before that clause's
     // target is bound -- not at the top of the function -- because the
     // first clause's own `iterable` is evaluated in the ENCLOSING scope

@@ -14,6 +14,7 @@
 #include "domain/parser/statement_parser.h"
 #include "domain/semantic/class_table.h"
 #include "domain/semantic/expression_typer.h"
+#include "domain/semantic/narrowing_map.h"
 #include "domain/semantic/scope_stack.h"
 #include "domain/semantic/type_map.h"
 #include "domain/semantic/type_name.h"
@@ -64,10 +65,14 @@ Typed type_expression(const std::string& expression,
     const ClassTable& classes = table != nullptr ? *table : owned;
 
     TypeMap types;
+    // Every fixture here narrows nothing, so an empty map changes none of
+    // their expectations -- it exists only to satisfy the constructor's
+    // shape, which now matches TypeChecker's own.
+    NarrowingMap narrowings;
     diagnostics::DiagnosticSink sink;
     Typed result;
-    result.type = ExpressionTyper(scopes, classes, types, sink).type_of(statement->value(),
-                                                                       expected);
+    result.type = ExpressionTyper(scopes, classes, types, narrowings, sink)
+                      .type_of(statement->value(), expected);
     result.printed = type_name(result.type);
     result.diagnostics = sink.diagnostics();
     result.map_size = types.size();
@@ -1390,8 +1395,9 @@ TEST(ExpressionTyper, AListComprehensionMayReadItsOwnTarget) {
 
     ClassTable classes;
     TypeMap types;
+    NarrowingMap narrowings;
     diagnostics::DiagnosticSink sink;
-    ExpressionTyper typer(scopes, classes, types, sink);
+    ExpressionTyper typer(scopes, classes, types, narrowings, sink);
     typer.set_statement_line(1);
 
     const Type result = typer.type_of(statement->value(), Type::unknown());

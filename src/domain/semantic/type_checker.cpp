@@ -143,7 +143,8 @@ bool is_literal_true(const ast::Expr& condition) {
 } // namespace
 
 TypeChecker::TypeChecker(diagnostics::DiagnosticSink& sink)
-    : sink_(sink), scopes_(), classes_(), types_(), typer_(scopes_, classes_, types_, sink_) {}
+    : sink_(sink), scopes_(), classes_(), types_(), narrowings_(),
+      typer_(scopes_, classes_, types_, narrowings_, sink_) {}
 
 TypeMap TypeChecker::check(const ast::Module& module) {
     module.accept(*this);
@@ -925,7 +926,16 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
     if (value_type.kind != TypeKind::Unknown && existing.binding->type.kind != TypeKind::Unknown &&
         !is_subtype(value_type, existing.binding->type, &classes_)) {
         report_incompatible_assignment(target, value_type, existing.binding->type, "variable");
+        // The entry is left UNTOUCHED: the declared type is a permanent
+        // ceiling, so a rejected assignment must not narrow to a type that
+        // ceiling forbids.
+        return;
     }
+    // Compatible with the declared ceiling, so this becomes the path's
+    // current type. kill() first, so any narrowing on a path BENEATH this one
+    // goes with it -- `x = C()` invalidates whatever was known about `x.y`.
+    narrowings_.kill(target.identifier());
+    narrowings_.set(target.identifier(), value_type);
 }
 
 void TypeChecker::assign_tuple(const ast::TupleExpr& target, const ast::Expr& value, int line) {
@@ -1030,11 +1040,20 @@ void TypeChecker::assign_attribute(const ast::Attribute& target, const ast::Expr
             // same reason.
             types_.insert(&target, value_type);
             types_.insert(&target.value(), *self_type);
+            // This IS the declared type, so no entry is needed -- but a
+            // narrowing on a path beneath this one still has to go.
+            if (const std::optional<NarrowedPath> path = narrowing_path_of(target)) {
+                narrowings_.kill(*path);
+            }
             return;
         }
     }
 
-    const Type value_type = typer_.type_of(value, Type::unknown());
+    // Typed for its side effects -- the TypeMap entries and the attr-defined
+    // report -- but NOT used as the comparison target: it now carries the
+    // NARROWED type, and comparing against that would make narrowing restrict
+    // what may be assigned next. The declared type is the ceiling, always.
+    //
     // Reuses type_of_attribute entirely, which already reports attr-defined
     // ("\"C\" has no attribute \"x\"") for a name the class never declares --
     // the attribute set is closed at the class definition, so assigning a
@@ -1051,10 +1070,60 @@ void TypeChecker::assign_attribute(const ast::Attribute& target, const ast::Expr
     // "variable has type ...", never "target has type ...", exactly like an
     // ordinary Name target's (assign_name already used "variable"; this was
     // the one call site left saying something else with no test pinning it).
-    const Type member_type = typer_.type_of(target, Type::unknown());
-    if (value_type.kind != TypeKind::Unknown && member_type.kind != TypeKind::Unknown &&
-        !is_subtype(value_type, member_type, &classes_)) {
-        report_incompatible_assignment(target, value_type, member_type, "variable");
+    const Type value_type = typer_.type_of(value, Type::unknown());
+    const Type narrowed_or_declared = typer_.type_of(target, Type::unknown());
+    const std::optional<NarrowedPath> path = narrowing_path_of(target);
+    const Type ceiling = path.has_value()
+                             ? declared_type_of_path(*path).value_or(narrowed_or_declared)
+                             : narrowed_or_declared;
+    if (value_type.kind != TypeKind::Unknown && ceiling.kind != TypeKind::Unknown &&
+        !is_subtype(value_type, ceiling, &classes_)) {
+        report_incompatible_assignment(target, value_type, ceiling, "variable");
+        return;
+    }
+    if (path.has_value()) {
+        narrowings_.kill(*path);
+        narrowings_.set(*path, value_type);
+    }
+}
+
+std::optional<Type> TypeChecker::declared_type_of_path(const NarrowedPath& path) const {
+    std::size_t start = 0;
+    const std::size_t first_dot = path.find('.');
+    const std::string root = path.substr(0, first_dot);
+    const Resolution resolution = scopes_.resolve(root);
+    if (resolution.binding == nullptr) {
+        return std::nullopt;
+    }
+    Type current = resolution.binding->type;
+    start = first_dot;
+    while (start != std::string::npos) {
+        const std::size_t next = path.find('.', start + 1);
+        const std::string link = next == std::string::npos
+                                     ? path.substr(start + 1)
+                                     : path.substr(start + 1, next - start - 1);
+        if (current.kind != TypeKind::Class) {
+            return std::nullopt;
+        }
+        const std::optional<Type> member = classes_.member_type(current.name, link);
+        if (!member.has_value()) {
+            return std::nullopt;
+        }
+        current = *member;
+        start = next;
+    }
+    return current;
+}
+
+void TypeChecker::redeclare_narrowing(const ast::Expr& target,
+                                      const std::optional<Type>& narrowed) {
+    const std::optional<NarrowedPath> path = narrowing_path_of(target);
+    if (!path.has_value()) {
+        return;
+    }
+    narrowings_.kill(*path);
+    if (narrowed.has_value()) {
+        narrowings_.set(*path, *narrowed);
     }
 }
 
@@ -1475,6 +1544,9 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
     }
 
     if (!node.has_value()) {
+        // A value-less annotation re-declares the path with nothing to
+        // narrow it to -- killed and left at its declared type.
+        redeclare_narrowing(node.target(), std::nullopt);
         return;
     }
     if (info.redefinition) {
@@ -1482,12 +1554,48 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
         // error alongside it. Still type the value for the TypeMap, but
         // never against the colliding annotation's type.
         typer_.type_of(node.value(), Type::unknown());
+        redeclare_narrowing(node.target(), std::nullopt);
         return;
     }
     const Type value_type = typer_.type_of(node.value(), info.type);
     if (value_type.kind != TypeKind::Unknown && info.type.kind != TypeKind::Unknown &&
         !is_subtype(value_type, info.type, &classes_)) {
         report_incompatible_assignment(node, value_type, info.type, "variable");
+        // Incompatible with the fresh annotation, so nothing narrows to a
+        // type that annotation forbids -- killed and left at the declared
+        // (annotated) type, same as the value-less and redefinition arms.
+        redeclare_narrowing(node.target(), std::nullopt);
+        return;
+    }
+    // The value checked out against the fresh annotation. Whether that
+    // narrows the path is NOT one rule -- verified against mypy 1.18.1, and
+    // the two are asymmetric:
+    //
+    //   A NAME target does NOT narrow from its own annotated-and-valued
+    //   declaring statement: `x: object = 5` (function- or module-local, and
+    //   a class-body bare name alike) reveals `builtins.object` on the very
+    //   next line, and `print(x + 1)` right there is a genuine "Unsupported
+    //   operand types" error -- narrowing for a plain variable only ever
+    //   comes from a SEPARATE, later plain reassignment (assign_name's own
+    //   rule), never from the declaring annotation itself. A bare Name's own
+    //   AnnAssign is always this path's first-ever declaration in this scope
+    //   (bind_resolved_annotation's non-redefinition outcome means exactly
+    //   that, whether freshly bound or filling this same statement's own
+    //   placeholder), so there is no reachable case where narrowing it here
+    //   would even matter for a genuine re-declaration -- mypy rejects a
+    //   second one as `already defined` before any narrowing question arises.
+    //
+    //   An ATTRIBUTE target DOES narrow from its own declaring statement,
+    //   including a BRAND NEW one: `self.n: object = 5` (n not previously
+    //   declared at all) reveals `builtins.int` on the next line, and is
+    //   Success -- matching the plain `self.n = 5` form assign_attribute
+    //   already narrows, and matching the "annotation ignored" / "inherited
+    //   override" cases just above, which narrow to the VALUE's type
+    //   regardless of which declared type ends up installed.
+    if (dynamic_cast<const ast::Name*>(&node.target()) != nullptr) {
+        redeclare_narrowing(node.target(), std::nullopt);
+    } else {
+        redeclare_narrowing(node.target(), value_type);
     }
 }
 
@@ -1530,6 +1638,9 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         }
         report(node, "TypeError", "method must have at least one argument");
         FunctionScopeGuard guard(scopes_);
+        // A real `def` boundary resets the narrowing map -- see
+        // NarrowingMap::clear for the full per-construct rule.
+        NarrowingScopeGuard narrowing_guard(narrowings_);
         // A `class` statement is legal in even this broken method's body, and
         // its body IS still walked below, so the alias frame belongs here
         // too -- otherwise visit(ClassDef) would find no frame to register in
@@ -1735,6 +1846,9 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // is_unfilled_placeholder needs this same flag to avoid mistaking a
     // same-line parameter for its own placeholder-fill case.
     FunctionScopeGuard guard(scopes_);
+    // A real `def` boundary resets the narrowing map -- see
+    // NarrowingMap::clear for the full per-construct rule.
+    NarrowingScopeGuard narrowing_guard(narrowings_);
     // The frame every function-local `class`
     // statement in THIS body registers its bare-name alias into, torn down
     // (restoring any shadowed outer one) when this body's walk is done -- so
@@ -1897,6 +2011,10 @@ void TypeChecker::visit(const ast::ClassDef& node) {
     }
 
     ClassContextGuard guard(scopes_, current_class_qualified_name_, qualified_name);
+    // A nested class body ALSO resets the narrowing map -- see
+    // NarrowingMap::clear for the full per-construct rule and the measured
+    // reason a class body is a boundary exactly like a `def` is.
+    NarrowingScopeGuard narrowing_guard(narrowings_);
     // Declares every method signature and
     // placeholder-declares every attribute BEFORE any of this class's own
     // body statements are walked for real -- see pre_collect_class_body's

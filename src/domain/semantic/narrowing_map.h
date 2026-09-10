@@ -223,6 +223,24 @@ NarrowingState join_narrowings(
     const std::function<std::optional<Type>(const NarrowedPath&)>& declared_type_of,
     const ClassLookup* classes = nullptr);
 
+// Clears the map for the duration of a function boundary and restores it
+// afterwards. RAII rather than paired calls because both users have
+// report-and-return paths, and a skipped restore corrupts every later read.
+class NarrowingScopeGuard {
+public:
+    explicit NarrowingScopeGuard(NarrowingMap& narrowings)
+        : narrowings_(narrowings), saved_(narrowings.snapshot()) {
+        narrowings_.clear();
+    }
+    ~NarrowingScopeGuard() { narrowings_.restore(std::move(saved_)); }
+    NarrowingScopeGuard(const NarrowingScopeGuard&) = delete;
+    NarrowingScopeGuard& operator=(const NarrowingScopeGuard&) = delete;
+
+private:
+    NarrowingMap& narrowings_;
+    NarrowingState saved_;
+};
+
 } // namespace cythonpp::domain::semantic
 
 #endif // CYTHONPP_DOMAIN_SEMANTIC_NARROWING_MAP_H
