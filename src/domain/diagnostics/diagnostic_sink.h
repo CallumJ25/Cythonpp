@@ -34,12 +34,14 @@ public:
     // reaches diagnostics_ -- so has_errors()/empty() cannot see it either.
     //
     // Why the filter lives on the sink rather than on the pass that wants it:
-    // the semantic pass reports "TypeError" from FOUR classes (TypeChecker,
-    // AnnotationResolver, ExpressionTyper and its calls translation unit)
-    // across 31 call sites, three of which report straight to the sink with
-    // no TypeChecker method in between. A flag consulted in one reporting
-    // helper covers 14 of the 31 and silently misses the rest, and "forgot a
-    // call site" is this defect's documented recurring failure mode. Filtering
+    // the semantic pass reports "TypeError" from FOUR classes across 31 call
+    // sites (counted 2026-09-10): 14 in TypeChecker, which do route through
+    // its own report() helper, plus 9 in AnnotationResolver, 4 in
+    // ExpressionTyper and 4 in expression_typer_calls.cpp, each of which
+    // calls its OWN class's error() helper and reaches this sink with no
+    // TypeChecker method in between. So a flag consulted in TypeChecker::
+    // report covers 14 of the 31 and silently misses 17, and "forgot a call
+    // site" is this defect's documented recurring failure mode. Filtering
     // at the single point every diagnostic must pass through is complete by
     // construction: no producer, present or future, can route around it.
     //
