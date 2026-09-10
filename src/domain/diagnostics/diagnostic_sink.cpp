@@ -5,15 +5,17 @@
 
 namespace cythonpp::domain::diagnostics {
 
-void DiagnosticSink::report(Diagnostic diagnostic) {
-    if (is_suppressed(diagnostic.code)) {
+void DiagnosticSink::report(Diagnostic diagnostic, Suppressibility suppressibility) {
+    if (suppressibility == Suppressibility::Suppressible && suppression_depth_ > 0) {
         return;
     }
     diagnostics_.push_back(std::move(diagnostic));
 }
 
-void DiagnosticSink::report_error(std::string code, std::string message, int line, int column) {
-    report(Diagnostic{Severity::Error, std::move(code), std::move(message), line, column});
+void DiagnosticSink::report_error(std::string code, std::string message, int line, int column,
+                                  Suppressibility suppressibility) {
+    report(Diagnostic{Severity::Error, std::move(code), std::move(message), line, column},
+           suppressibility);
 }
 
 const std::vector<Diagnostic>& DiagnosticSink::diagnostics() const { return diagnostics_; }
@@ -25,19 +27,12 @@ bool DiagnosticSink::has_errors() const {
 
 bool DiagnosticSink::empty() const { return diagnostics_.empty(); }
 
-void DiagnosticSink::push_suppressed_code(std::string code) {
-    suppressed_codes_.push_back(std::move(code));
-}
+void DiagnosticSink::push_suppression() { ++suppression_depth_; }
 
-void DiagnosticSink::pop_suppressed_code() {
-    if (!suppressed_codes_.empty()) {
-        suppressed_codes_.pop_back();
+void DiagnosticSink::pop_suppression() {
+    if (suppression_depth_ > 0) {
+        --suppression_depth_;
     }
-}
-
-bool DiagnosticSink::is_suppressed(const std::string& code) const {
-    return std::find(suppressed_codes_.begin(), suppressed_codes_.end(), code) !=
-           suppressed_codes_.end();
 }
 
 } // namespace cythonpp::domain::diagnostics

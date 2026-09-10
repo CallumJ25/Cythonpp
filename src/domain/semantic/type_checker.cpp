@@ -274,7 +274,7 @@ void TypeChecker::scan_top_level_names(const ast::Module& module) {
                 // conditional-function-definition allowance, measured above.
                 return;
             }
-            report(*node, "TypeError",
+            report(*node, DiagnosticKind::SemanticAnalyzerTypeError,
                    "name \"" + name + "\" already defined on line " +
                        std::to_string(existing->second.line));
             collided_top_level_.insert(node);
@@ -414,7 +414,7 @@ void TypeChecker::validate_class_bases(const std::vector<ClassDeclaration>& all_
                 // bug. NotImplementedError rather than TypeError because the
                 // program may well be one mypy accepts; naming the construct
                 // is the honest answer.
-                report(*base, "NotImplementedError", "a tuple base class is not supported");
+                report(*base, DiagnosticKind::NotImplementedError, "a tuple base class is not supported");
             }
             // AND NOTHING ELSE. Every other way a base can be wrong is
             // already reported, by AnnotationResolver, at the moment
@@ -628,7 +628,7 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
                         return;
                     }
                     const Resolution existing = scopes_.resolve(function_def->name());
-                    report(*function_def, "TypeError",
+                    report(*function_def, DiagnosticKind::SemanticAnalyzerTypeError,
                           "name \"" + function_def->name() + "\" already defined on line " +
                               std::to_string(existing.binding->declared_line));
                 } else {
@@ -728,7 +728,7 @@ TypeChecker::AnnotationBinding TypeChecker::bind_resolved_annotation(const ast::
             scopes_.rebind(target.identifier(), Binding{type, line, /*annotated=*/true});
             return info;
         }
-        report(target, "TypeError",
+        report(target, DiagnosticKind::SemanticAnalyzerTypeError,
               "name \"" + target.identifier() + "\" already defined on line " +
                   std::to_string(existing.binding->declared_line));
         info.redefinition = true;
@@ -783,7 +783,8 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
                                        is_unfilled_placeholder(
                                            *scopes_.resolve(name->identifier()).binding, line);
         if (is_new_definition && is_bare_empty_container(value)) {
-            report(*name, "TypeError", "need type annotation for \"" + name->identifier() + "\"");
+            report(*name, DiagnosticKind::TypeCheckerTypeError,
+                   "need type annotation for \"" + name->identifier() + "\"");
         }
         assign_name(*name, value_type, line);
         if (is_new_definition && scopes_.current_kind() == ScopeKind::Class) {
@@ -1654,7 +1655,8 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
             AnnotationResolver resolver(classes_, sink_);
             resolver.resolve(node.return_annotation());
         }
-        report(node, "TypeError", "method must have at least one argument");
+        report(node, DiagnosticKind::TypeCheckerTypeError,
+               "method must have at least one argument");
         FunctionScopeGuard guard(scopes_);
         // A real `def` boundary resets the narrowing map -- see
         // NarrowingMap::clear for the full per-construct rule.
@@ -1786,7 +1788,8 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     const bool init_carveout = is_method && node.name() == "__init__" && any_param_annotated;
     const bool return_missing = !node.has_return_annotation() && !init_carveout;
     if (any_param_missing || return_missing) {
-        report(node, "TypeError", "function is missing a type annotation");
+        report(node, DiagnosticKind::TypeCheckerTypeError,
+               "function is missing a type annotation");
     }
 
     // A wrong-typed default is reported at the `def` line (mypy: code
@@ -1826,7 +1829,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
             if (default_type.kind != TypeKind::Unknown &&
                 param_types[i].kind != TypeKind::Unknown &&
                 !is_subtype(default_type, param_types[i], &classes_)) {
-                report(node, "TypeError",
+                report(node, DiagnosticKind::TypeCheckerTypeError,
                       "incompatible default for argument \"" + parameter.name +
                           "\" (default has type \"" + type_name(default_type) +
                           "\", argument has type \"" + type_name(param_types[i]) + "\")");
@@ -1866,7 +1869,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
             if (is_unfilled_placeholder(*existing.binding, def_line)) {
                 scopes_.rebind(node.name(), signature);
             } else {
-                report(node, "TypeError",
+                report(node, DiagnosticKind::SemanticAnalyzerTypeError,
                       "name \"" + node.name() + "\" already defined on line " +
                           std::to_string(existing.binding->declared_line));
             }
@@ -1914,7 +1917,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         if (!scopes_.bind(parameter.name, Binding{param_types[i], def_line,
                                                   /*annotated=*/parameter.annotation != nullptr,
                                                   /*order_exempt=*/true})) {
-            report(node, "TypeError",
+            report(node, DiagnosticKind::SemanticAnalyzerTypeError,
                   "duplicate argument \"" + parameter.name + "\" in function definition");
         }
     }
@@ -1939,7 +1942,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // own definition rather than at the fall-through point.
     if (node.has_return_annotation() && return_type.kind != TypeKind::NoneType &&
         return_type.kind != TypeKind::Unknown && !always_returns(node.body())) {
-        report(node, "TypeError", "missing return statement");
+        report(node, DiagnosticKind::TypeCheckerTypeError, "missing return statement");
     }
 }
 
@@ -2346,13 +2349,36 @@ void TypeChecker::visit(const ast::If& node) {
     //    because mypy's own semantic analyzer does (see check_suite's
     //    comment for the measurements) -- so every statement after this `if`
     //    is still typed against this state.
-    //  - It cannot produce a TYPE diagnostic. statement_always_leaves is true
-    //    of this `if`, so check_suite has the sink's "TypeError" suppression
-    //    live for the whole remainder of the suite, nested subtrees included.
-    //  - It does not escape the suite as a narrowing. check_suite restores the
-    //    state as of this `if` before the suite walk returns, so the
-    //    enclosing construct's end-of-suite snapshot is this join's result,
-    //    not whatever the dead statements after it narrowed.
+    //  - WHEREVER THE TERMINATOR IS LEGAL PYTHON, it cannot produce a
+    //    type-CHECKER diagnostic. There, statement_always_leaves agrees with
+    //    the decision made here, so check_suite has the suppression live for
+    //    the whole remainder of the suite, nested subtrees included.
+    //
+    //    THE CAVEAT, and it is load-bearing twice over. (i) This call passes
+    //    always_leaves_branch its CONTEXT-FREE DEFAULTS (in_function =
+    //    in_loop = true) while check_suite passes the REAL context, so at
+    //    module or class-body scope the two DISAGREE: the fallback fires,
+    //    no region opens, and this join's state is read by a genuinely
+    //    type-checked statement. Measured against mypy 1.18.1 and CPython
+    //    3.14.2 on `n: object = object()` / `total: int = 0` / `if total > 0:
+    //    n = 7; return / else: return` / `total = total + n + 1` at MODULE
+    //    scope: cythonpp reports `8:9: TypeError: unsupported operand types
+    //    for + ("int" and "object")`. No union-rule violation, because every
+    //    such program is one BOTH oracles reject (mypy `"return" outside
+    //    function [misc]`, exit 1; CPython `SyntaxError: 'return' outside
+    //    function` at compile time) -- but the guarantee is conditional, not
+    //    absolute, and the absolute phrasing is what let this defect recur.
+    //    (ii) The suppression covers DiagnosticKind::TypeCheckerTypeError
+    //    only. A SemanticAnalyzerTypeError, NameError, NotImplementedError or
+    //    OverflowError in the remainder still reports, by design -- see
+    //    diagnostic_kind.h.
+    //  - It does not escape the suite as a narrowing -- subject to the SAME
+    //    context caveat: the restore lives in check_suite, so it happens only
+    //    where check_suite's own context agrees that the suite went
+    //    unreachable. Where it does, check_suite restores the state as of
+    //    this `if` before the suite walk returns, so the enclosing
+    //    construct's end-of-suite snapshot is this join's result, not
+    //    whatever the dead statements after it narrowed.
     //
     // AND THE FALLBACK ITSELF IS THE RIGHT VALUE, not merely a harmless one.
     // It is the union over the edges by which control ACTUALLY leaves, which
@@ -2518,7 +2544,7 @@ void TypeChecker::visit(const ast::For& node) {
         // of a tuple[K, V] is the UNION K | V, not a positional pair, so
         // there is nothing correct to bind a/b to element-wise. Mirrors
         // type_of_list_comp's identical tuple-target arm.
-        report(*tuple_target, "NotImplementedError",
+        report(*tuple_target, DiagnosticKind::NotImplementedError,
               "tuple targets in for loops are not supported");
         // Bind each element to Unknown anyway, the
         // same precedent assign_tuple's own arity-mismatch fallback sets --
@@ -2583,7 +2609,7 @@ void TypeChecker::visit(const ast::Return& node) {
         // nor Unknown (no reliable declared type to enforce at all).
         if (current_return_type_.kind != TypeKind::Unknown &&
             current_return_type_.kind != TypeKind::NoneType) {
-            report(node, "TypeError", "return value expected");
+            report(node, DiagnosticKind::TypeCheckerTypeError, "return value expected");
         }
         return;
     }
@@ -2614,7 +2640,7 @@ void TypeChecker::visit(const ast::Return& node) {
         // as everywhere: the root cause already reported.
         if (value_type.kind != TypeKind::Unknown &&
             !is_subtype(value_type, Type::none(), &classes_)) {
-            report(node, "TypeError", "no return value expected");
+            report(node, DiagnosticKind::TypeCheckerTypeError, "no return value expected");
         }
         return;
     }
@@ -2625,7 +2651,7 @@ void TypeChecker::visit(const ast::Return& node) {
         // (got \"str\", expected \"int\")", lower-cased to match this
         // codebase's existing message-casing convention (every other message
         // here starts lower-case despite mypy's own title case).
-        report(node, "TypeError",
+        report(node, DiagnosticKind::TypeCheckerTypeError,
               "incompatible return value type (got \"" + type_name(value_type) +
                   "\", expected \"" + type_name(current_return_type_) + "\")");
     }
@@ -2781,7 +2807,11 @@ void TypeChecker::check_suite(const std::vector<ast::StmtPtr>& body) {
         if (!unreachable.has_value() &&
             statement_always_leaves(*statement, in_function_body_, in_loop_body_)) {
             narrowings_at_terminator = narrowings_.snapshot();
-            unreachable.emplace(sink_, "TypeError");
+            // What this drops is every DiagnosticKind::TypeCheckerTypeError
+            // and nothing else -- see diagnostic_kind.h for the measurement
+            // that splits cythonpp's own "TypeError" spelling in two, and
+            // why the split is an enumerator rather than a flag.
+            unreachable.emplace(sink_);
         }
     }
 
@@ -2818,15 +2848,16 @@ bool TypeChecker::is_bare_empty_container(const ast::Expr& value) {
     return false;
 }
 
-void TypeChecker::report(const ast::Node& at, std::string code, std::string message) {
+void TypeChecker::report(const ast::Node& at, DiagnosticKind kind, std::string message) {
     const ast::SourceSpan span = at.span();
-    sink_.report_error(std::move(code), std::move(message), span.start_line, span.start_column);
+    sink_.report_error(diagnostic_code(kind), std::move(message), span.start_line,
+                       span.start_column, suppressibility_of(kind));
 }
 
 void TypeChecker::report_incompatible_assignment(const ast::Node& at, const Type& value_type,
                                                  const Type& target_type,
                                                  const char* target_label) {
-    report(at, "TypeError",
+    report(at, DiagnosticKind::TypeCheckerTypeError,
           "incompatible types in assignment (expression has type \"" + type_name(value_type) +
               "\", " + target_label + " has type \"" + type_name(target_type) + "\")");
 }

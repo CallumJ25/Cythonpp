@@ -5,6 +5,7 @@
 #include <string>
 
 #include "class_table.h"
+#include "diagnostic_kind.h"
 #include "domain/ast/attribute.h"
 #include "domain/ast/bin_op.h"
 #include "domain/ast/bool_op.h"
@@ -395,7 +396,7 @@ private:
 
     // Reports at `at`'s span start and returns Unknown, mirroring
     // AnnotationResolver::error, so every failure path is one line.
-    Type error(const ast::Expr& at, std::string code, std::string message);
+    Type error(const ast::Expr& at, DiagnosticKind kind, std::string message);
 
     ScopeStack& scopes_;
     const ClassTable& classes_;

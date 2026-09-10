@@ -752,7 +752,10 @@ ast::ExprPtr ExpressionParser::error(const lexer::Token& token, std::string mess
 }
 
 ast::ExprPtr ExpressionParser::error_at(ast::SourceSpan span, std::string message) {
-    sink_.report_error("SyntaxError", std::move(message), span.start_line, span.start_column);
+    // NotSuppressible: nothing outside domain/semantic/ pushes a suppression,
+    // and a syntax error is a syntax error however the program flows.
+    sink_.report_error("SyntaxError", std::move(message), span.start_line, span.start_column,
+                       diagnostics::Suppressibility::NotSuppressible);
     return nullptr;
 }
 

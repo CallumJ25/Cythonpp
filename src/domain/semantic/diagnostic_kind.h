@@ -1,0 +1,111 @@
+#ifndef CYTHONPP_DOMAIN_SEMANTIC_DIAGNOSTIC_KIND_H
+#define CYTHONPP_DOMAIN_SEMANTIC_DIAGNOSTIC_KIND_H
+
+#include "domain/diagnostics/suppressibility.h"
+
+namespace cythonpp::domain::semantic {
+
+// The closed set of diagnostics this pass can produce. Every report site in
+// domain/semantic/ names one of these instead of spelling a code string, and
+// the (code, suppressibility) pair is derived from it below.
+//
+// WHY THIS EXISTS AT ALL, since the project's diagnostic vocabulary is only
+// four codes and a string would carry all four: the code string is a LOSSY
+// proxy for the one question an unreachable region has to ask. Measured
+// against mypy 1.18.1 -- mypy's SEMANTIC ANALYZER runs in unreachable code
+// and its TYPE CHECKER does not, and cythonpp spells "TypeError" for
+// judgements on BOTH sides of that line. So "suppress the code TypeError"
+// silences, among others, `name "y" already defined on line 3` (mypy
+// [no-redef], reported in unreachable code) and `duplicate argument "x" in
+// function definition` (mypy exit 2 AND a CPython compile-time SyntaxError,
+// so the file never runs at any reachability). Nine measured classes of
+// program that an oracle rejects were being silently accepted.
+//
+// Splitting TypeError into two ENUMERATORS -- rather than adding a second
+// parameter beside the code string -- is what makes the classification
+// unforgettable AND unfalsifiable: there is no way to spell "TypeError" at a
+// report site without choosing a side, and no way to pair one code with the
+// other's answer. Note that NEITHER enumerator is called plain `TypeError`:
+// if one were, it would read as the obvious choice and a new site would take
+// it by default, which is the exact failure this table exists to prevent.
+// Both are named for the mypy phase that owns the judgement, so the name IS
+// the question.
+enum class DiagnosticKind {
+    // "TypeError" for a judgement mypy's TYPE CHECKER owns: operand types,
+    // argument types and arity, assignment compatibility, return types,
+    // missing/unannotated signatures, `need type annotation`, list and dict
+    // item types, `method must have at least one argument`, `not callable`,
+    // missing return. Measured: mypy reports none of these in unreachable
+    // code (probe E02 against its reachable control E04, plus the per-class
+    // table in the round-4 report). SUPPRESSIBLE.
+    TypeCheckerTypeError,
+
+    // "TypeError" for a judgement mypy's SEMANTIC ANALYZER owns: a
+    // redefinition ([no-redef]), a duplicate parameter name (a blocking
+    // mypy error and a CPython SyntaxError), and every verdict on whether an
+    // annotation is a well-formed type at all ([valid-type], [type-arg]).
+    // Measured: mypy reports all of these in unreachable code. NEVER
+    // SUPPRESSIBLE.
+    //
+    // The test for a new site: would mypy still say this if the statement sat
+    // after a `return`? If it is a claim about the SHAPE of a definition or
+    // an annotation, yes; if it is a claim about the TYPES flowing through an
+    // expression, no.
+    SemanticAnalyzerTypeError,
+
+    // "NameError". Also semantic-analyzer output -- mypy reports
+    // [name-defined] and [used-before-def] in unreachable code (probes E01,
+    // E06, E07). NEVER SUPPRESSIBLE.
+    NameError,
+
+    // "NotImplementedError". This compiler's own capability claim, with no
+    // mypy analogue by construction: it says nothing about the program's
+    // types, so it cannot contradict either oracle, and the project's rule
+    // states outright that it is not silent acceptance. It must survive
+    // unreachability because there is no dead-code elimination here -- an
+    // unreachable subtree still has to be handed to codegen, and a construct
+    // this compiler cannot model does not become modellable by being
+    // unreachable. NEVER SUPPRESSIBLE.
+    NotImplementedError,
+
+    // "OverflowError". A capability claim too, for the same reason: a
+    // literal that does not fit 64 bits does not start fitting because the
+    // statement holding it never runs. NEVER SUPPRESSIBLE.
+    OverflowError,
+};
+
+// The Python exception name this kind is reported under. Two kinds share
+// "TypeError", deliberately -- the four-code vocabulary is fixed by the
+// project's rule, and re-spelling a semantic-analyzer judgement as a fifth
+// code would change labelled corpus output to encode something only this
+// compiler's internals care about.
+inline const char* diagnostic_code(DiagnosticKind kind) {
+    switch (kind) {
+    case DiagnosticKind::TypeCheckerTypeError:
+    case DiagnosticKind::SemanticAnalyzerTypeError:
+        return "TypeError";
+    case DiagnosticKind::NameError:
+        return "NameError";
+    case DiagnosticKind::NotImplementedError:
+        return "NotImplementedError";
+    case DiagnosticKind::OverflowError:
+        return "OverflowError";
+    }
+    // No default label, so clang's -Wswitch flags an unhandled enumerator
+    // here rather than letting it fall through silently. Unreachable for any
+    // valid enumerator.
+    return "TypeError";
+}
+
+// Whether TypeChecker::check_suite's unreachable-region suppression applies.
+// Exactly one kind is suppressible; see each enumerator's own comment for the
+// measurement behind it.
+inline diagnostics::Suppressibility suppressibility_of(DiagnosticKind kind) {
+    return kind == DiagnosticKind::TypeCheckerTypeError
+               ? diagnostics::Suppressibility::Suppressible
+               : diagnostics::Suppressibility::NotSuppressible;
+}
+
+} // namespace cythonpp::domain::semantic
+
+#endif // CYTHONPP_DOMAIN_SEMANTIC_DIAGNOSTIC_KIND_H

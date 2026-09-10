@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "class_table.h"
+#include "diagnostic_kind.h"
 #include "domain/ast/ann_assign.h"
 #include "domain/ast/assign.h"
 #include "domain/ast/attribute.h"
@@ -1120,8 +1121,20 @@ private:
     //   $ mypy --strict ... -> Success: no issues found in 1 source file
     //   $ python probe.py  -> module ran   (exit 0)
     //
-    // WHAT IS SUPPRESSED IS EXACTLY "TypeError", via DiagnosticSuppression on
-    // the sink. NameError stays because mypy reports it there (above).
+    // WHAT IS SUPPRESSED IS EXACTLY DiagnosticKind::TypeCheckerTypeError,
+    // via DiagnosticSuppression on the sink -- NOT the code string
+    // "TypeError". That distinction is the whole point and it cost a round to
+    // learn: cythonpp spells "TypeError" for judgements mypy's semantic
+    // analyzer owns as well as for judgements its type checker owns, and
+    // mypy's semantic analyzer DOES run here. Suppressing the string silently
+    // accepted a redefinition after a `return` (mypy [no-redef]), a duplicate
+    // parameter name in unreachable code (mypy exit 2 AND a CPython
+    // compile-time SyntaxError, so the file never runs at any reachability),
+    // and every malformed annotation ([valid-type], [type-arg]) -- nine
+    // measured classes. diagnostic_kind.h carries the per-class measurements
+    // and the test a new report site should apply.
+    //
+    // NameError stays because mypy reports it there (above).
     // NotImplementedError and OverflowError stay because neither is a mypy
     // type judgement at all -- both are THIS compiler's own capability claims
     // ("cannot model this construct", "this literal does not fit 64 bits"),
@@ -1141,7 +1154,7 @@ private:
     // CPython printed `7` twice.
     void check_suite(const std::vector<ast::StmtPtr>& body);
 
-    void report(const ast::Node& at, std::string code, std::string message);
+    void report(const ast::Node& at, DiagnosticKind kind, std::string message);
     void report_incompatible_assignment(const ast::Node& at, const Type& value_type,
                                         const Type& target_type, const char* target_label);
 

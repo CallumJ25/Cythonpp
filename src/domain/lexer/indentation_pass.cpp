@@ -133,8 +133,13 @@ void Builder::close_line(const Token& next) {
     }
 
     if (line.col != levels_.back().col) {
-        sink_.report_error("IndentationError", "unindent does not match any outer indentation level",
-                           next.line_number(), next.column_number());
+        // NotSuppressible: nothing outside domain/semantic/ pushes a
+        // suppression, and a malformed source file is malformed however the
+        // rest of the program flows.
+        sink_.report_error("IndentationError",
+                           "unindent does not match any outer indentation level",
+                           next.line_number(), next.column_number(),
+                           diagnostics::Suppressibility::NotSuppressible);
         // Accept this line as the current level so one bad line does not
         // cascade into every line below it. Only ever above the sentinel:
         // overwriting the base would make it poppable, and the next dedent
@@ -152,7 +157,8 @@ void Builder::close_line(const Token& next) {
 
 void Builder::report_tab_error(const Token& at) {
     sink_.report_error("TabError", "inconsistent use of tabs and spaces in indentation",
-                       at.line_number(), at.column_number());
+                       at.line_number(), at.column_number(),
+                       diagnostics::Suppressibility::NotSuppressible);
 }
 
 void Builder::emit(token_type type, const Token& at) {

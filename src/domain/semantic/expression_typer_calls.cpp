@@ -61,7 +61,7 @@ Type ExpressionTyper::type_of_construction(const std::string& class_name,
             // these argument types are not supported"): the real signature is
             // an overload set this model has no way to write down, so it says
             // so instead of guessing an arity in either direction.
-            return error(call, "NotImplementedError",
+            return error(call, DiagnosticKind::NotImplementedError,
                          "calls to '" + class_name +
                              "', which inherits an overloaded builtin constructor, are not "
                              "supported");
@@ -231,7 +231,7 @@ Type ExpressionTyper::type_of_name_call(const ast::Name& callee, const ast::Call
         // Type::callable carries no parameter NAMES and builtin_call_table
         // has no per-overload diagnostic text, so this cannot reproduce
         // mypy's real wording; it names the builtin instead.
-        return error(call, "NotImplementedError",
+        return error(call, DiagnosticKind::NotImplementedError,
                      "calls to builtin '" + identifier +
                          "' with these argument types are not supported");
     }
@@ -269,7 +269,7 @@ Type ExpressionTyper::type_of_name_call(const ast::Name& callee, const ast::Call
         }
         // NEVER NameError: the name IS defined and mypy accepts the call, so
         // NameError would be a false positive against the hard invariant.
-        return error(call, "NotImplementedError",
+        return error(call, DiagnosticKind::NotImplementedError,
                      "calls to builtin '" + identifier + "' are not supported");
     }
 
@@ -338,7 +338,7 @@ Type ExpressionTyper::type_of_positional_call(const Type& callable, const ast::C
     }
 
     if (arg_exprs.size() > param_count) {
-        return error(call, "TypeError", "too many arguments for " + label);
+        return error(call, DiagnosticKind::TypeCheckerTypeError, "too many arguments for " + label);
     }
     if (arg_exprs.size() < required_count) {
         // mypy names the missing
@@ -351,7 +351,7 @@ Type ExpressionTyper::type_of_positional_call(const Type& callable, const ast::C
         // \"f\"" -- never an invented count form. Lower-cased to match this
         // file's own convention (see "too many arguments for" one branch
         // above), and symmetric with it for the same reason.
-        return error(call, "TypeError", "too few arguments for " + label);
+        return error(call, DiagnosticKind::TypeCheckerTypeError, "too few arguments for " + label);
     }
 
     // Arity is now known good: between required_count and param_count
@@ -371,7 +371,7 @@ Type ExpressionTyper::type_of_positional_call(const Type& callable, const ast::C
     for (std::size_t index = 0; index < arg_types.size(); ++index) {
         const Type& expected_param = callable.args[index];
         if (!is_subtype(arg_types[index], expected_param, &classes_)) {
-            error(*arg_exprs[index], "TypeError",
+            error(*arg_exprs[index], DiagnosticKind::TypeCheckerTypeError,
                  "argument " + std::to_string(index + 1) + " to " + label +
                      " has incompatible type \"" + type_name(arg_types[index]) + "\"; expected \"" +
                      type_name(expected_param) + "\"");
@@ -408,7 +408,7 @@ Type ExpressionTyper::type_of_call_result(const Type& callee_type, const ast::Ca
         // binary_result, ...). Reporting TypeError here -- as the brief's
         // table implies by omission -- would risk a false positive on a
         // union whose every member is in fact callable.
-        return error(call, "NotImplementedError",
+        return error(call, DiagnosticKind::NotImplementedError,
                      unsupported_message(UnsupportedReason::UnionOperand));
     }
     if (callee_type.kind == TypeKind::Class) {
@@ -416,10 +416,11 @@ Type ExpressionTyper::type_of_call_result(const Type& callee_type, const ast::Ca
         // TypeError -- verified mypy-clean when __call__ exists, so
         // reporting TypeError here would be a false positive against the
         // hard invariant.
-        return error(call, "NotImplementedError",
+        return error(call, DiagnosticKind::NotImplementedError,
                      "calling an instance of a user-defined class is not supported");
     }
-    return error(call, "TypeError", "\"" + type_name(callee_type) + "\" not callable");
+    return error(call, DiagnosticKind::TypeCheckerTypeError,
+                 "\"" + type_name(callee_type) + "\" not callable");
 }
 
 } // namespace cythonpp::domain::semantic

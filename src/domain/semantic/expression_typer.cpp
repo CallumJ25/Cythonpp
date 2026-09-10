@@ -283,7 +283,7 @@ Type ExpressionTyper::type_of(const ast::Expr& expr, const Type& expected) {
 Type ExpressionTyper::type_of_constant(const ast::Constant& constant, bool negated) {
     if (constant.type() == lexer::token_type::LITERAL_INT &&
         !integer_literal_fits_64_bits(constant.lexeme(), /*allow_two_to_63=*/negated)) {
-        return error(constant, "OverflowError",
+        return error(constant, DiagnosticKind::OverflowError,
                      "integer literal is too large for a 64-bit integer");
     }
     return literal_type(constant.type());
@@ -393,7 +393,8 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
         if (is_builtin_function_name(name.identifier())) {
             return Type::unknown();
         }
-        return error(name, "NameError", "name '" + name.identifier() + "' is not defined");
+        return error(name, DiagnosticKind::NameError,
+                     "name '" + name.identifier() + "' is not defined");
     }
     // THE ORDERING RULE (Task 11): a read is order-checked only against a
     // binding in its OWN immediately-enclosing scope; a read resolving
@@ -414,7 +415,7 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
     // `x = x + 1` case, which relies on `>=` firing at module/local scope.
     if (resolution.in_own_scope && !resolution.binding->order_exempt &&
         resolution.binding->declared_line >= statement_line_) {
-        return error(name, "NameError",
+        return error(name, DiagnosticKind::NameError,
                      "name '" + name.identifier() + "' is used before definition");
     }
     // THE READ RULE: a narrowing entry for this path, if any, else the
@@ -519,7 +520,7 @@ Type ExpressionTyper::type_of_list(const ast::ListExpr& list, const Type& expect
         for (std::size_t index = 0; index < elements.size(); ++index) {
             const Type actual = type_of(*elements[index], element_type);
             if (!is_subtype(actual, element_type, &classes_)) {
-                error(*elements[index], "TypeError",
+                error(*elements[index], DiagnosticKind::TypeCheckerTypeError,
                      "list item " + std::to_string(index) + " has incompatible type \"" +
                          type_name(actual) + "\"; expected \"" + type_name(element_type) + "\"");
             }
@@ -562,7 +563,7 @@ Type ExpressionTyper::type_of_dict(const ast::DictExpr& dict, const Type& expect
             // one side is wrong (see the class comment's example, where the
             // value side ("int": "int") matches but is still quoted).
             if (!key_ok || !value_ok) {
-                error(*entries[index].key, "TypeError",
+                error(*entries[index].key, DiagnosticKind::TypeCheckerTypeError,
                      "dict entry " + std::to_string(index) + " has incompatible type \"" +
                          type_name(actual_key) + "\": \"" + type_name(actual_value) +
                          "\"; expected \"" + type_name(key_expected) + "\": \"" +
@@ -728,7 +729,7 @@ Type ExpressionTyper::type_of_attribute_unnarrowed(const ast::Attribute& attribu
         // mypy narrows; this compiler does not model per-branch environments
         // yet, so `(A | None).f` is deferred rather than guessed at, exactly
         // like every other union-operand case.
-        return error(attribute, "NotImplementedError",
+        return error(attribute, DiagnosticKind::NotImplementedError,
                      unsupported_message(UnsupportedReason::UnionOperand));
     case TypeKind::Class:
         // An INSTANCE receiver: self is bound (dropped) below, per THE self
@@ -756,7 +757,7 @@ Type ExpressionTyper::type_of_attribute_unnarrowed(const ast::Attribute& attribu
     case TypeKind::Range:
     case TypeKind::Callable:
     case TypeKind::Object:
-        return error(attribute, "NotImplementedError", kBuiltinMemberMessage);
+        return error(attribute, DiagnosticKind::NotImplementedError, kBuiltinMemberMessage);
     }
     // Unreachable: the switch is exhaustive over TypeKind and has no default,
     // so adding a kind warns here rather than silently falling through.
@@ -874,7 +875,7 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
     // builtin-inheriting classes only, and the hard invariant (never a false
     // TypeError) holds.
     if (classes_.inherits_builtin(receiver.name)) {
-        return error(attribute, "NotImplementedError", kBuiltinMemberMessage);
+        return error(attribute, DiagnosticKind::NotImplementedError, kBuiltinMemberMessage);
     }
     // Every base is an ordinary user-class-shaped entry (including a seeded
     // exception class -- inherits_builtin is deliberately false for those),
@@ -889,7 +890,7 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
     // is, in practice, the single most reachable leak point of all (every
     // attribute miss on such a class goes through here), since it does not
     // even require the receiver to be `self`.
-    return error(attribute, "TypeError",
+    return error(attribute, DiagnosticKind::TypeCheckerTypeError,
                  "\"" + strip_synthetic_class_prefix(receiver.name) + "\" has no attribute \"" +
                      attribute.attribute() + "\"");
 }
@@ -954,7 +955,7 @@ Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
             // NotImplementedError, not TypeError. element_type of a
             // tuple[K, V] is the UNION K | V, not a positional pair, so
             // there is nothing correct to bind k/v to element-wise.
-            return error(*clause.target, "NotImplementedError",
+            return error(*clause.target, DiagnosticKind::NotImplementedError,
                          "tuple targets in comprehensions are not supported");
         }
 
@@ -1014,9 +1015,9 @@ Type ExpressionTyper::apply(const RuleResult& result, const ast::Expr& at,
     case RuleResult::Status::Ok:
         return result.type;
     case RuleResult::Status::NotApplicable:
-        return error(at, "TypeError", std::move(type_error_message));
+        return error(at, DiagnosticKind::TypeCheckerTypeError, std::move(type_error_message));
     case RuleResult::Status::Unsupported:
-        return error(at, "NotImplementedError", unsupported_message(result.reason));
+        return error(at, DiagnosticKind::NotImplementedError, unsupported_message(result.reason));
     }
     // Unreachable: the switch is exhaustive over RuleResult::Status and has no
     // default, so adding a status warns here rather than silently falling
@@ -1024,9 +1025,10 @@ Type ExpressionTyper::apply(const RuleResult& result, const ast::Expr& at,
     return Type::unknown();
 }
 
-Type ExpressionTyper::error(const ast::Expr& at, std::string code, std::string message) {
+Type ExpressionTyper::error(const ast::Expr& at, DiagnosticKind kind, std::string message) {
     const ast::SourceSpan span = at.span();
-    sink_.report_error(std::move(code), std::move(message), span.start_line, span.start_column);
+    sink_.report_error(diagnostic_code(kind), std::move(message), span.start_line,
+                       span.start_column, suppressibility_of(kind));
     return Type::unknown();
 }
 

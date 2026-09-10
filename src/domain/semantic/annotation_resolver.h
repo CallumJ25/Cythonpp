@@ -4,6 +4,7 @@
 #include <string>
 
 #include "class_lookup.h"
+#include "diagnostic_kind.h"
 #include "domain/ast/attribute.h"
 #include "domain/ast/bin_op.h"
 #include "domain/ast/constant.h"
@@ -48,7 +49,7 @@ private:
     // Reports at `at`'s span start -- Diagnostic is a point, not a range, and
     // the spec declined to reopen that -- and returns Unknown so every
     // failure path is one line.
-    Type error(const ast::Expr& at, std::string code, std::string message);
+    Type error(const ast::Expr& at, DiagnosticKind kind, std::string message);
 
     const ClassLookup& classes_;
     diagnostics::DiagnosticSink& sink_;

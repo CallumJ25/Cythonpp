@@ -77,14 +77,15 @@ Type AnnotationResolver::resolve(const ast::Expr& annotation) {
     if (const auto* operation = dynamic_cast<const ast::BinOp*>(&annotation)) {
         return resolve_union(*operation);
     }
-    return error(annotation, "TypeError", "not a valid type annotation");
+    return error(annotation, DiagnosticKind::SemanticAnalyzerTypeError,
+                 "not a valid type annotation");
 }
 
 Type AnnotationResolver::resolve_name(const ast::Name& name) {
     if (std::optional<TypeKind> kind = builtin_type_kind(name.identifier())) {
         if (builtin_type_arity(name.identifier()) != 0) {
             // mypy's type-arg rule under --strict's disallow-any-generics.
-            return error(name, "TypeError",
+            return error(name, DiagnosticKind::SemanticAnalyzerTypeError,
                          "missing type parameters for generic type \"" + name.identifier() +
                              "\"");
         }
@@ -107,7 +108,8 @@ Type AnnotationResolver::resolve_name(const ast::Name& name) {
     // A builtin that is not a type -- `x: print` -- also lands here. mypy
     // errors on it too, with different wording, so this is a wording
     // divergence rather than a compliance one.
-    return error(name, "NameError", "name '" + name.identifier() + "' is not defined");
+    return error(name, DiagnosticKind::NameError,
+                 "name '" + name.identifier() + "' is not defined");
 }
 
 Type AnnotationResolver::resolve_constant(const ast::Constant& constant) {
@@ -125,10 +127,11 @@ Type AnnotationResolver::resolve_constant(const ast::Constant& constant) {
         // unsupported-construct message is not a TypeError, and 5b's
         // two-pass collection already makes a plain Name forward reference
         // work -- which is the case forward references exist for.
-        return error(constant, "NotImplementedError",
+        return error(constant, DiagnosticKind::NotImplementedError,
                      "string forward references are not supported");
     }
-    return error(constant, "TypeError", "not a valid type annotation");
+    return error(constant, DiagnosticKind::SemanticAnalyzerTypeError,
+                 "not a valid type annotation");
 }
 
 Type AnnotationResolver::resolve_attribute(const ast::Attribute& attribute) {
@@ -147,7 +150,8 @@ Type AnnotationResolver::resolve_attribute(const ast::Attribute& attribute) {
     if (root == nullptr) {
         // e.g. `f().x`: mypy rejects this too ("Invalid type comment or
         // annotation"), so TypeError is correct here, not a compliance gap.
-        return error(attribute, "TypeError", "not a valid type annotation");
+        return error(attribute, DiagnosticKind::SemanticAnalyzerTypeError,
+                     "not a valid type annotation");
     }
 
     std::string dotted = root->identifier();
@@ -161,14 +165,15 @@ Type AnnotationResolver::resolve_attribute(const ast::Attribute& attribute) {
     // A qualified name mypy would resolve to a real class is registered under
     // that same dotted name; if it is not in the table, mypy would not have
     // resolved it either, so this cannot make invariant (a) false.
-    return error(attribute, "NameError", "name '" + dotted + "' is not defined");
+    return error(attribute, DiagnosticKind::NameError, "name '" + dotted + "' is not defined");
 }
 
 Type AnnotationResolver::resolve_union(const ast::BinOp& operation) {
     // PEP 604. Only `|` builds a union; every other binary operator in
     // annotation position is simply not an annotation.
     if (operation.op() != lexer::token_type::OP_PIPE) {
-        return error(operation, "TypeError", "not a valid type annotation");
+        return error(operation, DiagnosticKind::SemanticAnalyzerTypeError,
+                     "not a valid type annotation");
     }
 
     const Type left = resolve(operation.left());
@@ -187,7 +192,8 @@ Type AnnotationResolver::resolve_union(const ast::BinOp& operation) {
 Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
     const auto* base = dynamic_cast<const ast::Name*>(&subscript.value());
     if (base == nullptr) {
-        return error(subscript, "TypeError", "not a valid type annotation");
+        return error(subscript, DiagnosticKind::SemanticAnalyzerTypeError,
+                     "not a valid type annotation");
     }
 
     std::optional<TypeKind> kind = builtin_type_kind(base->identifier());
@@ -199,24 +205,26 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
                 // non-generic user class draws below. Subscripting a builtin
                 // generic is simply unimplemented, not a type error on a
                 // clean program.
-                return error(*base, "NotImplementedError",
+                return error(*base, DiagnosticKind::NotImplementedError,
                              "generic builtin type '" + base->identifier() + "' is not supported");
             }
             // Either a genuine user class (no user-defined generics in the
             // subset) or a seeded builtin that is NOT one of the seven
             // generic ones -- `x: ValueError[int]` is a real mypy type-arg
             // error too, so this is the correct diagnostic for it as well.
-            return error(*base, "TypeError",
+            return error(*base, DiagnosticKind::SemanticAnalyzerTypeError,
                          "'" + base->identifier() + "' is not subscriptable");
         }
         // Optional, Union, Callable and Generic all land here: none of them
         // can be imported, so the base is simply undefined. This is where the
         // import gap becomes visible, and it is the correct outcome.
-        return error(*base, "NameError", "name '" + base->identifier() + "' is not defined");
+        return error(*base, DiagnosticKind::NameError,
+                     "name '" + base->identifier() + "' is not defined");
     }
     const int arity = builtin_type_arity(base->identifier());
     if (arity == 0) {
-        return error(*base, "TypeError", "'" + base->identifier() + "' is not subscriptable");
+        return error(*base, DiagnosticKind::SemanticAnalyzerTypeError,
+                     "'" + base->identifier() + "' is not subscriptable");
     }
 
     // dict[str, int] arrives as Subscript(Name dict, TupleExpr(str, int));
@@ -240,7 +248,7 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
             if (constant != nullptr && constant->type() == lexer::token_type::ELLIPSIS) {
                 // mypy accepts tuple[int, ...], so this must NOT be a
                 // TypeError or the hard invariant breaks.
-                return error(*argument, "NotImplementedError",
+                return error(*argument, DiagnosticKind::NotImplementedError,
                              "variadic tuple annotations are not supported");
             }
         }
@@ -250,7 +258,7 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
         // Before resolving the arguments, so a wrong-arity annotation draws
         // one diagnostic about arity rather than that plus one per argument.
         const std::string plural = arity == 1 ? " type argument, but " : " type arguments, but ";
-        return error(*base, "TypeError",
+        return error(*base, DiagnosticKind::SemanticAnalyzerTypeError,
                      "\"" + base->identifier() + "\" expects " + std::to_string(arity) + plural +
                          std::to_string(arguments.size()) + " given");
     }
@@ -279,9 +287,10 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
     return type;
 }
 
-Type AnnotationResolver::error(const ast::Expr& at, std::string code, std::string message) {
+Type AnnotationResolver::error(const ast::Expr& at, DiagnosticKind kind, std::string message) {
     const ast::SourceSpan span = at.span();
-    sink_.report_error(std::move(code), std::move(message), span.start_line, span.start_column);
+    sink_.report_error(diagnostic_code(kind), std::move(message), span.start_line,
+                       span.start_column, suppressibility_of(kind));
     return Type::unknown();
 }
 

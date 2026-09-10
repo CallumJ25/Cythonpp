@@ -129,7 +129,8 @@ std::vector<ast::StmtPtr> StatementParser::parse_statement_list() {
             // statements around it are still worth parsing.
             const ast::SourceSpan span = ast::span_of(tokens_.peek());
             sink_.report_error("IndentationError", "unexpected indent", span.start_line,
-                               span.start_column);
+                               span.start_column,
+                               diagnostics::Suppressibility::NotSuppressible);
             skip_unexpected_block();
             continue;
         }
@@ -793,7 +794,10 @@ ast::StmtPtr StatementParser::error(const lexer::Token& token, std::string messa
 }
 
 ast::StmtPtr StatementParser::error_at(ast::SourceSpan span, std::string message) {
-    sink_.report_error("SyntaxError", std::move(message), span.start_line, span.start_column);
+    // NotSuppressible: nothing outside domain/semantic/ pushes a suppression,
+    // and a syntax error is a syntax error however the program flows.
+    sink_.report_error("SyntaxError", std::move(message), span.start_line, span.start_column,
+                       diagnostics::Suppressibility::NotSuppressible);
     return nullptr;
 }
 
