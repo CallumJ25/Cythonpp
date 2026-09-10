@@ -2274,12 +2274,38 @@ void TypeChecker::visit(const ast::If& node) {
     // condition (an unbound name, say) still reports.
     typer_.set_statement_line(node.span().start_line);
     typer_.type_of(node.condition(), Type::unknown());
+
+    // NARROWING JOIN. Each branch is walked from the SAME pre-`if` state, so
+    // one branch's narrowing never leaks into its sibling, and the state
+    // afterwards is the union over both edges. An `if` with no `else` needs
+    // no special case: restoring `before` and walking an empty orelse leaves
+    // exactly `before`, which is the fall-through edge, and an edge that
+    // never assigned a path contributes that path's DECLARED type -- which is
+    // what makes `if f: self.n = 7` on an `object`-declared attribute widen
+    // back to `object` rather than leaking the branch's `int` past the `if`.
+    // Verified against mypy 1.18.1: `builtins.int | builtins.str` for a
+    // genuine two-branch split, `builtins.int` when both branches agree, and
+    // `builtins.object` for the else-less case.
+    const NarrowingState before = narrowings_.snapshot();
     for (const ast::StmtPtr& statement : node.body()) {
         statement->accept(*this);
     }
+    const NarrowingState after_body = narrowings_.snapshot();
+
+    narrowings_.restore(before);
     for (const ast::StmtPtr& statement : node.orelse()) {
         statement->accept(*this);
     }
+    const NarrowingState after_orelse = narrowings_.snapshot();
+
+    // `classes_` must be threaded through: without it, a joined `Sub | Base`
+    // against a declared `Base` is not recognised as equivalent to it, so it
+    // is kept as a stored Union -- and a Union operand defers every operator
+    // applied to it, turning otherwise-clean code into a false
+    // NotImplementedError.
+    narrowings_.restore(join_narrowings(
+        {after_body, after_orelse},
+        [this](const NarrowedPath& path) { return declared_type_of_path(path); }, &classes_));
 }
 
 void TypeChecker::visit(const ast::While& node) {
@@ -2287,9 +2313,40 @@ void TypeChecker::visit(const ast::While& node) {
     // typed and never checked against anything.
     typer_.set_statement_line(node.span().start_line);
     typer_.type_of(node.condition(), Type::unknown());
+
+    // NARROWING JOIN, ONE FORWARD PASS. The body starts from the pre-loop
+    // state, which is what lets a narrowing established before the loop reach
+    // into it (measured: mypy does too). Afterwards the state is the union of
+    // the pre-loop state -- the edge where the body ran zero times -- and the
+    // end-of-body state, which is what makes `self.n = 7` before a loop whose
+    // body assigns a str come out as `int | str` after it, exactly as mypy
+    // reports.
+    //
+    // ONE MEASURED DIVERGENCE, accepted deliberately: at the LOOP HEAD mypy
+    // sees the fixpoint (`int | str`) where this sees the pre-loop narrowing
+    // (`int`), so an int-only operation at the head that mypy rejects is
+    // accepted here. A MISSED error, the invariant-safe direction. Reaching
+    // the fixpoint needs a second walk of the body, and a walk of this body
+    // re-runs every side effect it has -- every diagnostic reported, every
+    // name bound, every member declared -- so the second pass would
+    // double-report all of them. The other single-pass option, dropping to
+    // the declared type on loop entry, would REJECT the mypy-clean
+    // `self.n = 7` / `while f: print(self.n + 1); self.n = 8`; a false
+    // TypeError is never an acceptable trade for a missed one.
+    const NarrowingState before = narrowings_.snapshot();
     for (const ast::StmtPtr& statement : node.body()) {
         statement->accept(*this);
     }
+    const NarrowingState after_body = narrowings_.snapshot();
+    narrowings_.restore(join_narrowings(
+        {before, after_body},
+        [this](const NarrowedPath& path) { return declared_type_of_path(path); }, &classes_));
+
+    // The `else` suite runs when the loop exits normally, so it sees the
+    // joined state. Nothing here models a `break` edge -- `while/else` and
+    // break/continue edges are outside this feature's scope, and no probe was
+    // run for them, so this asserts nothing about them beyond walking their
+    // statements as before.
     for (const ast::StmtPtr& statement : node.orelse()) {
         statement->accept(*this);
     }
@@ -2353,9 +2410,21 @@ void TypeChecker::visit(const ast::For& node) {
     // Any other target shape (Attribute, Subscript) is outside this task's
     // tested scope; nothing to bind.
 
+    // NARROWING JOIN, ONE FORWARD PASS -- same shape as While, see its own
+    // comment for the measured loop-head divergence this accepts
+    // deliberately. The snapshot is taken AFTER the target is bound above:
+    // the target's own binding is a fresh bind, not a narrowing, so
+    // snapshotting before it would put the loop variable's pre-loop state
+    // (unbound, or a prior iteration's leftover binding) on the joined edge.
+    const NarrowingState before = narrowings_.snapshot();
     for (const ast::StmtPtr& statement : node.body()) {
         statement->accept(*this);
     }
+    const NarrowingState after_body = narrowings_.snapshot();
+    narrowings_.restore(join_narrowings(
+        {before, after_body},
+        [this](const NarrowedPath& path) { return declared_type_of_path(path); }, &classes_));
+
     for (const ast::StmtPtr& statement : node.orelse()) {
         statement->accept(*this);
     }

@@ -3938,5 +3938,218 @@ TEST(TypeChecker, AParameterDefaultIgnoresANarrowingToStr) {
                              "type \"object\", argument has type \"str\")");
 }
 
+// A GENUINE TWO-BRANCH SPLIT gives a real union, not a widen. Verified
+// against mypy 1.18.1: `builtins.int | builtins.str`. So the arithmetic
+// below is a real error (mypy reports it too) while `object` accepts it.
+TEST(TypeChecker, TwoBranchesJoinToTheirUnion) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "    def m(self, f: bool) -> None:\n"
+                 "        if f:\n"
+                 "            self.n = 7\n"
+                 "        else:\n"
+                 "            self.n = \"s\"\n"
+                 "        x: object = self.n\n"
+                 "        print(x)\n");
+}
+
+// TwoBranchesJoinToTheirUnion above only reads the joined path through a
+// wider `object` target, which stays clean whether the join keeps both
+// branches' contributions or just one -- so it cannot, by itself, catch a
+// join that silently dropped the `if`-branch and kept only the `else` edge.
+// This applies `+` directly to the joined path instead: a Union operand
+// defers every operator (NotImplementedError, distinct from any TypeError a
+// single-branch narrowing would produce), so this fails differently -- or
+// not at all -- if a branch's contribution goes missing from the join.
+TEST(TypeChecker, TwoBranchesJoinDefersOnTheUnionRatherThanJustOneEdge) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    n: object = object()\n"
+                                         "    def m(self, f: bool) -> None:\n"
+                                         "        if f:\n"
+                                         "            self.n = 7\n"
+                                         "        else:\n"
+                                         "            self.n = \"s\"\n"
+                                         "        print(self.n + 1)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "operations on a union-typed value require "
+                             "narrowing, which is not supported");
+}
+
+// AGREEING BRANCHES COLLAPSE, because the join de-duplicates. Verified:
+// `builtins.int`, so `self.n + 1` afterwards is clean.
+TEST(TypeChecker, AgreeingBranchesJoinToOneType) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "    def m(self, f: bool) -> int:\n"
+                 "        if f:\n"
+                 "            self.n = 7\n"
+                 "        else:\n"
+                 "            self.n = 8\n"
+                 "        return self.n + 1\n");
+}
+
+// AN `if` WITH NO `else` WIDENS BACK TO THE DECLARED TYPE, because the
+// fall-through edge contributes it. Verified against mypy 1.18.1:
+// `builtins.object`, and `self.n + 1` there IS
+// `Unsupported operand types for + ("object" and "int")`. Without the join
+// this leaked the branch's `int` past the `if` and silently accepted it.
+TEST(TypeChecker, AnIfWithoutAnElseWidensBackToTheDeclaredType) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    n: object = object()\n"
+                                         "    def m(self, f: bool) -> int:\n"
+                                         "        if f:\n"
+                                         "            self.n = 7\n"
+                                         "        return self.n + 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "unsupported operand types for + (\"object\" and \"int\")");
+}
+
+// A NARROWING ESTABLISHED BEFORE A LOOP REACHES INTO THE BODY and past it
+// when the body assigns nothing. Verified: `builtins.int` after the loop.
+TEST(TypeChecker, ANarrowingSurvivesALoopThatAssignsNothing) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "    def m(self, xs: list[int]) -> int:\n"
+                 "        self.n = 7\n"
+                 "        for x in xs:\n"
+                 "            print(x)\n"
+                 "        return self.n + 1\n");
+}
+
+TEST(TypeChecker, ANarrowingReachesIntoALoopBody) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "    def m(self, xs: list[int]) -> None:\n"
+                 "        self.n = 7\n"
+                 "        for x in xs:\n"
+                 "            print(self.n + x)\n");
+}
+
+// AFTER A LOOP WHOSE BODY ASSIGNS, the state is the union of the pre-loop
+// state and the end-of-body state. Verified: `builtins.int | builtins.str`,
+// so the arithmetic is an error and an `object` target is clean.
+TEST(TypeChecker, ALoopBodysAssignmentJoinsIntoThePostLoopState) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "    def m(self, xs: list[int]) -> None:\n"
+                 "        self.n = 7\n"
+                 "        for x in xs:\n"
+                 "            self.n = \"s\"\n"
+                 "        y: object = self.n\n"
+                 "        print(y)\n");
+}
+
+TEST(TypeChecker, ThePostLoopUnionIsNotStillTheNarrowedType) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    n: object = object()\n"
+                                         "    def m(self, xs: list[int]) -> int:\n"
+                                         "        self.n = 7\n"
+                                         "        for x in xs:\n"
+                                         "            self.n = \"s\"\n"
+                                         "        return self.n + 1\n");
+    EXPECT_FALSE(checked.diagnostics.empty());
+}
+
+// ThePostLoopUnionIsNotStillTheNarrowedType above only asserts that SOME
+// diagnostic appears, which a join that dropped the pre-loop edge entirely
+// (keeping just the end-of-body state) would also produce -- `self.n + 1`
+// on a bare `str` is its own TypeError. This pins the diagnostic's CODE
+// instead: the correct join is `int | str` (pre-loop `int` union end-of-body
+// `str`), and a Union operand defers every operator
+// (NotImplementedError), which a single-branch `str` narrowing would not.
+TEST(TypeChecker, ThePostLoopJoinIncludesThePreLoopEdgeNotJustEndOfBody) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    n: object = object()\n"
+                                         "    def m(self, xs: list[int]) -> int:\n"
+                                         "        self.n = 7\n"
+                                         "        for x in xs:\n"
+                                         "            self.n = \"s\"\n"
+                                         "        return self.n + 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "operations on a union-typed value require "
+                             "narrowing, which is not supported");
+}
+
+// THE MEASURED, ACCEPTED DIVERGENCE, pinned as a test so it cannot change
+// silently. At the LOOP HEAD mypy sees the union fixpoint
+// (`builtins.int | builtins.str`, so `self.n + 1` there is an error it
+// reports) while this checker walks the body ONCE and therefore sees the
+// pre-loop narrowing (`int`, so it is clean). A MISSED error, which is the
+// invariant-safe direction. The two-pass alternative would re-run every
+// side effect of the body walk -- every diagnostic reported, every scope bind,
+// every member declaration -- and double-report all of them; the other
+// single-pass option, widening on loop entry, would instead REJECT the
+// mypy-clean `self.n = 7` / `while cond: print(self.n + 1); self.n = 8`.
+TEST(TypeChecker, ALoopHeadSeesThePreLoopNarrowingRatherThanTheFixpoint) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "    def m(self, xs: list[int]) -> None:\n"
+                 "        self.n = 7\n"
+                 "        for x in xs:\n"
+                 "            print(self.n + 1)\n"
+                 "            self.n = \"s\"\n");
+}
+
+// A COMPATIBLE loop body must stay clean -- this is the case that rules out
+// widening on loop entry. Verified against mypy 1.18.1: `Success`.
+TEST(TypeChecker, ALoopBodyAssigningACompatibleTypeStaysClean) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "    def m(self, f: bool) -> None:\n"
+                 "        self.n = 7\n"
+                 "        while f:\n"
+                 "            print(self.n + 1)\n"
+                 "            self.n = 8\n");
+}
+
+// A branch's narrowing must not leak into the SIBLING branch: each starts
+// from the pre-`if` state.
+TEST(TypeChecker, ABranchsNarrowingDoesNotLeakIntoItsSibling) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    n: object = object()\n"
+                                         "    def m(self, f: bool) -> None:\n"
+                                         "        if f:\n"
+                                         "            self.n = 7\n"
+                                         "        else:\n"
+                                         "            print(self.n + 1)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 7);
+}
+
+// THE `classes_` ARGUMENT MUST BE THREADED THROUGH the join, not left null.
+// A joined `Sub | Base` against a path declared `Base` is equivalent to
+// `Base` only when the base chain is resolvable -- with `classes` null,
+// `is_equivalent` cannot see that `Sub` is a `Base`, so the join keeps a
+// stored `Union`, and applying `+` to a Union operand is
+// UnsupportedReason::UnionOperand ("operations on a union-typed value
+// require narrowing, which is not supported"). Passing `&classes_`
+// recognises the union as equivalent to the declared `Base` and drops it, so
+// the same `+` instead hits the ordinary user-class-operand path,
+// UnsupportedReason::UserClassOperator ("operators on user-defined class
+// instances are not supported") -- still a NotImplementedError either way
+// (neither Base nor a Base-or-Sub union models `+`), but a DIFFERENT reason,
+// which is what makes this test able to tell the two code paths apart.
+TEST(TypeChecker, AJoinRecognisesASubclassAsEquivalentToItsDeclaredBase) {
+    const Checked checked = check_module("class Base:\n"
+                                         "    pass\n"
+                                         "class Sub(Base):\n"
+                                         "    pass\n"
+                                         "class Bag:\n"
+                                         "    n: Base = Base()\n"
+                                         "    def m(self, f: bool) -> None:\n"
+                                         "        if f:\n"
+                                         "            self.n = Sub()\n"
+                                         "        print(self.n + 1)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message,
+              "operators on user-defined class instances are not supported");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic
