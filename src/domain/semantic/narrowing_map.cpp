@@ -5,7 +5,7 @@
 
 #include "domain/ast/attribute.h"
 #include "domain/ast/name.h"
-#include "domain/semantic/type_compatibility.h"
+#include "type_compatibility.h"
 
 namespace cythonpp::domain::semantic {
 namespace {

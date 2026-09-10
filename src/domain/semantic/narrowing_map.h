@@ -98,21 +98,32 @@ public:
     // the class comment.
     void kill(const NarrowedPath& path);
 
-    // A REAL `def` -- and ONLY a real `def` -- resets the whole map.
-    // Measured against mypy 1.18.1: after `self.n = 7`, a nested `def`
-    // reading `self.n` sees the DECLARED `object`, and `self.n + 1` inside it
-    // is a genuine "Unsupported operand types" error. So for a `def` the wall
-    // is right, and getting it wrong there costs a FALSE NEGATIVE.
+    // What resets the whole map, stated per construct rather than as one
+    // exclusive claim -- four constructs, four measurements against mypy
+    // 1.18.1, because "ONLY X resets" is itself a claim that needs its own
+    // counterexample check before it ships.
     //
-    // A COMPREHENSION BODY AND A LAMBDA BODY ARE NOT BOUNDARIES, measured on
-    // the same version and stated here because assuming otherwise inverts
-    // that risk. Narrowing crosses into both: `[self.n + 1 for _ in
-    // range(3)]` reveals `builtins.list[builtins.int]`, and `h = lambda:
-    // self.n + 1` reveals `def () -> builtins.int`, on a file mypy --strict
-    // accepts and CPython runs (printing `[8, 8, 8]`). Clearing on either
-    // would read `self.n` back as `object`, making `object + 1` a FALSE
-    // TypeError on a program both oracles accept -- the direction this
-    // compiler must never take.
+    // A REAL `def` RESETS. After `self.n = 7`, a nested `def` reading
+    // `self.n` sees the DECLARED `object`, and `self.n + 1` inside it is a
+    // genuine "Unsupported operand types" error.
+    //
+    // A NESTED `class` BODY ALSO RESETS. After `self.n = 7`, `class Local:`
+    // reading `self.n` in its body also sees the DECLARED `object` --
+    // `reveal_type(self.n)` inside the class body reveals `builtins.object`,
+    // while a `reveal_type(self.n)` immediately before the class statement
+    // and another immediately after both reveal `builtins.int`, so the reset
+    // does not leak past the class body either. The concrete consequence:
+    // `class Local: v = self.n + 1` draws a genuine "Unsupported operand
+    // types" error from mypy --strict, while CPython runs the same file and
+    // prints the narrowed `8` -- the oracles disagree, and getting this
+    // wrong (treating the class body as narrowed) would make cythonpp side
+    // with CPython and silently accept a program mypy rejects.
+    //
+    // A COMPREHENSION BODY AND AN UNANNOTATED LAMBDA BODY DO NOT RESET.
+    // Narrowing crosses into both: `[self.n + 1 for _ in range(3)]` reveals
+    // `builtins.list[builtins.int]`, and `h = lambda: self.n + 1` reveals
+    // `def () -> builtins.int`, on a file mypy --strict accepts and CPython
+    // runs (printing `8`).
     //
     // One wrinkle, recorded so it is not mistaken later for a boundary: a
     // lambda that has an EXPECTED type from its context (an annotated
@@ -121,6 +132,18 @@ public:
     // mypy reports the operand error there. The unannotated case above is the
     // one that decides this rule, because a boundary that clears would break
     // it while no boundary at all merely misses the annotated case's error.
+    //
+    // THE ASYMMETRY, and which way to err when unsure about a construct not
+    // yet measured: failing to reset at a `def` or a `class` body reads a
+    // narrowed value where mypy has already forgotten it, which SILENTLY
+    // ACCEPTS a program mypy rejects -- the direction this compiler must
+    // never take, because it breaks the union rule outright. Resetting at a
+    // comprehension or a lambda body, on the other hand, only invents a FALSE
+    // TypeError on a program both oracles already accept -- wrong, but the
+    // safe wrong: a missed error, not a fabricated one. When a new construct's
+    // boundary status is not yet measured, treating it as resetting (like
+    // `def`/`class`) is the direction that cannot silently accept what mypy
+    // would reject.
     void clear();
 
     // For the join: capture the state on one edge, put another edge's state
