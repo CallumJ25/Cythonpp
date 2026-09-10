@@ -3602,6 +3602,30 @@ TEST(TypeChecker, AUserClassNamedLikeABuiltinFunctionStillWins) {
                  "    return h.n\n");
 }
 
+// THE ASYMMETRIC CELL: this precedence does NOT extend to a builtin-function
+// name that is ALSO one of the modelled kSupportedBuiltinCalls entries (15 of
+// the 49 function-table names, `len` among them) -- is_supported_builtin_call
+// short-circuits earlier in type_of_name_call, before the user-class-wins
+// condition is ever consulted, so `class len` still resolves as the modelled
+// builtin call rather than the user's own constructor. Verified: mypy
+// --strict reports `Success` and CPython prints `0` for the equivalent
+// top-level program, so this is a MISSED error, not a false one --
+// NotImplementedError keeps it inside the sanctioned escape hatch. Pinned
+// here so the asymmetry with the `hash` case just above stays a recorded
+// fact rather than folklore.
+TEST(TypeChecker, AUserClassNamedLikeAModelledBuiltinCallDoesNotWin) {
+    const Checked checked = check_module("class len:\n"
+                                         "    def __init__(self) -> None:\n"
+                                         "        self.n = 0\n"
+                                         "def f() -> int:\n"
+                                         "    h = len()\n"
+                                         "    return h.n\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message,
+              "calls to builtin 'len' with these argument types are not supported");
+}
+
 // An ordinary unbound name is STILL a NameError. This table must not turn
 // every misspelling into silence.
 TEST(TypeChecker, AnUnknownNameIsStillANameError) {

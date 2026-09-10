@@ -44,7 +44,11 @@ TEST(BuiltinFunctionTable, DoesNotContainClassNames) {
     }
 }
 
+// Paired with a TRUE assertion in the same test, so a predicate hardwired to
+// always return false cannot pass this test silently -- a pure `EXPECT_FALSE`
+// guard has no failure mode if the real body underneath is never reached.
 TEST(BuiltinFunctionTable, DoesNotContainAnArbitraryName) {
+    EXPECT_TRUE(is_builtin_function_name("len"));
     EXPECT_FALSE(is_builtin_function_name("definitely_not_a_builtin"));
     EXPECT_FALSE(is_builtin_function_name(""));
 }

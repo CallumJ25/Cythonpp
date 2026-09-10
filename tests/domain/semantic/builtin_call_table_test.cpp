@@ -246,6 +246,17 @@ TEST(BuiltinCallTable, AnUnrelatedNameIsNeitherSupportedNorABuiltinCallableName)
     EXPECT_FALSE(is_builtin_callable_name("frobnicate"));
 }
 
+// Pins the widening this table gained from the generated builtin-function
+// table: `hash` is not one of the 27 modelled kSupportedBuiltinCalls entries,
+// but it IS a real builtin function, so a call to it must still be a
+// NotImplementedError deferral, never a NameError. Fails if
+// is_builtin_callable_name's consultation of is_builtin_function_name is
+// ever reverted.
+TEST(BuiltinCallTable, ABuiltinFunctionNotInTheModelledSetIsStillCallable) {
+    EXPECT_FALSE(is_supported_builtin_call("hash"));
+    EXPECT_TRUE(is_builtin_callable_name("hash"));
+}
+
 TEST(BuiltinCallTable, OnlyTheFiveContainerConstructorsAreEmptyDisplayBuiltins) {
     for (const std::string& name : {"list", "dict", "set", "frozenset", "tuple"}) {
         EXPECT_TRUE(is_empty_display_builtin(name)) << name;
