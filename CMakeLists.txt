@@ -29,6 +29,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/semantic/class_table.cpp
     src/domain/semantic/annotation_resolver.cpp
     src/domain/semantic/scope_stack.cpp
+    src/domain/semantic/narrowing_map.cpp
     src/domain/semantic/expression_typer.cpp
     src/domain/semantic/expression_typer_calls.cpp
     src/domain/semantic/builtin_call_table.cpp
@@ -94,6 +95,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/semantic/builtin_function_table_test.cpp
         tests/domain/semantic/class_table_test.cpp
         tests/domain/semantic/scope_stack_test.cpp
+        tests/domain/semantic/narrowing_map_test.cpp
         tests/domain/semantic/expression_typer_test.cpp
         tests/domain/semantic/builtin_call_table_test.cpp
         tests/domain/semantic/type_checker_test.cpp
