@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "builtin_call_table.h"
 #include "builtin_type_names.h"
 #include "domain/ast/source_span.h"
 #include "domain/lexer/keyword_table.h"
@@ -360,6 +361,29 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
         // to order-check against. A missed error, accepted.
         if (classes_.is_class(name.identifier())) {
             return classes_.constructor_type(name.identifier());
+        }
+        // A bare builtin FUNCTION used as a VALUE. `f = len` is mypy-clean
+        // (measured, mypy 1.18.1: `Success`, reveal_type `def (typing.Sized)
+        // -> builtins.int`) and reported `name 'len' is not defined` -- the
+        // smallest known violation of this project's hard invariant. The
+        // reason it was invisible is structural: the class table holds
+        // CLASSES and builtin_type_names holds model KINDS, and a builtin
+        // function is neither, so both carve-outs above miss it.
+        //
+        // Unknown, NOT a Callable. This model has no signature for most of
+        // these, Unknown is absorbing, and the result is therefore a MISSED
+        // error rather than a false one: `f([1, 2])` types as Unknown and
+        // reports nothing, and `y: type = len` -- which mypy rejects with
+        // `expression has type "Callable[[Sized], int]"` -- becomes clean.
+        // Modelling real signatures is separate work; builtin_call_table.h is
+        // where a modelled one belongs.
+        //
+        // PLACED LAST of the three carve-outs, so a live scope binding
+        // (checked by the enclosing branch), a model kind, and a user class of
+        // the same spelling all still win -- `class hash: ...` must resolve to
+        // the user's class, and `def f(len: str)` to the parameter.
+        if (is_builtin_function_name(name.identifier())) {
+            return Type::unknown();
         }
         return error(name, "NameError", "name '" + name.identifier() + "' is not defined");
     }

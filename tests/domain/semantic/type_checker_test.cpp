@@ -3552,5 +3552,65 @@ TEST(TypeChecker, AVariableTupleIndexStillYieldsTheUnion) {
               "variable has type \"int\")");
 }
 
+// A bare builtin FUNCTION used as a VALUE. Verified against mypy 1.18.1:
+// `Success`, with reveal_type(g) `def (typing.Sized) -> builtins.int`. This
+// was `NameError: name 'len' is not defined` -- a false NameError, and the
+// smallest known violation of the hard invariant before this change.
+TEST(TypeChecker, ABuiltinFunctionUsedAsAValueIsClean) {
+    expect_clean("def f() -> None:\n"
+                 "    g = len\n"
+                 "    print(g)\n");
+}
+
+TEST(TypeChecker, ABuiltinFunctionIsAssignableToObject) {
+    expect_clean("x: object = len\n"
+                 "print(x)\n");
+}
+
+// THE SAME STRUCTURAL GAP, wider than a bare value: a CALL to a builtin
+// function this model does not model was a false NameError too. Verified:
+// `print(hash(x))` is `Success` under mypy --strict. It becomes the existing
+// "not supported" deferral, matching how `zip(...)` is already handled --
+// never NameError, since the name IS defined and mypy accepts the call.
+TEST(TypeChecker, ACallToAnUnmodelledBuiltinFunctionIsDeferred) {
+    const Checked checked = check_module("def f(x: int) -> None:\n"
+                                         "    print(hash(x))\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "calls to builtin 'hash' are not supported");
+}
+
+// PRECEDENCE, and it must stay this way: a live scope binding of the same
+// spelling wins, because the carve-out sits inside type_of_name's
+// "resolution came back null" branch. `def f(len: str) -> int: return 1` uses
+// the parameter.
+TEST(TypeChecker, ALocalNamedLikeABuiltinFunctionStillWins) {
+    const Checked checked = check_module("def f(len: str) -> int:\n"
+                                         "    return len\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+}
+
+// A USER class of the same spelling wins too -- the class carve-out is
+// checked BEFORE the function table.
+TEST(TypeChecker, AUserClassNamedLikeABuiltinFunctionStillWins) {
+    expect_clean("class hash:\n"
+                 "    def __init__(self) -> None:\n"
+                 "        self.n = 0\n"
+                 "def f() -> int:\n"
+                 "    h = hash()\n"
+                 "    return h.n\n");
+}
+
+// An ordinary unbound name is STILL a NameError. This table must not turn
+// every misspelling into silence.
+TEST(TypeChecker, AnUnknownNameIsStillANameError) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    print(nope)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'nope' is not defined");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

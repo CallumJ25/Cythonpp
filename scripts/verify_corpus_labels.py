@@ -6,6 +6,7 @@ script's output is CHECKED IN and the tests read the checked-in file.
 
 Usage:
     python scripts/verify_corpus_labels.py --generate-class-table
+    python scripts/verify_corpus_labels.py --generate-function-table
     python scripts/verify_corpus_labels.py --check-corpus     # added in Task 24
 """
 
@@ -176,6 +177,84 @@ def generate_class_table() -> str:
         max_bases=MAX_BASES,
         rows="\n".join(rows),
         alias_rows="\n".join(alias_rows),
+    )
+
+
+FUNCTION_HEADER = """#ifndef CYTHONPP_DOMAIN_SEMANTIC_BUILTIN_FUNCTION_TABLE_H
+#define CYTHONPP_DOMAIN_SEMANTIC_BUILTIN_FUNCTION_TABLE_H
+
+#include <cstddef>
+
+namespace cythonpp::domain::semantic {{
+
+// Every name in Python's `builtins` module that is callable and is NOT a
+// class. GENERATED -- do not edit by hand. Regenerate with:
+//
+//     python scripts/verify_corpus_labels.py --generate-function-table
+//
+// Extracted from Python {version} on {system}.
+//
+// WHY THIS FILE EXISTS. `len` is invisible to this compiler for a structural
+// reason: builtin_class_table.h holds CLASSES, builtin_type_names.h holds
+// model KINDS, and a builtin function is neither -- so both of
+// ExpressionTyper::type_of_name's carve-outs miss it and `f = len` was
+// `NameError: name 'len' is not defined` on code mypy accepts. The same gap
+// made every CALL to an unmodelled builtin function a false NameError too:
+// `hash(x)` was `NameError: name 'hash' is not defined`.
+//
+// WHY EXTRACTED RATHER THAN CURATED, the same reason builtin_class_table.h
+// gives: a hand-picked list has exactly one failure mode -- a forgotten name
+// -- and it is silent.
+//
+// COMPLEMENTARY TO builtin_class_table.h BY CONSTRUCTION: that file's filter
+// is `isinstance(getattr(builtins, name), type)` and this one's is
+// `callable(...) and not isinstance(..., type)`, so no name appears in both
+// and `int`/`str`/`list` stay classes.
+//
+// SITE-ADDED NAMES, recorded rather than hidden: `exit`, `quit`, `copyright`,
+// `credits`, `license` and `help` are callable instances installed by the
+// `site` module, not true builtins, and they appear here because the
+// extraction cannot tell the difference. typeshed declares all of them in
+// builtins, so treating them as defined agrees with mypy; and even if it did
+// not, a SURPLUS name here is a missed error, never a false one.
+//
+// THIS FILE CARRIES NO SIGNATURES, deliberately. A name found here resolves
+// to Unknown, which is absorbing -- so `f = len` is clean and `f([1, 2])`
+// reports nothing, and `y: type = len` (which mypy rejects) becomes a missed
+// error. Modelling real signatures for builtin functions is separate work;
+// builtin_call_table.h is where a modelled one goes.
+
+constexpr const char* kBuiltinFunctions[] = {{
+{rows}
+}};
+
+constexpr std::size_t kBuiltinFunctionCount =
+    sizeof(kBuiltinFunctions) / sizeof(kBuiltinFunctions[0]);
+
+}} // namespace cythonpp::domain::semantic
+
+#endif // CYTHONPP_DOMAIN_SEMANTIC_BUILTIN_FUNCTION_TABLE_H
+"""
+
+
+def function_names():
+    """Callable builtins that are NOT classes -- the exact complement of
+    class_names(), so no name can appear in both tables."""
+    return [
+        name
+        for name in sorted(dir(builtins))
+        if not name.startswith("_")
+        and callable(getattr(builtins, name))
+        and not isinstance(getattr(builtins, name), type)
+    ]
+
+
+def generate_function_table() -> str:
+    rows = [f'    "{name}",' for name in function_names()]
+    return FUNCTION_HEADER.format(
+        version=sys.version.split()[0],
+        system=platform.system(),
+        rows="\n".join(rows),
     )
 
 
@@ -489,6 +568,7 @@ def main() -> int:
     # would look like a corpus check ran when it never did.
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--generate-class-table", action="store_true")
+    group.add_argument("--generate-function-table", action="store_true")
     group.add_argument(
         "--check-corpus",
         action="store_true",
@@ -500,6 +580,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.generate_class_table:
         sys.stdout.write(generate_class_table())
+        return 0
+    if args.generate_function_table:
+        sys.stdout.write(generate_function_table())
         return 0
     if args.check_corpus:
         return check_corpus()

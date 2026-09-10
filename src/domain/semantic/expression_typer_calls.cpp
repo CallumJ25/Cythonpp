@@ -236,7 +236,18 @@ Type ExpressionTyper::type_of_name_call(const ast::Name& callee, const ast::Call
                          "' with these argument types are not supported");
     }
 
-    if (is_builtin_callable_name(identifier)) {
+    // The generated builtin-function table and builtin_class_table.h are
+    // complementary by construction -- no name is in both -- so
+    // classes_.is_class(identifier) can be true for a builtin FUNCTION name
+    // only because user code declared a class of that same spelling
+    // (`class hash: ...`), a genuine shadow the user's class must win, not a
+    // real seeded builtin colliding with itself. This exception does not
+    // touch the five real generic callables (zip/map/filter/enumerate/
+    // reversed), which are seeded builtin classes in their own right and must
+    // keep resolving as the builtin deferral below, exactly as before this
+    // table existed.
+    if (is_builtin_callable_name(identifier) &&
+        !(is_builtin_function_name(identifier) && classes_.is_class(identifier))) {
         types_.insert(&callee, Type::unknown());
         for (const ast::ExprPtr& arg : call.args()) {
             type_of(*arg, Type::unknown());

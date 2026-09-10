@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "builtin_function_table.h"
 #include "operator_rules.h"
 #include "rule_result.h"
 #include "type_compatibility.h"
@@ -245,8 +246,18 @@ bool is_supported_builtin_call(const std::string& name) {
     return contains(name, kSupportedBuiltinCalls);
 }
 
+bool is_builtin_function_name(const std::string& name) {
+    for (std::size_t index = 0; index < kBuiltinFunctionCount; ++index) {
+        if (name == kBuiltinFunctions[index]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool is_builtin_callable_name(const std::string& name) {
-    return is_supported_builtin_call(name) || contains(name, kUnsupportedBuiltinCalls);
+    return is_supported_builtin_call(name) || is_builtin_function_name(name) ||
+           contains(name, kUnsupportedBuiltinCalls);
 }
 
 bool is_empty_display_builtin(const std::string& name) {

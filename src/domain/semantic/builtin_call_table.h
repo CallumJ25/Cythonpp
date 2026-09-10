@@ -21,13 +21,29 @@ namespace cythonpp::domain::semantic {
 // a genuine error) apart for a Name callee.
 bool is_supported_builtin_call(const std::string& name);
 
-// Every name Python's builtins module defines that is CALLABLE, whether or
-// not this model can type the call -- a SUPERSET of is_supported_builtin_call
-// (it additionally contains enumerate/zip/map/filter/reversed). A callee name
-// outside this set is a genuine NameError; a name inside it but outside
-// is_supported_builtin_call is NotImplementedError, never NameError -- the
-// name IS defined and mypy accepts the call, so NameError would be a false
-// positive against the hard invariant.
+// Whether `name` is a builtin FUNCTION -- a name in Python's builtins module
+// that is callable and is not a class (see builtin_function_table.h, which is
+// generated). Complementary to builtin_class_table.h by construction; no name
+// is in both.
+//
+// Separate from is_supported_builtin_call and is_builtin_callable_name below,
+// which are about whether a CALL can be typed. This one answers the prior
+// question: does this name exist at all? A resolution miss on one of these
+// used to fall straight into a false NameError.
+bool is_builtin_function_name(const std::string& name);
+
+// Every builtin name a CALL to which this compiler will not report as a
+// NameError: the modelled set above, plus the generated builtin-function
+// table, plus five real generic callables (enumerate/zip/map/filter/reversed)
+// this model cannot type because each needs a generic Iterator its Type has
+// no constructor for.
+//
+// This used to be a hand-curated list of 32 names described as "every
+// callable in builtins", which it was not -- it omitted most of them (`hash`,
+// `getattr`, `sorted` on its own, ...) and included class names. Consulting
+// the generated table closes that gap: a call to any builtin function is now
+// either modelled or a named NotImplementedError, never a NameError, since
+// the name IS defined and mypy accepts the call.
 bool is_builtin_callable_name(const std::string& name);
 
 // True for the five container constructors -- list, dict, set, frozenset,
