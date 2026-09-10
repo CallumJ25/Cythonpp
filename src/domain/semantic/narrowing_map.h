@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "class_lookup.h"
 #include "domain/ast/expr.h"
 #include "type.h"
 
@@ -37,14 +38,21 @@ using NarrowingState = std::map<NarrowedPath, Type>;
 // about identity.
 //
 // SUBSCRIPT LINKS ARE EXCLUDED, deliberately and by scope rather than by
-// oversight. Measured: mypy DOES key on integer-literal subscripts
-// index-sensitively -- `self.items[0].n` narrows and `self.items[1].n` on the
-// next line does not, and a variable index narrows nothing. That is real but
-// rare, and omitting it is safe because the fallback is the declared type,
-// i.e. a missed error. TWO TRAPS FOR WHOEVER ADDS THEM: a subscript may never
-// be the LAST link (`self.items[0] = 7` does not narrow `self.items[0]`,
-// because the read goes back through `__getitem__` and its declared return
-// type wins), and a variable index must key nothing at all.
+// oversight. All three claims below were measured against mypy 1.18.1, with
+// `items: list[Inner]` and `Inner.n: object`.
+//
+// mypy DOES key on integer-literal subscripts index-sensitively: after
+// `self.items[0].n = 7`, `self.items[0].n` reveals `builtins.int` while
+// `self.items[1].n` on the next line reveals `builtins.object`. That is real
+// but rare, and omitting it is safe because the fallback is the declared
+// type, i.e. a missed error.
+//
+// TWO TRAPS FOR WHOEVER ADDS THEM. A subscript may never be the LAST link:
+// with `vals: list[object]`, `self.vals[0] = 7` leaves `self.vals[0]` at
+// `builtins.object`, because the read goes back through `__getitem__` and
+// its declared return type wins. And a VARIABLE index must key nothing at
+// all: with an `i: int` parameter, `self.items[i].n = 7` leaves
+// `self.items[i].n` at `builtins.object`.
 std::optional<NarrowedPath> narrowing_path_of(const ast::Expr& expr);
 
 // The narrowing state of the code currently being checked: a map from path to
@@ -90,11 +98,29 @@ public:
     // the class comment.
     void kill(const NarrowedPath& path);
 
-    // Every function boundary resets the whole map. Measured: a nested `def`
-    // reading `self.n` sees the DECLARED type, and using it arithmetically is
-    // a genuine mypy error -- so this is the one wall where getting it wrong
-    // produces a FALSE NEGATIVE rather than a false positive. Lambdas and
-    // comprehension bodies are function boundaries too.
+    // A REAL `def` -- and ONLY a real `def` -- resets the whole map.
+    // Measured against mypy 1.18.1: after `self.n = 7`, a nested `def`
+    // reading `self.n` sees the DECLARED `object`, and `self.n + 1` inside it
+    // is a genuine "Unsupported operand types" error. So for a `def` the wall
+    // is right, and getting it wrong there costs a FALSE NEGATIVE.
+    //
+    // A COMPREHENSION BODY AND A LAMBDA BODY ARE NOT BOUNDARIES, measured on
+    // the same version and stated here because assuming otherwise inverts
+    // that risk. Narrowing crosses into both: `[self.n + 1 for _ in
+    // range(3)]` reveals `builtins.list[builtins.int]`, and `h = lambda:
+    // self.n + 1` reveals `def () -> builtins.int`, on a file mypy --strict
+    // accepts and CPython runs (printing `[8, 8, 8]`). Clearing on either
+    // would read `self.n` back as `object`, making `object + 1` a FALSE
+    // TypeError on a program both oracles accept -- the direction this
+    // compiler must never take.
+    //
+    // One wrinkle, recorded so it is not mistaken later for a boundary: a
+    // lambda that has an EXPECTED type from its context (an annotated
+    // assignment, an argument position, an element of a `list[Callable[...]]`)
+    // does get its body checked against the declared, un-narrowed type, and
+    // mypy reports the operand error there. The unannotated case above is the
+    // one that decides this rule, because a boundary that clears would break
+    // it while no boundary at all merely misses the annotated case's error.
     void clear();
 
     // For the join: capture the state on one edge, put another edge's state
@@ -117,20 +143,62 @@ private:
 // `builtins.object`. So a "same on all edges, else declared" shortcut is
 // wrong and this really does need a union at every merge.
 //
-// ONE NORMALISATION on top of Type::union_of: a union that contains Object
-// collapses to Object. That is an identity rather than a heuristic -- Object
-// is the top of the lattice, so `T | object` IS `object` -- and it is what
-// makes the `if`-without-`else` case come out as the measured
-// `builtins.object` instead of the equivalent-but-differently-spelled
-// `int | object`, whose Union kind would then defer every operator on it.
+// TWO REASONS A PATH GETS NO ENTRY, neither of which is "it was not
+// narrowed":
 //
-// A path `declared_type_of` cannot resolve is DROPPED rather than guessed at:
-// nothing resolvable means nothing to layer a narrowing over. So is a joined
-// type equal to the declared type, keeping "a missing entry means the
-// declared type" true in both directions.
+//  1. `declared_type_of` cannot resolve it. Nothing resolvable means nothing
+//     to layer a narrowing over, so the path is dropped rather than guessed
+//     at.
+//  2. The union is EQUIVALENT to the declared type, by mutual is_subtype and
+//     NOT by operator==. That distinction is the whole point: == is exact and
+//     order-sensitive, so it would store `bool | int` over a declared `int`
+//     (mypy reveals `builtins.int`), `int | float` over a declared `float`
+//     (mypy reveals `builtins.float`), and would keep or drop the same two
+//     branches over a declared `int | str` depending only on which branch
+//     came first. A stored Union defers every operator applied to it, so
+//     storing one where the declared type already says the same thing turns
+//     a working program into a NotImplementedError. `classes` is threaded in
+//     for exactly this reason: `Sub | Base` over a declared `Base` reveals
+//     `Base` in mypy, and recognising that needs the base chain. It may be
+//     null, and two Class types are then simply unrelated.
+//
+//     This is also what drops an UNKNOWN join, which matters on its own:
+//     Type::union_of is absorbing on Unknown, so one edge assigning from an
+//     unmodellable expression would otherwise store Unknown over a perfectly
+//     good declared type, and Unknown is compatible with everything in both
+//     directions, so the reader would silently stop checking that path. It
+//     needs no guard of its own -- is_subtype answers true whenever either
+//     side is Unknown, so an Unknown value is equivalent to every declared
+//     type and never gets stored.
+//
+// WHAT PRESENCE MEANS, AND HOW FAR THAT REACHES. In THIS FUNCTION'S OUTPUT no
+// entry is even equivalent to its declared type, since (2) drops those, so
+// presence here does mean "this path joined to something genuinely different
+// from what it was declared as". That is a property of this function's
+// output ONLY, and not of a NarrowingState in general: set() filters nothing,
+// so a snapshot of a live map may well hold an entry equal to the declared
+// type. Do NOT build a "was this path narrowed here?" signal on entry
+// presence in a state of unknown provenance.
+//
+// The read rule stays the only rule either way -- an entry when there is one,
+// the declared type otherwise -- and it composes, because a stored value
+// equal to the declared type contributes exactly what an absent entry
+// contributes to a later join.
+//
+// ONE NORMALISATION on top of Type::union_of: a union that contains Object
+// collapses to Object, an identity rather than a heuristic, since Object is
+// the top of the lattice and `T | object` IS `object`. It only ever shapes
+// the value STORED, and it can be applied on either side of the equivalence
+// test above without changing the answer -- unlike under ==, where the two
+// orders genuinely disagreed. A caller that respects the declared type as a
+// permanent ceiling never reaches it, because a union containing Object is
+// then also equivalent to its declared type and dropped by (2); it is here so
+// that a value which does get stored is never a Union whose Object member
+// would defer every operator on it.
 NarrowingState join_narrowings(
     const std::vector<NarrowingState>& edges,
-    const std::function<std::optional<Type>(const NarrowedPath&)>& declared_type_of);
+    const std::function<std::optional<Type>(const NarrowedPath&)>& declared_type_of,
+    const ClassLookup* classes = nullptr);
 
 } // namespace cythonpp::domain::semantic
 

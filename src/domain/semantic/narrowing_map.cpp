@@ -5,6 +5,7 @@
 
 #include "domain/ast/attribute.h"
 #include "domain/ast/name.h"
+#include "domain/semantic/type_compatibility.h"
 
 namespace cythonpp::domain::semantic {
 namespace {
@@ -23,15 +24,8 @@ bool is_proper_prefix(const NarrowedPath& path, const NarrowedPath& candidate) {
 
 // The Object collapse on top of an already-computed union -- see
 // join_narrowings' own comment for why it is an identity and not a
-// heuristic. Applied only to decide the STORED value, never to decide
-// whether an entry is trivial (see the "equal to declared" check below,
-// which must compare the union BEFORE this collapse): a union that only
-// collapses to the declared type because Object absorbed a genuinely
-// different contribution (e.g. `int | object` collapsing to `object`) is
-// still real information from at least one edge, and must be kept, while a
-// union with no distinct contribution at all (every edge already at the
-// declared type) collapses to that same declared type without ever forming
-// a Union, and that one is the trivial case meant to be dropped.
+// heuristic, and why applying it before rather than after the equivalence
+// test cannot change which entries survive.
 Type collapse_object_union(Type joined) {
     if (joined.kind != TypeKind::Union) {
         return joined;
@@ -87,7 +81,8 @@ void NarrowingMap::restore(NarrowingState state) { entries_ = std::move(state); 
 
 NarrowingState join_narrowings(
     const std::vector<NarrowingState>& edges,
-    const std::function<std::optional<Type>(const NarrowedPath&)>& declared_type_of) {
+    const std::function<std::optional<Type>(const NarrowedPath&)>& declared_type_of,
+    const ClassLookup* classes) {
     // Every path any edge narrowed. A path no edge touched needs no entry:
     // its declared type is what a missing entry already means.
     std::set<NarrowedPath> paths;
@@ -110,17 +105,21 @@ NarrowingState join_narrowings(
             const auto it = edge.find(path);
             contributions.push_back(it == edge.end() ? *declared : it->second);
         }
-        // Compared BEFORE the Object collapse: this is what tells "no edge
-        // contributed anything but the declared type" (drop) apart from "a
-        // real per-edge difference happened to collapse to the declared
-        // type anyway" (keep, storing the collapsed value).
-        Type raw = Type::union_of(std::move(contributions));
-        if (raw == *declared) {
-            // Equal to the declared type, so an entry would say nothing a
-            // missing one does not.
+        Type value = collapse_object_union(Type::union_of(std::move(contributions)));
+        // is_equivalent, NEVER operator==: == is exact and order-sensitive,
+        // so it would store a union that says exactly what the declared type
+        // already says, and a stored Union defers every operator on it.
+        //
+        // This is also what drops an Unknown join, and no separate guard is
+        // needed for one: union_of is absorbing on Unknown, is_subtype
+        // answers true whenever either side is Unknown, so an Unknown value
+        // is equivalent to every declared type and never gets stored. A
+        // separate `if` would be unreachable code claiming to prevent
+        // something it cannot be shown to prevent.
+        if (is_equivalent(value, *declared, classes)) {
             continue;
         }
-        joined.emplace(path, collapse_object_union(std::move(raw)));
+        joined.emplace(path, std::move(value));
     }
     return joined;
 }
