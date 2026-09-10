@@ -47,5 +47,49 @@ TEST(DiagnosticSink, WarningsDoNotCountAsErrors) {
     EXPECT_FALSE(sink.has_errors());
 }
 
+// A suppressed code is DROPPED, not merely hidden: it never reaches
+// diagnostics(), so empty()/has_errors() cannot see it either. Another code
+// reported in the same region is untouched -- suppression is per code, which
+// is what lets the semantic pass silence "TypeError" in unreachable code
+// while keeping "NameError" there.
+TEST(DiagnosticSink, SuppressesOnlyTheNamedCode) {
+    DiagnosticSink sink;
+    {
+        DiagnosticSuppression suppression(sink, "TypeError");
+        sink.report_error("TypeError", "dropped", 1, 1);
+        sink.report_error("NameError", "kept", 2, 1);
+    }
+
+    ASSERT_EQ(sink.diagnostics().size(), 1u);
+    EXPECT_EQ(sink.diagnostics()[0].code, "NameError");
+    EXPECT_TRUE(sink.has_errors());
+}
+
+// The guard's scope is the region, and reporting resumes exactly when it ends.
+TEST(DiagnosticSink, ReportingResumesWhenTheGuardIsDestroyed) {
+    DiagnosticSink sink;
+    { DiagnosticSuppression suppression(sink, "TypeError"); }
+    sink.report_error("TypeError", "kept", 1, 1);
+
+    ASSERT_EQ(sink.diagnostics().size(), 1u);
+    EXPECT_EQ(sink.diagnostics()[0].message, "kept");
+}
+
+// THE REASON IT IS A STACK AND NOT A BOOL. Unreachable regions nest, so the
+// same code is pushed twice; when the inner region ends the outer one is
+// still live and must still suppress. A bool would un-suppress here.
+TEST(DiagnosticSink, NestedSuppressionsOfTheSameCodeDoNotUnsuppressEachOther) {
+    DiagnosticSink sink;
+    {
+        DiagnosticSuppression outer(sink, "TypeError");
+        { DiagnosticSuppression inner(sink, "TypeError"); }
+        sink.report_error("TypeError", "still dropped", 1, 1);
+    }
+    sink.report_error("TypeError", "kept", 2, 1);
+
+    ASSERT_EQ(sink.diagnostics().size(), 1u);
+    EXPECT_EQ(sink.diagnostics()[0].message, "kept");
+}
+
 } // namespace
 } // namespace cythonpp::domain::diagnostics
