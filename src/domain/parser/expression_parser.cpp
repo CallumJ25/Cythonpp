@@ -99,6 +99,12 @@ ast::ExprPtr ExpressionParser::parse_expression() {
     // operand, but in `n := 1` the target fills the operand slot first, so
     // that branch never sees it -- and the enclosing bracket rule would
     // otherwise report "never closed" and point at the wrong thing.
+    //
+    // Whoever implements this: a walrus target inside a comprehension would
+    // WRITE through NarrowingMap from expression-typing code, which
+    // NarrowingShadowGuard's whole-map restore (domain/semantic/narrowing_map.h)
+    // is currently sound only by assuming never happens -- read that guard's
+    // comment before wiring one up.
     if (tokens_.check(token_type::OP_WALRUS)) {
         return error(tokens_.peek(), "assignment expressions are not supported");
     }
