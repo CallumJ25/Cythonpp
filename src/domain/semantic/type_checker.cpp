@@ -1777,19 +1777,42 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // the ENCLOSING scope, matching Python's own evaluate-at-def-time
     // semantics -- a default cannot see another parameter of the same def,
     // so this runs entirely BEFORE the Function scope below is pushed.
-    typer_.set_statement_line(def_line);
-    for (std::size_t i = 0; i < params.size(); ++i) {
-        const ast::Parameter& parameter = params[i];
-        if (parameter.default_value == nullptr) {
-            continue;
-        }
-        const Type default_type = typer_.type_of(*parameter.default_value, param_types[i]);
-        if (default_type.kind != TypeKind::Unknown && param_types[i].kind != TypeKind::Unknown &&
-            !is_subtype(default_type, param_types[i], &classes_)) {
-            report(node, "TypeError",
-                  "incompatible default for argument \"" + parameter.name +
-                      "\" (default has type \"" + type_name(default_type) +
-                      "\", argument has type \"" + type_name(param_types[i]) + "\")");
+    //
+    // A default is typed WITHOUT the enclosing scope's narrowings, and that
+    // is measured rather than inherited from the scope decision above.
+    // Verified against mypy 1.18.1: with `x: object` narrowed to `int` on
+    // the line before, `reveal_type(x)` is `builtins.int` while
+    // `def inner(a: int = x)` on the very next line is
+    // `Incompatible default for argument "a" (default has type "object",
+    // argument has type "int")` -- the DECLARED type is what mypy checks a
+    // default against, even though it narrows the name immediately above.
+    // The same holds at module scope, and with `x = "s"` against
+    // `a: str = x`, so it is the position and not a quirk of `int`.
+    // (CPython runs all three, printing the narrowed value, so this is mypy
+    // alone rejecting -- which the union rule still covers.) A short-lived
+    // guard rather than moving the loop, because the loop must STAY in the
+    // enclosing scope for name resolution; only the narrowings reset.
+    // The braces are load-bearing: the reset lasts for the defaults and
+    // nothing else, so it neither survives into the body walk (which has a
+    // boundary guard of its own) nor leaves two guards restoring the same
+    // map in an order a reader has to work out.
+    {
+        NarrowingScopeGuard defaults_narrowing_guard(narrowings_);
+        typer_.set_statement_line(def_line);
+        for (std::size_t i = 0; i < params.size(); ++i) {
+            const ast::Parameter& parameter = params[i];
+            if (parameter.default_value == nullptr) {
+                continue;
+            }
+            const Type default_type = typer_.type_of(*parameter.default_value, param_types[i]);
+            if (default_type.kind != TypeKind::Unknown &&
+                param_types[i].kind != TypeKind::Unknown &&
+                !is_subtype(default_type, param_types[i], &classes_)) {
+                report(node, "TypeError",
+                      "incompatible default for argument \"" + parameter.name +
+                          "\" (default has type \"" + type_name(default_type) +
+                          "\", argument has type \"" + type_name(param_types[i]) + "\")");
+            }
         }
     }
 

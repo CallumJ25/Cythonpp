@@ -909,6 +909,17 @@ Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
     // both oracles accept. So type_of_list_comp does NOT touch the narrowing
     // map; it pushes only its own Comprehension SCOPE, exactly as before.
     //
+    // What it DOES do is hide the paths its own targets rebind, for its own
+    // duration -- see NarrowingShadowGuard. Not being a boundary is exactly
+    // what makes that necessary: a narrowing key carries no scope, so a
+    // comprehension target shadowing an enclosing name would otherwise read
+    // the enclosing name's narrowing for a variable that is not it. The
+    // guard is constructed up front, before the first clause's iterable is
+    // typed, since that iterable is evaluated in the ENCLOSING scope and
+    // must still see every enclosing narrowing; nothing is hidden until a
+    // target is actually bound below.
+    NarrowingShadowGuard narrowing_shadow(narrowings_);
+
     // Constructed on the FIRST clause only, right before that clause's
     // target is bound -- not at the top of the function -- because the
     // first clause's own `iterable` is evaluated in the ENCLOSING scope
@@ -965,6 +976,16 @@ Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
             // one line.
             binding.order_exempt = true;
             scopes_.bind(name_target->identifier(), binding);
+            // This target now means something entirely different from
+            // whatever an enclosing scope's same-spelled name meant, so any
+            // narrowing keyed on that spelling (and, by kill()'s prefix
+            // rule, on anything beneath it) stops applying here. Restored
+            // when this comprehension's own scope ends -- an enclosing
+            // narrowing is shadowed, not destroyed. Done AFTER the bind
+            // rather than before, purely so the two halves of "this name is
+            // the comprehension's now" sit together; nothing between them
+            // reads the map.
+            narrowing_shadow.shadow(name_target->identifier());
         }
         // Every other assignable target shape (Attribute, Subscript) binds
         // no new name at all, so there is nothing to do for it here.

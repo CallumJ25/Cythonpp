@@ -842,14 +842,24 @@ private:
     std::optional<Type> declared_type_of_path(const NarrowedPath& path) const;
 
     // An annotation RE-declares a path, so anything known about that path
-    // (and about anything beneath it) is stale. Its value, when there is one
-    // and it checked out against the annotation, then narrows it: verified
-    // against mypy 1.18.1, `x: object = 5` reveals `builtins.int` on the next
-    // read.
+    // (and about anything beneath it) is stale.
     //
-    // `narrowed` is std::nullopt for a value-less annotation (`x: int`) and
-    // for one whose value was already reported as incompatible -- in both
-    // cases the path is killed and left at its declared type, since narrowing
+    // Whether its value then NARROWS it depends on the target's shape, and
+    // the two halves are asymmetric -- verified against mypy 1.18.1. A bare
+    // NAME does NOT narrow from its own declaring statement: `x: object = 5`
+    // reveals `builtins.object` on the next read, at module scope, function
+    // scope and class-body scope alike, so narrowing a plain variable only
+    // ever comes from a SEPARATE, later plain reassignment. An ATTRIBUTE
+    // target DOES, even a brand-new one: `self.n: object = 5` reveals
+    // `builtins.int`. The caller (visit(AnnAssign)) is what branches on
+    // that; this function just does what its argument says. See that call
+    // site for the full statement of the rule.
+    //
+    // `narrowed` is std::nullopt for a value-less annotation (`x: int`), for
+    // every bare Name target per the asymmetry above, and
+    // for one whose value was already reported as incompatible -- in each
+    // case the path is killed and left at its declared type, which for the
+    // incompatible one is the point: narrowing
     // to a type the annotation forbids is exactly what the declared-type
     // ceiling exists to prevent.
     void redeclare_narrowing(const ast::Expr& target, const std::optional<Type>& narrowed);

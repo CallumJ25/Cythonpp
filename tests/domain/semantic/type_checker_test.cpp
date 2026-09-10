@@ -3808,5 +3808,135 @@ TEST(TypeChecker, AnAnnAssignNarrowsABrandNewSelfAttributeFromItsOwnDeclaringVal
                  "        print(self.n + 1)\n");
 }
 
+// A COMPREHENSION TARGET SHADOWS AN ENCLOSING NARROWING OF THE SAME NAME.
+// A narrowing key carries no scope, and a comprehension is deliberately NOT
+// a boundary, so the comprehension's own `x` would otherwise read the
+// enclosing `x`'s narrowing. Verified against mypy 1.18.1: this is
+// `Unsupported operand types for + ("str" and "int")`, and CPython raises
+// `TypeError: can only concatenate str (not "int") to str` on the same file,
+// so BOTH oracles reject it -- reading the enclosing narrowing here is a
+// silent accept, the one direction this compiler must never take.
+TEST(TypeChecker, AComprehensionTargetShadowsAnEnclosingNarrowingOfTheSameName) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    x: object = object()\n"
+                                         "    x = 7\n"
+                                         "    ys = [x + 1 for x in [\"a\", \"b\"]]\n"
+                                         "    print(ys)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand types for + (\"str\" and \"int\")");
+}
+
+// The ATTRIBUTE flavour, which the bare-name shadow must cover for free:
+// killing `b` also kills `b.n`, per NarrowingMap::kill's prefix rule, so the
+// comprehension's fresh `b` reads `n`'s DECLARED type. Verified against mypy
+// 1.18.1 (`Unsupported operand types for + ("object" and "int")`) and
+// CPython (`TypeError: unsupported operand type(s) for +: 'object' and
+// 'int'`).
+TEST(TypeChecker, AComprehensionTargetShadowsANarrowedAttributeRoot) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    n: object = object()\n"
+                                         "def f(items: list[Bag], b: Bag) -> None:\n"
+                                         "    b.n = 7\n"
+                                         "    ys = [b.n + 1 for b in items]\n"
+                                         "    print(ys)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand types for + (\"object\" and \"int\")");
+}
+
+// The same at MODULE scope, where the narrowing lives in the module's own
+// scope rather than a function's -- the shadow is a property of the key
+// having no scope at all, so it must not depend on which scope narrowed.
+// Same two oracle verdicts as the function-scope case above.
+TEST(TypeChecker, AComprehensionTargetShadowsAModuleScopeNarrowing) {
+    const Checked checked = check_module("x: object = object()\n"
+                                         "x = 7\n"
+                                         "ys = [x + 1 for x in [\"a\", \"b\"]]\n"
+                                         "print(ys)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand types for + (\"str\" and \"int\")");
+}
+
+// NESTED: the read sits in an INNER comprehension, one more scope down from
+// the shadowing target, so the shadow has to outlive the clause that
+// installed it and still be visible to a nested comprehension's own guard.
+// Same two oracle verdicts again.
+TEST(TypeChecker, AnInnerComprehensionStillSeesAnOuterTargetsShadow) {
+    const Checked checked =
+        check_module("def f() -> None:\n"
+                     "    x: object = object()\n"
+                     "    x = 7\n"
+                     "    ys = [[x + 1 for _ in range(2)] for x in [\"a\", \"b\"]]\n"
+                     "    print(ys)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand types for + (\"str\" and \"int\")");
+}
+
+// SHADOWED, NOT DESTROYED: the enclosing narrowing comes back after the
+// comprehension ends. Verified against mypy 1.18.1: `[str(x) for x in
+// ["a", "b"]]` followed by `reveal_type(x)` reveals `builtins.int`, the file
+// is Success, and CPython prints `8`. A permanent kill instead of a scoped
+// one would invent a false TypeError here.
+TEST(TypeChecker, AnEnclosingNarrowingSurvivesPastAComprehension) {
+    expect_clean("def f() -> None:\n"
+                 "    x: object = object()\n"
+                 "    x = 7\n"
+                 "    ys = [str(x) for x in [\"a\", \"b\"]]\n"
+                 "    print(x + 1)\n"
+                 "    print(ys)\n");
+}
+
+// A PARAMETER DEFAULT IS CHECKED AGAINST THE DECLARED TYPE, NOT THE NARROWED
+// ONE, even though the narrowing is live on the line immediately above.
+// Verified against mypy 1.18.1: `reveal_type(x)` on the preceding line is
+// `builtins.int` while the `def` line is `Incompatible default for argument
+// "a" (default has type "object", argument has type "int")`. CPython runs
+// the file and prints `7`, so this is mypy alone rejecting -- which the
+// union rule still covers, and accepting it silently is a false negative.
+TEST(TypeChecker, AParameterDefaultIsCheckedAgainstTheDeclaredTypeNotTheNarrowedOne) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    x: object = object()\n"
+                                         "    x = 7\n"
+                                         "    def inner(a: int = x) -> None:\n"
+                                         "        print(a)\n"
+                                         "    inner()\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "incompatible default for argument \"a\" (default has "
+                             "type \"object\", argument has type \"int\")");
+}
+
+// The same at MODULE scope, and with `str` rather than `int` as the
+// parameter type -- measured separately so the rule is not mistaken for a
+// quirk of one scope or one type. mypy 1.18.1 reports the same
+// `Incompatible default` in both, and CPython runs the module-scope one.
+TEST(TypeChecker, AParameterDefaultIgnoresAModuleScopeNarrowing) {
+    const Checked checked = check_module("x: object = object()\n"
+                                         "x = 7\n"
+                                         "def inner(a: int = x) -> None:\n"
+                                         "    print(a)\n"
+                                         "inner()\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "incompatible default for argument \"a\" (default has "
+                             "type \"object\", argument has type \"int\")");
+}
+
+TEST(TypeChecker, AParameterDefaultIgnoresANarrowingToStr) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    x: object = object()\n"
+                                         "    x = \"s\"\n"
+                                         "    def inner(a: str = x) -> None:\n"
+                                         "        print(a)\n"
+                                         "    inner()\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "incompatible default for argument \"a\" (default has "
+                             "type \"object\", argument has type \"str\")");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

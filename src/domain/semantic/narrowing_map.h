@@ -241,6 +241,54 @@ private:
     NarrowingState saved_;
 };
 
+// Hides INDIVIDUAL paths for the duration of a scope that is NOT a narrowing
+// boundary, and puts the whole map back afterwards. The distinction from
+// NarrowingScopeGuard above is the whole point: that one clears everything
+// because the construct forgets everything, this one clears only the paths a
+// construct REBINDS while leaving every other narrowing readable through it.
+//
+// The construct that needs it is a comprehension, whose own target shadows an
+// enclosing name of the same spelling. A NarrowedPath carries no scope
+// qualification, so an entry installed for the enclosing `x` would otherwise
+// be read for the comprehension's own, entirely unrelated, `x`. Verified
+// against mypy 1.18.1: with `x: object` narrowed to `int`,
+// `[x + 1 for x in ["a", "b"]]` is `Unsupported operand types for +
+// ("str" and "int")` -- the comprehension's `x` is a `str`, and reading the
+// enclosing narrowing there silently accepts a program mypy rejects (CPython
+// raises `TypeError: can only concatenate str (not "int") to str` on the
+// same file, so both oracles reject it).
+//
+// RESTORE, NOT A PERMANENT KILL, and that too is measured: the enclosing
+// narrowing survives PAST the comprehension. `[str(x) for x in ["a", "b"]]`
+// followed by `reveal_type(x)` reveals `builtins.int`, so the shadowing is
+// scoped to the comprehension exactly as the name binding is.
+//
+// Restoring the whole map is sound here only because expression typing
+// installs no narrowings of its own -- every set() in this pass comes from a
+// statement's assignment, and a comprehension contains no statements. If an
+// expression ever starts narrowing (a walrus target would), this guard must
+// become a per-path save/restore instead of a whole-map one.
+class NarrowingShadowGuard {
+public:
+    explicit NarrowingShadowGuard(NarrowingMap& narrowings)
+        : narrowings_(narrowings), saved_(narrowings.snapshot()) {}
+
+    // Hide `path` and, via NarrowingMap::kill's own prefix rule, everything
+    // beneath it -- which is what makes an ATTRIBUTE root work for free:
+    // shadowing the bare target `b` also drops `b.n`, so
+    // `[b.n + 1 for b in items]` reads the fresh `b`'s DECLARED `n` rather
+    // than the enclosing `b.n`'s narrowing.
+    void shadow(const NarrowedPath& path) { narrowings_.kill(path); }
+
+    ~NarrowingShadowGuard() { narrowings_.restore(std::move(saved_)); }
+    NarrowingShadowGuard(const NarrowingShadowGuard&) = delete;
+    NarrowingShadowGuard& operator=(const NarrowingShadowGuard&) = delete;
+
+private:
+    NarrowingMap& narrowings_;
+    NarrowingState saved_;
+};
+
 } // namespace cythonpp::domain::semantic
 
 #endif // CYTHONPP_DOMAIN_SEMANTIC_NARROWING_MAP_H
