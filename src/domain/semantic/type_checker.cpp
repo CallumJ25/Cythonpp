@@ -131,6 +131,25 @@ private:
     Type previous_;
 };
 
+// Sets a bool for the duration of a body walk and puts the previous value
+// back, the same shape as ReturnContextGuard above and for the same reason:
+// visit(FunctionDef) has a report-and-return path between the set and the
+// restore, so RAII is the only safe pairing.
+class FlagGuard {
+public:
+    FlagGuard(bool& current, bool new_value) : current_(current), previous_(current) {
+        current_ = new_value;
+    }
+    ~FlagGuard() { current_ = previous_; }
+
+    FlagGuard(const FlagGuard&) = delete;
+    FlagGuard& operator=(const FlagGuard&) = delete;
+
+private:
+    bool& current_;
+    bool previous_;
+};
+
 // The `while True` half of always_returns' While arm: true only for a
 // Constant whose token type is BOOL_TRUE, per the brief's own precise
 // definition -- NOT any expression ExpressionTyper would type as `bool`
@@ -171,9 +190,7 @@ void TypeChecker::visit(const ast::Module& node) {
     }
     collect_signatures(node);
     pre_bind_assignment_targets(node);
-    for (const ast::StmtPtr& statement : node.body()) {
-        statement->accept(*this);
-    }
+    check_suite(node.body());
 }
 
 void TypeChecker::for_each_flat_statement(
@@ -1658,9 +1675,9 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         // the "missing an annotation" completeness check just above.
         ReturnContextGuard return_guard(current_return_type_, Type::unknown());
         pre_bind_function_body(node.body());
-        for (const ast::StmtPtr& statement : node.body()) {
-            statement->accept(*this);
-        }
+        FlagGuard function_guard(in_function_body_, true);
+        FlagGuard loop_guard(in_loop_body_, false);
+        check_suite(node.body());
         return;
     }
 
@@ -1907,8 +1924,10 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // check can tell "used before definition" apart from "not defined"; see
     // pre_bind_function_body's own comment.
     pre_bind_function_body(node.body());
-    for (const ast::StmtPtr& statement : node.body()) {
-        statement->accept(*this);
+    {
+        FlagGuard function_guard(in_function_body_, true);
+        FlagGuard loop_guard(in_loop_body_, false);
+        check_suite(node.body());
     }
 
     // Task 20's return-path check, run once per FunctionDef at the very end
@@ -2047,9 +2066,9 @@ void TypeChecker::visit(const ast::ClassDef& node) {
     // it), and still the REAL pass for a function-local or collision-losing
     // class, which that module-wide phase never sees.
     pre_collect_class_body(node, qualified_name);
-    for (const ast::StmtPtr& statement : node.body()) {
-        statement->accept(*this);
-    }
+    FlagGuard function_guard(in_function_body_, false);
+    FlagGuard loop_guard(in_loop_body_, false);
+    check_suite(node.body());
 }
 
 void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
@@ -2288,15 +2307,11 @@ void TypeChecker::visit(const ast::If& node) {
     // genuine two-branch split, `builtins.int` when both branches agree, and
     // `builtins.object` for the else-less case.
     const NarrowingState before = narrowings_.snapshot();
-    for (const ast::StmtPtr& statement : node.body()) {
-        statement->accept(*this);
-    }
+    check_suite(node.body());
     const NarrowingState after_body = narrowings_.snapshot();
 
     narrowings_.restore(before);
-    for (const ast::StmtPtr& statement : node.orelse()) {
-        statement->accept(*this);
-    }
+    check_suite(node.orelse());
     const NarrowingState after_orelse = narrowings_.snapshot();
 
     // A BRANCH CONTROL ALWAYS LEAVES CONTRIBUTES NO EDGE. Its end-of-branch
@@ -2318,9 +2333,40 @@ void TypeChecker::visit(const ast::If& node) {
     // edge yields `unsupported operand types for + ("object" and "int")` on
     // the last line -- rejecting a program both oracles accept. The same
     // holds with the branches swapped, and for a `self.` attribute path in
-    // place of the local. Keeping BOTH edges when dropping would leave none
-    // (a branch each way leaves) costs nothing: the merge is unreachable, so
-    // whatever state it carries is never read.
+    // place of the local.
+    //
+    // WHEN DROPPING WOULD LEAVE NO EDGES (a branch each way leaves), BOTH ARE
+    // KEPT, and the guarantee that makes that safe is NARROW -- state it
+    // precisely, because an earlier version of this comment claimed "the
+    // merge is unreachable, so whatever state it carries is never read",
+    // which was false at the time it was written and is the reason this
+    // defect recurred three times. What is actually true:
+    //
+    //  - The state IS read. check_suite keeps walking the rest of the suite,
+    //    because mypy's own semantic analyzer does (see check_suite's
+    //    comment for the measurements) -- so every statement after this `if`
+    //    is still typed against this state.
+    //  - It cannot produce a TYPE diagnostic. statement_always_leaves is true
+    //    of this `if`, so check_suite has the sink's "TypeError" suppression
+    //    live for the whole remainder of the suite, nested subtrees included.
+    //  - It does not escape the suite as a narrowing. check_suite restores the
+    //    state as of this `if` before the suite walk returns, so the
+    //    enclosing construct's end-of-suite snapshot is this join's result,
+    //    not whatever the dead statements after it narrowed.
+    //
+    // AND THE FALLBACK ITSELF IS THE RIGHT VALUE, not merely a harmless one.
+    // It is the union over the edges by which control ACTUALLY leaves, which
+    // is the only non-arbitrary state available -- and for the both-arms-
+    // `break` case it is exactly the state the enclosing loop's exit sees,
+    // since those two break edges ARE that loop's exit edges. The two
+    // alternatives are both worse: restoring the pre-`if` state reproduces
+    // the very false TypeError above (measured -- delete the whole `if` from
+    // the fixture at the top of this comment and the same message lands on
+    // the same operand pair, because the pre-`if` state is where `n` is still
+    // its declared `object`), and dropping the fallback so `edges` stays
+    // empty is that same thing with less information still, since
+    // join_narrowings over zero edges returns an empty state, i.e. every path
+    // back to its declared type.
     //
     // THREE TERMINATORS, and all three are handled here: `return`, `break`
     // and `continue`. `break` and `continue` are both parsed, so both reach
@@ -2333,7 +2379,7 @@ void TypeChecker::visit(const ast::If& node) {
     // and identical again with a `while` in place of the `for`. The fourth
     // terminator, `raise`, is the one the parser genuinely does not admit
     // yet -- `if f: ... else: raise ...` is masked purely by that gap, so
-    // whoever lands `raise` must add it to always_leaves_branch here.
+    // whoever lands `raise` must add it to statement_always_leaves.
     //
     // The predicate is always_leaves_branch and NOT always_returns, on
     // purpose: see its declaration for why widening always_returns instead
@@ -2392,8 +2438,9 @@ void TypeChecker::visit(const ast::While& node) {
     // `self.n = 7` / `while f: print(self.n + 1); self.n = 8`; a false
     // TypeError is never an acceptable trade for a missed one.
     const NarrowingState before = narrowings_.snapshot();
-    for (const ast::StmtPtr& statement : node.body()) {
-        statement->accept(*this);
+    {
+        FlagGuard loop_guard(in_loop_body_, true);
+        check_suite(node.body());
     }
     const NarrowingState after_body = narrowings_.snapshot();
     narrowings_.restore(join_narrowings(
@@ -2426,9 +2473,7 @@ void TypeChecker::visit(const ast::While& node) {
     // `while/else` or a `for/else` suite instead of a mid-body jump draws a
     // diagnostic on mypy's line (a NotImplementedError for the joined
     // `int | str` operand, which is the sanctioned "cannot model" code).
-    for (const ast::StmtPtr& statement : node.orelse()) {
-        statement->accept(*this);
-    }
+    check_suite(node.orelse());
 }
 
 void TypeChecker::visit(const ast::For& node) {
@@ -2516,17 +2561,16 @@ void TypeChecker::visit(const ast::For& node) {
     // Any other target shape (Attribute, Subscript) is outside this task's
     // tested scope; nothing to bind.
 
-    for (const ast::StmtPtr& statement : node.body()) {
-        statement->accept(*this);
+    {
+        FlagGuard loop_guard(in_loop_body_, true);
+        check_suite(node.body());
     }
     const NarrowingState after_body = narrowings_.snapshot();
     narrowings_.restore(join_narrowings(
         {before, after_body},
         [this](const NarrowedPath& path) { return declared_type_of_path(path); }, &classes_));
 
-    for (const ast::StmtPtr& statement : node.orelse()) {
-        statement->accept(*this);
-    }
+    check_suite(node.orelse());
 }
 
 void TypeChecker::visit(const ast::Return& node) {
@@ -2659,55 +2703,91 @@ bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
     return false;
 }
 
-bool TypeChecker::always_leaves_branch(const std::vector<ast::StmtPtr>& body) {
+bool TypeChecker::always_leaves_branch(const std::vector<ast::StmtPtr>& body, bool in_function,
+                                       bool in_loop) {
+    // An any-of fold over the per-statement rule below. A hit ANYWHERE in the
+    // list counts, not just at the end: whatever follows a `break` in the
+    // same suite is dead code, so the branch still never falls through.
     for (const ast::StmtPtr& statement : body) {
-        // All three terminators count, and a hit anywhere in the list counts
-        // (not just at the end): whatever follows a `break` in the same suite
-        // is dead code, so the branch still never falls through.
-        if (dynamic_cast<const ast::Return*>(statement.get()) != nullptr ||
-            dynamic_cast<const ast::Break*>(statement.get()) != nullptr ||
-            dynamic_cast<const ast::Continue*>(statement.get()) != nullptr) {
+        if (statement_always_leaves(*statement, in_function, in_loop)) {
             return true;
         }
-        if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
-            // An `if` with no `else` can always fall through, so it never
-            // counts -- that is what makes a `break` guarded by a nested `if`
-            // CONDITIONAL, and a conditional terminator must still contribute
-            // its edge.
-            if (!if_stmt->orelse().empty() && always_leaves_branch(if_stmt->body()) &&
-                always_leaves_branch(if_stmt->orelse())) {
-                return true;
-            }
-            continue;
-        }
-        if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
-            if (is_literal_true(while_stmt->condition()) &&
-                !contains_reachable_break(while_stmt->body())) {
-                // Never exits, so it never falls through to the merge either.
-                return true;
-            }
-            // Its `else` runs outside its own break scope, so a terminator
-            // there targets the ENCLOSING construct; the `else` itself always
-            // runs whenever the body cannot break out.
-            if (!contains_reachable_break(while_stmt->body()) &&
-                always_leaves_branch(while_stmt->orelse())) {
-                return true;
-            }
-            continue;
-        }
-        if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
-            if (!contains_reachable_break(for_stmt->body()) &&
-                always_leaves_branch(for_stmt->orelse())) {
-                return true;
-            }
-            continue;
-        }
-        // A nested loop's own BODY is never recursed into: a `break` or
-        // `continue` written there belongs to that loop, so it cannot leave
-        // this branch. FunctionDef/ClassDef bodies are new scopes no
-        // terminator can reach out of.
     }
     return false;
+}
+
+bool TypeChecker::statement_always_leaves(const ast::Stmt& statement, bool in_function,
+                                          bool in_loop) {
+    // All three terminators the parser admits count, each only where Python
+    // permits it to appear at all -- see the header for the four measured
+    // rows that make the context checks load-bearing rather than pedantic.
+    // `raise` is the fourth terminator and the parser rejects it outright
+    // ("raise statements are not supported"), so whoever lands it must add
+    // it here (legal in both contexts, unlike these three).
+    if (dynamic_cast<const ast::Return*>(&statement) != nullptr) {
+        return in_function;
+    }
+    if (dynamic_cast<const ast::Break*>(&statement) != nullptr ||
+        dynamic_cast<const ast::Continue*>(&statement) != nullptr) {
+        return in_loop;
+    }
+    if (const auto* if_stmt = dynamic_cast<const ast::If*>(&statement)) {
+        // An `if` with no `else` can always fall through, so it never
+        // counts -- that is what makes a `break` guarded by a nested `if`
+        // CONDITIONAL, and a conditional terminator must still contribute
+        // its edge.
+        return !if_stmt->orelse().empty() &&
+               always_leaves_branch(if_stmt->body(), in_function, in_loop) &&
+               always_leaves_branch(if_stmt->orelse(), in_function, in_loop);
+    }
+    if (const auto* while_stmt = dynamic_cast<const ast::While*>(&statement)) {
+        if (is_literal_true(while_stmt->condition()) &&
+            !contains_reachable_break(while_stmt->body())) {
+            // Never exits, so it never falls through to the merge either.
+            // No terminator is involved, so this arm needs no context check:
+            // `while True: pass` is legal wherever a statement is legal.
+            return true;
+        }
+        // Its `else` runs outside its own break scope, so a terminator
+        // there targets the ENCLOSING construct -- which is also why the
+        // orelse recursion passes THIS suite's context through unchanged
+        // rather than in_loop=true; the `else` itself always runs whenever
+        // the body cannot break out.
+        return !contains_reachable_break(while_stmt->body()) &&
+               always_leaves_branch(while_stmt->orelse(), in_function, in_loop);
+    }
+    if (const auto* for_stmt = dynamic_cast<const ast::For*>(&statement)) {
+        return !contains_reachable_break(for_stmt->body()) &&
+               always_leaves_branch(for_stmt->orelse(), in_function, in_loop);
+    }
+    // A nested loop's own BODY is never recursed into: a `break` or
+    // `continue` written there belongs to that loop, so it cannot leave
+    // this branch. FunctionDef/ClassDef bodies are new scopes no
+    // terminator can reach out of.
+    return false;
+}
+
+void TypeChecker::check_suite(const std::vector<ast::StmtPtr>& body) {
+    // Constructed in place the moment the suite goes unreachable, and
+    // destroyed on the way out of this function -- so the region is exactly
+    // "the rest of THIS suite", and an enclosing suite's own reachable
+    // remainder is unaffected. std::optional::emplace is what lets a
+    // non-movable guard have a run-time-decided start.
+    std::optional<diagnostics::DiagnosticSuppression> unreachable;
+    NarrowingState narrowings_at_terminator;
+
+    for (const ast::StmtPtr& statement : body) {
+        statement->accept(*this);
+        if (!unreachable.has_value() &&
+            statement_always_leaves(*statement, in_function_body_, in_loop_body_)) {
+            narrowings_at_terminator = narrowings_.snapshot();
+            unreachable.emplace(sink_, "TypeError");
+        }
+    }
+
+    if (unreachable.has_value()) {
+        narrowings_.restore(std::move(narrowings_at_terminator));
+    }
 }
 
 bool TypeChecker::is_bare_empty_container(const ast::Expr& value) {

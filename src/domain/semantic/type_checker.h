@@ -112,10 +112,24 @@ namespace cythonpp::domain::semantic {
 //     textually regardless of the `if False:` guard around it -- so it judges
 //     the `while True` skippable and reports a spurious "missing return
 //     statement" mypy would not.
+//   - A THIRD failure mode, measured 2026-09-10 and in the same (false
+//     TypeError) direction as the one above, but NOT requiring dead code:
+//     `for i in range(3): / total = total + i / else: / return total` as the
+//     whole body of a `-> int` function draws `TypeError: missing return
+//     statement` from this checker while `mypy --strict` says `Success: no
+//     issues found in 1 source file`, and CPython runs it (identically for
+//     the `while cond ... else: return` form). A loop whose body has no
+//     reachable `break` ALWAYS runs its `else`, so that `else`'s return is
+//     guaranteed -- which is exactly the clause always_leaves_branch already
+//     carries and this predicate does not. Adding it here would be a narrow,
+//     safe widening; it is untouched only because it fell outside the round
+//     that measured it. It is a real union-rule violation (both oracles
+//     accept the program), not merely an imprecision.
 // This ships anyway because building real reachability analysis (constant
 // folding, unreachable-code pruning) is out of scope for this task -- the
-// syntactic rule catches the overwhelmingly common shapes correctly and both
-// known failure modes require an artificial exercise in dead code to trigger.
+// syntactic rule catches the overwhelmingly common shapes correctly and the
+// first two known failure modes require an artificial exercise in dead code
+// to trigger.
 //
 // Checked once per FunctionDef, at the very end of its body walk, ONLY when
 // the function has a return annotation that is neither None nor Unknown --
@@ -1008,7 +1022,124 @@ private:
     // `else` then always runs and runs outside the nested loop's own break
     // scope -- the same body-vs-orelse distinction contains_reachable_break
     // draws, for the same reason.
-    static bool always_leaves_branch(const std::vector<ast::StmtPtr>& body);
+    //
+    // THE TWO CONTEXT FLAGS DEFAULT TO TRUE, which is "assume every
+    // terminator is legal where it stands" -- exactly the behaviour this
+    // predicate had before they existed, so visit(If)'s join (its only
+    // caller besides check_suite) is unchanged. check_suite passes the real
+    // context instead; see statement_always_leaves for why.
+    static bool always_leaves_branch(const std::vector<ast::StmtPtr>& body,
+                                     bool in_function = true, bool in_loop = true);
+
+    // The per-statement half of always_leaves_branch, extracted so the
+    // reachability walk below can ask the question of ONE statement -- "is
+    // everything after this statement, in this suite, dead code?" --
+    // without re-deriving the rule. always_leaves_branch is now literally an
+    // any-of fold over this, and its own contract is UNCHANGED: a hit
+    // anywhere in the list still counts, because whatever follows a
+    // terminator in the same suite cannot fall through either.
+    //
+    // The rule itself is documented on always_leaves_branch above; every
+    // clause of it lives here now.
+    //
+    // `in_function`/`in_loop` say whether a `return`, or a `break`/
+    // `continue`, is LEGAL PYTHON where this statement stands. They exist
+    // because a terminator that CPython refuses to compile must not start an
+    // unreachable region: doing so drops the only diagnostic this checker
+    // has on a program both oracles reject. Four rows, all measured against
+    // mypy 1.18.1 and CPython 3.14.2:
+    //
+    //   x: int = 0 / break / y: int = "s"
+    //     mypy: `"break" outside loop` -- EXIT 2, no bracketed code, and the
+    //           line-3 type error never appears (mypy stopped before type
+    //           checking; this is a BLOCKING error, not reachability pruning)
+    //     CPython: `SyntaxError: 'break' outside loop` -- compile time, so
+    //              the file never runs at all
+    //   the same with `continue`: `"continue" outside loop`, exit 2;
+    //     CPython `SyntaxError: 'continue' not properly in loop`
+    //   x: int = 0 / return / y: int = "s"
+    //     mypy: `"return" outside function  [misc]`, exit 1
+    //     CPython: `SyntaxError: 'return' outside function`
+    //   for i in range(2): / class C: / a: int = 0 / break
+    //     mypy: `"break" outside loop`, exit 2; CPython: SyntaxError. So a
+    //     CLASS BODY resets in_loop even inside a loop -- and `def f(): /
+    //     class C: / return` measures the same way, so it resets in_function
+    //     too. `def f(): break` (in a function, no loop) is likewise
+    //     `"break" outside loop`.
+    //
+    // Both oracles reject all four, so cythonpp must not go silent on them;
+    // at 2997f6f it rejected each one via the type error on the following
+    // line, and suppressing that error without this gate would have turned
+    // four rejections into four silent acceptances. That cythonpp reports
+    // nothing for the stray terminator ITSELF is a separate, PRE-EXISTING
+    // gap (a bare module-level `break` with no type error after it is
+    // silently accepted at 2997f6f too); closing it belongs to the parser,
+    // whose SyntaxError code this pass does not own.
+    //
+    // The one legal module-scope shape is unaffected and now correct:
+    // `x: int = 0 / while True: / x = x + 1 / y: int = "s"` involves no
+    // terminator, mypy is CLEAN on it, and 2997f6f reported a false
+    // TypeError there that this change removes.
+    static bool statement_always_leaves(const ast::Stmt& statement, bool in_function = true,
+                                        bool in_loop = true);
+
+    // THE ONE CHOKE POINT every suite walk goes through, and the whole of
+    // this checker's reachability model. It walks each statement exactly as
+    // an open-coded `for` loop did before, and additionally, once a statement
+    // says statement_always_leaves, treats the REST of the suite -- including
+    // every nested subtree of it -- as unreachable.
+    //
+    // UNREACHABLE MEANS "TYPE-UNCHECKED", NOT "UNVISITED", and that is a
+    // measurement against mypy 1.18.1, not a convenience. mypy's semantic
+    // analyzer runs over unreachable code and its type checker does not:
+    //
+    //   def f() -> int:
+    //       return 0
+    //       print(nope_not_defined)
+    //   print(f())
+    //
+    //   $ mypy --strict --no-color-output --no-error-summary probe.py
+    //   probe.py:3: error: Name "nope_not_defined" is not defined  [name-defined]
+    //
+    // while the same position given a bad attribute, a bad call arity and a
+    // bad argument type is silent (`Success` -- and the CONTROL with those
+    // three statements made reachable reports all three, so the silence is
+    // reachability and not unreportability). So the walk must CONTINUE: names
+    // must still bind and resolve. Dropping the walk instead is wrong in both
+    // directions at once -- it loses the NameError above, and it invents one
+    // for a name bound only in unreachable code and read from statically
+    // reachable code, which BOTH oracles accept:
+    //
+    //   def f(c: bool) -> None:
+    //       if c:
+    //           return
+    //           x: int = 1
+    //       print(x)
+    //   print("module ran")
+    //
+    //   $ mypy --strict ... -> Success: no issues found in 1 source file
+    //   $ python probe.py  -> module ran   (exit 0)
+    //
+    // WHAT IS SUPPRESSED IS EXACTLY "TypeError", via DiagnosticSuppression on
+    // the sink. NameError stays because mypy reports it there (above).
+    // NotImplementedError and OverflowError stay because neither is a mypy
+    // type judgement at all -- both are THIS compiler's own capability claims
+    // ("cannot model this construct", "this literal does not fit 64 bits"),
+    // unreachable code still has to be emitted as C++, and neither is silent
+    // acceptance, so keeping them cannot violate the union rule.
+    //
+    // NARROWING DOES NOT ESCAPE. The state is snapshotted at the moment the
+    // suite goes unreachable and restored before returning, so the enclosing
+    // construct's own end-of-suite snapshot sees the state as of the
+    // terminator -- which is where the suite genuinely ends. Without this a
+    // narrowing recorded by an unreachable statement reaches REACHABLE code
+    // through the enclosing loop join; measured at 2997f6f on
+    // `n: object = object()` / `n = 7` / `while f:` / `if f: break else:
+    // break` / `n = "s"` / `k: int = n`, which drew `incompatible types in
+    // assignment (expression has type "int | str", variable has type "int")`
+    // on the reachable `k: int = n` while mypy --strict said `Success` and
+    // CPython printed `7` twice.
+    void check_suite(const std::vector<ast::StmtPtr>& body);
 
     void report(const ast::Node& at, std::string code, std::string message);
     void report_incompatible_assignment(const ast::Node& at, const Type& value_type,
@@ -1023,6 +1154,19 @@ private:
     // typer_ because typer_'s constructor takes a reference to it.
     NarrowingMap narrowings_;
     ExpressionTyper typer_;
+
+    // Whether the suite currently being walked is lexically inside a
+    // function body, and inside a loop body -- the two facts
+    // statement_always_leaves needs to tell a real terminator from a
+    // statement CPython refuses to compile. Both start false, which is
+    // module scope. Set by FlagGuard (in the .cpp) around each body walk:
+    // a FunctionDef body sets in_function=true and in_loop=FALSE (a `break`
+    // cannot cross a `def`), a ClassDef body sets BOTH false (measured: a
+    // class body resets each), a While/For BODY sets in_loop=true, and a
+    // While/For ORELSE inherits unchanged, because an `else` runs outside
+    // its own loop's break scope.
+    bool in_function_body_ = false;
+    bool in_loop_body_ = false;
 
     // One recorded module-scope definition, for the collision rule
     // scan_top_level_names implements. `at_flat_top_level` is false for a
