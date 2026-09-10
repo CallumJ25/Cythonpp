@@ -2298,14 +2298,58 @@ void TypeChecker::visit(const ast::If& node) {
     }
     const NarrowingState after_orelse = narrowings_.snapshot();
 
+    // A BRANCH THAT ALWAYS RETURNS CONTRIBUTES NO EDGE. Its end-of-branch
+    // state is unreachable at the merge, and taking it anyway is not merely
+    // imprecise -- it is a FALSE TypeError, because a branch that never
+    // assigned the path contributes that path's DECLARED type and so widens
+    // a narrowing the surviving branch established. Measured against mypy
+    // 1.18.1 and CPython 3.13.5:
+    //
+    //   def m(f: bool) -> int:
+    //       n: object = object()
+    //       if f:
+    //           n = 7
+    //       else:
+    //           return 0
+    //       return n + 1
+    //
+    // mypy: `Success`; CPython: prints `8` then `0`. Taking the returning
+    // edge yields `unsupported operand types for + ("object" and "int")` on
+    // the last line -- rejecting a program both oracles accept. The same
+    // holds with the branches swapped, and for a `self.` attribute path in
+    // place of the local. Keeping BOTH edges when dropping would leave none
+    // (a branch each way returns) costs nothing: the merge is unreachable, so
+    // whatever state it carries is never read.
+    //
+    // `always_returns` is the only terminator this sees, because `return` is
+    // the only one the parser admits today -- a `raise` in a branch would
+    // terminate it just as surely, so whoever lands `raise` must re-check
+    // this (`if f: ... else: raise ...` is masked purely by that parser gap).
+    //
+    // NOT EXTENDED TO THE LOOP JOINS BELOW, deliberately. The `while`/`for`
+    // equivalent of this shape lands on `NotImplementedError: operations on a
+    // union-typed value require narrowing`, which is inside the sanctioned
+    // "this compiler cannot model it" code rather than a false TypeError, and
+    // is already better than the pre-join behaviour.
+    //
     // `classes_` must be threaded through: without it, a joined `Sub | Base`
     // against a declared `Base` is not recognised as equivalent to it, so it
     // is kept as a stored Union -- and a Union operand defers every operator
     // applied to it, turning otherwise-clean code into a false
     // NotImplementedError.
+    std::vector<NarrowingState> edges;
+    if (!always_returns(node.body())) {
+        edges.push_back(after_body);
+    }
+    if (!always_returns(node.orelse())) {
+        edges.push_back(after_orelse);
+    }
+    if (edges.empty()) {
+        edges = {after_body, after_orelse};
+    }
     narrowings_.restore(join_narrowings(
-        {after_body, after_orelse},
-        [this](const NarrowedPath& path) { return declared_type_of_path(path); }, &classes_));
+        edges, [this](const NarrowedPath& path) { return declared_type_of_path(path); },
+        &classes_));
 }
 
 void TypeChecker::visit(const ast::While& node) {
@@ -2343,10 +2387,24 @@ void TypeChecker::visit(const ast::While& node) {
         [this](const NarrowedPath& path) { return declared_type_of_path(path); }, &classes_));
 
     // The `else` suite runs when the loop exits normally, so it sees the
-    // joined state. Nothing here models a `break` edge -- `while/else` and
-    // break/continue edges are outside this feature's scope, and no probe was
-    // run for them, so this asserts nothing about them beyond walking their
-    // statements as before.
+    // joined state.
+    //
+    // A `break` OR `continue` EDGE IS NOT MODELLED, and that is a MEASURED
+    // GAP, not merely an unexplored one. Against mypy 1.18.1 and CPython
+    // 3.13.5, on `self.n = 7` / `while f: self.n = "s"; if f: break;
+    // self.n = 8` / `return self.n + 1`: mypy reports `Unsupported operand
+    // types for + ("str" and "int")` with a left operand of `int | str`,
+    // CPython runs the file (printing `8`), and this checker is SILENT --
+    // because only the end-of-body state reaches the join, and the body ends
+    // on `self.n = 8`, agreeing with the pre-loop `int`. The same shape with
+    // `continue` in place of `break` measures identically. Both are missed
+    // errors: the safe direction, but still gaps.
+    // `test_files/semantic/error_narrowing_misses_a_break_edge.py` pins the
+    // silence so closing it is visible as a corpus change rather than as a
+    // surprise. Also measured, and NOT gaps: the same shape written with a
+    // `while/else` or a `for/else` suite instead of a mid-body jump draws a
+    // diagnostic on mypy's line (a NotImplementedError for the joined
+    // `int | str` operand, which is the sanctioned "cannot model" code).
     for (const ast::StmtPtr& statement : node.orelse()) {
         statement->accept(*this);
     }
@@ -2360,6 +2418,33 @@ void TypeChecker::visit(const ast::For& node) {
     // switch type_of_list_comp uses for its own, identical need -- rather
     // than a second copy of the three-way RuleResult handling here.
     const Type element = typer_.element_type_of(node.iterable(), iterable_type);
+
+    // NARROWING JOIN, ONE FORWARD PASS -- same shape as While, see its own
+    // comment for the measured loop-head divergence this accepts
+    // deliberately. The snapshot is taken BEFORE the target is bound below,
+    // because the zero-iteration edge is exactly the state in which the
+    // target was never assigned: on that edge the target keeps whatever it
+    // held before the loop. Measured against mypy 1.18.1 and CPython 3.13.5:
+    //
+    //   def m(xs: list[int]) -> int:
+    //       x: object = "s"
+    //       for x in xs:
+    //           print(x)
+    //       return x + 1
+    //
+    // mypy: `Unsupported operand types for + ("object" and "int")` on the
+    // last line; CPython: prints `1`, `2`, `3` (so the union rule says this
+    // program must draw a diagnostic). Snapshotting after the bind puts the
+    // loop's element type on BOTH edges, the join collapses to `int`, and
+    // the read comes out clean -- silently accepting what mypy rejects.
+    // Snapshotting before puts the pre-loop `object` on the zero-iteration
+    // edge, so `object | int` joins back to the declared `object` and the
+    // error reports at mypy's line. The case that argues for the other
+    // ordering -- a target with NO prior binding, `for x in xs: print(x)`
+    // then `x + 1`, which mypy accepts -- was measured too and stays clean
+    // under this ordering: with nothing bound before the loop there is no
+    // pre-loop entry for the join to widen against.
+    const NarrowingState before = narrowings_.snapshot();
 
     if (const auto* tuple_target = dynamic_cast<const ast::TupleExpr*>(&node.target())) {
         // mypy ACCEPTS a tuple target (`for a, b in pairs:` is mypy-clean),
@@ -2410,13 +2495,6 @@ void TypeChecker::visit(const ast::For& node) {
     // Any other target shape (Attribute, Subscript) is outside this task's
     // tested scope; nothing to bind.
 
-    // NARROWING JOIN, ONE FORWARD PASS -- same shape as While, see its own
-    // comment for the measured loop-head divergence this accepts
-    // deliberately. The snapshot is taken AFTER the target is bound above:
-    // the target's own binding is a fresh bind, not a narrowing, so
-    // snapshotting before it would put the loop variable's pre-loop state
-    // (unbound, or a prior iteration's leftover binding) on the joined edge.
-    const NarrowingState before = narrowings_.snapshot();
     for (const ast::StmtPtr& statement : node.body()) {
         statement->accept(*this);
     }

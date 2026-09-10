@@ -147,8 +147,20 @@ public:
     void clear();
 
     // For the join: capture the state on one edge, put another edge's state
-    // back. Paired with restore by an RAII guard at every call site, never by
-    // hand -- a skipped restore corrupts every later read in the file.
+    // back. A skipped restore corrupts every later read in the file, so the
+    // function-boundary user pairs them with NarrowingScopeGuard below, whose
+    // report-and-return paths make RAII the only safe option.
+    //
+    // The control-flow joins in TypeChecker's visit(If)/visit(While)/
+    // visit(For) pair them BY HAND instead, and that is acceptable there for
+    // one reason: those bodies are straight-line -- walk the statements,
+    // snapshot, restore -- with no early return between the snapshot and its
+    // restore, and nothing in domain/semantic/ throws (the checker's error
+    // channel is DiagnosticSink, not exceptions), so there is no path that
+    // can skip the restore. A guard would also be the wrong shape: a join
+    // does not put the SNAPSHOT back, it puts the joined result back. If an
+    // early return or a throw is ever introduced into one of those walks,
+    // that site needs a guard.
     NarrowingState snapshot() const;
     void restore(NarrowingState state);
 

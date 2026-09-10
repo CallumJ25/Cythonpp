@@ -4151,5 +4151,154 @@ TEST(TypeChecker, AJoinRecognisesASubclassAsEquivalentToItsDeclaredBase) {
               "operators on user-defined class instances are not supported");
 }
 
+// A BRANCH THAT ALWAYS RETURNS MUST NOT CONTRIBUTE ITS EDGE. Its
+// end-of-branch state is unreachable at the merge, and taking it anyway
+// widens the surviving branch's narrowing back to the declared type -- a
+// FALSE TypeError on a program both oracles accept.
+//
+// Verified against mypy 1.18.1 (`Success`) and CPython 3.13.5 (prints `8`
+// then `0`) for all four shapes below: the narrowed path as a `self.`
+// attribute and as a plain local, each with the returning branch written
+// second and first.
+TEST(TypeChecker, AReturningElseBranchContributesNoEdgeToTheJoinForAnAttribute) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "    def m(self, f: bool) -> int:\n"
+                 "        if f:\n"
+                 "            self.n = 7\n"
+                 "        else:\n"
+                 "            return 0\n"
+                 "        return self.n + 1\n");
+}
+
+TEST(TypeChecker, AReturningIfBranchContributesNoEdgeToTheJoinForAnAttribute) {
+    expect_clean("class Bag:\n"
+                 "    n: object = object()\n"
+                 "    def m(self, f: bool) -> int:\n"
+                 "        if not f:\n"
+                 "            return 0\n"
+                 "        else:\n"
+                 "            self.n = 7\n"
+                 "        return self.n + 1\n");
+}
+
+TEST(TypeChecker, AReturningElseBranchContributesNoEdgeToTheJoinForALocal) {
+    expect_clean("def m(f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    if f:\n"
+                 "        n = 7\n"
+                 "    else:\n"
+                 "        return 0\n"
+                 "    return n + 1\n");
+}
+
+TEST(TypeChecker, AReturningIfBranchContributesNoEdgeToTheJoinForALocal) {
+    expect_clean("def m(f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    if not f:\n"
+                 "        return 0\n"
+                 "    else:\n"
+                 "        n = 7\n"
+                 "    return n + 1\n");
+}
+
+// THE OTHER HALF OF THE SAME RULE, and the one that keeps the four tests
+// above from being satisfiable by simply dropping the `else` edge always: a
+// NON-terminating `else` still contributes. Asserts the exact code and
+// message, because a join that kept only the if-edge would report a
+// `TypeError` on `int + 1`... i.e. nothing at all, and a join that kept only
+// the else-edge would report `TypeError` on `str + 1` -- neither is the
+// `int | str` union this must produce. Verified against mypy 1.18.1:
+// `Unsupported operand types for + ("str" and "int")`, left operand
+// `int | str`.
+TEST(TypeChecker, ANonReturningElseBranchStillContributesItsEdge) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    n: object = object()\n"
+                                         "    def m(self, f: bool) -> int:\n"
+                                         "        if f:\n"
+                                         "            self.n = 7\n"
+                                         "        else:\n"
+                                         "            self.n = \"s\"\n"
+                                         "        return self.n + 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "operations on a union-typed value require "
+                             "narrowing, which is not supported");
+    EXPECT_EQ(error.line, 8);
+}
+
+// When BOTH branches return, dropping both edges would leave the join with
+// nothing to union. The merge is unreachable in that case, so whatever state
+// it carries is never read -- keeping both edges is the cheap, safe
+// fallback, and this pins that it neither crashes nor invents a diagnostic.
+// Verified against mypy 1.18.1: `Success`; CPython 3.13.5 prints `1`.
+TEST(TypeChecker, BothBranchesReturningKeepsBothEdgesRatherThanNone) {
+    expect_clean("def m(f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    if f:\n"
+                 "        n = 7\n"
+                 "        return 1\n"
+                 "    else:\n"
+                 "        return 0\n");
+}
+
+// visit(While) has its OWN join, separate code from visit(For)'s, so the
+// `for`-bodied ThePostLoopJoinIncludesThePreLoopEdgeNotJustEndOfBody above
+// cannot pin it. Same assertion, same reasoning, a `while` body instead:
+// the correct join is `int | str` (pre-loop `int` union end-of-body `str`),
+// and a Union operand defers every operator (NotImplementedError), which the
+// end-of-body `str` alone would not -- that would be a plain TypeError on
+// `str + int`. Verified against mypy 1.18.1: `Unsupported operand types for
+// + ("str" and "int")`, left operand `int | str`, on the return line.
+TEST(TypeChecker, TheWhilePostLoopJoinIncludesThePreLoopEdgeNotJustEndOfBody) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    n: object = object()\n"
+                                         "    def m(self, f: bool) -> int:\n"
+                                         "        self.n = 7\n"
+                                         "        while f:\n"
+                                         "            self.n = \"s\"\n"
+                                         "        return self.n + 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "operations on a union-typed value require "
+                             "narrowing, which is not supported");
+    EXPECT_EQ(error.line, 7);
+}
+
+// THE `for`-TARGET SNAPSHOT ORDERING. The zero-iteration edge is the state
+// in which the target was never assigned, so the pre-loop snapshot must be
+// taken BEFORE the target is bound. Snapshotting after puts the element type
+// on both edges, the join collapses to `int`, and this comes out silently
+// clean -- accepting a program mypy rejects.
+//
+// Verified against mypy 1.18.1: `Unsupported operand types for + ("object"
+// and "int")` on the `return` line; CPython 3.13.5 runs the file, printing
+// `1`, `2`, `3`. Both the code and the line are asserted, since the whole
+// point of the ordering is which type reaches that one read.
+TEST(TypeChecker, AForTargetsPreLoopStateIsOnTheZeroIterationEdge) {
+    const Checked checked = check_module("def m(xs: list[int]) -> int:\n"
+                                         "    x: object = \"s\"\n"
+                                         "    for x in xs:\n"
+                                         "        print(x)\n"
+                                         "    return x + 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "unsupported operand types for + (\"object\" and \"int\")");
+    EXPECT_EQ(error.line, 5);
+}
+
+// THE CONTROL for the ordering above: a target with no prior binding at all.
+// This is the case an "after the bind" snapshot was originally defended
+// with, and it is clean either way -- with nothing bound before the loop
+// there is no pre-loop entry for the join to widen against. Verified against
+// mypy 1.18.1: `Success`; CPython 3.13.5 prints `1`, `2`, `3`.
+TEST(TypeChecker, AForTargetWithNoPriorBindingStaysCleanAfterTheLoop) {
+    expect_clean("def m(xs: list[int]) -> int:\n"
+                 "    for x in xs:\n"
+                 "        print(x)\n"
+                 "    return x + 1\n");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic
