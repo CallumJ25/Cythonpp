@@ -58,6 +58,12 @@ docs/
 # the protection disappears if the directory is ever recreated by hand.
 .mypy_cache/
 
+# scripts/ holds the one Python file in this repo. Running it directly leaves
+# no bytecode, but IMPORTING it (which is how its helpers get unit-probed) does
+# -- and a stray `git add -A` at that moment commits it. Listed for the same
+# reason scratch_mypy/ is: the window is narrow and the mistake is silent.
+__pycache__/
+
 # The scratch directory used to run mypy on probe programs OUTSIDE the corpus.
 # Empty in a clean tree, so `git status` never mentions it -- which is exactly
 # why it needs listing here rather than being noticed in time: one `git add

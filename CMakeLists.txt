@@ -84,6 +84,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/parser/statement_parser_error_test.cpp
         tests/domain/semantic/type_test.cpp
         tests/domain/semantic/rule_result_test.cpp
+        tests/domain/semantic/diagnostic_kind_test.cpp
         tests/domain/semantic/type_name_test.cpp
         tests/domain/semantic/type_compatibility_test.cpp
         tests/domain/semantic/join_test.cpp

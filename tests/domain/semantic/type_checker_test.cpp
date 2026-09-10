@@ -5007,5 +5007,177 @@ TEST(TypeChecker, AModuleLevelWhileTrueWithNoBreakDoesStartAnUnreachableRegion) 
                  "y: int = \"s\"\n");
 }
 
+// ---------------------------------------------------------------------------
+// UNREACHABLE CODE SUPPRESSES MYPY'S TYPE CHECKER, NOT ITS SEMANTIC ANALYZER.
+//
+// Every test below sits inside an unreachable region and MUST still report,
+// because mypy reports its analogue there. They are the cases round 3 lost by
+// keying suppression on the code string "TypeError", which cythonpp spells on
+// both sides of that line. Each was measured against mypy 1.18.1 and CPython
+// 3.14.2 on 2026-09-10; the verbatim mypy line is quoted per test.
+// ---------------------------------------------------------------------------
+
+// 1a. An annotated redefinition after a `return`.
+//   $ mypy --strict --no-color-output --no-error-summary q.py
+//   q.py:4: error: Name "y" already defined on line 3  [no-redef]   (exit 1)
+//   $ python q.py    -> no output (exit 0)
+TEST(TypeChecker, AnAnnotatedRedefinitionAfterAReturnStillReports) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    return\n"
+                                         "    y: int = 1\n"
+                                         "    y: str = \"s\"\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"y\" already defined on line 3");
+    EXPECT_EQ(error.line, 4);
+}
+
+// 1b. A nested `def` redefined after a `return`.
+//   $ mypy --strict ... r.py
+//   r.py:5: error: Name "g" already defined on line 3  [no-redef]   (exit 1)
+//   $ python r.py    -> no output (exit 0)
+TEST(TypeChecker, ANestedDefRedefinedInUnreachableCodeStillReports) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    return\n"
+                                         "    def g() -> int:\n"
+                                         "        return 0\n"
+                                         "    def g() -> int:\n"
+                                         "        return 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(error.line, 5);
+}
+
+// 1c. After a bare `break`, so the region opens on a loop terminator rather
+// than a `return`.
+//   $ mypy --strict ... s2.py
+//   s2.py:6: error: Name "z" already defined on line 5  [no-redef]  (exit 1)
+//   $ python s2.py (with print(f()) appended) -> 0 (exit 0)
+TEST(TypeChecker, ARedefinitionAfterABareBreakStillReports) {
+    const Checked checked = check_module("def f() -> int:\n"
+                                         "    total: int = 0\n"
+                                         "    for i in range(3):\n"
+                                         "        break\n"
+                                         "        z: int = 1\n"
+                                         "        z: str = \"s\"\n"
+                                         "    return total\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"z\" already defined on line 5");
+    EXPECT_EQ(error.line, 6);
+}
+
+// 1d. After an `if`/`else` whose arms both return -- the shape that reaches
+// the empty-edges fallback in visit(If) as well as the region.
+//   $ mypy --strict ... s3.py
+//   s3.py:7: error: Name "w" already defined on line 6  [no-redef]  (exit 1)
+//   $ python s3.py (with print(f(True)) appended) -> 0 (exit 0)
+TEST(TypeChecker, ARedefinitionAfterABothArmsReturningIfStillReports) {
+    const Checked checked = check_module("def f(c: bool) -> int:\n"
+                                         "    if c:\n"
+                                         "        return 0\n"
+                                         "    else:\n"
+                                         "        return 1\n"
+                                         "    w: int = 1\n"
+                                         "    w: str = \"s\"\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"w\" already defined on line 6");
+    EXPECT_EQ(error.line, 7);
+}
+
+// 1e. THE WORST ONE: a duplicate parameter name, which BOTH oracles reject.
+// mypy's error is BLOCKING (exit 2, no bracketed code) and CPython refuses to
+// compile the file at all, so it never runs at any reachability -- there is no
+// reading of reachability under which silence here is defensible.
+//   $ mypy --strict ... v3.py
+//   v3.py:3: error: Duplicate argument "x" in function definition   (exit 2)
+//   $ python v3.py
+//   SyntaxError: duplicate argument 'x' in function definition      (exit 1)
+TEST(TypeChecker, ADuplicateArgumentInUnreachableCodeStillReports) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    return\n"
+                                         "    def g(x: int, x: str) -> None:\n"
+                                         "        pass\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "duplicate argument \"x\" in function definition");
+    EXPECT_EQ(error.line, 3);
+}
+
+// A class-body redefinition inside an unreachable region: the same
+// bind_annotation site as 1a, reached through a ScopeKind::Class push, so the
+// classification cannot be scope-dependent.
+//   $ mypy --strict ... r1.py
+//   r1.py:5: error: Name "y" already defined on line 4  [no-redef]  (exit 1)
+//   $ python r1.py   -> no output (exit 0)
+TEST(TypeChecker, AClassBodyRedefinitionInUnreachableCodeStillReports) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    return\n"
+                                         "    class C:\n"
+                                         "        y: int = 1\n"
+                                         "        y: str = \"s\"\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"y\" already defined on line 4");
+    EXPECT_EQ(error.line, 5);
+}
+
+// WHETHER AN ANNOTATION IS A WELL-FORMED TYPE is also semantic-analyzer
+// output -- mypy's [valid-type] and [type-arg] -- and it is reported in
+// unreachable code just like [no-redef]. This class was NOT among the five
+// shapes the round-3 review found; it turned up in the per-site audit of what
+// each "TypeError" site actually asserts. Four sub-classes, one test each,
+// all four measured reported by mypy in unreachable position.
+//
+//   $ mypy --strict ... an1.py
+//   an1.py:3: error: Invalid type: try using Literal[5] instead?  [valid-type]
+TEST(TypeChecker, AnInvalidAnnotationInUnreachableCodeStillReports) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    return\n"
+                                         "    x: 5 = 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "not a valid type annotation");
+    EXPECT_EQ(error.line, 3);
+}
+
+//   $ mypy --strict ... an2.py
+//   an2.py:3: error: "list" expects 1 type argument, but 2 given  [type-arg]
+TEST(TypeChecker, AWrongArityAnnotationInUnreachableCodeStillReports) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    return\n"
+                                         "    x: list[int, str] = []\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"list\" expects 1 type argument, but 2 given");
+    EXPECT_EQ(error.line, 3);
+}
+
+//   $ mypy --strict ... an3.py
+//   an3.py:3: error: "int" expects no type arguments, but 1 given  [type-arg]
+TEST(TypeChecker, ASubscriptedNonGenericAnnotationInUnreachableCodeStillReports) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    return\n"
+                                         "    x: int[str] = 1\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "'int' is not subscriptable");
+    EXPECT_EQ(error.line, 3);
+}
+
+//   $ mypy --strict ... an5.py
+//   an5.py:3: error: Missing type parameters for generic type "list"  [type-arg]
+TEST(TypeChecker, ABareGenericAnnotationInUnreachableCodeStillReports) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    return\n"
+                                         "    x: list = []\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "missing type parameters for generic type \"list\"");
+    EXPECT_EQ(error.line, 3);
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

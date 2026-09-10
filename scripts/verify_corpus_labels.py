@@ -273,6 +273,38 @@ def corpus_dir() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent.parent / "test_files" / "semantic"
 
 
+def _mypy_blocked_on_sample(sample_name: str, result) -> bool:
+    """True when mypy's exit 2 is a BLOCKING error about this sample.
+
+    mypy uses exit 2 for two unrelated things. A blocking source error --
+    `Duplicate argument "x" in function definition`, `"break" outside loop` --
+    is a real verdict: its semantic analyzer reported on the file and then
+    stopped before type checking, printing `<file>:<line>: error: ...` plus
+    `(errors prevented further checking)`. A crash or fatal invocation error
+    is not a verdict at all, and must never be allowed to "confirm" an
+    '# mypy: error' label, because then a broken mypy would confirm every one
+    of them.
+
+    The discriminator is "did mypy report a diagnostic against THIS FILE":
+    a `<sample>:<line>: error:` line on stdout. An INTERNAL ERROR is excluded
+    explicitly, because mypy formats those as a file-and-line diagnostic too
+    (`file.py:3: error: INTERNAL ERROR --`) and would otherwise slip through.
+    """
+    combined = result.stdout + result.stderr
+    if "INTERNAL ERROR" in combined:
+        return False
+    prefix = sample_name + ":"
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(prefix):
+            continue
+        rest = stripped[len(prefix):]
+        line_number, separator, tail = rest.partition(":")
+        if separator and line_number.isdigit() and tail.strip().startswith("error:"):
+            return True
+    return False
+
+
 def _is_mypy_error_line(line: str) -> bool:
     """True for exactly '# mypy: error' or '# mypy: error ' + freeform detail.
 
@@ -526,14 +558,20 @@ def check_corpus() -> int:
                 return 1
 
             # mypy's exit codes are 0 (clean), 1 (type errors found), and 2
-            # (crash or fatal error -- bad flags, an internal exception,
-            # etc). Only 0 and 1 are a real clean/error signal about the
-            # SAMPLE. Treating >=2 as "error" (as `returncode == 0` alone
-            # implicitly does) would let a crashed mypy invocation happily
-            # "validate" every '# mypy: error' label without ever having
-            # checked the code -- so it is scored as a hard failure instead,
-            # distinct from a genuine label mismatch.
-            if result.returncode >= 2:
+            # for BOTH a crash/fatal error (bad flags, an internal exception)
+            # AND a BLOCKING source error -- one its semantic analyzer
+            # reports before type checking can start, such as `Duplicate
+            # argument "x" in function definition`. The second of those IS a
+            # real verdict about the sample, and the union rule needs it:
+            # CPython refuses to compile such a file at all, so a sample
+            # pinning one is among the most valuable a corpus can hold.
+            #
+            # Treating every exit 2 as "error" would let a crashed mypy
+            # happily "validate" every '# mypy: error' label without ever
+            # having checked the code, so the two cases are told apart by
+            # whether mypy actually reported on THIS FILE -- see
+            # _mypy_blocked_on_sample.
+            if result.returncode >= 2 and not _mypy_blocked_on_sample(sample.name, result):
                 print(
                     f"CRASHED    {sample.name}: mypy --strict exited {result.returncode} "
                     "(crash or fatal error, not a clean/error verdict)"
