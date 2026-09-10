@@ -32,18 +32,29 @@ bool is_supported_builtin_call(const std::string& name);
 // used to fall straight into a false NameError.
 bool is_builtin_function_name(const std::string& name);
 
-// Every builtin name a CALL to which this compiler will not report as a
-// NameError: the modelled set above, plus the generated builtin-function
-// table, plus five real generic callables (enumerate/zip/map/filter/reversed)
-// this model cannot type because each needs a generic Iterator its Type has
-// no constructor for.
+// Every builtin FUNCTION name this predicate covers, a CALL to which this
+// compiler will not report as a NameError: the modelled set above, plus the
+// generated builtin-function table, plus five real generic callables
+// (enumerate/zip/map/filter/reversed) this model cannot type because each
+// needs a generic Iterator its Type has no constructor for.
+//
+// NOT every non-NameError callable name -- deliberately narrower. A builtin
+// CLASS used as a constructor (`object()`, `ValueError()`, `super()`,
+// `memoryview()`, ...) is also never a NameError, but it is resolved through
+// ClassTable before this predicate is ever consulted (see type_of_name_call),
+// not through this table, so it is correctly false here (measured: `o =
+// object()` is mypy-clean and draws no diagnostic from this compiler either).
+// This predicate only needs to answer for a Name callee that ClassTable does
+// not already know how to construct.
 //
 // This used to be a hand-curated list of 32 names described as "every
 // callable in builtins", which it was not -- it omitted most of them (`hash`,
-// `getattr`, `sorted` on its own, ...) and included class names. Consulting
-// the generated table closes that gap: a call to any builtin function is now
-// either modelled or a named NotImplementedError, never a NameError, since
-// the name IS defined and mypy accepts the call.
+// `getattr`, ...) and included class names. (`sorted` was NOT one of the
+// omissions -- it is the 21st entry of kSupportedBuiltinCalls below and was
+// always modelled.) Consulting the generated table closes the real gap: a
+// call to any builtin function is now either modelled or a named
+// NotImplementedError, never a NameError, since the name IS defined and
+// mypy accepts the call.
 bool is_builtin_callable_name(const std::string& name);
 
 // True for the five container constructors -- list, dict, set, frozenset,

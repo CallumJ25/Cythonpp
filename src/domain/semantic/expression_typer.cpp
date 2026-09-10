@@ -375,8 +375,16 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
         // error rather than a false one: `f([1, 2])` types as Unknown and
         // reports nothing, and `y: type = len` -- which mypy rejects with
         // `expression has type "Callable[[Sized], int]"` -- becomes clean.
-        // Modelling real signatures is separate work; builtin_call_table.h is
-        // where a modelled one belongs.
+        // Measured, some of these are missed by BOTH oracles: `g = len; g(1,
+        // 2, 3)` is a CPython `TypeError: len() takes exactly one argument (3
+        // given)` as well as two mypy errors, and cythonpp reports nothing.
+        // The asymmetry worth knowing: a CALL to an unmodelled builtin still
+        // draws a loud NotImplementedError (type_of_name_call's builtin
+        // deferral, just below in this file's sibling translation unit), but
+        // a bare VALUE reference to that same builtin draws nothing here,
+        // even though neither can actually be code-generated. Modelling real
+        // signatures is separate work; builtin_call_table.h is where a
+        // modelled one belongs.
         //
         // PLACED LAST of the three carve-outs, so a live scope binding
         // (checked by the enclosing branch), a model kind, and a user class of

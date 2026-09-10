@@ -246,6 +246,21 @@ Type ExpressionTyper::type_of_name_call(const ast::Name& callee, const ast::Call
     // reversed), which are seeded builtin classes in their own right and must
     // keep resolving as the builtin deferral below, exactly as before this
     // table existed.
+    //
+    // ONLY REACHED for a function-table name is_supported_builtin_call does
+    // NOT already claim above. Fifteen names -- abs, chr, divmod, hex, input,
+    // isinstance, len, max, min, ord, print, repr, round, sorted, sum -- are
+    // in BOTH kSupportedBuiltinCalls and the generated function table, so
+    // is_supported_builtin_call's branch above already returns for them and
+    // this condition is never consulted. A user class of one of those 15
+    // spellings therefore does NOT win: `class len: ...` still resolves as
+    // the modelled builtin call and draws "calls to builtin 'len' with these
+    // argument types are not supported" instead of the user's own
+    // constructor (measured: mypy --strict Success, CPython runs, cythonpp
+    // NotImplementedError). That is an accepted asymmetry with the
+    // user-class-wins story below, not a bug -- NotImplementedError still
+    // keeps the program inside the sanctioned escape hatch rather than a
+    // false TypeError or NameError, so the union invariant holds either way.
     if (is_builtin_callable_name(identifier) &&
         !(is_builtin_function_name(identifier) && classes_.is_class(identifier))) {
         types_.insert(&callee, Type::unknown());

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Developer tool. Regenerates builtin_class_table.h and re-derives corpus labels.
+"""Developer tool. Regenerates builtin_class_table.h and builtin_function_table.h,
+and re-derives corpus labels.
 
 NEVER run by ctest. The test suite must pass with no Python installed, so this
 script's output is CHECKED IN and the tests read the checked-in file.
@@ -220,9 +221,17 @@ namespace cythonpp::domain::semantic {{
 //
 // THIS FILE CARRIES NO SIGNATURES, deliberately. A name found here resolves
 // to Unknown, which is absorbing -- so `f = len` is clean and `f([1, 2])`
-// reports nothing, and `y: type = len` (which mypy rejects) becomes a missed
-// error. Modelling real signatures for builtin functions is separate work;
-// builtin_call_table.h is where a modelled one goes.
+// reports nothing, and `y: type = len` (which mypy rejects with an
+// incompatible-assignment error) becomes a missed error. Measured, some of
+// these are missed by BOTH oracles, not just mypy: `g = len; g(1, 2, 3)`
+// raises `TypeError: len() takes exactly one argument (3 given)` under
+// CPython as well as two mypy errors, and cythonpp reports nothing for
+// either. The asymmetry worth knowing: a CALL to an unmodelled builtin still
+// draws a loud NotImplementedError (see builtin_call_table.h), but a VALUE
+// reference to that same builtin draws nothing at all here, even though
+// neither can actually be code-generated. Modelling real signatures for
+// builtin functions is separate work; builtin_call_table.h is where a
+// modelled one goes.
 
 constexpr const char* kBuiltinFunctions[] = {{
 {rows}
