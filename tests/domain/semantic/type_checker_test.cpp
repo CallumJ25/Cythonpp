@@ -4397,20 +4397,29 @@ TEST(TypeChecker, AnIfArmMixingBreakAndContinueLeavesTheBranch) {
 }
 
 // One arm returning and the other breaking leaves NO edge to keep, the same
-// situation as both arms returning -- keeping both is the cheap, safe
-// fallback, and this pins that it neither crashes nor invents a diagnostic.
-// Verified against mypy 1.18.1 and CPython 3.14.2 with `print(m([1, 2],
-// True))` / `print(m([1, 2], False))` appended: mypy `Success`, CPython
-// prints `0` twice.
+// situation as both arms returning -- keeping both is the fallback, and this
+// pins that it neither crashes nor invents a diagnostic.
+//
+// THE FIXTURE NOW READS A NARROWED PATH AFTER THE MERGE, which the original
+// version of this test did not: its `total = total + 1` involved no narrowed
+// path at all, so it passed at 2997f6f while the defect it is named for was
+// live -- one of four guard tests on this task that were vacuous in exactly
+// that way. `n` is declared `object` and narrowed to `int` only in the
+// breaking arm, so a merge state that widens it back to `object` makes
+// `total + n + 1` a TypeError. Verified against mypy 1.18.1 and CPython
+// 3.14.2 with `print(m([1, 2], True))` / `print(m([1, 2], False))` appended:
+// mypy `Success: no issues found in 1 source file`, CPython prints `0` twice.
 TEST(TypeChecker, ABreakingBranchAndAReturningBranchKeepBothEdgesRatherThanNone) {
     expect_clean("def m(xs: list[int], f: bool) -> int:\n"
+                 "    n: object = object()\n"
                  "    total: int = 0\n"
                  "    for _ in xs:\n"
                  "        if f:\n"
+                 "            n = 7\n"
                  "            break\n"
                  "        else:\n"
                  "            return 0\n"
-                 "        total = total + 1\n"
+                 "        total = total + n + 1\n"
                  "    return total\n");
 }
 
@@ -4502,6 +4511,500 @@ TEST(TypeChecker, ABreakingWhileTrueStillNeedsAReturnAfterIt) {
     EXPECT_EQ(error.code, "TypeError");
     EXPECT_EQ(error.message, "missing return statement");
     EXPECT_EQ(error.line, 1);
+}
+
+// ---------------------------------------------------------------------------
+// UNREACHABLE CODE: TypeError is suppressed, the walk is not.
+//
+// Every "clean" fixture in this section READS A NARROWED PATH after the merge
+// or the terminator, and every one of them was proven non-vacuous by
+// neutering check_suite (see the round-3 report for the exact failure sets).
+// The rule that earns that paragraph: four earlier guard tests on this defect
+// passed while the shape they were named for was broken, because their
+// fixtures had nothing after the merge point to read.
+// ---------------------------------------------------------------------------
+
+// THE REPORTED DEFECT. Both arms of the nested `if` leave (one breaks, one
+// returns), so `total = total + n + 1` is dead code -- and at 2997f6f it drew
+// `TypeError: unsupported operand types for + ("int" and "object")` at 10:17,
+// because the empty-edges fallback restored `n` to its declared `object` and
+// the checker type-checked the dead statement anyway. Measured 2026-09-10:
+//   $ mypy --strict --no-color-output --no-error-summary f1.py   -> exit 0
+//   $ python f1.py                                               -> 0 / 0
+// Both oracles accept it, so the diagnostic was a false positive.
+TEST(TypeChecker, AStatementAfterABranchThatAlwaysLeavesDrawsNoTypeError) {
+    expect_clean("def m(xs: list[int], f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    total: int = 0\n"
+                 "    for _ in xs:\n"
+                 "        if f:\n"
+                 "            n = 7\n"
+                 "            break\n"
+                 "        else:\n"
+                 "            return 0\n"
+                 "        total = total + n + 1\n"
+                 "    return total\n");
+}
+
+// The same with the arms mirrored -- measured identically: mypy exit 0,
+// CPython prints `0` twice.
+TEST(TypeChecker, TheMirroredUnreachableMergeIsAlsoClean) {
+    expect_clean("def m(xs: list[int], f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    total: int = 0\n"
+                 "    for _ in xs:\n"
+                 "        if f:\n"
+                 "            return 0\n"
+                 "        else:\n"
+                 "            n = 7\n"
+                 "            break\n"
+                 "        total = total + n + 1\n"
+                 "    return total\n");
+}
+
+// BOTH ARMS THE SAME TERMINATOR. `n = 7` is in neither arm here, so the dead
+// statement reads `n` at its declared `object` no matter which edge the join
+// keeps -- which is exactly why no choice of merge state could have fixed
+// this and the suppression had to be structural. Verified against mypy 1.18.1
+// and CPython 3.14.2 with `print(m([1], True))` / `print(m([], False))`:
+// mypy `Success: no issues found in 1 source file`, CPython prints `0` twice.
+TEST(TypeChecker, BothArmsBreakingLeavesTheRemainderOfTheLoopBodyUnchecked) {
+    expect_clean("def m(xs: list[int], f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    total: int = 0\n"
+                 "    for _ in xs:\n"
+                 "        if f:\n"
+                 "            break\n"
+                 "        else:\n"
+                 "            break\n"
+                 "        total = total + n + 1\n"
+                 "    return total\n");
+}
+
+// Both arms RETURNING, at function-body level rather than in a loop. Verified
+// against mypy 1.18.1: `Success`; with `print(f(True))` / `print(f(False))`
+// appended CPython prints `0` then `1`.
+TEST(TypeChecker, BothArmsReturningLeavesTheRemainderOfTheBodyUnchecked) {
+    expect_clean("def f(c: bool) -> int:\n"
+                 "    total: int = 0\n"
+                 "    if c:\n"
+                 "        return total\n"
+                 "    else:\n"
+                 "        return total + 1\n"
+                 "    total = total + \"s\"\n");
+}
+
+// A BARE `break`, with no nested `if` in the way. Verified against mypy
+// 1.18.1: `Success`; CPython prints `0`.
+TEST(TypeChecker, AStatementAfterABareBreakIsNotTypeChecked) {
+    expect_clean("def f() -> int:\n"
+                 "    total: int = 0\n"
+                 "    for i in range(3):\n"
+                 "        total = total + i\n"
+                 "        break\n"
+                 "        total = total + \"s\"\n"
+                 "    return total\n");
+}
+
+// A BARE `continue`. Verified against mypy 1.18.1: `Success`; CPython prints
+// `3`.
+TEST(TypeChecker, AStatementAfterABareContinueIsNotTypeChecked) {
+    expect_clean("def f() -> int:\n"
+                 "    total: int = 0\n"
+                 "    for i in range(3):\n"
+                 "        total = total + i\n"
+                 "        continue\n"
+                 "        total = total + \"s\"\n"
+                 "    return total\n");
+}
+
+// A `for ... else: return` whose body has NO break: the `else` always runs,
+// so what follows it is dead. Verified against mypy 1.18.1: `Success`.
+// Written `-> None` deliberately -- the `-> int` form draws a SEPARATE,
+// PRE-EXISTING false `missing return statement` from always_returns, which
+// does not carry this clause; see that predicate's own comment.
+TEST(TypeChecker, AStatementAfterAForElseReturnIsNotTypeChecked) {
+    expect_clean("def f() -> None:\n"
+                 "    total: int = 0\n"
+                 "    for i in range(3):\n"
+                 "        total = total + i\n"
+                 "    else:\n"
+                 "        return\n"
+                 "    total = total + \"s\"\n");
+}
+
+// The `while cond ... else: return` form of the same. Verified against mypy
+// 1.18.1: `Success`. `-> None` for the same reason as above.
+TEST(TypeChecker, AStatementAfterAWhileElseReturnIsNotTypeChecked) {
+    expect_clean("def f() -> None:\n"
+                 "    total: int = 0\n"
+                 "    while total < 3:\n"
+                 "        total = total + 1\n"
+                 "    else:\n"
+                 "        return\n"
+                 "    total = total + \"s\"\n");
+}
+
+// A `while True:` with no break never falls out of the loop at all. Verified
+// against mypy 1.18.1: `Success`; CPython prints `1`.
+TEST(TypeChecker, AStatementAfterAWhileTrueThatReturnsIsNotTypeChecked) {
+    expect_clean("def f() -> int:\n"
+                 "    total: int = 0\n"
+                 "    while True:\n"
+                 "        total = total + 1\n"
+                 "        return total\n"
+                 "    total = total + \"s\"\n");
+}
+
+// ---------------------------------------------------------------------------
+// The discriminators between "suppress TypeError" and "stop walking". Every
+// one of them PASSES here and FAILS under a check_suite that returns early at
+// the terminator, which is exactly why the walk continues.
+// ---------------------------------------------------------------------------
+
+// A NAME BOUND ONLY IN UNREACHABLE CODE still binds, and a statically
+// reachable read of it resolves. Measured 2026-09-10 on exactly this program
+// plus a `print("module ran")` line:
+//   $ mypy --strict --no-color-output --no-error-summary c10.py
+//   Success: no issues found in 1 source file
+//   $ python c10.py
+//   module ran                     (exit 0)
+// Both oracles accept it, so a `NameError` here would be a false positive --
+// which is precisely what dropping the walk produces. The ANNOTATION on `x`
+// is load-bearing: mypy reports `Cannot determine type of "x"  [has-type]`
+// for the unannotated `x = 1`, so only the annotated form is clean.
+TEST(TypeChecker, ANameBoundOnlyInUnreachableCodeStillResolves) {
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        return\n"
+                 "        x: int = 1\n"
+                 "    print(x)\n");
+}
+
+// NameError IS STILL REPORTED in unreachable code, because mypy reports it
+// there. Measured 2026-09-10:
+//   $ mypy --strict --no-color-output --no-error-summary e01.py
+//   e01.py:3: error: Name "nope_not_defined" is not defined  [name-defined]
+// mypy's semantic analyzer runs everywhere; only its type checker stops. A
+// checker that skipped the subtree would go silent and miss an error mypy
+// reports.
+TEST(TypeChecker, AnUndefinedNameInUnreachableCodeStillReportsNameError) {
+    const Checked checked = check_module("def f() -> int:\n"
+                                         "    return 0\n"
+                                         "    print(nope_not_defined)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'nope_not_defined' is not defined");
+    EXPECT_EQ(error.line, 3);
+}
+
+// NotImplementedError SURVIVES in unreachable code, deliberately: it is this
+// compiler's own capability claim ("cannot model this construct"), not a mypy
+// type judgement, the code still has to be emitted as C++, and it is not
+// silent acceptance -- so keeping it cannot violate the union rule. mypy is
+// silent on this file (measured: `Success`), and that is fine, because
+// NotImplementedError is not a claim about mypy.
+TEST(TypeChecker, NotImplementedErrorSurvivesInUnreachableCode) {
+    const Checked checked = check_module("def f() -> int:\n"
+                                         "    return 0\n"
+                                         "    s = \"a\"\n"
+                                         "    s.upper()\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "methods on builtin types are not supported");
+    EXPECT_EQ(error.line, 4);
+}
+
+// OverflowError likewise survives, for the same reason: a literal that does
+// not fit 64 bits is still a literal this compiler cannot emit, wherever it
+// stands. mypy is silent on this file (measured: `Success`).
+TEST(TypeChecker, OverflowErrorSurvivesInUnreachableCode) {
+    const Checked checked = check_module("def f() -> int:\n"
+                                         "    return 0\n"
+                                         "    x = 99999999999999999999999\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "OverflowError");
+    EXPECT_EQ(error.line, 3);
+}
+
+// NARROWING MUST NOT ESCAPE AN UNREACHABLE STATEMENT. `n = "s"` is dead code
+// so its own TypeError is suppressed -- but if it still recorded a narrowing,
+// the loop's end-of-body snapshot would carry `n` as `str`, the loop join
+// would yield `int | str`, and the REACHABLE `k: int = n` would draw a
+// diagnostic from OUTSIDE the suppressed region. That is exactly what 2997f6f
+// did: `10:5: TypeError: incompatible types in assignment (expression has
+// type "int | str", variable has type "int")`. Measured 2026-09-10:
+//   $ mypy --strict --no-color-output --no-error-summary leak.py   -> exit 0
+//   $ python leak.py                                               -> 7 / 7
+// So a false positive on reachable code, and a union-rule violation. The fix
+// is check_suite restoring the narrowing state as of the terminator.
+TEST(TypeChecker, NarrowingDoesNotEscapeAnUnreachableStatement) {
+    expect_clean("def m(f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    n = 7\n"
+                 "    while f:\n"
+                 "        if f:\n"
+                 "            break\n"
+                 "        else:\n"
+                 "            break\n"
+                 "        n = \"s\"\n"
+                 "    k: int = n\n"
+                 "    return k\n");
+}
+
+// The NotImplementedError-flavoured form of the same leak: a stored
+// `int | str` defers every operator applied to it, so at 2997f6f the
+// reachable `n + 1` drew `10:12: NotImplementedError: operations on a
+// union-typed value require narrowing, which is not supported`. Measured
+// 2026-09-10: mypy exit 0, CPython prints `8` twice.
+TEST(TypeChecker, AnEscapedNarrowingDoesNotDeferAReachableOperator) {
+    expect_clean("def m(f: bool) -> int:\n"
+                 "    n: object = object()\n"
+                 "    n = 7\n"
+                 "    while f:\n"
+                 "        if f:\n"
+                 "            break\n"
+                 "        else:\n"
+                 "            break\n"
+                 "        n = \"s\"\n"
+                 "    return n + 1\n");
+}
+
+// ---------------------------------------------------------------------------
+// Controls: the suppression region must END where it should.
+// ---------------------------------------------------------------------------
+
+// THE GUARD IS POPPED. An `if` with no `else` can fall through, so the
+// statement after it is REACHABLE and its type error must still report --
+// even though the `if`'s own body contains an unreachable region. Verified
+// against mypy 1.18.1: `Unsupported operand types for + ("int" and "str")` on
+// line 6 and nothing on line 5.
+TEST(TypeChecker, AReachableTypeErrorAfterAnUnreachableRegionStillReports) {
+    const Checked checked = check_module("def f(c: bool) -> int:\n"
+                                         "    total: int = 0\n"
+                                         "    if c:\n"
+                                         "        return 0\n"
+                                         "        total = total + \"s\"\n"
+                                         "    total = total + \"s\"\n"
+                                         "    return total\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand types for + (\"int\" and \"str\")");
+    EXPECT_EQ(error.line, 6);
+}
+
+// A SIBLING ARM IS NOT SUPPRESSED. The `if` body goes unreachable after its
+// `return`, but the `else` arm is a DIFFERENT suite and is fully reachable.
+// Verified against mypy 1.18.1: `Unsupported operand types for + ("int" and
+// "str")` on line 7 only.
+TEST(TypeChecker, TheElseArmIsNotSuppressedByItsSiblingsUnreachableRegion) {
+    const Checked checked = check_module("def f(c: bool) -> int:\n"
+                                         "    total: int = 0\n"
+                                         "    if c:\n"
+                                         "        return 0\n"
+                                         "        total = total + \"s\"\n"
+                                         "    else:\n"
+                                         "        total = total + \"s\"\n"
+                                         "    return total\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand types for + (\"int\" and \"str\")");
+    EXPECT_EQ(error.line, 7);
+}
+
+// REGIONS NEST, so the suppression is a DEPTH COUNTER and not a bool: an
+// unreachable `if` inside an unreachable suite pushes a second region, and
+// popping the inner one must not un-suppress the outer. Lines 7 and 8 sit
+// inside two and one nested regions respectively; line 9 is reachable.
+// Verified against mypy 1.18.1: `Unsupported operand types for + ("int" and
+// "str")` on line 9 alone.
+TEST(TypeChecker, NestedUnreachableRegionsPopBackToReachable) {
+    const Checked checked = check_module("def f(c: bool, d: bool) -> int:\n"
+                                         "    total: int = 0\n"
+                                         "    if c:\n"
+                                         "        return 0\n"
+                                         "        if d:\n"
+                                         "            return 1\n"
+                                         "            total = total + \"s\"\n"
+                                         "        total = total + \"s\"\n"
+                                         "    total = total + \"s\"\n"
+                                         "    return total\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand types for + (\"int\" and \"str\")");
+    EXPECT_EQ(error.line, 9);
+}
+
+// ---------------------------------------------------------------------------
+// Controls, one per skipping rule, where control GENUINELY falls through.
+// A too-eager predicate would silence REACHABLE code -- a missed error the
+// suite would otherwise never notice. All five were measured as REPORTING by
+// mypy 1.18.1, and all five raise under CPython on the falling-through path.
+// ---------------------------------------------------------------------------
+
+// An `if` with NO `else` always has a fall-through edge.
+TEST(TypeChecker, AnIfWithNoElseThatReturnsLeavesTheRestReachable) {
+    const Checked checked = check_module("def f(c: bool) -> int:\n"
+                                         "    total: int = 0\n"
+                                         "    if c:\n"
+                                         "        return total\n"
+                                         "    total = total + \"s\"\n"
+                                         "    return total\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand types for + (\"int\" and \"str\")");
+    EXPECT_EQ(error.line, 5);
+}
+
+// A REACHABLE `break` in the body means the `else` can be SKIPPED, so
+// `else: return` no longer terminates the enclosing suite. This is the subtle
+// one: a checker that read `else: return` as an unconditional terminator
+// without looking for a break would silently accept a program both oracles
+// reject.
+TEST(TypeChecker, AReachableBreakWithAnElseReturnLeavesTheRestReachable) {
+    const Checked checked = check_module("def f(c: bool) -> int:\n"
+                                         "    total: int = 0\n"
+                                         "    for i in range(3):\n"
+                                         "        if c:\n"
+                                         "            break\n"
+                                         "    else:\n"
+                                         "        return total\n"
+                                         "    total = total + \"s\"\n"
+                                         "    return total\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand types for + (\"int\" and \"str\")");
+    EXPECT_EQ(error.line, 8);
+}
+
+// A `while True:` that DOES have a reachable break falls out of the loop.
+TEST(TypeChecker, AWhileTrueWithAReachableBreakLeavesTheRestReachable) {
+    const Checked checked = check_module("def f(c: bool) -> int:\n"
+                                         "    total: int = 0\n"
+                                         "    while True:\n"
+                                         "        if c:\n"
+                                         "            break\n"
+                                         "    total = total + \"s\"\n"
+                                         "    return total\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand types for + (\"int\" and \"str\")");
+    EXPECT_EQ(error.line, 6);
+}
+
+// Only ONE arm returning leaves the other arm's fall-through edge.
+TEST(TypeChecker, AnIfWhereOnlyOneArmReturnsLeavesTheRestReachable) {
+    const Checked checked = check_module("def f(c: bool) -> int:\n"
+                                         "    total: int = 0\n"
+                                         "    if c:\n"
+                                         "        return total\n"
+                                         "    else:\n"
+                                         "        total = total + 1\n"
+                                         "    total = total + \"s\"\n"
+                                         "    return total\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand types for + (\"int\" and \"str\")");
+    EXPECT_EQ(error.line, 7);
+}
+
+// A `break` in a NESTED loop belongs to that loop and does not terminate the
+// OUTER body.
+TEST(TypeChecker, ABreakInANestedLoopLeavesTheOuterBodyReachable) {
+    const Checked checked = check_module("def f() -> int:\n"
+                                         "    total: int = 0\n"
+                                         "    for i in range(2):\n"
+                                         "        for j in range(2):\n"
+                                         "            break\n"
+                                         "        total = total + \"s\"\n"
+                                         "    return total\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "unsupported operand types for + (\"int\" and \"str\")");
+    EXPECT_EQ(error.line, 6);
+}
+
+// ---------------------------------------------------------------------------
+// A TERMINATOR CPYTHON REFUSES TO COMPILE DOES NOT START A REGION.
+//
+// Every row below is a program BOTH ORACLES REJECT, where the type error on
+// the following line is the only diagnostic this checker has. Suppressing it
+// would turn a rejection into a silent acceptance -- a union-rule violation.
+// mypy's own silence about that following line is NOT reachability pruning:
+// it is a BLOCKING error (exit 2 for break/continue, no bracketed code), so
+// mypy never reached type checking at all. Measured 2026-09-10 and quoted in
+// statement_always_leaves' own comment.
+// ---------------------------------------------------------------------------
+
+TEST(TypeChecker, AModuleLevelBreakDoesNotStartAnUnreachableRegion) {
+    const Checked checked = check_module("x: int = 0\n"
+                                         "break\n"
+                                         "y: int = \"s\"\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "incompatible types in assignment (expression has type \"str\", "
+                             "variable has type \"int\")");
+    EXPECT_EQ(error.line, 3);
+}
+
+TEST(TypeChecker, AModuleLevelContinueDoesNotStartAnUnreachableRegion) {
+    const Checked checked = check_module("x: int = 0\n"
+                                         "continue\n"
+                                         "y: int = \"s\"\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 3);
+}
+
+TEST(TypeChecker, AModuleLevelReturnDoesNotStartAnUnreachableRegion) {
+    const Checked checked = check_module("x: int = 0\n"
+                                         "return\n"
+                                         "y: int = \"s\"\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 3);
+}
+
+// A CLASS BODY resets both context flags, even inside a function or a loop.
+// Measured: `for i in range(2): / class C: / a: int = 0 / break` is
+// `"break" outside loop` under mypy (exit 2) and a CPython SyntaxError, and
+// `def f(): / class C: / return` is `"return" outside function  [misc]`.
+TEST(TypeChecker, AClassBodyReturnDoesNotStartAnUnreachableRegion) {
+    const Checked checked = check_module("class C:\n"
+                                         "    a: int = 0\n"
+                                         "    return\n"
+                                         "    b: int = \"s\"\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 4);
+}
+
+// A `break` inside a loop's own BODY is legal, and the region it opens ends
+// with that body -- the rest of the MODULE stays reachable. Verified against
+// mypy 1.18.1: `Incompatible types in assignment (expression has type "str",
+// variable has type "int")  [assignment]` on line 4.
+TEST(TypeChecker, ALoopBodyBreakLeavesTheRestOfTheModuleReachable) {
+    const Checked checked = check_module("x: int = 0\n"
+                                         "for i in range(3):\n"
+                                         "    break\n"
+                                         "y: int = \"s\"\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 4);
+}
+
+// THE ONE LEGAL module-scope shape, and the direction the context gate must
+// NOT block: a `while True:` with no break involves no terminator at all, so
+// what follows it really is unreachable. Measured 2026-09-10:
+//   $ mypy --strict --no-color-output --no-error-summary d04.py
+//   (no output, exit 0)
+// 2997f6f reported a false `TypeError: incompatible types in assignment` on
+// the last line here; this is a FIX, not a preserved behaviour.
+TEST(TypeChecker, AModuleLevelWhileTrueWithNoBreakDoesStartAnUnreachableRegion) {
+    expect_clean("x: int = 0\n"
+                 "while True:\n"
+                 "    x = x + 1\n"
+                 "y: int = \"s\"\n");
 }
 
 } // namespace
