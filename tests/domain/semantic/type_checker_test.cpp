@@ -5893,6 +5893,38 @@ TEST(TypeChecker, AConditionalNestedDefDifferingInParameterCountOrANestedTypeCol
     EXPECT_EQ(nested_error.line, 6);
 }
 
+// The unordered union match must consume each member at most once, not just
+// test one-way containment at equal sizes. Type::union_of de-duplicates with
+// `operator==`, which is order-SENSITIVE, so `list[int | str] |
+// list[str | int]` really does survive as a TWO-member union whose members
+// are identical under this predicate -- and against `list[int | str] | int`,
+// also two members, containment alone matches both left members onto the
+// first right one and never notices the `int`. Measured: with containment
+// only, this fixture goes silent.
+//   $ mypy --strict ... u1.py
+//   u1.py:6: error: All conditional function variants must have identical
+//                   signatures  [misc]
+//   u1.py:6: note:     def g(a: list[int | str]) -> None
+//   u1.py:6: note:     def g(a: list[int | str] | int) -> None
+//   $ python u1.py -> exit 0
+// (mypy collapses the repeated member where Type::union_of does not; both
+// tools reject the program either way, so that is not a divergence here.)
+TEST(TypeChecker, AUnionRepeatingOneMemberStillNoticesADifferentMember) {
+    const Checked checked =
+        check_module("def f(c: bool) -> None:\n"
+                     "    if c:\n"
+                     "        def g(a: list[int | str] | list[str | int]) -> None:\n"
+                     "            print(a)\n"
+                     "    else:\n"
+                     "        def g(a: list[int | str] | int) -> None:\n"
+                     "            print(a)\n"
+                     "    print(g)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(error.line, 6);
+}
+
 // An alias of a function value with a PARAMETER, then a conditional `def` of
 // the same name whose parameter name MATCHES the aliased function's. The
 // existing binding carries a Callable type but no recorded names, and this is
@@ -5953,8 +5985,10 @@ TEST(TypeChecker, TheSixCollisionClassesThatMustKeepReportingStillDo) {
 
     // 3. VARIABLE, then a conditional def. mypy `:4: Incompatible
     //    redefinition (redefinition with type "Callable[[], int]", original
-    //    type "int")  [misc]`. This is the row has_identical_signature's
-    //    non-Callable arm is responsible for.
+    //    type "int")  [misc]`. has_identical_signature rejects it on `kind`
+    //    (Int is not Callable) rather than on its explicit non-Callable
+    //    guard, which is defensive only -- measured, deleting that guard
+    //    fails no test.
     const Checked var_then_cond = check_module("def f(c: bool) -> None:\n"
                                                "    g: int = 2\n"
                                                "    if c:\n"

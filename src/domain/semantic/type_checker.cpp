@@ -415,11 +415,21 @@ std::vector<std::string> TypeChecker::param_names_of(const std::vector<ast::Para
 
 bool TypeChecker::has_identical_signature(const Binding& existing, const Type& signature,
                                           const std::vector<std::string>& param_names) {
-    // Both sides must be signatures at all. Reached with a non-Callable
-    // `existing` whenever a `def` collides with a VARIABLE binding of the
-    // same name -- `g: int = 1` then a conditional `def g`, which mypy
-    // reports as `Incompatible redefinition` -- so this is the arm that keeps
-    // that collision class reporting rather than a redundant guard.
+    // Both sides must be signatures at all, which is reached with a
+    // non-Callable `existing` whenever a `def` collides with a VARIABLE
+    // binding of the same name (`g: int = 1` then a conditional `def g`,
+    // mypy's `Incompatible redefinition`).
+    //
+    // HONESTLY DEFENSIVE, not load-bearing, and measured: deleting this whole
+    // guard fails NO test. The variable-collision class keeps reporting
+    // without it, because same_type_up_to_union_order compares `kind` first
+    // and Int is not Callable. What the guard actually buys is the
+    // `signature.args.size() - 1` below, which would underflow to a huge
+    // size_t for an args-empty Callable -- unreachable through
+    // Type::callable, which always pushes a return type, but a silently wrong
+    // answer rather than a crash if some future producer ever emits one. Kept
+    // for that, and stated as defensive so a reader does not credit it with
+    // the collision class it does not decide.
     if (existing.type.kind != TypeKind::Callable || signature.kind != TypeKind::Callable ||
         existing.type.args.empty() || signature.args.empty()) {
         return false;
