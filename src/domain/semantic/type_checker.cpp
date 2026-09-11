@@ -613,24 +613,35 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
                     // redefinition. So reporting here would be a false
                     // TypeError on code mypy accepts, which is the one thing
                     // this pass must never do. The first binding wins and
-                    // this one is dropped silently; if the two signatures
-                    // genuinely disagree that is a MISSED error, the safe
-                    // direction, and the same choice the top-level name scan
-                    // already makes for its own conditional-redefinition
-                    // allowance.
+                    // this one is dropped silently.
+                    //
+                    // The SIGNATURE-EQUALITY half is the same second
+                    // condition visit(FunctionDef)'s own conditional
+                    // allowance carries, so the rule is one rule at both
+                    // sites. mypy's allowance is exactly "identical
+                    // signatures"; measured 2026-09-11 at MODULE scope,
+                    // `if C: def g() -> int ... else: def g(a: int) -> str`
+                    // draws `All conditional function variants must have
+                    // identical signatures  [misc]`, and so does the
+                    // flat-then-conditional ordering of the same pair. Both
+                    // were silently accepted here before the equality test.
                     //
                     // A def colliding with a VARIABLE binding (annotated or
                     // not) is a different collision class entirely -- mypy
                     // reports it regardless of either side's conditionality
                     // (measured: `Incompatible redefinition`) -- so that case
-                    // must always fall through to the report below.
-                    if (!at_flat_top_level && def_bound_names.count(function_def->name()) != 0) {
+                    // must always fall through to the report below. It
+                    // already does, twice over: def_bound_names holds only
+                    // names bound FROM a FunctionDef, and a variable's type
+                    // could not equal a Callable signature anyway.
+                    const Resolution bound = scopes_.resolve(function_def->name());
+                    if (!at_flat_top_level && def_bound_names.count(function_def->name()) != 0 &&
+                        bound.binding->type == signature_type) {
                         return;
                     }
-                    const Resolution existing = scopes_.resolve(function_def->name());
                     report(*function_def, DiagnosticKind::SemanticAnalyzerTypeError,
                           "name \"" + function_def->name() + "\" already defined on line " +
-                              std::to_string(existing.binding->declared_line));
+                              std::to_string(bound.binding->declared_line));
                 } else {
                     def_bound_names.insert(function_def->name());
                 }
@@ -1868,6 +1879,55 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
             // change to either rule only has one place to update.
             if (is_unfilled_placeholder(*existing.binding, def_line)) {
                 scopes_.rebind(node.name(), signature);
+            } else if (conditional_defs_.count(&node) != 0 &&
+                       existing.binding->type == signature_type) {
+                // mypy's CONDITIONAL-FUNCTION-DEFINITION allowance, which is
+                // NOT scope-limited -- this site used to have no
+                // conditionality test at all, so seven measured shapes both
+                // oracles accept drew a false
+                // `name "g" already defined on line N`. Measured 2026-09-11
+                // (mypy 1.18.1 / Python 3.14.2), all mypy-CLEAN and all
+                // CPython-clean, all previously rejected here:
+                //   if c: def g ... else: def g              (both arms)
+                //   flat def g, then def g inside an `if`
+                //   two defs of g in the SAME `if` body
+                //   two defs of g in a `while` body
+                //   def g in `if c`, def g in `if not c`
+                //   flat def g, then def g in a `for` body
+                //   flat def g, then def g in a NESTED `if`
+                // and an eighth where the first binding is not a def at all:
+                //   g = h (h a module-level def), then def g inside an `if`
+                //
+                // THE TWO CONDITIONS ARE BOTH LOAD-BEARING, and dropping
+                // either turns a missed error into a shipped one:
+                //
+                // 1. `conditional_defs_.count(&node)` -- the allowance is
+                //    about the LATER definition only. `def g` then a FLAT
+                //    `def g` is `Name "g" already defined` under mypy
+                //    (measured, both at module and function scope), and a
+                //    later VARIABLE definition is an error even when it is
+                //    itself conditional (measured: `if c: def g` then
+                //    `if not c: g: int = 1` -> `Name "g" already defined on
+                //    line 3`). The latter never reaches here: it is
+                //    bind_resolved_annotation's report, deliberately left
+                //    alone.
+                //
+                // 2. `existing.binding->type == signature_type` -- mypy's
+                //    allowance is exactly "identical signatures". Measured:
+                //    `if c: def g() -> int ... else: def g(a: int) -> str` ->
+                //    `All conditional function variants must have identical
+                //    signatures  [misc]`, and `g: int = 1` then a conditional
+                //    `def g` -> `Incompatible redefinition (redefinition with
+                //    type "Callable[[], int]", original type "int")  [misc]`.
+                //    Both keep reporting here; the wording differs from
+                //    mypy's, a wording divergence rather than a compliance
+                //    one, since both oracles reject the program either way.
+                //    Type::operator== includes defaulted_params, so
+                //    `def g(a: int = 1)` versus `def g(a: int)` -- mypy's
+                //    `identical signatures` error, measured -- still reports.
+                //
+                // The first binding wins and this one is dropped, matching
+                // collect_signatures' own conditional-redefinition arm.
             } else {
                 report(node, DiagnosticKind::SemanticAnalyzerTypeError,
                       "name \"" + node.name() + "\" already defined on line " +
@@ -1927,6 +1987,17 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // check can tell "used before definition" apart from "not defined"; see
     // pre_bind_function_body's own comment.
     pre_bind_function_body(node.body());
+    // Classify every nested `def` in THIS body as conditional or not, before
+    // the body walk reaches any of them -- see conditional_defs_' comment and
+    // the redefinition rule at the binding site above.
+    for_each_flat_statement(node.body(), /*directly_in_body=*/true,
+                            [this](const ast::Stmt& statement, bool at_flat_top_level) {
+                                const auto* nested =
+                                    dynamic_cast<const ast::FunctionDef*>(&statement);
+                                if (nested != nullptr && !at_flat_top_level) {
+                                    conditional_defs_.insert(nested);
+                                }
+                            });
     {
         FlagGuard function_guard(in_function_body_, true);
         FlagGuard loop_guard(in_loop_body_, false);

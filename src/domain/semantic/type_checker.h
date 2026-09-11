@@ -1195,6 +1195,23 @@ private:
     std::map<std::string, TopLevelDefinition> top_level_definitions_;
     std::set<const ast::Node*> collided_top_level_;
 
+    // Every nested `def` that does NOT sit directly in its enclosing
+    // function's body -- i.e. one inside an `if`/`while`/`for` at any depth
+    // within that body. mypy's conditional-function-definition allowance
+    // turns on exactly this fact, and it is NOT scope-limited the way
+    // scan_top_level_names' `at_flat_top_level` is: the same rule holds at
+    // module scope, in a class body, and inside a `def`.
+    //
+    // Filled in visit(FunctionDef) by the same for_each_flat_statement walk
+    // scan_top_level_names uses on the module body, run once per function
+    // body just before that body is walked -- so by the time the nested
+    // def's own visit(FunctionDef) reaches the binding site, its enclosing
+    // body's scan has already classified it. Keyed by node ADDRESS, never
+    // cleared: the AST outlives the check, two bodies cannot contain the same
+    // FunctionDef node, and a stale entry is therefore impossible rather than
+    // merely unlikely.
+    std::set<const ast::FunctionDef*> conditional_defs_;
+
     // Every MODULE-and-CLASS-level class the declaration pass declared, in
     // declaration order. The member-collection phase walks this to
     // pre-collect every class's members before the first statement is

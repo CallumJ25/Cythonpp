@@ -5179,5 +5179,424 @@ TEST(TypeChecker, ABareGenericAnnotationInUnreachableCodeStillReports) {
     EXPECT_EQ(error.line, 3);
 }
 
+
+// ---------------------------------------------------------------------------
+// Round 5: the four shapes from the round-4 review's Critical table, and
+// their REACHABLE twins. Every one of the eight is a program `mypy --strict`
+// and CPython BOTH accept, and every one was rejected with a `TypeError`
+// before this round. The reachable form is the pre-existing defect; the
+// unreachable form is the reach that round 4's un-suppression widened. All
+// measurements 2026-09-11, mypy 1.18.1 (compiled: yes) / Python 3.14.2.
+// ---------------------------------------------------------------------------
+
+// Critical rows 1-3, REACHABLE.
+//   $ cat r_type.py            $ cat r_slice.py             $ cat r_memv.py
+//   x: type[int] = int         def f() -> None:             def f() -> None:
+//   print(x)                       y: slice[int]                y: memoryview[int]
+//                              print("ran")                 print("ran")
+//   $ mypy --strict --no-color-output --no-error-summary <each> -> exit 0, no output
+//   $ python <each>  ->  `<class 'int'>` / `ran` / `ran`, exit 0 each
+//   before: 1:4 / 2:8 / 2:8  error: TypeError: 'X' is not subscriptable
+// NotImplementedError is the sanctioned "cannot model this construct" answer
+// and is not silent acceptance, so it is the right answer for a generic this
+// model has no representation for -- what it must not be is a TypeError.
+TEST(TypeChecker, ASubscriptedGenericBuiltinIsUnsupportedNotATypeError) {
+    for (const std::string& name : {"type", "slice", "memoryview", "ExceptionGroup",
+                                    "BaseExceptionGroup"}) {
+        const Checked checked = check_module("x: " + name + "[int]\n");
+        const diagnostics::Diagnostic error = only_error(checked);
+        EXPECT_EQ(error.code, "NotImplementedError") << name;
+        EXPECT_EQ(error.message, "generic builtin type '" + name + "' is not supported") << name;
+        EXPECT_EQ(error.line, 1) << name;
+    }
+}
+
+// Critical rows 1-3, UNREACHABLE -- the position round 4 un-suppressed.
+//   $ cat u_type.py
+//   def f() -> None:
+//       return
+//       x: type[int] = int
+//   print("ran")
+//   $ mypy --strict ... u_type.py   -> exit 0, no output
+//   $ python u_type.py              -> ran   (exit 0)
+//   @613a460: silent   @fd616ac: 3:8: error: TypeError: 'type' is not subscriptable
+// Not re-masked by restoring suppression: the KIND changed, so the judgement
+// is right in both positions now.
+TEST(TypeChecker, ASubscriptedGenericBuiltinInUnreachableCodeIsUnsupportedNotATypeError) {
+    for (const std::string& name : {"type", "slice", "memoryview"}) {
+        const Checked checked = check_module("def f() -> None:\n"
+                                             "    return\n"
+                                             "    x: " + name + "[int]\n");
+        const diagnostics::Diagnostic error = only_error(checked);
+        EXPECT_EQ(error.code, "NotImplementedError") << name;
+        EXPECT_EQ(error.message, "generic builtin type '" + name + "' is not supported") << name;
+        EXPECT_EQ(error.line, 3) << name;
+    }
+}
+
+// Critical row 4, REACHABLE, plus the seven other conditional-def shapes the
+// same gate rejected. mypy's conditional-function-definition allowance is NOT
+// scope-limited, and cythonpp's function-scope site had no conditionality
+// test at all. Every fixture below: `mypy --strict` exit 0 with no output,
+// CPython exit 0. Verbatim before-state, function-scope site:
+//   m04 if/else both arms        6:9: TypeError: name "g" already defined on line 3
+//   m10 flat then `if`           5:9: ... on line 2
+//   m14 two defs in a `while`    5:9: ... on line 3
+//   m15 `if c` and `if not c`    6:9: ... on line 3
+//   m19 two defs in ONE `if`     5:9: ... on line 3
+//   m20 flat then `for` body     5:9: ... on line 2
+//   m23 flat then a NESTED `if`  6:13: ... on line 2
+//   m32 three arms of if/elif/else   TWO diagnostics, 6:9 and 9:9
+TEST(TypeChecker, AConditionalNestedDefIsNotARedefinition) {
+    // m04: both arms of an if/else.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g() -> int:\n"
+                 "            return 0\n"
+                 "    else:\n"
+                 "        def g() -> int:\n"
+                 "            return 1\n"
+                 "    print(g())\n");
+    // m10: a FLAT def first, then a conditional one.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    def g() -> int:\n"
+                 "        return 0\n"
+                 "    if c:\n"
+                 "        def g() -> int:\n"
+                 "            return 1\n"
+                 "    print(g())\n");
+    // m14: two defs in a `while` body -- both conditional, no `if` involved.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    while c:\n"
+                 "        def g() -> int:\n"
+                 "            return 0\n"
+                 "        def g() -> int:\n"
+                 "            return 1\n"
+                 "        print(g())\n");
+    // m15: two separate `if`s rather than one if/else.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g() -> int:\n"
+                 "            return 0\n"
+                 "    if not c:\n"
+                 "        def g() -> int:\n"
+                 "            return 1\n"
+                 "    print(g())\n");
+    // m19: two defs inside the SAME `if` body.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g() -> int:\n"
+                 "            return 0\n"
+                 "        def g() -> int:\n"
+                 "            return 1\n"
+                 "        print(g())\n");
+    // m20: a `for` body, so the conditional block is a loop with a target.
+    expect_clean("def f(xs: list[int]) -> None:\n"
+                 "    def g() -> int:\n"
+                 "        return 0\n"
+                 "    for i in xs:\n"
+                 "        def g() -> int:\n"
+                 "            return 1\n"
+                 "    print(g())\n");
+    // m23: nested two blocks deep, so "conditional" is not depth-one only.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    def g() -> int:\n"
+                 "        return 0\n"
+                 "    if c:\n"
+                 "        if c:\n"
+                 "            def g() -> int:\n"
+                 "                return 1\n"
+                 "    print(g())\n");
+    // m32: three arms, so the allowance is not "at most two definitions".
+    expect_clean("def f(c: bool, d: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g() -> int:\n"
+                 "            return 0\n"
+                 "    elif d:\n"
+                 "        def g() -> int:\n"
+                 "            return 1\n"
+                 "    else:\n"
+                 "        def g() -> int:\n"
+                 "            return 2\n"
+                 "    print(g())\n");
+}
+
+// m31, an eighth shape the review's table does not have, and the one that
+// shows the test is SIGNATURE EQUALITY rather than "was the earlier binding a
+// def": the first binding comes from a plain assignment of a function VALUE,
+// and mypy is still clean.
+//   $ mypy --strict ... m31_fn_alias_then_cond_def.py   -> exit 0, no output
+//   before: 6:9: error: TypeError: name "g" already defined on line 4
+TEST(TypeChecker, AConditionalNestedDefOverAnAliasOfTheSameSignatureIsClean) {
+    expect_clean("def h() -> int:\n"
+                 "    return 2\n"
+                 "def f(c: bool) -> None:\n"
+                 "    g = h\n"
+                 "    if c:\n"
+                 "        def g() -> int:\n"
+                 "            return 0\n"
+                 "    print(g())\n");
+}
+
+// Critical row 4, UNREACHABLE -- the review's own `rd1.py`, verbatim:
+//   def f(c: bool) -> None:
+//       return
+//       if c:
+//           def g() -> int:
+//               return 0
+//       else:
+//           def g() -> int:
+//               return 1
+//   print("ran")
+//   $ mypy --strict ... rd1.py  -> exit 0, no output
+//   $ python rd1.py             -> ran   (exit 0)
+//   @613a460: silent   @fd616ac: 7:9: TypeError: name "g" already defined on line 4
+TEST(TypeChecker, AConditionalNestedDefInUnreachableCodeIsNotARedefinition) {
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    return\n"
+                 "    if c:\n"
+                 "        def g() -> int:\n"
+                 "            return 0\n"
+                 "    else:\n"
+                 "        def g() -> int:\n"
+                 "            return 1\n");
+}
+
+// ---------------------------------------------------------------------------
+// Round 5 CONTROLS: collision classes that must KEEP reporting. Each is a
+// program mypy rejects, so silence here would be a false negative -- the
+// failure mode a relaxed DEFAULT (rather than a measured rule) would have
+// shipped.
+// ---------------------------------------------------------------------------
+
+// m03: two FLAT nested defs. The allowance is about the LATER definition, and
+// this one is not conditional.
+//   $ mypy --strict ... m03_fn_flat.py
+//   m03_fn_flat.py:4: error: Name "g" already defined on line 2  [no-redef]
+TEST(TypeChecker, TwoFlatNestedDefsStillCollide) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    def g() -> int:\n"
+                                         "        return 0\n"
+                                         "    def g() -> int:\n"
+                                         "        return 1\n"
+                                         "    print(g())\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"g\" already defined on line 2");
+    EXPECT_EQ(error.line, 4);
+}
+
+// m21: conditional, but the two signatures DISAGREE. mypy rejects with its
+// own wording, so both oracles reject and silence here would be a real miss.
+//   $ mypy --strict ... m21_fn_cond_diff_sig.py
+//   m21...py:6: error: All conditional function variants must have identical
+//                      signatures  [misc]
+// cythonpp keeps the `already defined` wording: a wording divergence, not a
+// compliance one.
+TEST(TypeChecker, AConditionalNestedDefWithADifferentSignatureStillCollides) {
+    const Checked checked = check_module("def f(c: bool) -> None:\n"
+                                         "    if c:\n"
+                                         "        def g() -> int:\n"
+                                         "            return 0\n"
+                                         "    else:\n"
+                                         "        def g(a: int) -> str:\n"
+                                         "            return \"s\"\n"
+                                         "    print(g)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(error.line, 6);
+}
+
+// m29: the signatures differ ONLY in a default, which Type::operator==
+// compares through defaulted_params. mypy rejects this too.
+//   $ mypy --strict ... m29_fn_cond_def_same_sig_defaults.py
+//   m29...py:6: error: All conditional function variants must have identical
+//                      signatures  [misc]
+//   m29...py:6: note:     def g(a: int = ...) -> int  /  def g(a: int) -> int
+TEST(TypeChecker, AConditionalNestedDefDifferingOnlyInADefaultStillCollides) {
+    const Checked checked = check_module("def f(c: bool) -> None:\n"
+                                         "    if c:\n"
+                                         "        def g(a: int = 1) -> int:\n"
+                                         "            return a\n"
+                                         "    else:\n"
+                                         "        def g(a: int) -> int:\n"
+                                         "            return a\n"
+                                         "    print(g(1))\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(error.line, 6);
+}
+
+// m26/m28: a def colliding with a VARIABLE binding, which mypy reports
+// regardless of conditionality -- the class the site's own comment warns must
+// not be swept into the allowance.
+//   $ mypy --strict ... m26_fn_var_then_cond_def.py
+//   m26...py:4: error: Incompatible redefinition (redefinition with type
+//                      "Callable[[], int]", original type "int")  [misc]
+//   $ mypy --strict ... m28_fn_assign_then_cond_def.py  -> same message, line 4
+TEST(TypeChecker, AConditionalNestedDefCollidingWithAVariableStillCollides) {
+    const Checked annotated = check_module("def f(c: bool) -> None:\n"
+                                           "    g: int = 1\n"
+                                           "    if c:\n"
+                                           "        def g() -> int:\n"
+                                           "            return 0\n"
+                                           "    print(g)\n");
+    const diagnostics::Diagnostic annotated_error = only_error(annotated);
+    EXPECT_EQ(annotated_error.code, "TypeError");
+    EXPECT_EQ(annotated_error.message, "name \"g\" already defined on line 2");
+    EXPECT_EQ(annotated_error.line, 4);
+
+    const Checked inferred = check_module("def f(c: bool) -> None:\n"
+                                          "    g = 1\n"
+                                          "    if c:\n"
+                                          "        def g() -> int:\n"
+                                          "            return 0\n"
+                                          "    print(g)\n");
+    const diagnostics::Diagnostic inferred_error = only_error(inferred);
+    EXPECT_EQ(inferred_error.code, "TypeError");
+    EXPECT_EQ(inferred_error.message, "name \"g\" already defined on line 2");
+    EXPECT_EQ(inferred_error.line, 4);
+}
+
+// m27: the reverse order -- a conditional def, then a conditional VARIABLE.
+// The later definition is not a def, so the allowance does not apply.
+//   $ mypy --strict ... m27_fn_cond_def_then_cond_var.py
+//   m27...py:6: error: Name "g" already defined on line 3  [no-redef]
+TEST(TypeChecker, AConditionalVariableAfterAConditionalNestedDefStillCollides) {
+    const Checked checked = check_module("def f(c: bool) -> None:\n"
+                                         "    if c:\n"
+                                         "        def g() -> int:\n"
+                                         "            return 0\n"
+                                         "    if not c:\n"
+                                         "        g: int = 1\n"
+                                         "    print(g)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(error.line, 6);
+}
+
+// m01: two flat MODULE-level defs -- the other half of the rule, unchanged by
+// this round and pinned so the alignment cannot silence it.
+//   $ mypy --strict ... m01_mod_flat.py
+//   m01_mod_flat.py:3: error: Name "g" already defined on line 1  [no-redef]
+TEST(TypeChecker, TwoFlatModuleLevelDefsStillCollide) {
+    const Checked checked = check_module("def g() -> int:\n"
+                                         "    return 0\n"
+                                         "def g() -> int:\n"
+                                         "    return 1\n"
+                                         "print(g())\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"g\" already defined on line 1");
+    EXPECT_EQ(error.line, 3);
+}
+
+// A CLASS redefinition. mypy allows no conditional class redefinition at all,
+// and this round's allowance must not reach it.
+//   $ mypy --strict ... c_classredef.py
+//   c_classredef.py:3: error: Name "D" already defined on line 1  [no-redef]
+//   $ mypy --strict ... m18_mod_cond_class.py
+//   m18...py:6: error: Name "K" already defined on line 3  [no-redef]
+TEST(TypeChecker, AClassRedefinitionStillCollidesFlatAndConditional) {
+    const Checked flat = check_module("class D:\n"
+                                      "    a: int = 0\n"
+                                      "class D:\n"
+                                      "    b: int = 0\n"
+                                      "print(D)\n");
+    const diagnostics::Diagnostic flat_error = only_error(flat);
+    EXPECT_EQ(flat_error.code, "TypeError");
+    EXPECT_EQ(flat_error.message, "name \"D\" already defined on line 1");
+    EXPECT_EQ(flat_error.line, 3);
+
+    const Checked conditional = check_module("C: bool = True\n"
+                                             "if C:\n"
+                                             "    class K:\n"
+                                             "        a: int = 0\n"
+                                             "else:\n"
+                                             "    class K:\n"
+                                             "        b: int = 0\n"
+                                             "print(K)\n");
+    const diagnostics::Diagnostic conditional_error = only_error(conditional);
+    EXPECT_EQ(conditional_error.code, "TypeError");
+    EXPECT_EQ(conditional_error.message, "name \"K\" already defined on line 3");
+    EXPECT_EQ(conditional_error.line, 6);
+}
+
+// m33/m34: the MODULE-scope half of the signature-equality test, which was a
+// false NEGATIVE before this round -- mypy rejects, cythonpp was silent. The
+// two sites now apply one rule, which is why this is pinned here rather than
+// disclosed.
+//   $ mypy --strict ... m33_mod_cond_diff_sig.py
+//   m33...py:6: error: All conditional function variants must have identical
+//                      signatures  [misc]
+//   $ mypy --strict ... m34_mod_flat_then_cond_diff_sig.py  -> same, line 5
+TEST(TypeChecker, AConditionalModuleLevelDefWithADifferentSignatureCollides) {
+    const Checked both_arms = check_module("C: bool = True\n"
+                                           "if C:\n"
+                                           "    def g() -> int:\n"
+                                           "        return 0\n"
+                                           "else:\n"
+                                           "    def g(a: int) -> str:\n"
+                                           "        return \"s\"\n"
+                                           "print(g)\n");
+    const diagnostics::Diagnostic both_error = only_error(both_arms);
+    EXPECT_EQ(both_error.code, "TypeError");
+    EXPECT_EQ(both_error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(both_error.line, 6);
+
+    const Checked flat_first = check_module("C: bool = True\n"
+                                            "def g() -> int:\n"
+                                            "    return 0\n"
+                                            "if C:\n"
+                                            "    def g(a: int) -> str:\n"
+                                            "        return \"s\"\n"
+                                            "print(g)\n");
+    const diagnostics::Diagnostic flat_error = only_error(flat_first);
+    EXPECT_EQ(flat_error.code, "TypeError");
+    EXPECT_EQ(flat_error.message, "name \"g\" already defined on line 2");
+    EXPECT_EQ(flat_error.line, 5);
+}
+
+// The module-scope shapes mypy ACCEPTS, so the equality test added there
+// cannot have narrowed the allowance: m02 (if/else), m08 (flat then
+// conditional), m24 (a `while` body), m35 (an alias, then a conditional def).
+// All four: `mypy --strict` exit 0, no output.
+TEST(TypeChecker, AConditionalModuleLevelDefWithTheSameSignatureIsStillClean) {
+    expect_clean("C: bool = True\n"
+                 "if C:\n"
+                 "    def g() -> int:\n"
+                 "        return 0\n"
+                 "else:\n"
+                 "    def g() -> int:\n"
+                 "        return 1\n"
+                 "print(g())\n");
+    expect_clean("C: bool = True\n"
+                 "def g() -> int:\n"
+                 "    return 0\n"
+                 "if C:\n"
+                 "    def g() -> int:\n"
+                 "        return 1\n"
+                 "print(g())\n");
+    expect_clean("C: bool = True\n"
+                 "while C:\n"
+                 "    def g() -> int:\n"
+                 "        return 0\n"
+                 "    def g() -> int:\n"
+                 "        return 1\n"
+                 "    break\n"
+                 "print(g())\n");
+    expect_clean("C: bool = True\n"
+                 "def h() -> int:\n"
+                 "    return 2\n"
+                 "g = h\n"
+                 "if C:\n"
+                 "    def g() -> int:\n"
+                 "        return 0\n"
+                 "print(g())\n");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic
