@@ -1134,6 +1134,22 @@ std::optional<Type> TypeChecker::self_attribute_receiver_type(const ast::Attribu
         self_resolution.binding->type.name != current_class_qualified_name_) {
         return std::nullopt;
     }
+    // The type check above is necessary but NOT sufficient: a nested
+    // `def inner(self: Bag)` inside a Bag method binds `self` to exactly
+    // Class("Bag") and passes it, so `self.q = 1` there used to declare "q"
+    // on Bag and make a later read of it come out clean where mypy reports an
+    // attribute miss at both the store and the read. The binding must ALSO be
+    // a method's own first parameter -- a fact about the BINDING, deliberately
+    // not about the innermost function, since mypy attributes a store to the
+    // method's self through any number of capturing closures (see
+    // Binding::method_self for both measurements).
+    //
+    // collect_self_attribute_placeholders needs no matching edit: it never
+    // recurses into a nested def, so the only `self` its structural scan can
+    // see is already an enclosing method's own first parameter.
+    if (!self_resolution.binding->method_self) {
+        return std::nullopt;
+    }
     return self_resolution.binding->type;
 }
 
@@ -2106,9 +2122,17 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         // `x` once (keeping only the FIRST parameter's type) instead of
         // reporting the duplicate. Verified against mypy 1.18.1: `Duplicate
         // argument "x" in function definition`.
+        //
+        // `method_self` is the ONE place the `is_method` this function
+        // already computed becomes a durable fact about the BINDING rather
+        // than about the scope -- which is what lets `self.x = ...` declare
+        // an attribute from inside a closure that captured a method's self,
+        // and refuse to from a nested def's own shadowing `self` parameter.
+        // See Binding::method_self for both measurements.
         if (!scopes_.bind(parameter.name, Binding{param_types[i], def_line,
                                                   /*annotated=*/parameter.annotation != nullptr,
-                                                  /*order_exempt=*/true})) {
+                                                  /*order_exempt=*/true,
+                                                  /*method_self=*/is_method && i == 0})) {
             report(node, DiagnosticKind::SemanticAnalyzerTypeError,
                   "duplicate argument \"" + parameter.name + "\" in function definition");
         }

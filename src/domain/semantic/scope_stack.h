@@ -63,6 +63,45 @@ struct Binding {
     // same-line coincidence.
     bool order_exempt = false;
 
+    // True ONLY for a method's own first parameter -- the `self` a `def`
+    // directly inside a class body binds at index 0. False for every other
+    // binding, including a parameter merely SPELLED "self" on a plain
+    // function or on a nested def, and including one annotated with the
+    // enclosing class.
+    //
+    // Exists because `self.x = ...` DECLARES an instance attribute exactly
+    // when the `self` it stores through is a method's own first parameter,
+    // and that question cannot be answered from the binding's TYPE (the only
+    // thing TypeChecker::self_attribute_receiver_type used to consult) nor
+    // from the innermost function's own method-ness. Measured 2026-09-11
+    // against mypy 1.18.1 and CPython 3.14.2, both halves:
+    //
+    //   - TYPE alone is too LOOSE. A nested `def inner(self: Bag)` inside a
+    //     Bag method binds `self` to exactly Class("Bag"), so a type-only
+    //     guard passed and `self.q = 1` there declared "q" on Bag -- a later
+    //     `self.q` read from another method then came out clean where mypy
+    //     reports `"Bag" has no attribute "q"` at BOTH the store and the
+    //     read. A missed error.
+    //   - "the IMMEDIATELY ENCLOSING function is a method" is too TIGHT, and
+    //     wrong in the unsafe direction. mypy attributes a store to the
+    //     method's self no matter how many nested function scopes the
+    //     reference is closed over: a `def inner()` inside a Bag method that
+    //     writes the CAPTURED `self.q = 1` is `Success`, and so is the same
+    //     store two closures deep, in both cases with a later `self.q` read
+    //     from a different method also clean. Requiring the innermost
+    //     function to be a method reported a false TypeError on all of those.
+    //
+    // What the BINDING gets right and neither of those does: the flag
+    // travels with the name, so resolving outward through any number of
+    // closures still finds the method's own `self` and still declares, while
+    // a nested def's own shadowing parameter is a different binding and does
+    // not. Set at the one parameter-binding site in
+    // TypeChecker::visit(FunctionDef) from the `is_method` it already
+    // computes; nothing else in this codebase binds a method parameter, and
+    // no path rebinds `self` (it is order_exempt, so the placeholder-fill
+    // rebind cannot mistake it for a placeholder).
+    bool method_self = false;
+
     // The parameter NAMES of `type`, in order, when this binding was made
     // from a `def` statement -- and EMPTY whenever they are not known.
     //
@@ -97,9 +136,11 @@ struct Binding {
     // report" would have been a false positive on the second.
     //
     // Declared LAST on purpose: every existing brace-initialisation of a
-    // Binding passes one to four members positionally, and appending keeps
+    // Binding passes one to five members positionally, and appending keeps
     // all of them meaning what they say. Filled by assignment at the two
-    // sites that have names, never positionally.
+    // sites that have names, never positionally. (`method_self` was inserted
+    // ABOVE this member for the same reason -- appending it below would have
+    // pushed `param_names` off the end of the positional prefix.)
     std::vector<std::string> param_names;
 };
 

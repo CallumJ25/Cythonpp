@@ -1229,6 +1229,133 @@ TEST(TypeChecker, AnAnnotatedAttributeOnAShadowedSelfDeclaresNothing) {
     EXPECT_EQ(error.line, 6);
 }
 
+// The sibling of the test above, and the case the TYPE check alone could not
+// catch: a nested `def inner(self: Bag)` inside a Bag method binds `self` to
+// exactly Class("Bag"), so the type check passes and `self.q = 1` there used
+// to declare "q" on Bag -- making the later read come out clean. Telling that
+// case apart needs the syntactic question a type check cannot ask: is this
+// `self` a METHOD's own first parameter? mypy reports three errors on this
+// program (attr-defined at the store, attr-defined at the read, and
+// `Returning Any` on the read's own return); the two attr-defined ones are
+// what this checker matches.
+TEST(TypeChecker, ANestedDefsSelfDoesNotDeclareOntoTheEnclosingClass) {
+    const Checked checked = check_module(
+        "class Bag:\n"
+        "    def m(self) -> None:\n"
+        "        def inner(self: Bag) -> None:\n"
+        "            self.q = 1\n"
+        "        inner(self)\n"
+        "    def read(self) -> int:\n"
+        "        return self.q\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 4) << "the store, inside the nested def";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].line, 7) << "the read, from the other method";
+}
+
+// The SAME rule through the guard's OTHER call site: `self.x: T = ...` in
+// visit(AnnAssign)'s Attribute-target branch, which shares
+// self_attribute_receiver_type verbatim with assign_attribute above. Tested
+// separately because the test above exercises only the plain-Assign site, so
+// a change that fixed one and not the other would pass it.
+//
+// Only ONE diagnostic, and the asymmetry is pre-existing rather than
+// introduced here: an annotated attribute STORE never types its target, so
+// the store itself stays silent (exactly as
+// AnAnnotatedAttributeOnANonSelfReceiverDeclaresNothing already records for
+// a non-self receiver) and the READ is what reports. mypy reports four
+// errors on this program -- `Type cannot be declared in assignment to
+// non-self attribute` and attr-defined at the store, `Returning Any` and
+// attr-defined at the read -- so three are missed. What matters is that the
+// read is no longer CLEAN: before this change the annotated store declared
+// "q" on Bag and cythonpp said nothing at all.
+TEST(TypeChecker, ANestedDefsAnnotatedSelfAttributeDoesNotDeclareOntoTheEnclosingClass) {
+    const Checked checked = check_module(
+        "class Bag:\n"
+        "    def m(self) -> None:\n"
+        "        def inner(self: Bag) -> None:\n"
+        "            self.q: int = 1\n"
+        "        inner(self)\n"
+        "    def read(self) -> int:\n"
+        "        return self.q\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(error.line, 7) << "the READ reports; the annotated store itself stays silent";
+}
+
+// UNCHANGED, and this is the guard that matters: a real method's own `self`
+// still declares. Every existing self.x test covers this, but state it here
+// too so a regression shows up next to the change that could cause it.
+TEST(TypeChecker, AMethodsOwnSelfStillDeclaresOntoItsClass) {
+    expect_clean("class Bag:\n"
+                 "    def __init__(self) -> None:\n"
+                 "        self.n = 0\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.n\n");
+}
+
+// A nested def inside a method must still be able to READ an attribute the
+// enclosing class really declares -- the change is about DECLARING, not
+// reading. Written UNQUOTED deliberately: the `"Bag"` string forward
+// reference the same program could use is a NotImplementedError in this
+// grammar (measured: "string forward references are not supported"), so the
+// quoted spelling would test the deferral rather than this rule. Both
+// spellings are mypy-clean.
+TEST(TypeChecker, ANestedDefCanStillReadARealAttribute) {
+    expect_clean("class Bag:\n"
+                 "    def __init__(self) -> None:\n"
+                 "        self.n = 0\n"
+                 "    def m(self) -> int:\n"
+                 "        def inner(b: Bag) -> int:\n"
+                 "            return b.n\n"
+                 "        return inner(self)\n");
+}
+
+// THE COUNTERWEIGHT to the rule above, and the reason Binding::method_self is
+// a fact about the BINDING rather than about the innermost function. A nested
+// def with NO `self` parameter of its own CAPTURES the enclosing method's,
+// and mypy attributes the store to that method's self: measured 2026-09-11
+// against mypy 1.18.1, this exact program is "Success: no issues found",
+// including the `self.q` read from the OTHER method, and CPython runs it.
+//
+// A guard phrased as "the immediately enclosing function must itself be a
+// method" was implemented and measured: it reported
+// `"Bag" has no attribute "q"` at BOTH lines here -- two false TypeErrors on
+// a program both oracles accept. This test is what fails if that phrasing is
+// ever reintroduced, and the whole existing suite passed with it in place.
+TEST(TypeChecker, AClosureCapturingAMethodsSelfStillDeclaresOntoItsClass) {
+    expect_clean("class Bag:\n"
+                 "    def m(self) -> None:\n"
+                 "        def inner() -> None:\n"
+                 "            self.q = 1\n"
+                 "        inner()\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.q\n");
+}
+
+// The same rule at depth: mypy does not care HOW MANY function scopes the
+// captured `self` is closed over (measured: "Success" for this program too),
+// so neither may this guard. Separate from the single-closure case above
+// because a rule that walked exactly one scope outward would pass that one
+// and fail this one.
+TEST(TypeChecker, AClosureTwoDeepCapturingAMethodsSelfStillDeclares) {
+    expect_clean("class Bag:\n"
+                 "    def m(self) -> None:\n"
+                 "        def a() -> None:\n"
+                 "            def b() -> None:\n"
+                 "                self.q = 1\n"
+                 "            b()\n"
+                 "        a()\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.q\n");
+}
+
 // An annotated attribute store on a NON-self receiver is unchanged: the
 // annotation is resolved for `expected`, nothing is declared, and the TARGET
 // is never typed -- so the store itself is silent (mypy reports two errors

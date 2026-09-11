@@ -937,23 +937,31 @@ private:
     //
     // Purely syntactic plus one ScopeStack::resolve (the receiver is never
     // itself typed here, so this check alone can never report anything): the
-    // receiver must be a bare Name spelled "self" that currently resolves to
-    // Class(current_class_qualified_name_).
+    // receiver must be a bare Name spelled "self" that resolves to a binding
+    // which BOTH has type Class(current_class_qualified_name_) AND is a
+    // method's own first parameter (Binding::method_self).
     //
-    // What that DOES stop is a nested function whose own `self` is bound to a
-    // DIFFERENT type -- `def inner(self: int) -> None: self.q = 1` inside a
-    // Bag method must not declare "q" on Bag, and mypy reports its own
-    // attr-defined error there. What it does NOT stop, measured against the
-    // built binary rather than assumed, is a nested `def inner(self: Bag)`
-    // inside a Bag method: its `self` resolves to exactly
-    // Class("Bag"), the guard passes, and `self.q: int = 1` there declares
-    // "q" on Bag, so a later `self.q` read comes out CLEAN where mypy reports
-    // four errors (`Type cannot be declared in assignment to non-self
-    // attribute`, plus attr-defined at both the store and the read). Missed
-    // errors, never false ones -- telling that case apart needs the
-    // syntactic "is this parameter the FIRST one of a method, not of some
-    // nested def" question this guard deliberately does not ask, since it
-    // resolves `self` by TYPE.
+    // BOTH conditions are load-bearing, and the second was added by Task 12
+    // after the first alone proved insufficient. The type check stops a
+    // nested function whose own `self` is bound to a DIFFERENT type --
+    // `def inner(self: int) -> None: self.q = 1` inside a Bag method must not
+    // declare "q" on Bag, and mypy reports its own attr-defined error there.
+    // What it does NOT stop is a nested `def inner(self: Bag)` inside a Bag
+    // method: that `self` resolves to exactly Class("Bag"), so a type-only
+    // guard passed and `self.q = 1` there declared "q" on Bag, making a later
+    // `self.q` read come out clean where mypy reports `"Bag" has no attribute
+    // "q"` at both the store and the read. The method_self check is what
+    // tells those apart.
+    //
+    // It is deliberately a fact about the BINDING rather than about the
+    // innermost function. Requiring "the immediately enclosing function is
+    // itself a method" was tried and MEASURED WRONG in the unsafe direction:
+    // mypy attributes a store to the method's self through any number of
+    // capturing closures, so a `def inner()` inside a Bag method writing the
+    // captured `self.q = 1` is `Success` (as is the same store two closures
+    // deep), and that version reported a false TypeError on every one. The
+    // flag travels with the name, so resolving outward through a closure
+    // still finds the method's own `self`. See Binding::method_self.
     std::optional<Type> self_attribute_receiver_type(const ast::Attribute& target) const;
 
     // Which of three states a `self.x` store's attribute name is in --
