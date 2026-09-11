@@ -797,6 +797,53 @@ private:
     // into that number, so no signature producer can compute it differently.
     static std::size_t defaulted_param_count(const std::vector<ast::Parameter>& params);
 
+    // The names of `params`, in order, for Binding::param_names -- the ONE
+    // place the AST's Parameter::name list becomes that vector, so the two
+    // `def`-binding sites cannot record it two different ways.
+    static std::vector<std::string> param_names_of(const std::vector<ast::Parameter>& params);
+
+    // mypy's "All conditional function variants must have identical
+    // signatures": whether a `def` whose signature is `signature` (parameter
+    // names `param_names`) may silently redefine the name `existing` already
+    // holds. It answers ONLY the signature half of that rule -- the caller
+    // still has to establish that the redefinition is a conditional `def`.
+    //
+    // A THIRD comparison, deliberately neither of the two that already exist,
+    // and the reason each is wrong here is worth stating once:
+    //
+    //   - `Type::operator==` is exact and UNION-ORDER-SENSITIVE (type.h says
+    //     so, and says the asymmetry with is_subtype is intentional). mypy's
+    //     identity is order-INsensitive: measured 2026-09-11 with mypy
+    //     1.18.1, conditional variants `def g(a: int | str)` and
+    //     `def g(a: str | int)` are accepted, and so are `int | None` versus
+    //     `None | int`, a three-member rotation, `int | (str | float)` versus
+    //     `float | str | int`, and a union nested inside a `list`, `dict` or
+    //     `tuple` argument. Using == here reported a TypeError on every one
+    //     of those -- a false positive on code both oracles accept.
+    //   - `is_equivalent` (mutual is_subtype) is order-insensitive but too
+    //     LOOSE in three ways that each turn a real error into silence:
+    //     Unknown is absorbing in is_subtype, so an unresolvable annotation
+    //     would match anything; the Callable arm deliberately ignores
+    //     `defaulted_params`, while mypy treats `def g(a: int = 1)` and
+    //     `def g(a: int)` as DIFFERENT signatures (measured: `All conditional
+    //     function variants ...`); and a class name is canonicalised through
+    //     the base chain.
+    //
+    // So this is structural identity, exactly as `operator==` computes it,
+    // with Union members matched as an unordered set at every depth -- and
+    // then parameter names compared on top, which no comparison of two
+    // `Type`s could do at all (see Binding::param_names for why the names
+    // live on the binding and what "empty" there means).
+    //
+    // Static because it consults no ClassLookup: two Class types must agree
+    // on their `name` exactly. Both sides arrive already canonicalised by
+    // AnnotationResolver -- measured, `def g(a: IOError)` against
+    // `def g(a: OSError)` is mypy-clean and accepted here -- so routing
+    // through ClassLookup would buy nothing and would give this rule a
+    // dependency the question does not have.
+    static bool has_identical_signature(const Binding& existing, const Type& signature,
+                                        const std::vector<std::string>& param_names);
+
     // Resolves `annotation` and attempts to bind `target` into the CURRENT
     // scope with it (annotated = true). If the name is already bound there,
     // reports the settled redefinition wording and returns

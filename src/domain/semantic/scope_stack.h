@@ -62,6 +62,45 @@ struct Binding {
     // same-line collision would be a real use-before-definition, not a
     // same-line coincidence.
     bool order_exempt = false;
+
+    // The parameter NAMES of `type`, in order, when this binding was made
+    // from a `def` statement -- and EMPTY whenever they are not known.
+    //
+    // Why they live here and not in `Type`: mypy's redefinition rule compares
+    // parameter names (measured 2026-09-11, mypy 1.18.1 -- `if c: def g(a:
+    // int) -> int` against a prior `def g(b: int) -> int` is `All conditional
+    // function variants must have identical signatures  [misc]`, where the
+    // same pair with matching names is accepted), but `Type::callable`
+    // deliberately carries only {parameter types, return type, defaulted
+    // count}. Putting names into `Type` was rejected: `Type` is a copied
+    // value compared with an exact `operator==` by unrelated callers, its
+    // Callables are also built by builtin_call_table and by
+    // ClassTable::constructor_type from places that have no names to supply,
+    // and two sites erase `args[0]` to bind `self` -- every one of those
+    // would have to learn to keep a parallel name vector in step, and the
+    // failure mode of forgetting is a signature whose names and types
+    // disagree. A `Binding` is instead exactly as scoped as the question:
+    // the rule asks about the binding a redefinition collides with, and
+    // `ScopeStack::resolve` already hands that binding over.
+    //
+    // EMPTY means "not recorded", and the reader must treat it that way
+    // rather than as "a zero-parameter signature": only the two `def`-binding
+    // sites in TypeChecker fill it, so a binding made by an assignment of a
+    // function value (`g = h`) carries h's Callable type with no names at
+    // all. TypeChecker::has_identical_signature tells the two apart by
+    // LENGTH against the Callable's own parameter count, and falls back to
+    // comparing types only when they disagree -- which is the direction that
+    // misses an error rather than inventing one. Measured: `g = h` (h taking
+    // one parameter) followed by a conditional `def g` with a DIFFERENT
+    // parameter name is a mypy error this compiler does not report, while the
+    // same shape with a MATCHING name is mypy-clean, so "unknown names means
+    // report" would have been a false positive on the second.
+    //
+    // Declared LAST on purpose: every existing brace-initialisation of a
+    // Binding passes one to four members positionally, and appending keeps
+    // all of them meaning what they say. Filled by assignment at the two
+    // sites that have names, never positionally.
+    std::vector<std::string> param_names;
 };
 
 // What a lookup found, and WHERE, because the ordering rule (3b) depends on

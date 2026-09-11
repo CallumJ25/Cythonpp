@@ -5408,8 +5408,10 @@ TEST(TypeChecker, AConditionalNestedDefWithADifferentSignatureStillCollides) {
     EXPECT_EQ(error.line, 6);
 }
 
-// m29: the signatures differ ONLY in a default, which Type::operator==
-// compares through defaulted_params. mypy rejects this too.
+// m29: the signatures differ ONLY in a default, which
+// has_identical_signature compares through defaulted_params -- the one thing
+// `is_equivalent` would have thrown away, since its Callable arm deliberately
+// ignores that field. mypy rejects this too.
 //   $ mypy --strict ... m29_fn_cond_def_same_sig_defaults.py
 //   m29...py:6: error: All conditional function variants must have identical
 //                      signatures  [misc]
@@ -5596,6 +5598,417 @@ TEST(TypeChecker, AConditionalModuleLevelDefWithTheSameSignatureIsStillClean) {
                  "    def g() -> int:\n"
                  "        return 0\n"
                  "print(g())\n");
+}
+
+// ---------------------------------------------------------------------------
+// The conditional-`def` allowance, second half: mypy's "identical signatures"
+// is NOT Type::operator==. Implementing it with == was wrong in BOTH
+// directions at once -- == is union-order-SENSITIVE where mypy is not, and
+// carries no parameter NAMES where mypy compares them. The tests below pin
+// each direction with fixtures that differ in EXACTLY the dimension under
+// test, because the previous round's controls all differed in a way `Type`
+// does represent and so were no evidence about either dimension.
+//
+// Every mypy/CPython claim below was measured on 2026-09-11 with mypy 1.18.1
+// and CPython 3.14.2, on the exact fixture quoted, with the commands
+// `mypy --strict --no-color-output --no-error-summary FILE` and
+// `python FILE`.
+// ---------------------------------------------------------------------------
+
+// Finding 1, the MODULE-scope false positive this predicate closes. The two
+// arms differ only in the ORDER of one union's members.
+//   $ mypy --strict ... t1_mod_order.py   -> exit 0, no output
+//   $ python t1_mod_order.py              -> `1`, exit 0
+// The control that isolates the dimension is not a second fixture but
+// neutering: restore `==` at collect_signatures' arm and this reports
+// `6:5 TypeError: name "g" already defined on line 3`.
+TEST(TypeChecker, AConditionalModuleLevelDefDifferingOnlyInUnionOrderIsClean) {
+    expect_clean("C: bool = True\n"
+                 "if C:\n"
+                 "    def g(a: int | str) -> None:\n"
+                 "        print(a)\n"
+                 "else:\n"
+                 "    def g(a: str | int) -> None:\n"
+                 "        print(a)\n"
+                 "g(1)\n");
+}
+
+// Finding 1's four FUNCTION-scope sub-shapes, all mypy exit 0 / CPython exit
+// 0 as measured, and all reported before this round -- the fourth puts the
+// differently-ordered union in the RETURN type rather than a parameter, which
+// is a separate position in `Type::args` and so a separate chance to get the
+// recursion wrong.
+TEST(TypeChecker, AConditionalNestedDefDifferingOnlyInUnionOrderIsClean) {
+    // Both arms of an if/else.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g(a: int | str) -> None:\n"
+                 "            print(a)\n"
+                 "    else:\n"
+                 "        def g(a: str | int) -> None:\n"
+                 "            print(a)\n"
+                 "    g(1)\n");
+    // A FLAT def first, then a conditional one.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    def g(a: int | str) -> None:\n"
+                 "        print(a)\n"
+                 "    if c:\n"
+                 "        def g(a: str | int) -> None:\n"
+                 "            print(a)\n"
+                 "    g(1)\n");
+    // `int | None` against `None | int`, the optional spelling.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g(a: int | None) -> None:\n"
+                 "            print(a)\n"
+                 "    else:\n"
+                 "        def g(a: None | int) -> None:\n"
+                 "            print(a)\n"
+                 "    g(1)\n");
+    // The union is the RETURN type, not a parameter.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g() -> int | str:\n"
+                 "            return 0\n"
+                 "    else:\n"
+                 "        def g() -> str | int:\n"
+                 "            return \"s\"\n"
+                 "    print(g())\n");
+}
+
+// Order-insensitivity has to reach INSIDE type arguments, at any depth, and
+// that is a measurement rather than an assumption: every fixture below is
+// `mypy --strict` exit 0 (measured one by one), and a top-level-only
+// comparison would have left all seven a false positive.
+TEST(TypeChecker, SignatureIdentityIsUnionOrderInsensitiveInsideTypeArguments) {
+    // Inside a `list` argument.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g(a: list[int | str]) -> None:\n"
+                 "            print(a)\n"
+                 "    else:\n"
+                 "        def g(a: list[str | int]) -> None:\n"
+                 "            print(a)\n"
+                 "    g([])\n");
+    // Inside a `dict`'s KEY position, with a second argument that matches.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g(a: dict[int | str, bool]) -> None:\n"
+                 "            print(a)\n"
+                 "    else:\n"
+                 "        def g(a: dict[str | int, bool]) -> None:\n"
+                 "            print(a)\n"
+                 "    g({})\n");
+    // Inside a `tuple` element.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g(a: tuple[int | str, bool]) -> None:\n"
+                 "            print(a)\n"
+                 "    else:\n"
+                 "        def g(a: tuple[str | int, bool]) -> None:\n"
+                 "            print(a)\n"
+                 "    g((1, True))\n");
+    // TWO levels deep, with both unions reordered.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g(a: list[dict[int | str, list[bool | float]]]) -> None:\n"
+                 "            print(a)\n"
+                 "    else:\n"
+                 "        def g(a: list[dict[str | int, list[float | bool]]]) -> None:\n"
+                 "            print(a)\n"
+                 "    g([])\n");
+    // A three-member union ROTATED, so no pairwise-swap shortcut suffices.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g(a: int | str | float) -> None:\n"
+                 "            print(a)\n"
+                 "    else:\n"
+                 "        def g(a: float | int | str) -> None:\n"
+                 "            print(a)\n"
+                 "    g(1)\n");
+    // A PARENTHESISED nested union against a flat one -- Type::union_of
+    // flattens, so the two are the same three members in different orders.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g(a: int | (str | float)) -> None:\n"
+                 "            print(a)\n"
+                 "    else:\n"
+                 "        def g(a: float | str | int) -> None:\n"
+                 "            print(a)\n"
+                 "    g(1)\n");
+    // A DUPLICATED member against a two-member union -- union_of also
+    // de-duplicates, so the arity ends up equal as well as the membership.
+    expect_clean("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        def g(a: int | int | str) -> None:\n"
+                 "            print(a)\n"
+                 "    else:\n"
+                 "        def g(a: str | int) -> None:\n"
+                 "            print(a)\n"
+                 "    g(1)\n");
+}
+
+// Finding 2, the FUNCTION-scope false negative this predicate closes: the two
+// signatures differ only in a parameter NAME, which mypy compares and
+// `Type::callable` does not carry at all.
+//   $ mypy --strict ... r1_fn_name_flatfirst.py
+//   r1...py:5: error: All conditional function variants must have identical
+//                     signatures  [misc]
+//   r1...py:5: note:     def g(a: int) -> int   /   def g(b: int) -> int
+//   $ python r1_fn_name_flatfirst.py  -> exit 0   (CPython accepts; the union
+//                                         rule still forbids accepting it)
+// Measured the same way for all four shapes below, each at the line asserted.
+TEST(TypeChecker, AConditionalNestedDefDifferingOnlyInAParameterNameCollides) {
+    const Checked flat_first = check_module("def f(c: bool) -> None:\n"
+                                            "    def g(a: int) -> int:\n"
+                                            "        return a\n"
+                                            "    if c:\n"
+                                            "        def g(b: int) -> int:\n"
+                                            "            return b\n"
+                                            "    print(g(1))\n");
+    const diagnostics::Diagnostic flat_error = only_error(flat_first);
+    EXPECT_EQ(flat_error.code, "TypeError");
+    EXPECT_EQ(flat_error.message, "name \"g\" already defined on line 2");
+    EXPECT_EQ(flat_error.line, 5);
+
+    const Checked both_arms = check_module("def f(c: bool) -> None:\n"
+                                           "    if c:\n"
+                                           "        def g(a: int) -> int:\n"
+                                           "            return a\n"
+                                           "    else:\n"
+                                           "        def g(b: int) -> int:\n"
+                                           "            return b\n"
+                                           "    print(g(1))\n");
+    const diagnostics::Diagnostic both_error = only_error(both_arms);
+    EXPECT_EQ(both_error.code, "TypeError");
+    EXPECT_EQ(both_error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(both_error.line, 6);
+
+    const Checked while_body = check_module("def f(c: bool) -> None:\n"
+                                            "    def g(a: int) -> int:\n"
+                                            "        return a\n"
+                                            "    while c:\n"
+                                            "        def g(b: int) -> int:\n"
+                                            "            return b\n"
+                                            "        break\n"
+                                            "    print(g(1))\n");
+    const diagnostics::Diagnostic while_error = only_error(while_body);
+    EXPECT_EQ(while_error.code, "TypeError");
+    EXPECT_EQ(while_error.message, "name \"g\" already defined on line 2");
+    EXPECT_EQ(while_error.line, 5);
+
+    // Names SWAPPED between two parameters: the multiset of names and the
+    // list of types are both unchanged, so only an ORDERED name comparison
+    // catches it.
+    const Checked swapped = check_module("def f(c: bool) -> None:\n"
+                                         "    if c:\n"
+                                         "        def g(a: int, b: str) -> None:\n"
+                                         "            print(a, b)\n"
+                                         "    else:\n"
+                                         "        def g(b: int, a: str) -> None:\n"
+                                         "            print(b, a)\n"
+                                         "    g(1, \"s\")\n");
+    const diagnostics::Diagnostic swapped_error = only_error(swapped);
+    EXPECT_EQ(swapped_error.code, "TypeError");
+    EXPECT_EQ(swapped_error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(swapped_error.line, 6);
+}
+
+// The MODULE-scope twin of finding 2, silent at the round-5 base as well as
+// at round 5's HEAD -- so this half was never closed for a name-only
+// difference, only for a type-only one. One predicate at two sites closes it.
+//   $ mypy --strict ... r5_mod_name.py
+//   r5...py:6: error: All conditional function variants must have identical
+//                     signatures  [misc]
+//   $ python r5_mod_name.py -> `1`, exit 0
+TEST(TypeChecker, AConditionalModuleLevelDefDifferingOnlyInAParameterNameCollides) {
+    const Checked checked = check_module("C: bool = True\n"
+                                         "if C:\n"
+                                         "    def g(a: int) -> int:\n"
+                                         "        return a\n"
+                                         "else:\n"
+                                         "    def g(b: int) -> int:\n"
+                                         "        return b\n"
+                                         "print(g(1))\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(error.line, 6);
+}
+
+// Both dimensions at once, which is the one fixture that would pass under
+// EITHER half of the fix alone but only for the wrong reason: a predicate
+// that fixed order and forgot names would silence it. mypy reports it.
+//   $ mypy --strict ... r6_fn_name_and_order.py
+//   r6...py:6: error: All conditional function variants must have identical
+//                     signatures  [misc]
+//   r6...py:6: note:     def g(a: int | str) -> None
+//   r6...py:6: note:     def g(b: str | int) -> None
+TEST(TypeChecker, AConditionalNestedDefDifferingInBothAParameterNameAndUnionOrderCollides) {
+    const Checked checked = check_module("def f(c: bool) -> None:\n"
+                                         "    if c:\n"
+                                         "        def g(a: int | str) -> None:\n"
+                                         "            print(a)\n"
+                                         "    else:\n"
+                                         "        def g(b: str | int) -> None:\n"
+                                         "            print(b)\n"
+                                         "    g(1)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(error.line, 6);
+}
+
+// Two differences the order-insensitive comparison must NOT swallow, both
+// mypy `All conditional function variants must have identical signatures
+// [misc]` as measured: a differing parameter COUNT (which also differs in
+// `args.size()`, the guard the unordered union match depends on) and a
+// differing type NESTED inside an argument (which the recursion must
+// distinguish from a reordering at that same depth).
+TEST(TypeChecker, AConditionalNestedDefDifferingInParameterCountOrANestedTypeCollides) {
+    const Checked count = check_module("def f(c: bool) -> None:\n"
+                                       "    if c:\n"
+                                       "        def g(a: int) -> None:\n"
+                                       "            print(a)\n"
+                                       "    else:\n"
+                                       "        def g(a: int, b: int) -> None:\n"
+                                       "            print(a, b)\n"
+                                       "    g(1)\n");
+    const diagnostics::Diagnostic count_error = only_error(count);
+    EXPECT_EQ(count_error.code, "TypeError");
+    EXPECT_EQ(count_error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(count_error.line, 6);
+
+    const Checked nested = check_module("def f(c: bool) -> None:\n"
+                                        "    if c:\n"
+                                        "        def g(a: list[int]) -> None:\n"
+                                        "            print(a)\n"
+                                        "    else:\n"
+                                        "        def g(a: list[str]) -> None:\n"
+                                        "            print(a)\n"
+                                        "    g([])\n");
+    const diagnostics::Diagnostic nested_error = only_error(nested);
+    EXPECT_EQ(nested_error.code, "TypeError");
+    EXPECT_EQ(nested_error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(nested_error.line, 6);
+}
+
+// An alias of a function value with a PARAMETER, then a conditional `def` of
+// the same name whose parameter name MATCHES the aliased function's. The
+// existing binding carries a Callable type but no recorded names, and this is
+// the fixture that fixes which way that ambiguity must resolve: mypy accepts
+// it, so "names not recorded" must fall back to comparing types only.
+//   $ mypy --strict ... m31q.py  -> exit 0, no output
+//   $ python m31q.py             -> `1`, exit 0
+// The opposite default is not hypothetical: with a DIFFERENT parameter name
+// the same shape is a mypy error this compiler does not report (disclosed as
+// a missed error, the safe direction -- closing it needs parameter names
+// inside `Type`, which the header explains was rejected), and "unknown names
+// means report" would have turned THIS fixture into a false positive to
+// close it.
+TEST(TypeChecker, AConditionalNestedDefOverAnAliasWithAParameterIsStillClean) {
+    expect_clean("def h(x: int) -> int:\n"
+                 "    return x\n"
+                 "def f(c: bool) -> None:\n"
+                 "    g = h\n"
+                 "    if c:\n"
+                 "        def g(x: int) -> int:\n"
+                 "            return x\n"
+                 "    print(g(1))\n");
+}
+
+// All six collision classes the round-5 review's §2.2 table requires to keep
+// reporting, pinned together as one guard on THIS predicate: a predicate too
+// loose in any direction silences one of them. Each row re-measured at
+// 2026-09-11 on the exact fixture below; mypy's code is in the comment, and
+// where cythonpp's line pair is reversed relative to mypy's that is the
+// long-standing cosmetic divergence (parked item (f)), not a disagreement
+// about whether the program is bad.
+TEST(TypeChecker, TheSixCollisionClassesThatMustKeepReportingStillDo) {
+    // 1. conditional def, then a FLAT def. mypy `:5: Name "g" already
+    //    defined on line 3  [no-redef]`.
+    const Checked cond_then_flat = check_module("def f(c: bool) -> None:\n"
+                                                "    if c:\n"
+                                                "        def g() -> int:\n"
+                                                "            return 0\n"
+                                                "    def g() -> int:\n"
+                                                "        return 1\n"
+                                                "    print(g())\n");
+    const diagnostics::Diagnostic cond_then_flat_error = only_error(cond_then_flat);
+    EXPECT_EQ(cond_then_flat_error.code, "TypeError");
+    EXPECT_EQ(cond_then_flat_error.message, "name \"g\" already defined on line 5");
+    EXPECT_EQ(cond_then_flat_error.line, 3);
+
+    // 2. def, then a VARIABLE. mypy `:4: Name "g" already defined on line 2
+    //    [no-redef]`.
+    const Checked def_then_var = check_module("def f(c: bool) -> None:\n"
+                                              "    def g() -> int:\n"
+                                              "        return 1\n"
+                                              "    g: int = 2\n"
+                                              "    print(g)\n");
+    const diagnostics::Diagnostic def_then_var_error = only_error(def_then_var);
+    EXPECT_EQ(def_then_var_error.code, "TypeError");
+    EXPECT_EQ(def_then_var_error.message, "name \"g\" already defined on line 2");
+    EXPECT_EQ(def_then_var_error.line, 4);
+
+    // 3. VARIABLE, then a conditional def. mypy `:4: Incompatible
+    //    redefinition (redefinition with type "Callable[[], int]", original
+    //    type "int")  [misc]`. This is the row has_identical_signature's
+    //    non-Callable arm is responsible for.
+    const Checked var_then_cond = check_module("def f(c: bool) -> None:\n"
+                                               "    g: int = 2\n"
+                                               "    if c:\n"
+                                               "        def g() -> int:\n"
+                                               "            return 1\n"
+                                               "    print(g)\n");
+    const diagnostics::Diagnostic var_then_cond_error = only_error(var_then_cond);
+    EXPECT_EQ(var_then_cond_error.code, "TypeError");
+    EXPECT_EQ(var_then_cond_error.message, "name \"g\" already defined on line 2");
+    EXPECT_EQ(var_then_cond_error.line, 4);
+
+    // 4. two FLAT module defs. mypy `:3: Name "g" already defined on line 1
+    //    [no-redef]`.
+    const Checked two_flat = check_module("def g() -> int:\n"
+                                          "    return 1\n"
+                                          "def g() -> int:\n"
+                                          "    return 2\n"
+                                          "print(g())\n");
+    const diagnostics::Diagnostic two_flat_error = only_error(two_flat);
+    EXPECT_EQ(two_flat_error.code, "TypeError");
+    EXPECT_EQ(two_flat_error.message, "name \"g\" already defined on line 1");
+    EXPECT_EQ(two_flat_error.line, 3);
+
+    // 5. a CLASS redefined in both arms of an if/else. mypy `:6: Name "D"
+    //    already defined on line 3  [no-redef]` -- the allowance is for
+    //    `def`s only, at every scope.
+    const Checked cond_class = check_module("C: bool = True\n"
+                                            "if C:\n"
+                                            "    class D:\n"
+                                            "        a: int = 0\n"
+                                            "else:\n"
+                                            "    class D:\n"
+                                            "        b: int = 1\n"
+                                            "print(D)\n");
+    const diagnostics::Diagnostic cond_class_error = only_error(cond_class);
+    EXPECT_EQ(cond_class_error.code, "TypeError");
+    EXPECT_EQ(cond_class_error.message, "name \"D\" already defined on line 3");
+    EXPECT_EQ(cond_class_error.line, 6);
+
+    // 6. conditional defs whose signatures differ in TYPE. mypy `:6: All
+    //    conditional function variants must have identical signatures
+    //    [misc]`.
+    const Checked type_differs = check_module("def f(c: bool) -> None:\n"
+                                              "    if c:\n"
+                                              "        def g(a: int) -> None:\n"
+                                              "            print(a)\n"
+                                              "    else:\n"
+                                              "        def g(a: str) -> None:\n"
+                                              "            print(a)\n"
+                                              "    g(1)\n");
+    const diagnostics::Diagnostic type_differs_error = only_error(type_differs);
+    EXPECT_EQ(type_differs_error.code, "TypeError");
+    EXPECT_EQ(type_differs_error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(type_differs_error.line, 6);
 }
 
 } // namespace

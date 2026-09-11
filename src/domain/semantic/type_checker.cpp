@@ -160,6 +160,56 @@ bool is_literal_true(const ast::Expr& condition) {
     return constant != nullptr && constant->type() == lexer::token_type::BOOL_TRUE;
 }
 
+// Structural type identity with Union members matched as an unordered SET at
+// every depth -- i.e. exactly what `Type::operator==` computes, minus its
+// union-order sensitivity, and nothing else relaxed. The sole caller is
+// TypeChecker::has_identical_signature, whose header comment records why
+// neither `operator==` nor `is_equivalent` answers this question.
+//
+// Recursion into `args` is load-bearing, not defensive: measured 2026-09-11
+// with mypy 1.18.1, conditional variants `def g(a: list[int | str])` and
+// `def g(a: list[str | int])` are accepted, and so are the same pair inside
+// `dict`'s key position, inside a `tuple` element, and two levels deep
+// (`list[dict[int | str, list[bool | float]]]`). A top-level-only check would
+// have left every one of those a false positive.
+//
+// The unordered match consumes each right-hand member at most once, rather
+// than just testing one-way containment at equal sizes. Type::union_of
+// de-duplicates with `operator==`, which is order-SENSITIVE, so a union can
+// legitimately hold two members that are distinct under == yet identical
+// here (`list[int | str] | list[str | int]`) -- and with those present,
+// containment-plus-equal-size would call {A, A'} and {A, B} identical.
+bool same_type_up_to_union_order(const Type& left, const Type& right) {
+    if (left.kind != right.kind || left.name != right.name ||
+        left.defaulted_params != right.defaulted_params ||
+        left.args.size() != right.args.size()) {
+        return false;
+    }
+    if (left.kind == TypeKind::Union) {
+        std::vector<bool> matched(right.args.size(), false);
+        for (const Type& member : left.args) {
+            bool found = false;
+            for (std::size_t index = 0; index < right.args.size(); ++index) {
+                if (!matched[index] && same_type_up_to_union_order(member, right.args[index])) {
+                    matched[index] = true;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return false;
+            }
+        }
+        return true;
+    }
+    for (std::size_t index = 0; index < left.args.size(); ++index) {
+        if (!same_type_up_to_union_order(left.args[index], right.args[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 TypeChecker::TypeChecker(diagnostics::DiagnosticSink& sink)
@@ -352,6 +402,45 @@ std::size_t TypeChecker::defaulted_param_count(const std::vector<ast::Parameter>
         }
     }
     return count;
+}
+
+std::vector<std::string> TypeChecker::param_names_of(const std::vector<ast::Parameter>& params) {
+    std::vector<std::string> names;
+    names.reserve(params.size());
+    for (const ast::Parameter& parameter : params) {
+        names.push_back(parameter.name);
+    }
+    return names;
+}
+
+bool TypeChecker::has_identical_signature(const Binding& existing, const Type& signature,
+                                          const std::vector<std::string>& param_names) {
+    // Both sides must be signatures at all. Reached with a non-Callable
+    // `existing` whenever a `def` collides with a VARIABLE binding of the
+    // same name -- `g: int = 1` then a conditional `def g`, which mypy
+    // reports as `Incompatible redefinition` -- so this is the arm that keeps
+    // that collision class reporting rather than a redundant guard.
+    if (existing.type.kind != TypeKind::Callable || signature.kind != TypeKind::Callable ||
+        existing.type.args.empty() || signature.args.empty()) {
+        return false;
+    }
+    if (!same_type_up_to_union_order(existing.type, signature)) {
+        return false;
+    }
+    // Equal `args` sizes are guaranteed by the line above, and `args` is
+    // parameters followed by the return type, so this is both sides' count.
+    const std::size_t parameters = signature.args.size() - 1;
+    // Names are RECORDED only when the existing binding came from a `def`,
+    // which is what the length agreement tests: a `g = h` binding carries
+    // h's Callable type with an empty name vector, and for a non-zero
+    // parameter count that disagreement is how the two are told apart. When
+    // they are not recorded the comparison falls back to types only -- see
+    // Binding::param_names for the measurement that rules out the opposite
+    // default.
+    if (existing.param_names.size() == parameters && existing.param_names != param_names) {
+        return false;
+    }
+    return true;
 }
 
 void TypeChecker::collect_classes(const ast::Module& module) {
@@ -597,8 +686,14 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
                 // instead caught by bind_annotation's own bool check below,
                 // since by the time that AnnAssign runs the def already
                 // occupies the name.
-                const Binding signature{signature_type, function_def->span().start_line,
-                                        /*annotated=*/true};
+                const std::vector<std::string> param_names =
+                    param_names_of(function_def->params());
+                Binding signature{signature_type, function_def->span().start_line,
+                                  /*annotated=*/true};
+                // Assigned rather than passed positionally, so the four
+                // members above keep meaning what they say -- see
+                // Binding::param_names' own comment.
+                signature.param_names = param_names;
                 if (!scopes_.bind(function_def->name(), signature)) {
                     // Suppress only a def colliding with an EARLIER def, and
                     // only when at least one side is conditional -- two FLAT
@@ -615,7 +710,7 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
                     // this pass must never do. The first binding wins and
                     // this one is dropped silently.
                     //
-                    // The SIGNATURE-EQUALITY half is the same second
+                    // The SIGNATURE-IDENTITY half is the same second
                     // condition visit(FunctionDef)'s own conditional
                     // allowance carries, so the rule is one rule at both
                     // sites. mypy's allowance is exactly "identical
@@ -624,7 +719,16 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
                     // draws `All conditional function variants must have
                     // identical signatures  [misc]`, and so does the
                     // flat-then-conditional ordering of the same pair. Both
-                    // were silently accepted here before the equality test.
+                    // were silently accepted here before the identity test.
+                    //
+                    // has_identical_signature, NOT `==`: `==` is
+                    // union-order-sensitive and carries no parameter names,
+                    // so it was wrong in both directions at once -- measured
+                    // at this exact site, `if c: def g(a: int | str)` /
+                    // `else: def g(a: str | int)` at module scope drew a
+                    // false TypeError, and the same pair spelled
+                    // `def g(a: int)` / `def g(b: int)` was silently accepted
+                    // where mypy reports. See the predicate's own comment.
                     //
                     // A def colliding with a VARIABLE binding (annotated or
                     // not) is a different collision class entirely -- mypy
@@ -633,10 +737,11 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
                     // must always fall through to the report below. It
                     // already does, twice over: def_bound_names holds only
                     // names bound FROM a FunctionDef, and a variable's type
-                    // could not equal a Callable signature anyway.
+                    // is not a Callable, which has_identical_signature
+                    // rejects outright.
                     const Resolution bound = scopes_.resolve(function_def->name());
                     if (!at_flat_top_level && def_bound_names.count(function_def->name()) != 0 &&
-                        bound.binding->type == signature_type) {
+                        has_identical_signature(*bound.binding, signature_type, param_names)) {
                         return;
                     }
                     report(*function_def, DiagnosticKind::SemanticAnalyzerTypeError,
@@ -1864,7 +1969,11 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     if (!is_method && scopes_.current_kind() == ScopeKind::Function) {
         const Type signature_type =
             Type::callable(param_types, return_type, defaulted_param_count(params));
-        const Binding signature{signature_type, def_line, /*annotated=*/true};
+        const std::vector<std::string> param_names = param_names_of(params);
+        Binding signature{signature_type, def_line, /*annotated=*/true};
+        // Assigned rather than passed positionally -- see
+        // Binding::param_names' own comment.
+        signature.param_names = param_names;
         if (scopes_.bound_in_current_scope(node.name())) {
             const Resolution existing = scopes_.resolve(node.name());
             // Routed through is_unfilled_placeholder for
@@ -1880,7 +1989,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
             if (is_unfilled_placeholder(*existing.binding, def_line)) {
                 scopes_.rebind(node.name(), signature);
             } else if (conditional_defs_.count(&node) != 0 &&
-                       existing.binding->type == signature_type) {
+                       has_identical_signature(*existing.binding, signature_type, param_names)) {
                 // mypy's CONDITIONAL-FUNCTION-DEFINITION allowance, which is
                 // NOT scope-limited -- this site used to have no
                 // conditionality test at all, so seven measured shapes both
@@ -1912,8 +2021,8 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
                 //    bind_resolved_annotation's report, deliberately left
                 //    alone.
                 //
-                // 2. `existing.binding->type == signature_type` -- mypy's
-                //    allowance is exactly "identical signatures". Measured:
+                // 2. `has_identical_signature(...)` -- mypy's allowance is
+                //    exactly "identical signatures". Measured:
                 //    `if c: def g() -> int ... else: def g(a: int) -> str` ->
                 //    `All conditional function variants must have identical
                 //    signatures  [misc]`, and `g: int = 1` then a conditional
@@ -1922,9 +2031,22 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
                 //    Both keep reporting here; the wording differs from
                 //    mypy's, a wording divergence rather than a compliance
                 //    one, since both oracles reject the program either way.
-                //    Type::operator== includes defaulted_params, so
+                //    The predicate compares `defaulted_params`, so
                 //    `def g(a: int = 1)` versus `def g(a: int)` -- mypy's
-                //    `identical signatures` error, measured -- still reports.
+                //    `identical signatures` error, measured -- still reports,
+                //    while differing default VALUES at the same count stay
+                //    clean, also matching mypy.
+                //
+                //    This used to be `existing.binding->type ==
+                //    signature_type`, which was wrong in BOTH directions at
+                //    once: `operator==` is union-order-sensitive, so
+                //    `def g(a: int | str)` against `def g(a: str | int)` drew
+                //    a false TypeError on code both oracles accept, and it
+                //    carries no parameter names, so `def g(a: int)` against
+                //    `def g(b: int)` was silently accepted where mypy reports
+                //    `All conditional function variants ...`. Never restore
+                //    `==` here; see has_identical_signature's own comment for
+                //    why `is_equivalent` is not the answer either.
                 //
                 // The first binding wins and this one is dropped, matching
                 // collect_signatures' own conditional-redefinition arm.
