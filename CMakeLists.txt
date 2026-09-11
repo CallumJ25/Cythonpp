@@ -26,6 +26,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/semantic/literal_type.cpp
     src/domain/semantic/operator_rules.cpp
     src/domain/semantic/builtin_type_names.cpp
+    src/domain/semantic/builtin_class_genericity.cpp
     src/domain/semantic/class_table.cpp
     src/domain/semantic/annotation_resolver.cpp
     src/domain/semantic/scope_stack.cpp
@@ -105,6 +106,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/semantic/builtin_type_names_test.cpp
         tests/domain/semantic/annotation_resolver_test.cpp
         tests/domain/semantic/builtin_class_table_test.cpp
+        tests/domain/semantic/builtin_class_genericity_test.cpp
         tests/domain/semantic/builtin_function_table_test.cpp
         tests/domain/semantic/class_table_test.cpp
         tests/domain/semantic/scope_stack_test.cpp

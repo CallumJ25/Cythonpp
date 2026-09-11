@@ -1,4 +1,5 @@
 #include <cstddef>
+#include <set>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -75,6 +76,55 @@ TEST(BuiltinClassTable, ContainsTheGenericBuiltinClasses) {
     for (const char* name : {"zip", "map", "filter", "enumerate", "reversed",
                              "staticmethod", "classmethod"}) {
         EXPECT_NE(find(name), nullptr) << name << " must be seeded";
+    }
+}
+
+// THE MEASUREMENT, PINNED. `accepts_type_arguments` is a claim about typeshed,
+// re-derived by the generator by running `mypy --strict` over one
+// `def f(a: NAME[int]) -> None` line per class name. ctest cannot run mypy, so
+// this test is where the answer that was measured is written down: exactly
+// these SEVENTEEN names must be true and every other entry false.
+//
+// Measured 2026-09-11 with mypy 1.18.1 (compiled: yes) / Python 3.14.2.
+// A name is false iff mypy answers `"NAME" expects no type arguments`; the
+// seventeen below answer otherwise. Verbatim, for the five that are not
+// simply clean:
+//   "classmethod" expects 3 type arguments, but 1 given  [type-arg]
+//   "staticmethod" expects 2 type arguments, but 1 given  [type-arg]
+//   "dict" expects 2 type arguments, but 1 given  [type-arg]
+//   Type argument "int" of "ExceptionGroup" must be a subtype of "Exception"  [type-var]
+//   Type argument "int" of "BaseExceptionGroup" must be a subtype of "BaseException"  [type-var]
+// The other twelve (enumerate, filter, frozenset, list, map, memoryview,
+// reversed, set, slice, tuple, type, zip) are `Success: no issues found`.
+//
+// This is the guard against a REGENERATION silently moving an answer, which
+// is the only failure mode left once the field is generated -- five of these
+// names (type, slice, memoryview, ExceptionGroup, BaseExceptionGroup) were
+// missing from the seven-name hand list this field replaced, and each was a
+// false `TypeError: 'X' is not subscriptable` on a program both oracles
+// accept.
+TEST(BuiltinClassTable, AcceptsTypeArgumentsIsTrueForExactlyTheSeventeenGenericNames) {
+    const std::set<std::string> generic = {
+        "BaseExceptionGroup", "ExceptionGroup", "classmethod", "dict", "enumerate",
+        "filter",             "frozenset",      "list",        "map", "memoryview",
+        "reversed",           "set",            "slice",       "staticmethod",
+        "tuple",              "type",           "zip",
+    };
+    std::set<std::string> recorded;
+    for (std::size_t index = 0; index < kBuiltinClassCount; ++index) {
+        if (kBuiltinClasses[index].accepts_type_arguments) {
+            recorded.insert(kBuiltinClasses[index].name);
+        }
+    }
+    EXPECT_EQ(recorded, generic);
+
+    // Spot-checks in the other direction, so a wholesale `= true` on every
+    // row cannot pass by making both sets equal to the whole table.
+    for (const char* name : {"ValueError", "Exception", "BaseException", "int", "str",
+                             "object", "super", "property", "range", "bytes"}) {
+        const BuiltinClass* entry = find(name);
+        ASSERT_NE(entry, nullptr) << name;
+        EXPECT_FALSE(entry->accepts_type_arguments) << name;
     }
 }
 

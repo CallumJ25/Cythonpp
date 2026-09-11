@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "builtin_class_genericity.h"
 #include "builtin_type_names.h"
 #include "domain/ast/source_span.h"
 #include "domain/ast/tuple_expr.h"
@@ -18,35 +19,6 @@ Type of_kind(TypeKind kind) {
     Type type;
     type.kind = kind;
     return type;
-}
-
-// The seven builtin classes typeshed marks generic -- zip, map, filter,
-// enumerate, reversed, staticmethod, classmethod. Bare use (`x: zip`) is a
-// mypy type-arg error while ours is clean (a recorded direction-(b) miss),
-// but `x: zip[int]` is mypy-CLEAN, so subscripting one of these must draw
-// NotImplementedError rather than the TypeError a genuinely non-generic
-// seeded class (e.g. `x: ValueError[int]`, a real mypy type-arg error) or a
-// genuinely user-defined generic (`class C: pass` then `x: C[int]`) draws.
-//
-// Deliberately narrower than "is this name in kBuiltinClasses" -- this
-// predicate's predecessor, is_seeded_builtin_class, matched the whole
-// 97-entry table and so reported EVERY subscripted seeded class as
-// unimplemented, even a non-generic one where mypy gives a genuine TypeError.
-// No missed error resulted (a diagnostic still fired either way) but the
-// wrong ONE fired. ClassLookup deliberately has only is_class and bases_of --
-// 5a's header explains the two-method choice -- so this cannot be answered by
-// asking `classes_`; consulting a small local list here, in the one place
-// that needs the distinction, keeps that seam intact.
-bool is_generic_builtin_class(const std::string& name) {
-    static constexpr const char* kGenericBuiltinClasses[] = {
-        "zip", "map", "filter", "enumerate", "reversed", "staticmethod", "classmethod",
-    };
-    for (const char* generic : kGenericBuiltinClasses) {
-        if (name == generic) {
-            return true;
-        }
-    }
-    return false;
 }
 
 } // namespace
@@ -199,19 +171,42 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
     std::optional<TypeKind> kind = builtin_type_kind(base->identifier());
     if (!kind.has_value()) {
         if (classes_.is_class(base->identifier())) {
-            if (is_generic_builtin_class(base->identifier())) {
-                // `x: zip[int]` is mypy-CLEAN -- zip is generic in typeshed --
-                // so this must not be the same TypeError a genuinely
-                // non-generic user class draws below. Subscripting a builtin
-                // generic is simply unimplemented, not a type error on a
-                // clean program.
+            // THE RULE: a `not subscriptable` TypeError requires POSITIVE
+            // evidence that mypy rejects the subscript. There are exactly two
+            // sources of such evidence and they are the two arms below; the
+            // remaining case is NotImplementedError, which cannot violate the
+            // union rule whichever name turns up next.
+            //
+            // `x: zip[int]` is mypy-CLEAN -- zip is generic in typeshed -- so
+            // it must not draw the same TypeError a genuinely non-generic
+            // class does. The predecessor of this branch asked a seven-name
+            // HAND-WRITTEN list and answered TypeError for every name missing
+            // from it. Five were missing (`type`, `slice`, `memoryview`,
+            // `ExceptionGroup`, `BaseExceptionGroup`), each a measured false
+            // positive on code both oracles accept. The answer is now a field
+            // on the class's own generated row, so "a builtin class whose
+            // genericity nobody recorded" is not a reachable state --
+            // builtin_class_genericity.h carries the whole account.
+            const std::optional<bool> takes_arguments =
+                builtin_class_accepts_type_arguments(base->identifier());
+            if (takes_arguments.has_value() && *takes_arguments) {
                 return error(*base, DiagnosticKind::NotImplementedError,
                              "generic builtin type '" + base->identifier() + "' is not supported");
             }
-            // Either a genuine user class (no user-defined generics in the
-            // subset) or a seeded builtin that is NOT one of the seven
-            // generic ones -- `x: ValueError[int]` is a real mypy type-arg
-            // error too, so this is the correct diagnostic for it as well.
+            // Evidence 1 (takes_arguments == false): the generated table
+            // records mypy answering `"X" expects no type arguments` for this
+            // builtin -- measured for `x: ValueError[int]`,
+            // `"ValueError" expects no type arguments, but 1 given
+            // [type-arg]`.
+            //
+            // Evidence 2 (nullopt): the name is not a builtin class at all,
+            // so -- having already passed classes_.is_class -- it is a class
+            // THIS PROGRAM declares, and there are no user-defined generics in
+            // the subset. Measured: `class C: pass` then `x: C[int]` gives
+            // `"C" expects no type arguments, but 1 given  [type-arg]`. This
+            // is deliberately NOT folded into the NotImplementedError arm: it
+            // is the case the brief's "default to NotImplementedError" would
+            // have silenced, and mypy rejects it.
             return error(*base, DiagnosticKind::SemanticAnalyzerTypeError,
                          "'" + base->identifier() + "' is not subscriptable");
         }

@@ -34,117 +34,142 @@ namespace cythonpp::domain::semantic {
 // Names that ARE model kinds (int, str, list, ...) appear here too and are
 // harmless: builtin_type_kind() is consulted before ClassLookup::is_class().
 //
-// Seven entries are GENERIC in typeshed -- zip, map, filter, enumerate,
-// reversed, staticmethod, classmethod. Bare use (`x: zip`) is a mypy type-arg
-// error while ours is clean, a recorded direction-(b) miss. But `x: zip[int]`
-// is mypy-CLEAN, so AnnotationResolver must report NotImplementedError for a
-// subscripted seeded class, never "'zip' is not subscriptable" (Task 9).
+// WHY `accepts_type_arguments` IS GENERATED TOO, and why the interpreter is
+// NOT the oracle for it. `x: zip[int]` is mypy-CLEAN (zip is generic in
+// typeshed), so AnnotationResolver must answer a subscripted generic builtin
+// with NotImplementedError; answering "'zip' is not subscriptable" would be a
+// TypeError on a program both oracles accept. That routing used to consult a
+// SEVEN-NAME HAND-WRITTEN list in annotation_resolver.cpp, and the list was
+// missing `type`, `slice`, `memoryview`, `ExceptionGroup` and
+// `BaseExceptionGroup` -- five measured false positives, `x: type[int] = int`
+// among them. So the flag is extracted, for exactly the reason the names and
+// bases are.
+//
+// The extraction asks MYPY, not the running interpreter, because the
+// interpreter gives the WRONG answer. Measured on Python 3.14.2:
+// `filter[int]`, `map[int]`, `reversed[int]`, `zip[int]` and `slice[int]` all
+// raise TypeError at runtime (no __class_getitem__) while mypy accepts every
+// one of them, and `type[int]` is accepted by both. Runtime subscriptability
+// would therefore have DEMOTED four names the old hand list already had
+// right. The question the union rule cares about is the static one -- does
+// mypy accept a type argument here -- so the generator writes one
+// `def f(a: NAME[int]) -> None` line per class name, runs `mypy --strict`
+// over it in a temporary directory, and records False for exactly those names
+// mypy answers `"NAME" expects no type arguments` for. Every other verdict
+// (clean, a different arity, a type-var bound complaint) means generic, and
+// an unrecognised verdict makes the generator raise rather than guess.
 
 // Four is enough: the widest direct-base list in the extraction is 2. The
 // generator raises if that ever stops being true.
 struct BuiltinClass {
     const char* name;
     const char* bases[4];
+
+    // False only for a class mypy reports `"X" expects no type arguments`
+    // for. See the paragraph above for why this is mypy-derived rather than
+    // interpreter-derived, and builtin_class_genericity.h for the one
+    // consumer.
+    bool accepts_type_arguments;
 };
 
 constexpr BuiltinClass kBuiltinClasses[] = {
-    {"ArithmeticError", {"Exception", nullptr, nullptr, nullptr}},
-    {"AssertionError", {"Exception", nullptr, nullptr, nullptr}},
-    {"AttributeError", {"Exception", nullptr, nullptr, nullptr}},
-    {"BaseException", {nullptr, nullptr, nullptr, nullptr}},
-    {"BaseExceptionGroup", {"BaseException", nullptr, nullptr, nullptr}},
-    {"BlockingIOError", {"OSError", nullptr, nullptr, nullptr}},
-    {"BrokenPipeError", {"ConnectionError", nullptr, nullptr, nullptr}},
-    {"BufferError", {"Exception", nullptr, nullptr, nullptr}},
-    {"BytesWarning", {"Warning", nullptr, nullptr, nullptr}},
-    {"ChildProcessError", {"OSError", nullptr, nullptr, nullptr}},
-    {"ConnectionAbortedError", {"ConnectionError", nullptr, nullptr, nullptr}},
-    {"ConnectionError", {"OSError", nullptr, nullptr, nullptr}},
-    {"ConnectionRefusedError", {"ConnectionError", nullptr, nullptr, nullptr}},
-    {"ConnectionResetError", {"ConnectionError", nullptr, nullptr, nullptr}},
-    {"DeprecationWarning", {"Warning", nullptr, nullptr, nullptr}},
-    {"EOFError", {"Exception", nullptr, nullptr, nullptr}},
-    {"EncodingWarning", {"Warning", nullptr, nullptr, nullptr}},
-    {"EnvironmentError", {"Exception", nullptr, nullptr, nullptr}},
-    {"Exception", {"BaseException", nullptr, nullptr, nullptr}},
-    {"ExceptionGroup", {"BaseExceptionGroup", "Exception", nullptr, nullptr}},
-    {"FileExistsError", {"OSError", nullptr, nullptr, nullptr}},
-    {"FileNotFoundError", {"OSError", nullptr, nullptr, nullptr}},
-    {"FloatingPointError", {"ArithmeticError", nullptr, nullptr, nullptr}},
-    {"FutureWarning", {"Warning", nullptr, nullptr, nullptr}},
-    {"GeneratorExit", {"BaseException", nullptr, nullptr, nullptr}},
-    {"IOError", {"Exception", nullptr, nullptr, nullptr}},
-    {"ImportError", {"Exception", nullptr, nullptr, nullptr}},
-    {"ImportWarning", {"Warning", nullptr, nullptr, nullptr}},
-    {"IndentationError", {"SyntaxError", nullptr, nullptr, nullptr}},
-    {"IndexError", {"LookupError", nullptr, nullptr, nullptr}},
-    {"InterruptedError", {"OSError", nullptr, nullptr, nullptr}},
-    {"IsADirectoryError", {"OSError", nullptr, nullptr, nullptr}},
-    {"KeyError", {"LookupError", nullptr, nullptr, nullptr}},
-    {"KeyboardInterrupt", {"BaseException", nullptr, nullptr, nullptr}},
-    {"LookupError", {"Exception", nullptr, nullptr, nullptr}},
-    {"MemoryError", {"Exception", nullptr, nullptr, nullptr}},
-    {"ModuleNotFoundError", {"ImportError", nullptr, nullptr, nullptr}},
-    {"NameError", {"Exception", nullptr, nullptr, nullptr}},
-    {"NotADirectoryError", {"OSError", nullptr, nullptr, nullptr}},
-    {"NotImplementedError", {"RuntimeError", nullptr, nullptr, nullptr}},
-    {"OSError", {"Exception", nullptr, nullptr, nullptr}},
-    {"OverflowError", {"ArithmeticError", nullptr, nullptr, nullptr}},
-    {"PendingDeprecationWarning", {"Warning", nullptr, nullptr, nullptr}},
-    {"PermissionError", {"OSError", nullptr, nullptr, nullptr}},
-    {"ProcessLookupError", {"OSError", nullptr, nullptr, nullptr}},
-    {"PythonFinalizationError", {"RuntimeError", nullptr, nullptr, nullptr}},
-    {"RecursionError", {"RuntimeError", nullptr, nullptr, nullptr}},
-    {"ReferenceError", {"Exception", nullptr, nullptr, nullptr}},
-    {"ResourceWarning", {"Warning", nullptr, nullptr, nullptr}},
-    {"RuntimeError", {"Exception", nullptr, nullptr, nullptr}},
-    {"RuntimeWarning", {"Warning", nullptr, nullptr, nullptr}},
-    {"StopAsyncIteration", {"Exception", nullptr, nullptr, nullptr}},
-    {"StopIteration", {"Exception", nullptr, nullptr, nullptr}},
-    {"SyntaxError", {"Exception", nullptr, nullptr, nullptr}},
-    {"SyntaxWarning", {"Warning", nullptr, nullptr, nullptr}},
-    {"SystemError", {"Exception", nullptr, nullptr, nullptr}},
-    {"SystemExit", {"BaseException", nullptr, nullptr, nullptr}},
-    {"TabError", {"IndentationError", nullptr, nullptr, nullptr}},
-    {"TimeoutError", {"OSError", nullptr, nullptr, nullptr}},
-    {"TypeError", {"Exception", nullptr, nullptr, nullptr}},
-    {"UnboundLocalError", {"NameError", nullptr, nullptr, nullptr}},
-    {"UnicodeDecodeError", {"UnicodeError", nullptr, nullptr, nullptr}},
-    {"UnicodeEncodeError", {"UnicodeError", nullptr, nullptr, nullptr}},
-    {"UnicodeError", {"ValueError", nullptr, nullptr, nullptr}},
-    {"UnicodeTranslateError", {"UnicodeError", nullptr, nullptr, nullptr}},
-    {"UnicodeWarning", {"Warning", nullptr, nullptr, nullptr}},
-    {"UserWarning", {"Warning", nullptr, nullptr, nullptr}},
-    {"ValueError", {"Exception", nullptr, nullptr, nullptr}},
-    {"Warning", {"Exception", nullptr, nullptr, nullptr}},
-    {"WindowsError", {"Exception", nullptr, nullptr, nullptr}},
-    {"ZeroDivisionError", {"ArithmeticError", nullptr, nullptr, nullptr}},
-    {"bool", {"int", nullptr, nullptr, nullptr}},
-    {"bytearray", {nullptr, nullptr, nullptr, nullptr}},
-    {"bytes", {nullptr, nullptr, nullptr, nullptr}},
-    {"classmethod", {nullptr, nullptr, nullptr, nullptr}},
-    {"complex", {nullptr, nullptr, nullptr, nullptr}},
-    {"dict", {nullptr, nullptr, nullptr, nullptr}},
-    {"enumerate", {nullptr, nullptr, nullptr, nullptr}},
-    {"filter", {nullptr, nullptr, nullptr, nullptr}},
-    {"float", {nullptr, nullptr, nullptr, nullptr}},
-    {"frozenset", {nullptr, nullptr, nullptr, nullptr}},
-    {"int", {nullptr, nullptr, nullptr, nullptr}},
-    {"list", {nullptr, nullptr, nullptr, nullptr}},
-    {"map", {nullptr, nullptr, nullptr, nullptr}},
-    {"memoryview", {nullptr, nullptr, nullptr, nullptr}},
-    {"object", {nullptr, nullptr, nullptr, nullptr}},
-    {"property", {nullptr, nullptr, nullptr, nullptr}},
-    {"range", {nullptr, nullptr, nullptr, nullptr}},
-    {"reversed", {nullptr, nullptr, nullptr, nullptr}},
-    {"set", {nullptr, nullptr, nullptr, nullptr}},
-    {"slice", {nullptr, nullptr, nullptr, nullptr}},
-    {"staticmethod", {nullptr, nullptr, nullptr, nullptr}},
-    {"str", {nullptr, nullptr, nullptr, nullptr}},
-    {"super", {nullptr, nullptr, nullptr, nullptr}},
-    {"tuple", {nullptr, nullptr, nullptr, nullptr}},
-    {"type", {nullptr, nullptr, nullptr, nullptr}},
-    {"zip", {nullptr, nullptr, nullptr, nullptr}},
+    {"ArithmeticError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"AssertionError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"AttributeError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"BaseException", {nullptr, nullptr, nullptr, nullptr}, false},
+    {"BaseExceptionGroup", {"BaseException", nullptr, nullptr, nullptr}, true},
+    {"BlockingIOError", {"OSError", nullptr, nullptr, nullptr}, false},
+    {"BrokenPipeError", {"ConnectionError", nullptr, nullptr, nullptr}, false},
+    {"BufferError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"BytesWarning", {"Warning", nullptr, nullptr, nullptr}, false},
+    {"ChildProcessError", {"OSError", nullptr, nullptr, nullptr}, false},
+    {"ConnectionAbortedError", {"ConnectionError", nullptr, nullptr, nullptr}, false},
+    {"ConnectionError", {"OSError", nullptr, nullptr, nullptr}, false},
+    {"ConnectionRefusedError", {"ConnectionError", nullptr, nullptr, nullptr}, false},
+    {"ConnectionResetError", {"ConnectionError", nullptr, nullptr, nullptr}, false},
+    {"DeprecationWarning", {"Warning", nullptr, nullptr, nullptr}, false},
+    {"EOFError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"EncodingWarning", {"Warning", nullptr, nullptr, nullptr}, false},
+    {"EnvironmentError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"Exception", {"BaseException", nullptr, nullptr, nullptr}, false},
+    {"ExceptionGroup", {"BaseExceptionGroup", "Exception", nullptr, nullptr}, true},
+    {"FileExistsError", {"OSError", nullptr, nullptr, nullptr}, false},
+    {"FileNotFoundError", {"OSError", nullptr, nullptr, nullptr}, false},
+    {"FloatingPointError", {"ArithmeticError", nullptr, nullptr, nullptr}, false},
+    {"FutureWarning", {"Warning", nullptr, nullptr, nullptr}, false},
+    {"GeneratorExit", {"BaseException", nullptr, nullptr, nullptr}, false},
+    {"IOError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"ImportError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"ImportWarning", {"Warning", nullptr, nullptr, nullptr}, false},
+    {"IndentationError", {"SyntaxError", nullptr, nullptr, nullptr}, false},
+    {"IndexError", {"LookupError", nullptr, nullptr, nullptr}, false},
+    {"InterruptedError", {"OSError", nullptr, nullptr, nullptr}, false},
+    {"IsADirectoryError", {"OSError", nullptr, nullptr, nullptr}, false},
+    {"KeyError", {"LookupError", nullptr, nullptr, nullptr}, false},
+    {"KeyboardInterrupt", {"BaseException", nullptr, nullptr, nullptr}, false},
+    {"LookupError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"MemoryError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"ModuleNotFoundError", {"ImportError", nullptr, nullptr, nullptr}, false},
+    {"NameError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"NotADirectoryError", {"OSError", nullptr, nullptr, nullptr}, false},
+    {"NotImplementedError", {"RuntimeError", nullptr, nullptr, nullptr}, false},
+    {"OSError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"OverflowError", {"ArithmeticError", nullptr, nullptr, nullptr}, false},
+    {"PendingDeprecationWarning", {"Warning", nullptr, nullptr, nullptr}, false},
+    {"PermissionError", {"OSError", nullptr, nullptr, nullptr}, false},
+    {"ProcessLookupError", {"OSError", nullptr, nullptr, nullptr}, false},
+    {"PythonFinalizationError", {"RuntimeError", nullptr, nullptr, nullptr}, false},
+    {"RecursionError", {"RuntimeError", nullptr, nullptr, nullptr}, false},
+    {"ReferenceError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"ResourceWarning", {"Warning", nullptr, nullptr, nullptr}, false},
+    {"RuntimeError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"RuntimeWarning", {"Warning", nullptr, nullptr, nullptr}, false},
+    {"StopAsyncIteration", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"StopIteration", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"SyntaxError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"SyntaxWarning", {"Warning", nullptr, nullptr, nullptr}, false},
+    {"SystemError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"SystemExit", {"BaseException", nullptr, nullptr, nullptr}, false},
+    {"TabError", {"IndentationError", nullptr, nullptr, nullptr}, false},
+    {"TimeoutError", {"OSError", nullptr, nullptr, nullptr}, false},
+    {"TypeError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"UnboundLocalError", {"NameError", nullptr, nullptr, nullptr}, false},
+    {"UnicodeDecodeError", {"UnicodeError", nullptr, nullptr, nullptr}, false},
+    {"UnicodeEncodeError", {"UnicodeError", nullptr, nullptr, nullptr}, false},
+    {"UnicodeError", {"ValueError", nullptr, nullptr, nullptr}, false},
+    {"UnicodeTranslateError", {"UnicodeError", nullptr, nullptr, nullptr}, false},
+    {"UnicodeWarning", {"Warning", nullptr, nullptr, nullptr}, false},
+    {"UserWarning", {"Warning", nullptr, nullptr, nullptr}, false},
+    {"ValueError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"Warning", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"WindowsError", {"Exception", nullptr, nullptr, nullptr}, false},
+    {"ZeroDivisionError", {"ArithmeticError", nullptr, nullptr, nullptr}, false},
+    {"bool", {"int", nullptr, nullptr, nullptr}, false},
+    {"bytearray", {nullptr, nullptr, nullptr, nullptr}, false},
+    {"bytes", {nullptr, nullptr, nullptr, nullptr}, false},
+    {"classmethod", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"complex", {nullptr, nullptr, nullptr, nullptr}, false},
+    {"dict", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"enumerate", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"filter", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"float", {nullptr, nullptr, nullptr, nullptr}, false},
+    {"frozenset", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"int", {nullptr, nullptr, nullptr, nullptr}, false},
+    {"list", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"map", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"memoryview", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"object", {nullptr, nullptr, nullptr, nullptr}, false},
+    {"property", {nullptr, nullptr, nullptr, nullptr}, false},
+    {"range", {nullptr, nullptr, nullptr, nullptr}, false},
+    {"reversed", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"set", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"slice", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"staticmethod", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"str", {nullptr, nullptr, nullptr, nullptr}, false},
+    {"super", {nullptr, nullptr, nullptr, nullptr}, false},
+    {"tuple", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"type", {nullptr, nullptr, nullptr, nullptr}, true},
+    {"zip", {nullptr, nullptr, nullptr, nullptr}, true},
 };
 
 constexpr std::size_t kBuiltinClassCount =

@@ -5,6 +5,12 @@ and re-derives corpus labels.
 NEVER run by ctest. The test suite must pass with no Python installed, so this
 script's output is CHECKED IN and the tests read the checked-in file.
 
+--generate-class-table needs `mypy` on PATH as well as the interpreter: one
+field of builtin_class_table.h (accepts_type_arguments) is a claim about
+TYPESHED, not about the running interpreter, and the interpreter gives the
+wrong answer for it (see that header's own comment). --check-corpus already
+needed mypy, so the script's dependency set is unchanged.
+
 Usage:
     python scripts/verify_corpus_labels.py --generate-class-table
     python scripts/verify_corpus_labels.py --generate-function-table
@@ -58,17 +64,42 @@ namespace cythonpp::domain::semantic {{
 // Names that ARE model kinds (int, str, list, ...) appear here too and are
 // harmless: builtin_type_kind() is consulted before ClassLookup::is_class().
 //
-// Seven entries are GENERIC in typeshed -- zip, map, filter, enumerate,
-// reversed, staticmethod, classmethod. Bare use (`x: zip`) is a mypy type-arg
-// error while ours is clean, a recorded direction-(b) miss. But `x: zip[int]`
-// is mypy-CLEAN, so AnnotationResolver must report NotImplementedError for a
-// subscripted seeded class, never "'zip' is not subscriptable" (Task 9).
+// WHY `accepts_type_arguments` IS GENERATED TOO, and why the interpreter is
+// NOT the oracle for it. `x: zip[int]` is mypy-CLEAN (zip is generic in
+// typeshed), so AnnotationResolver must answer a subscripted generic builtin
+// with NotImplementedError; answering "'zip' is not subscriptable" would be a
+// TypeError on a program both oracles accept. That routing used to consult a
+// SEVEN-NAME HAND-WRITTEN list in annotation_resolver.cpp, and the list was
+// missing `type`, `slice`, `memoryview`, `ExceptionGroup` and
+// `BaseExceptionGroup` -- five measured false positives, `x: type[int] = int`
+// among them. So the flag is extracted, for exactly the reason the names and
+// bases are.
+//
+// The extraction asks MYPY, not the running interpreter, because the
+// interpreter gives the WRONG answer. Measured on Python {version}:
+// `filter[int]`, `map[int]`, `reversed[int]`, `zip[int]` and `slice[int]` all
+// raise TypeError at runtime (no __class_getitem__) while mypy accepts every
+// one of them, and `type[int]` is accepted by both. Runtime subscriptability
+// would therefore have DEMOTED four names the old hand list already had
+// right. The question the union rule cares about is the static one -- does
+// mypy accept a type argument here -- so the generator writes one
+// `def f(a: NAME[int]) -> None` line per class name, runs `mypy --strict`
+// over it in a temporary directory, and records False for exactly those names
+// mypy answers `"NAME" expects no type arguments` for. Every other verdict
+// (clean, a different arity, a type-var bound complaint) means generic, and
+// an unrecognised verdict makes the generator raise rather than guess.
 
 // Four is enough: the widest direct-base list in the extraction is 2. The
 // generator raises if that ever stops being true.
 struct BuiltinClass {{
     const char* name;
     const char* bases[{max_bases}];
+
+    // False only for a class mypy reports `"X" expects no type arguments`
+    // for. See the paragraph above for why this is mypy-derived rather than
+    // interpreter-derived, and builtin_class_genericity.h for the one
+    // consumer.
+    bool accepts_type_arguments;
 }};
 
 constexpr BuiltinClass kBuiltinClasses[] = {{
@@ -148,9 +179,79 @@ def find_aliases(names):
     return aliases
 
 
+# The one verdict that means "not generic". Every other mypy verdict on
+# `NAME[int]` -- silence, a different arity, a type-var bound complaint --
+# means the class DOES take type arguments.
+_NOT_GENERIC_MARKER = "expects no type arguments"
+
+# Verdicts that positively confirm genericity. Listed so an UNRECOGNISED
+# diagnostic raises instead of being silently read as "generic": a misread
+# there would route a genuine `not subscriptable` TypeError to
+# NotImplementedError, which is the safe direction but still a missed error.
+_GENERIC_MARKERS = (
+    "expects 2 type arguments",
+    "expects 3 type arguments",
+    "Missing type parameters for generic type",
+    "must be a subtype of",
+)
+
+
+def accepts_type_arguments(names):
+    """name -> bool, by asking `mypy --strict` about `NAME[int]`.
+
+    NOT by asking the interpreter: `hasattr(cls, "__class_getitem__")` and
+    `cls[int]` both say False for filter/map/reversed/zip/slice, all of which
+    mypy accepts a type argument on. The union rule turns on what mypy says,
+    so mypy is what gets asked.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        probe = pathlib.Path(tmpdir) / "generic_probe.py"
+        probe.write_text(
+            "".join(f"def f{i}(a: {n}[int]) -> None: pass\n" for i, n in enumerate(names)),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            ["mypy", "--strict", "--no-color-output", "--no-error-summary", probe.name],
+            cwd=tmpdir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode >= 2:
+            raise SystemExit(
+                f"mypy --strict exited {result.returncode} on the genericity probe; "
+                f"cannot derive accepts_type_arguments\n{result.stdout}{result.stderr}"
+            )
+        verdicts = collections.defaultdict(list)
+        for line in result.stdout.splitlines():
+            parts = line.split(":", 2)
+            if len(parts) < 3 or not parts[1].isdigit():
+                continue
+            verdicts[int(parts[1])].append(parts[2].strip())
+
+    generic = {}
+    for index, name in enumerate(names):
+        messages = verdicts.get(index + 1, [])
+        errors = [m for m in messages if m.startswith("error:")]
+        if not errors:
+            generic[name] = True
+            continue
+        if any(_NOT_GENERIC_MARKER in m for m in errors):
+            generic[name] = False
+            continue
+        if all(any(marker in m for marker in _GENERIC_MARKERS) for m in errors):
+            generic[name] = True
+            continue
+        raise SystemExit(
+            f"unrecognised mypy verdict for {name}[int]; refusing to guess "
+            f"accepts_type_arguments: {errors}"
+        )
+    return generic
+
+
 def generate_class_table() -> str:
     names = class_names()
     known = set(names)
+    generic = accepts_type_arguments(names)
     rows = []
     for name in names:
         cls = getattr(builtins, name)
@@ -166,7 +267,8 @@ def generate_class_table() -> str:
             )
         padded = bases + [None] * (MAX_BASES - len(bases))
         rendered = ", ".join("nullptr" if b is None else f'"{b}"' for b in padded)
-        rows.append(f'    {{"{name}", {{{rendered}}}}},')
+        flag = "true" if generic[name] else "false"
+        rows.append(f'    {{"{name}", {{{rendered}}}, {flag}}},')
 
     alias_rows = [
         f'    {{"{alias}", "{canonical}"}},' for alias, canonical in find_aliases(names)

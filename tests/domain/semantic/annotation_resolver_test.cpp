@@ -364,6 +364,69 @@ TEST(AnnotationResolver, SubscriptingANonGenericSeededBuiltinIsAGenuineError) {
     EXPECT_EQ(error.message, "'ValueError' is not subscriptable");
 }
 
+// THE ROUND-5 CRITICAL, at the resolver. Every builtin class the generated
+// table records as taking type arguments must draw NotImplementedError, not
+// `'X' is not subscriptable`. FIVE of these names -- type, slice, memoryview,
+// ExceptionGroup, BaseExceptionGroup -- were missing from the seven-name hand
+// list this replaced, and each drew a false TypeError on a program
+// `mypy --strict` and CPython BOTH accept. Measured 2026-09-11
+// (mypy 1.18.1 / Python 3.14.2):
+//
+//   $ cat r_type.py
+//   x: type[int] = int
+//   print(x)
+//   $ mypy --strict --no-color-output --no-error-summary r_type.py -> exit 0, no output
+//   $ python r_type.py                                             -> <class 'int'>, exit 0
+//   $ cythonpp --types r_type.py  (before) 1:4: error: TypeError: 'type' is not subscriptable
+//
+// The REAL ClassTable, not FakeClassLookup: the whole point is that the
+// seeded table and the genericity field come from the same generated rows, so
+// a fake that seeds only the name under test would not exercise that.
+TEST(AnnotationResolver, EveryGenericBuiltinClassIsUnsupportedNotAnError) {
+    const ClassTable classes;
+    for (const std::string& name : {"type", "slice", "memoryview", "ExceptionGroup",
+                                    "BaseExceptionGroup", "zip", "map", "filter",
+                                    "enumerate", "reversed", "staticmethod", "classmethod"}) {
+        const Resolved resolved = resolve_annotation("x: " + name + "[int] = y\n", classes);
+        const diagnostics::Diagnostic error = only_error(resolved);
+
+        EXPECT_EQ(error.code, "NotImplementedError") << name;
+        EXPECT_EQ(error.message, "generic builtin type '" + name + "' is not supported") << name;
+    }
+}
+
+// THE CONTROL THAT MUST KEEP REPORTING, through the same real table: a
+// builtin class mypy really does answer `"X" expects no type arguments` for
+// still draws the genuine TypeError. Measured verbatim, 2026-09-11:
+//   p/c_valueerror.py:1: error: "ValueError" expects no type arguments, but 1 given  [type-arg]
+// If widening the generic set had been done by relaxing the DEFAULT instead
+// of by generating the answer, every one of these would have gone silent.
+TEST(AnnotationResolver, ANonGenericBuiltinClassStillDrawsAGenuineNotSubscriptableError) {
+    const ClassTable classes;
+    for (const std::string& name : {"ValueError", "Exception", "BaseException", "OSError",
+                                    "super", "property"}) {
+        const Resolved resolved = resolve_annotation("x: " + name + "[int] = y\n", classes);
+        const diagnostics::Diagnostic error = only_error(resolved);
+
+        EXPECT_EQ(error.code, "TypeError") << name;
+        EXPECT_EQ(error.message, "'" + name + "' is not subscriptable") << name;
+    }
+}
+
+// An alias spelling carries its OWN row, so it needs no canonicalisation:
+// mypy answers `"OSError" expects no type arguments` for `IOError[int]`, and
+// the generator recorded that against IOError's own row.
+TEST(AnnotationResolver, AnAliasSpellingOfANonGenericBuiltinIsStillAnError) {
+    const ClassTable classes;
+    for (const std::string& name : {"IOError", "EnvironmentError"}) {
+        const Resolved resolved = resolve_annotation("x: " + name + "[int] = y\n", classes);
+        const diagnostics::Diagnostic error = only_error(resolved);
+
+        EXPECT_EQ(error.code, "TypeError") << name;
+        EXPECT_EQ(error.message, "'" + name + "' is not subscriptable") << name;
+    }
+}
+
 // Verified against real mypy: `x: IOError = OSError()` and
 // `y: OSError = IOError()` are both clean -- IOError IS OSError, the same
 // class object, not a distinct class with a shared base. resolve_name must
