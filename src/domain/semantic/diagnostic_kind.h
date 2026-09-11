@@ -79,6 +79,14 @@ enum class DiagnosticKind {
 // project's rule, and re-spelling a semantic-analyzer judgement as a fifth
 // code would change labelled corpus output to encode something only this
 // compiler's internals care about.
+// BOTH FUNCTIONS BELOW ARE DELIBERATELY EXHAUSTIVE SWITCHES WITH NO `default`
+// LABEL, and CMakeLists.txt passes -Werror=switch, so adding an enumerator to
+// DiagnosticKind without answering BOTH questions for it is a COMPILE ERROR
+// at the exact two spots needing attention. That is the point: a `default`
+// label, or a `==` comparison against one enumerator, would quietly give a new
+// kind someone else's answer -- and "quietly gave it the wrong answer" is this
+// defect's documented failure mode four rounds running. Do not add a
+// `default:` here to silence anything.
 inline const char* diagnostic_code(DiagnosticKind kind) {
     switch (kind) {
     case DiagnosticKind::TypeCheckerTypeError:
@@ -91,9 +99,8 @@ inline const char* diagnostic_code(DiagnosticKind kind) {
     case DiagnosticKind::OverflowError:
         return "OverflowError";
     }
-    // No default label, so clang's -Wswitch flags an unhandled enumerator
-    // here rather than letting it fall through silently. Unreachable for any
-    // valid enumerator.
+    // Unreachable for any valid enumerator; present only because a function
+    // returning a value must, to the compiler, appear to always do so.
     return "TypeError";
 }
 
@@ -101,9 +108,19 @@ inline const char* diagnostic_code(DiagnosticKind kind) {
 // Exactly one kind is suppressible; see each enumerator's own comment for the
 // measurement behind it.
 inline diagnostics::Suppressibility suppressibility_of(DiagnosticKind kind) {
-    return kind == DiagnosticKind::TypeCheckerTypeError
-               ? diagnostics::Suppressibility::Suppressible
-               : diagnostics::Suppressibility::NotSuppressible;
+    switch (kind) {
+    case DiagnosticKind::TypeCheckerTypeError:
+        return diagnostics::Suppressibility::Suppressible;
+    case DiagnosticKind::SemanticAnalyzerTypeError:
+    case DiagnosticKind::NameError:
+    case DiagnosticKind::NotImplementedError:
+    case DiagnosticKind::OverflowError:
+        return diagnostics::Suppressibility::NotSuppressible;
+    }
+    // Unreachable for any valid enumerator. NotSuppressible rather than
+    // Suppressible: if this line is ever somehow reached, reporting is the
+    // recoverable mistake and silence is not.
+    return diagnostics::Suppressibility::NotSuppressible;
 }
 
 } // namespace cythonpp::domain::semantic

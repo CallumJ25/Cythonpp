@@ -46,6 +46,18 @@ set(CYTHONPP_LIB_SOURCES
 add_library(cythonpp_lib STATIC ${CYTHONPP_LIB_SOURCES})
 target_include_directories(cythonpp_lib PUBLIC ${CMAKE_SOURCE_DIR}/src)
 
+# -Wswitch is on by default; this PROMOTES IT TO AN ERROR, and it is the only
+# warning flag this project sets. Several places already rely on an exhaustive
+# switch with no `default` label as the thing that forces a new enumerator to
+# be considered -- semantic/diagnostic_kind.h says so outright for both of its
+# tables, and expression_typer.cpp's RuleResult switch carries a comment
+# claiming "adding a status warns here". A warning nobody is required to read
+# is not a guard, so the claim those comments make is only true with this flag
+# set. The blast radius was measured before adding it: the whole project,
+# library and tests, compiles clean under it.
+set(CYTHONPP_WARNINGS -Werror=switch)
+target_compile_options(cythonpp_lib PUBLIC ${CYTHONPP_WARNINGS})
+
 add_executable(cythonpp src/main.cpp)
 target_link_libraries(cythonpp PRIVATE cythonpp_lib)
 

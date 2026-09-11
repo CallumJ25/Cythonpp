@@ -11,23 +11,43 @@ namespace cythonpp::domain::semantic {
 namespace {
 
 // Hand-maintained, exactly like ALL_TOKEN_TYPES in
-// tests/domain/lexer/token_test.cpp and for the same reason: C++17 has no
-// enum reflection, so the coverage guard below has to be given the list. The
-// guard is what makes forgetting to extend it a FAILURE rather than a silent
-// gap -- see CoversEveryEnumerator.
+// tests/domain/lexer/token_test.cpp and for the same reason: C++17 has no enum
+// reflection, so the sweeps below have to be given the list.
+//
+// WHAT FORCES THIS LIST TO STAY COMPLETE IS THE COMPILER, NOT A TEST, and that
+// correction is worth recording because the first version of this file got it
+// wrong in precisely the way this task keeps getting things wrong. It carried a
+// `CoversEveryEnumerator` test asserting
+// `ALL_DIAGNOSTIC_KINDS.size() == static_cast<size_t>(OverflowError) + 1`, on
+// the reasoning that the enumerators are contiguous from zero. Probed by
+// actually adding a sixth enumerator: the test PASSED, because appending after
+// OverflowError does not change OverflowError's own value. It was a guard that
+// could not fail for the thing it was named for.
+//
+// The real guard is diagnostic_kind.h's two exhaustive switches plus
+// -Werror=switch (CMakeLists.txt): a new enumerator does not compile until
+// both its code and its suppressibility are stated. Re-probed with the same
+// sixth enumerator, the build now fails with
+// "error: enumeration value 'ProbeSixthKind' not handled in switch". The tests
+// below are the SECOND line of defence: they pin what the two tables answer,
+// and ExactlyOneKindIsSuppressible... additionally fails if a new kind is
+// classified suppressible once it is added here.
 constexpr std::array<DiagnosticKind, 5> ALL_DIAGNOSTIC_KINDS{
     DiagnosticKind::TypeCheckerTypeError, DiagnosticKind::SemanticAnalyzerTypeError,
     DiagnosticKind::NameError,            DiagnosticKind::NotImplementedError,
     DiagnosticKind::OverflowError,
 };
 
-// A new enumerator added anywhere in DiagnosticKind without being added here
-// breaks this: the enumerators are contiguous from zero, so the last one's
-// value plus one IS the count. That makes "extend the table, then decide the
-// classification" the only way forward, which is the whole point of the type.
-TEST(DiagnosticKind, CoversEveryEnumerator) {
-    EXPECT_EQ(ALL_DIAGNOSTIC_KINDS.size(),
-              static_cast<std::size_t>(DiagnosticKind::OverflowError) + 1);
+// The list's own integrity: five DISTINCT enumerators, none repeated. A
+// duplicate would silently shrink every sweep below by one -- the same class of
+// silent hole the array exists to close.
+TEST(DiagnosticKind, TheKindListHasNoDuplicates) {
+    for (std::size_t i = 0; i < ALL_DIAGNOSTIC_KINDS.size(); ++i) {
+        for (std::size_t j = i + 1; j < ALL_DIAGNOSTIC_KINDS.size(); ++j) {
+            EXPECT_NE(ALL_DIAGNOSTIC_KINDS[i], ALL_DIAGNOSTIC_KINDS[j])
+                << "duplicate at " << i << " and " << j;
+        }
+    }
 }
 
 // The four-code vocabulary is fixed by the project's rule, so every kind must
