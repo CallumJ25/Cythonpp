@@ -30,6 +30,39 @@ namespace cythonpp::domain::semantic {
 // it by default, which is the exact failure this table exists to prevent.
 // Both are named for the mypy phase that owns the judgement, so the name IS
 // the question.
+//
+// WHAT THIS DOES AND DOES NOT GUARANTEE, stated at the strength the code
+// actually supports, because it has been overstated at this mechanism three
+// rounds running. Measured 2026-09-11, by inserting the line and building:
+//
+//     sink_.report_error("TypeError", "ESCAPE HATCH probe", 1, 1,
+//                        diagnostics::Suppressibility::Suppressible);
+//
+// inside type_checker.cpp COMPILES CLEAN and the diagnostic appears at run
+// time. All three semantic classes hold `DiagnosticSink& sink_` directly --
+// that is how their seams reach it -- so a new site CAN bypass this enum
+// entirely. What is impossible is OMITTING the answer: DiagnosticSink::report
+// and ::report_error have no default `Suppressibility`, so a bypassing site
+// still has to state one. The true guarantee is therefore:
+//
+//   * a code STRING cannot be written at any of the three SEAMS (they take a
+//     DiagnosticKind), and
+//   * a new ENUMERATOR cannot compile until both tables below classify it,
+//     and
+//   * no producer anywhere can leave suppressibility unstated,
+//
+// but NOT "a code string cannot be written at a semantic report site at all".
+// The auditing consequence is the part that bites: `grep -n
+// "DiagnosticKind::" src/domain/semantic/*.cpp` lists every classified site
+// and would not see such a bypass, so a complete audit needs a SECOND grep,
+//
+//     grep -n "sink_" src/domain/semantic/*.cpp
+//
+// which must show only the three seams (`annotation_resolver.cpp`,
+// `expression_typer.cpp`, `type_checker.cpp`, one `report_error` each), plus
+// `check_suite`'s `unreachable.emplace(sink_)` and the AnnotationResolver
+// constructions that pass the sink along. Anything else is a producer that
+// the first grep cannot see.
 enum class DiagnosticKind {
     // "TypeError" for a judgement mypy's TYPE CHECKER owns: operand types,
     // argument types and arity, assignment compatibility, return types,
@@ -51,6 +84,18 @@ enum class DiagnosticKind {
     // after a `return`? If it is a claim about the SHAPE of a definition or
     // an annotation, yes; if it is a claim about the TYPES flowing through an
     // expression, no.
+    //
+    // AND THE SECOND QUESTION, which round 5 exists because nobody asked:
+    // does mypy say this AT ALL, on every sub-form the site fires on? The
+    // first question is the right one for "may this be suppressed?" and the
+    // WRONG one for "should this fire?". A class can be genuine
+    // semantic-analyzer output and still over-fire: `'X' is not
+    // subscriptable` was correct for `int[str]` and a false positive for
+    // `type[int]`, and `name "g" already defined` was correct for two flat
+    // defs and a false positive for a conditional one. Classifying such a
+    // site NotSuppressible -- correctly -- widens the reach of a judgement
+    // that was already wrong. Both questions, or neither answer is worth
+    // anything.
     SemanticAnalyzerTypeError,
 
     // "NameError". Also semantic-analyzer output -- mypy reports

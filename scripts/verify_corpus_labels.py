@@ -391,20 +391,50 @@ def _mypy_blocked_on_sample(sample_name: str, result) -> bool:
     a `<sample>:<line>: error:` line on stdout. An INTERNAL ERROR is excluded
     explicitly, because mypy formats those as a file-and-line diagnostic too
     (`file.py:3: error: INTERNAL ERROR --`) and would otherwise slip through.
+
+    A `[syntax]` error is excluded for the same reason, and this exclusion is
+    the round-5 tightening: without it an UNPARSEABLE sample confirmed its
+    `# mypy: error` label, where `613a460` had failed it loudly as CRASHED.
+    The two families separate cleanly, measured 2026-09-11 with mypy 1.18.1:
+
+        def f(                       -> `:1: error: '(' was never closed  [syntax]`   exit 2
+        x = (1                       -> `:2: error: '(' was never closed  [syntax]`   exit 2
+        a bad indent                 -> `:3: error: Unexpected indent  [syntax]`      exit 2
+        def g(x: int, x: str)        -> `:1: error: Duplicate argument "x" in
+                                          function definition`   exit 2, NO code
+        a module-level `break`       -> `:1: error: "break" outside loop`  exit 2, NO code
+
+    So every shape the exit-2 loosening exists for is codeless, and every
+    shape it must not bless carries `[syntax]`. A corrupt sample would still
+    go red in `ctest` (semantic_corpus_test.cpp reads a missing `# cythonpp:`
+    line as "zero diagnostics", and cythonpp reports SyntaxError for one), but
+    this script is the oracle every `# mypy:` label rests on, so it should not
+    be the harness that has to catch it.
     """
     combined = result.stdout + result.stderr
     if "INTERNAL ERROR" in combined:
         return False
     prefix = sample_name + ":"
+    blocked = False
     for line in result.stdout.splitlines():
         stripped = line.strip()
         if not stripped.startswith(prefix):
             continue
         rest = stripped[len(prefix):]
         line_number, separator, tail = rest.partition(":")
-        if separator and line_number.isdigit() and tail.strip().startswith("error:"):
-            return True
-    return False
+        if not separator or not line_number.isdigit():
+            continue
+        message = tail.strip()
+        if not message.startswith("error:"):
+            continue
+        if message.endswith("[syntax]"):
+            # Decisive, not merely unconvincing: a sample mypy cannot parse is
+            # not a verdict on the sample's TYPES at all, so it must not
+            # confirm anything. Returned rather than recorded, so one syntax
+            # error outweighs any number of other diagnostics.
+            return False
+        blocked = True
+    return blocked
 
 
 def _is_mypy_error_line(line: str) -> bool:
