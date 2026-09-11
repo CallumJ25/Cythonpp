@@ -62,7 +62,7 @@ public:
     // end must not un-suppress the outer.
     //
     // WHAT IS SUPPRESSED IS A PROPERTY OF THE DIAGNOSTIC, NOT ITS CODE.
-    // Round 3 of this fix keyed the filter on the code string "TypeError"
+    // An earlier version of this filter keyed on the code string "TypeError"
     // instead, and that string is a LOSSY proxy: cythonpp spells "TypeError"
     // both for judgements mypy's type checker owns (which mypy does not make
     // in unreachable code) and for judgements mypy's semantic analyzer owns

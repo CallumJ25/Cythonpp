@@ -669,7 +669,7 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
                 Type return_type = function_def->has_return_annotation()
                                         ? resolver.resolve(function_def->return_annotation())
                                         : Type::unknown();
-                // Cached BEFORE the Binding below moves from it, so Task 18's
+                // Cached BEFORE the Binding below moves from it, so
                 // visit(FunctionDef) can reuse this exact resolution rather
                 // than calling AnnotationResolver a second time on the same
                 // annotations (see top_level_signatures_'s own comment).

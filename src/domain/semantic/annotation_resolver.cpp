@@ -205,8 +205,8 @@ Type AnnotationResolver::resolve_subscript(const ast::Subscript& subscript) {
             // the subset. Measured: `class C: pass` then `x: C[int]` gives
             // `"C" expects no type arguments, but 1 given  [type-arg]`. This
             // is deliberately NOT folded into the NotImplementedError arm: it
-            // is the case the brief's "default to NotImplementedError" would
-            // have silenced, and mypy rejects it.
+            // is the case a blanket "default to NotImplementedError" here
+            // would silence, and mypy rejects it.
             return error(*base, DiagnosticKind::SemanticAnalyzerTypeError,
                          "'" + base->identifier() + "' is not subscriptable");
         }

@@ -85,7 +85,8 @@ enum class DiagnosticKind {
     // an annotation, yes; if it is a claim about the TYPES flowing through an
     // expression, no.
     //
-    // AND THE SECOND QUESTION, which round 5 exists because nobody asked:
+    // AND THE SECOND QUESTION, which is easy to skip and was skipped here
+    // once, at the cost of shipping false positives:
     // does mypy say this AT ALL, on every sub-form the site fires on? The
     // first question is the right one for "may this be suppressed?" and the
     // WRONG one for "should this fire?". A class can be genuine

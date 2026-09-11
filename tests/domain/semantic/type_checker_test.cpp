@@ -5138,8 +5138,8 @@ TEST(TypeChecker, AModuleLevelWhileTrueWithNoBreakDoesStartAnUnreachableRegion) 
 // UNREACHABLE CODE SUPPRESSES MYPY'S TYPE CHECKER, NOT ITS SEMANTIC ANALYZER.
 //
 // Every test below sits inside an unreachable region and MUST still report,
-// because mypy reports its analogue there. They are the cases round 3 lost by
-// keying suppression on the code string "TypeError", which cythonpp spells on
+// because mypy reports its analogue there. They are the cases lost by keying
+// suppression on the code string "TypeError", which cythonpp spells on
 // both sides of that line. Each was measured against mypy 1.18.1 and CPython
 // 3.14.2 on 2026-09-10; the verbatim mypy line is quoted per test.
 // ---------------------------------------------------------------------------
@@ -5308,11 +5308,11 @@ TEST(TypeChecker, ABareGenericAnnotationInUnreachableCodeStillReports) {
 
 
 // ---------------------------------------------------------------------------
-// Round 5: the four shapes from the round-4 review's Critical table, and
-// their REACHABLE twins. Every one of the eight is a program `mypy --strict`
-// and CPython BOTH accept, and every one was rejected with a `TypeError`
-// before this round. The reachable form is the pre-existing defect; the
-// unreachable form is the reach that round 4's un-suppression widened. All
+// Four conditional-`def` shapes and their REACHABLE twins. Every one of the
+// eight is a program `mypy --strict` and CPython BOTH accept, and every one
+// was once rejected with a `TypeError`. The reachable form is the original
+// defect; the unreachable form is the extra reach that un-suppressing
+// semantic-analyzer diagnostics in unreachable code widened it to. All
 // measurements 2026-09-11, mypy 1.18.1 (compiled: yes) / Python 3.14.2.
 // ---------------------------------------------------------------------------
 
@@ -5338,7 +5338,8 @@ TEST(TypeChecker, ASubscriptedGenericBuiltinIsUnsupportedNotATypeError) {
     }
 }
 
-// Critical rows 1-3, UNREACHABLE -- the position round 4 un-suppressed.
+// The same three shapes, UNREACHABLE -- the position un-suppressing
+// semantic-analyzer diagnostics exposed.
 //   $ cat u_type.py
 //   def f() -> None:
 //       return
@@ -5490,7 +5491,8 @@ TEST(TypeChecker, AConditionalNestedDefInUnreachableCodeIsNotARedefinition) {
 }
 
 // ---------------------------------------------------------------------------
-// Round 5 CONTROLS: collision classes that must KEEP reporting. Each is a
+// CONTROLS for the four shapes above: collision classes that must KEEP
+// reporting. Each is a
 // program mypy rejects, so silence here would be a false negative -- the
 // failure mode a relaxed DEFAULT (rather than a measured rule) would have
 // shipped.
@@ -5941,9 +5943,10 @@ TEST(TypeChecker, AConditionalNestedDefDifferingOnlyInAParameterNameCollides) {
     EXPECT_EQ(swapped_error.line, 6);
 }
 
-// The MODULE-scope twin of finding 2, silent at the round-5 base as well as
-// at round 5's HEAD -- so this half was never closed for a name-only
-// difference, only for a type-only one. One predicate at two sites closes it.
+// The MODULE-scope twin of the function-scope case above, and silent both
+// before and after the fix that closed that one -- so this half was never
+// closed for a name-only difference, only for a type-only one. One predicate
+// at two sites closes it.
 //   $ mypy --strict ... r5_mod_name.py
 //   r5...py:6: error: All conditional function variants must have identical
 //                     signatures  [misc]

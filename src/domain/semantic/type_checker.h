@@ -941,8 +941,8 @@ private:
     // which BOTH has type Class(current_class_qualified_name_) AND is a
     // method's own first parameter (Binding::method_self).
     //
-    // BOTH conditions are load-bearing, and the second was added by Task 12
-    // after the first alone proved insufficient. The type check stops a
+    // BOTH conditions are load-bearing, and the second was added only after
+    // the first alone proved insufficient. The type check stops a
     // nested function whose own `self` is bound to a DIFFERENT type --
     // `def inner(self: int) -> None: self.q = 1` inside a Bag method must not
     // declare "q" on Bag, and mypy reports its own attr-defined error there.

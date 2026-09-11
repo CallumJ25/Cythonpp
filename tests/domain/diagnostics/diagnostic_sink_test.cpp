@@ -60,7 +60,8 @@ TEST(DiagnosticSink, WarningsDoNotCountAsErrors) {
 // carry the SAME code, deliberately: cythonpp spells "TypeError" for
 // judgements on both sides of that line, so a filter keyed on the code string
 // cannot express this and a filter keyed on the code string is exactly what
-// silently accepted nine measured classes of rejected program in round 3.
+// what an earlier version of this filter used, and it silently accepted nine
+// measured classes of rejected program.
 TEST(DiagnosticSink, SuppressesOnlyTheSuppressibleDiagnosticEvenUnderOneCode) {
     DiagnosticSink sink;
     {
