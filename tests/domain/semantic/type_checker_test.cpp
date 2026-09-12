@@ -6175,5 +6175,174 @@ TEST(TypeChecker, TheSixCollisionClassesThatMustKeepReportingStillDo) {
     EXPECT_EQ(type_differs_error.line, 6);
 }
 
+// A loop whose body has no reachable break ALWAYS runs its else, so an else
+// that returns makes the whole loop return. Measured 2026-09-12: mypy
+// --strict is Success and CPython prints 1 then 3.
+TEST(TypeChecker, AForElseThatReturnsIsNotAMissingReturn) {
+    expect_clean("def f(xs: list[int]) -> int:\n"
+                 "    for x in xs:\n"
+                 "        print(x)\n"
+                 "    else:\n"
+                 "        return 3\n");
+}
+
+TEST(TypeChecker, AWhileElseThatReturnsIsNotAMissingReturn) {
+    expect_clean("def f(c: bool) -> int:\n"
+                 "    while c:\n"
+                 "        print(1)\n"
+                 "    else:\n"
+                 "        return 3\n");
+}
+
+// A8: the break belongs to the INNER loop and can never escape the outer
+// one, so the outer else still always runs. mypy: Success.
+TEST(TypeChecker, ABreakInANestedLoopBodyDoesNotBlockTheOuterElse) {
+    expect_clean("def f(xs: list[int], ys: list[int]) -> int:\n"
+                 "    for x in xs:\n"
+                 "        for y in ys:\n"
+                 "            break\n"
+                 "    else:\n"
+                 "        return 3\n");
+}
+
+// A10: the else returns through both arms of an if.
+TEST(TypeChecker, ALoopElseReturningViaBothIfArmsIsClean) {
+    expect_clean("def f(xs: list[int], c: bool) -> int:\n"
+                 "    for x in xs:\n"
+                 "        print(x)\n"
+                 "    else:\n"
+                 "        if c:\n"
+                 "            return 1\n"
+                 "        else:\n"
+                 "            return 2\n");
+}
+
+// A24: the predicate is "SOME statement always returns", not "the last one
+// does" -- a non-returning statement after the loop stays clean.
+TEST(TypeChecker, AStatementAfterAReturningLoopElseIsStillClean) {
+    expect_clean("def f(xs: list[int]) -> int:\n"
+                 "    for x in xs:\n"
+                 "        print(x)\n"
+                 "    else:\n"
+                 "        return 3\n"
+                 "    print(1)\n");
+}
+
+// A20: continue does not skip the else.
+TEST(TypeChecker, AContinueDoesNotBlockTheLoopElse) {
+    expect_clean("def f(xs: list[int]) -> int:\n"
+                 "    for x in xs:\n"
+                 "        continue\n"
+                 "    else:\n"
+                 "        return 3\n");
+}
+
+// A14: a break after a return in the same block is unreachable, so it does
+// not make the else skippable. mypy prunes it; so must the break scan.
+TEST(TypeChecker, AnUnreachableBreakAfterAReturnDoesNotBlockTheLoopElse) {
+    expect_clean("def f(xs: list[int]) -> int:\n"
+                 "    for x in xs:\n"
+                 "        return 1\n"
+                 "        break\n"
+                 "    else:\n"
+                 "        return 3\n");
+}
+
+// A2: an unconditional break escapes the loop and skips the else, so
+// control can fall off the end. Differs from the A1 clean case ONLY in the
+// presence of the break.
+TEST(TypeChecker, AReachableBreakMakesAReturningLoopElseAMissingReturn) {
+    const Checked checked = check_module("def f(xs: list[int]) -> int:\n"
+                                         "    for x in xs:\n"
+                                         "        break\n"
+                                         "    else:\n"
+                                         "        return 3\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "missing return statement");
+    EXPECT_EQ(error.line, 1);
+}
+
+// A3: a CONDITIONAL break is still a reachable break. This is the control
+// that differs from the `if False: break` shape in exactly one dimension --
+// whether the condition is a prunable constant.
+TEST(TypeChecker, AConditionalBreakStillBlocksTheLoopElse) {
+    const Checked checked = check_module("def f(xs: list[int], c: bool) -> int:\n"
+                                         "    for x in xs:\n"
+                                         "        if c:\n"
+                                         "            break\n"
+                                         "    else:\n"
+                                         "        return 3\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "missing return statement");
+    EXPECT_EQ(error.line, 1);
+}
+
+// A9: a break in a NESTED loop's ELSE belongs to the OUTER loop -- the
+// exact inverse of A8 above, differing only in body-vs-else placement.
+TEST(TypeChecker, ABreakInANestedLoopElseBlocksTheOuterElse) {
+    const Checked checked = check_module("def f(xs: list[int], ys: list[int]) -> int:\n"
+                                         "    for x in xs:\n"
+                                         "        for y in ys:\n"
+                                         "            pass\n"
+                                         "        else:\n"
+                                         "            break\n"
+                                         "    else:\n"
+                                         "        return 3\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "missing return statement");
+    EXPECT_EQ(error.line, 1);
+}
+
+// A7: the clause reads ORELSE only. A `for` BODY may run zero times, so a
+// returning body with no else is still a missing return.
+TEST(TypeChecker, AReturningForBodyWithNoElseIsStillAMissingReturn) {
+    const Checked checked = check_module("def f(xs: list[int]) -> int:\n"
+                                         "    for x in xs:\n"
+                                         "        return 1\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "missing return statement");
+    EXPECT_EQ(error.line, 1);
+}
+
+// A6: an else that does NOT return keeps the diagnostic. Differs from the
+// A1 clean case only in whether the else returns.
+TEST(TypeChecker, ALoopElseThatDoesNotReturnIsStillAMissingReturn) {
+    const Checked checked = check_module("def f(xs: list[int]) -> int:\n"
+                                         "    for x in xs:\n"
+                                         "        print(x)\n"
+                                         "    else:\n"
+                                         "        print(1)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "missing return statement");
+    EXPECT_EQ(error.line, 1);
+}
+
+// A12/A18/A19: a break inside an if's else arm still belongs to the loop.
+TEST(TypeChecker, ABreakInAnIfElseArmBlocksTheLoopElse) {
+    const Checked checked = check_module("def f(xs: list[int], c: bool) -> int:\n"
+                                         "    for x in xs:\n"
+                                         "        if c:\n"
+                                         "            print(1)\n"
+                                         "        else:\n"
+                                         "            break\n"
+                                         "    else:\n"
+                                         "        return 3\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "missing return statement");
+    EXPECT_EQ(error.line, 1);
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

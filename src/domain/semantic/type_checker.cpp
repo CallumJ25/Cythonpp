@@ -2922,11 +2922,56 @@ bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body
             }
             continue;
         }
+        // Anything else -- Return, ExprStmt, Assign, Continue, ... -- that
+        // always leaves makes everything AFTER it in this suite dead code,
+        // which mypy prunes before ever asking about a break: `for x in xs:
+        // return 1 / break` with a returning `else` is mypy-clean (measured
+        // 2026-09-12), where a plain textual scan would still find that
+        // `break` and wrongly call the `else` skippable. in_function/in_loop
+        // are both true here by construction: this scan only ever runs over
+        // a LOOP BODY, and a loop body inside a function is the only place a
+        // `break` this predicate cares about can legally appear at all.
+        //
+        // Deliberately checked ONLY here, after the Break/If/For/While arms
+        // above have already had their chance to find a nested break: a
+        // bare `break` is itself a statement that "always leaves" (in_loop
+        // is true), and a conditional `if c: break` with no other arm, or
+        // `if c: break else: return 1` with a leaving other arm, must still
+        // report the break as reachable (measured against mypy 1.18.1 --
+        // both keep "missing return statement"). Testing
+        // statement_always_leaves on every statement BEFORE the Break/If
+        // arms, as it may look like it should be ordered, would return early
+        // on the break itself, or skip descending into an If whose arms
+        // both leave, and silently stop finding real, reachable breaks.
+        if (statement_always_leaves(*statement, /*in_function=*/true, /*in_loop=*/true)) {
+            return false;
+        }
         // FunctionDef/ClassDef bodies are new scopes a `break` cannot reach
         // out of at all (and could not legally appear there either), so they
-        // are skipped.
+        // are skipped -- statement_always_leaves already answers false for
+        // both, so the check above never trips on them.
     }
     return false;
+}
+
+// A loop whose body contains no reachable `break` ALWAYS runs its `else`
+// clause -- that is what the `else` means -- so an `else` that always returns
+// makes the whole loop always return. Measured against mypy 1.18.1 on
+// 2026-09-12: `for x in xs: print(x)` / `else: return 3` as the whole body of
+// a `-> int` function is `Success` under mypy and prints `1` then `3` under
+// CPython, while this checker used to report `missing return statement`.
+//
+// Reads ORELSE only, never the body: a `for` body may run zero times, so
+// `for x in xs: return 1` with no `else` IS a genuine missing return
+// (mypy agrees, and there is a test pinning it).
+//
+// contains_reachable_break's own descent rule is exactly right here and is
+// deliberately reused rather than reimplemented: a break in a NESTED loop's
+// body can never escape this loop and must not count (mypy: clean), while one
+// in that nested loop's ORELSE targets this loop and must (mypy: error).
+bool TypeChecker::loop_else_always_returns(const std::vector<ast::StmtPtr>& body,
+                                           const std::vector<ast::StmtPtr>& orelse) {
+    return !orelse.empty() && !contains_reachable_break(body) && always_returns(orelse);
 }
 
 bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
@@ -2946,12 +2991,24 @@ bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
                 !contains_reachable_break(while_stmt->body())) {
                 return true;
             }
+            if (loop_else_always_returns(while_stmt->body(), while_stmt->orelse())) {
+                return true;
+            }
             continue;
         }
-        // A For, or a While with any other condition, is assumed skippable
-        // (false) -- the syntactic approximation the brief settles on. This
-        // can only ever answer false where mypy answers true (a missed
-        // error), never the reverse.
+        if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
+            if (loop_else_always_returns(for_stmt->body(), for_stmt->orelse())) {
+                return true;
+            }
+            continue;
+        }
+        // A For with a returning else (or a While with any non-`True`
+        // condition and a returning else) is now handled above via
+        // loop_else_always_returns. A For/While with NO else, or one whose
+        // else does not return, is assumed skippable (false) -- the
+        // syntactic approximation the brief settles on. This can only ever
+        // answer false where mypy answers true (a missed error), never the
+        // reverse.
     }
     return false;
 }

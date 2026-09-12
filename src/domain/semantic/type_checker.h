@@ -97,8 +97,9 @@ namespace cythonpp::domain::semantic {
 // is always assumed skippable (false).
 //
 // This is a syntactic approximation of mypy's real reachability analysis, and
-// it does NOT err in only one direction. Both are reachable, verified against
-// mypy 1.18.1:
+// it does NOT err in only one direction. All three of the following were
+// reachable, verified against mypy 1.18.1 -- the third is now fixed, the
+// first two remain:
 //   - mypy reports "missing return statement"; we do not: `while True: / for
 //     x in xs: pass / else: break` with no return after it. A loop's else
 //     runs outside that loop's own break scope, so mypy sees the `break`
@@ -106,31 +107,56 @@ namespace cythonpp::domain::semantic {
 //     checker once did not look inside a nested loop's orelse at all, so it
 //     stayed silent.
 //   - we report "missing return statement"; mypy does not: `while True: / if
-//     False: / break / return 1`. mypy prunes the `if False:` block as
-//     unreachable and never counts that break, so it judges the loop
-//     non-terminating and accepts the function. This checker has no
-//     reachability analysis -- contains_reachable_break finds the `break`
-//     textually regardless of the `if False:` guard around it -- so it judges
-//     the `while True` skippable and reports a spurious "missing return
-//     statement" mypy would not.
-//   - A THIRD failure mode, measured 2026-09-10 and in the same (false
-//     TypeError) direction as the one above, but NOT requiring dead code:
-//     `for i in range(3): / total = total + i / else: / return total` as the
-//     whole body of a `-> int` function draws `TypeError: missing return
-//     statement` from this checker while `mypy --strict` says `Success: no
-//     issues found in 1 source file`, and CPython runs it (identically for
-//     the `while cond ... else: return` form). A loop whose body has no
-//     reachable `break` ALWAYS runs its `else`, so that `else`'s return is
-//     guaranteed -- which is exactly the clause always_leaves_branch already
-//     carries and this predicate does not. Adding it here would be a narrow,
-//     safe widening; it is untouched only because it fell outside the round
-//     that measured it. It is a real union-rule violation (both oracles
-//     accept the program), not merely an imprecision.
+//     False: / break` with no return after the loop. mypy prunes the
+//     `if False:` block as unreachable and never counts that break, so it
+//     judges the loop non-terminating and accepts the function. This checker
+//     has no reachability analysis -- contains_reachable_break finds the
+//     `break` textually regardless of the `if False:` guard around it -- so
+//     it judges the `while True` skippable and reports a spurious "missing
+//     return statement" mypy would not. STILL OPEN; this is the one
+//     remaining known gap in this predicate. Re-measured 2026-09-12 with no
+//     trailing statement after the loop (the discriminating shape -- a
+//     trailing `return 1` after the loop would be clean either way,
+//     regardless of whether the break folds, so it proves nothing): mypy's
+//     prune set for THIS reachability judgement is `{False, 0, None}` --
+//     `if False:`, `if 0:` and `if None:` guarding the `break` are all
+//     `Success`, matching the redefinition-allowance prune set documented
+//     elsewhere in this codebase (see CLAUDE.md's conditional-def entry) --
+//     and it EXCLUDES `""`: `if "":` guarding the same `break` still reports
+//     `Missing return statement`. So mirroring the existing
+//     `is_literal_true` helper into an `is_literal_false` one -- which is
+//     what the obvious fix looks like -- would SILENCE A REAL ERROR for the
+//     `""` case exactly as it would for the redefinition check. Closing this
+//     needs a constant-folding evaluator matched to mypy's actual prune set,
+//     not a blanket falsy check, and building one is out of scope for this
+//     task.
+//   - A THIRD failure mode, previously open and NOW FIXED (loop_else_always_
+//     returns, added 2026-09-12): `for i in range(3): / total = total + i /
+//     else: / return total` as the whole body of a `-> int` function used to
+//     draw `TypeError: missing return statement` from this checker while
+//     `mypy --strict` said `Success: no issues found in 1 source file`, and
+//     CPython ran it (identically for the `while cond ... else: return`
+//     form) -- a real union-rule violation, not merely an imprecision, and
+//     the one of these three that needed NO dead code at all to trigger. A
+//     loop whose body has no reachable `break` ALWAYS runs its `else`, so
+//     that `else`'s return is guaranteed -- always_returns' For/While arms
+//     now check exactly that via loop_else_always_returns (see its own
+//     comment for the measurement), reusing contains_reachable_break's
+//     existing body-vs-orelse descent rule rather than reimplementing it.
+//     contains_reachable_break itself also grew a reachability check of its
+//     own in the same round: a `break` sitting after a statement that always
+//     leaves (e.g. `return 1` / `break` in the same suite) is dead code mypy
+//     prunes before ever asking about it, so the scan now stops at the first
+//     statement that always leaves, checked AFTER the Break/If/For/While
+//     arms above rather than before them -- checking it first would return
+//     early on a bare `break` itself (in_loop makes a Break "always leave"
+//     too) and on an If whose arms both leave, silently missing a real,
+//     reachable break in either case.
 // This ships anyway because building real reachability analysis (constant
 // folding, unreachable-code pruning) is out of scope for this task -- the
 // syntactic rule catches the overwhelmingly common shapes correctly and the
-// first two known failure modes require an artificial exercise in dead code
-// to trigger.
+// one remaining known failure mode requires an artificial exercise in dead
+// code to trigger.
 //
 // Checked once per FunctionDef, at the very end of its body walk, ONLY when
 // the function has a return annotation that is neither None nor Unknown --
@@ -1025,6 +1051,12 @@ private:
     // non-generic type needing no annotation, unlike a bare call to
     // `tuple()`, which mypy leaves just as unannotated as `[]`.
     static bool is_bare_empty_container(const ast::Expr& value);
+
+    // The loop-`else` half of always_returns, factored out because BOTH the
+    // For arm and the While arm need it and a second copy could drift. See
+    // the definition for the measurement. static, matching its two callers.
+    static bool loop_else_always_returns(const std::vector<ast::StmtPtr>& body,
+                                         const std::vector<ast::StmtPtr>& orelse);
 
     // Task 20's return-path check. Purely syntactic -- it touches no member,
     // no scope, no ClassTable, nothing but the AST shape -- so it can be (and
