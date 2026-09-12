@@ -3081,7 +3081,24 @@ bool TypeChecker::statement_always_leaves(const ast::Stmt& statement, bool in_fu
         // An `if` with no `else` can always fall through, so it never
         // counts -- that is what makes a `break` guarded by a nested `if`
         // CONDITIONAL, and a conditional terminator must still contribute
-        // its edge.
+        // its edge. The `!if_stmt->orelse().empty() &&` conjunct below is
+        // DEFENSIVE, not load-bearing, despite an earlier version of this
+        // comment implying otherwise: an empty orelse already makes the
+        // trailing `always_leaves_branch(if_stmt->orelse(), ...)` fold over
+        // zero statements and return false on its own, so the whole
+        // expression is false either way -- deleting the emptiness conjunct
+        // changes no test's outcome (verified 2026-09-12: 0 of 1393 tests
+        // fail with it removed). It stays for readability: stating the
+        // no-else case explicitly is easier to read than deriving it from
+        // an empty fold. What IS load-bearing is the AND between the two
+        // always_leaves_branch calls -- BOTH arms must leave for the `if`
+        // itself to count, since one arm leaving and the other falling
+        // through is exactly the conditional-terminator case the comment
+        // above describes. Verified 2026-09-12: changing that first `&&` to
+        // `||` (`!if_stmt->orelse().empty() || always_leaves_branch(body,
+        // ...) && always_leaves_branch(orelse, ...)`, which is
+        // `!empty() || (leaves(body) && leaves(orelse))` by precedence)
+        // fails 3 of 1393 tests.
         return !if_stmt->orelse().empty() &&
                always_leaves_branch(if_stmt->body(), in_function, in_loop) &&
                always_leaves_branch(if_stmt->orelse(), in_function, in_loop);

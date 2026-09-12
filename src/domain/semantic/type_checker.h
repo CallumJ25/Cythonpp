@@ -97,31 +97,40 @@ namespace cythonpp::domain::semantic {
 // is always assumed skippable (false).
 //
 // This is a syntactic approximation of mypy's real reachability analysis, and
-// it does NOT err in only one direction. All FOUR of the following were
-// reachable, verified against mypy 1.18.1 -- the third and fourth are now
-// fixed, the first two remain (the fourth was a defect in the very fix for
-// the third, caught by adversarial review of that same commit the same day
-// -- it is its own bullet rather than folded silently into the third's text,
-// because an earlier version of this comment claimed "the one remaining
-// known gap" the moment the third was fixed, while the fourth was ALSO still
-// open at that point; state the count the review actually found, not the
-// count assumed while writing the fix):
-//   - mypy reports "missing return statement"; we do not: `while True: / for
-//     x in xs: pass / else: break` with no return after it. A loop's else
-//     runs outside that loop's own break scope, so mypy sees the `break`
-//     escape the `while True` and demands a return. This
-//     checker once did not look inside a nested loop's orelse at all, so it
-//     stayed silent.
-//   - we report "missing return statement"; mypy does not: `while True: / if
-//     False: / break` with no return after the loop. mypy prunes the
-//     `if False:` block as unreachable and never counts that break, so it
-//     judges the loop non-terminating and accepts the function. This checker
-//     has no reachability analysis -- contains_reachable_break finds the
-//     `break` textually regardless of the `if False:` guard around it -- so
-//     it judges the `while True` skippable and reports a spurious "missing
-//     return statement" mypy would not. STILL OPEN as of this round -- see
-//     the intro sentence above for why this comment no longer calls it "the
-//     one remaining" gap on its own. Re-measured 2026-09-12 with no
+// it does NOT err in only one direction. FIVE failure modes have been
+// measured against mypy 1.18.1 so far. THREE are FIXED: the first (already
+// fixed before this task touched this file), the third and the fourth (both
+// fixed by this task, the fourth being a defect in the very fix for the
+// third, caught by adversarial review of that same commit the same day).
+// TWO remain OPEN, and they are DISTINCT gaps needing DIFFERENT machinery to
+// close -- see the second and fifth bullets below for what each needs. A
+// PRIOR version of this intro said "the third and fourth are now fixed, the
+// first two remain", which was wrong the moment it was written: the first
+// was never open in the first place (it is a historical entry, not a live
+// gap), so lumping it in with the still-open second overcounted the open set
+// by one. State the fixed/open split the measurements actually show, not a
+// single "N remain" tally that the next round has to re-derive from scratch:
+//   - FIXED (already, before this task -- a historical entry kept for the
+//     record, not a live gap): mypy reports "missing return statement"; we
+//     did not: `while True: / for x in xs: pass / else: break` with no
+//     return after it. A loop's else runs outside that loop's own break
+//     scope, so mypy sees the `break` escape the `while True` and demands a
+//     return. This checker once did not look inside a nested loop's orelse
+//     at all, so it stayed silent. Re-verified 2026-09-12 against the
+//     current binary: cythonpp and mypy now AGREE (both report "missing
+//     return statement" on this exact shape), confirming the fix already
+//     held and was not itself touched by this task.
+//   - STILL OPEN: we report "missing return statement"; mypy does not:
+//     `while True: / if False: / break` with no return after the loop. mypy
+//     prunes the `if False:` block as unreachable and never counts that
+//     break, so it judges the loop non-terminating and accepts the function.
+//     This checker has no reachability analysis -- contains_reachable_break
+//     finds the `break` textually regardless of the `if False:` guard around
+//     it -- so it judges the `while True` skippable and reports a spurious
+//     "missing return statement" mypy would not. Needs a CONSTANT-FOLDING
+//     evaluator matched to mypy's actual prune set (see below); the fifth
+//     bullet's gap needs different machinery entirely and the two must not
+//     be folded together. Re-measured 2026-09-12 with no
 //     trailing statement after the loop (the discriminating shape -- a
 //     trailing `return 1` after the loop would be clean either way,
 //     regardless of whether the break folds, so it proves nothing): mypy's
@@ -185,11 +194,35 @@ namespace cythonpp::domain::semantic {
 //     suppressed a real diagnostic after `while True: return / break` at
 //     module scope -- see contains_reachable_break's own comment for both
 //     measurements.
+//   - A FIFTH failure mode, found by later adversarial review, STILL OPEN,
+//     and a DISTINCT gap from the second bullet's constant-folding one --
+//     do not fold the two together or describe this as an instance of that
+//     one. Measured 2026-09-12: `def f(c: bool) -> int: / while c: / if c: /
+//     return 1 / break / else: / return 3` (called as `f(True)` then
+//     `f(False)`) draws a false "missing return statement" here, while
+//     `mypy --strict` is `Success: no issues found` and CPython prints `1`
+//     then `3` at exit 0 -- both oracles accept AND run it, needing no dead
+//     code to trigger. The mechanism is mypy's BINDER NARROWING, not
+//     constant folding: `while c:` narrows `c` to truthy for the duration of
+//     the loop body, so `if c:` inside that body is always true, so the
+//     `break` after it is unreachable and the loop's `else` is guaranteed --
+//     none of which `contains_reachable_break` can see, since it is purely
+//     syntactic and has no notion of a condition variable's narrowed state.
+//     See CLAUDE.md's "Semantic analysis traps worth knowing" for the full
+//     write-up (a second, independently re-measured variant beyond the one
+//     above; a reported count of five was NOT independently confirmed at
+//     that count, see CLAUDE.md for the honest tally) and why it is
+//     deliberately parked rather than fixed: closing it needs narrowing-
+//     aware break reachability, and the same over-/under-aggressive hazard
+//     applies as for constant folding above.
 // This ships anyway because building real reachability analysis (constant
-// folding, unreachable-code pruning) is out of scope for this task -- the
-// syntactic rule catches the overwhelmingly common shapes correctly and the
-// second bullet above is the only failure mode still open, requiring an
-// artificial exercise in dead code to trigger.
+// folding, binder-narrowing-aware reachability) is out of scope for this
+// task -- the syntactic rule catches the overwhelmingly common shapes
+// correctly, and exactly two failure modes remain open: the second bullet's
+// constant-folding gap, and the fifth bullet's narrowing gap. Each needs
+// different machinery to close; neither needs an artificial exercise in
+// dead code -- the fifth needs none at all, and the second only because
+// `if False:`/`if 0:`/`if None:` ARE themselves the dead code in question.
 //
 // Checked once per FunctionDef, at the very end of its body walk, ONLY when
 // the function has a return annotation that is neither None nor Unknown --
@@ -1125,6 +1158,17 @@ private:
     // as a blocking error). `in_loop` is NOT threaded the same way: this
     // scan only ever runs over a loop's own body, so `true` stays correct by
     // construction everywhere it is called from.
+    //
+    // MUTUALLY RECURSIVE with statement_always_leaves, an edge this comment
+    // did not mention before it existed: this function calls
+    // statement_always_leaves on its own trailing "does this statement
+    // always leave" check, and statement_always_leaves's While/For arms call
+    // back into this function on that loop's OWN body. Termination is still
+    // guaranteed -- every call in the cycle descends into a STRUCTURALLY
+    // SMALLER, NESTED statement list (a nested loop's or `if`'s own body/
+    // orelse, never the same list twice), so the recursion is bounded by the
+    // AST's finite depth, the same way any tree-shaped mutual recursion
+    // terminates.
     static bool contains_reachable_break(const std::vector<ast::StmtPtr>& body, bool in_function);
 
     // "Does control ALWAYS leave this branch rather than falling through to
@@ -1215,6 +1259,12 @@ private:
     // `x: int = 0 / while True: / x = x + 1 / y: int = "s"` involves no
     // terminator, mypy is CLEAN on it, and 2997f6f reported a false
     // TypeError there that this change removes.
+    //
+    // MUTUALLY RECURSIVE with contains_reachable_break (see that function's
+    // own comment for the termination argument): this function's While/For
+    // arms call contains_reachable_break on that loop's own body, and
+    // contains_reachable_break's trailing "does this statement always leave"
+    // check calls back into this function.
     static bool statement_always_leaves(const ast::Stmt& statement, bool in_function = true,
                                         bool in_loop = true);
 
