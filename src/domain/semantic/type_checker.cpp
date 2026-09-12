@@ -1124,11 +1124,15 @@ void TypeChecker::assign_subscript(const ast::Subscript& target, const ast::Expr
 
 std::optional<Type> TypeChecker::self_attribute_receiver_type(const ast::Attribute& target) const {
     const auto* receiver = dynamic_cast<const ast::Name*>(&target.value());
-    if (receiver == nullptr || receiver->identifier() != "self" ||
-        current_class_qualified_name_.empty()) {
+    if (receiver == nullptr || current_class_qualified_name_.empty()) {
         return std::nullopt;
     }
-    const Resolution self_resolution = scopes_.resolve("self");
+    // Resolved by the receiver's OWN spelling, not the literal "self": mypy
+    // keys on which BINDING the receiver resolves to, and a method's first
+    // parameter may be named anything. Measured 2026-09-12 --
+    // `def m(this) -> None: this.q = 1` with a reader above is mypy Success
+    // and CPython prints 1, where keying on "self" reported twice.
+    const Resolution self_resolution = scopes_.resolve(receiver->identifier());
     if (self_resolution.binding == nullptr ||
         self_resolution.binding->type.kind != TypeKind::Class ||
         self_resolution.binding->type.name != current_class_qualified_name_) {
@@ -1144,9 +1148,14 @@ std::optional<Type> TypeChecker::self_attribute_receiver_type(const ast::Attribu
     // method's self through any number of capturing closures (see
     // Binding::method_self for both measurements).
     //
-    // collect_self_attribute_placeholders needs no matching edit: it never
-    // recurses into a nested def, so the only `self` its structural scan can
-    // see is already an enclosing method's own first parameter.
+    // collect_self_attribute_placeholders now DOES descend into a nested def
+    // (Task 2, 2026-09-12), matching this real walk: a reader ABOVE a closure
+    // that captures the method's own receiver must see the attribute the
+    // closure declares, exactly as method_self lets the real walk attribute
+    // the store through any number of scopes. The pre-pass stops descending
+    // only at a def that REBINDS the receiver name (a real shadow) or at a
+    // nested class (a different `self` entirely) -- see
+    // collect_self_attribute_placeholders' own comment.
     if (!self_resolution.binding->method_self) {
         return std::nullopt;
     }
@@ -2373,7 +2382,9 @@ void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
             const Type signature = resolve_method_signature(*function_def, qualified_name);
             class_method_signatures_.emplace(function_def, signature);
             classes_.declare_method(qualified_name, function_def->name(), signature);
-            collect_self_attribute_placeholders(qualified_name, function_def->body());
+            collect_self_attribute_placeholders(qualified_name,
+                                                function_def->params().front().name,
+                                                function_def->body());
         } else if (const auto* assign = dynamic_cast<const ast::Assign*>(&statement)) {
             if (const auto* target_name = dynamic_cast<const ast::Name*>(&assign->target())) {
                 // A plain class-body Assign
@@ -2428,6 +2439,7 @@ Type TypeChecker::resolve_method_signature(const ast::FunctionDef& method,
 }
 
 void TypeChecker::declare_self_attribute_placeholder(const std::string& qualified_name,
+                                                     const std::string& receiver_name,
                                                      const ast::Expr& target, int line,
                                                      const ast::AnnAssign* annotated_statement) {
     const auto* attribute = dynamic_cast<const ast::Attribute*>(&target);
@@ -2435,7 +2447,7 @@ void TypeChecker::declare_self_attribute_placeholder(const std::string& qualifie
         return;
     }
     const auto* receiver = dynamic_cast<const ast::Name*>(&attribute->value());
-    if (receiver == nullptr || receiver->identifier() != "self") {
+    if (receiver == nullptr || receiver->identifier() != receiver_name) {
         return;
     }
     if (classes_.method_type(qualified_name, attribute->attribute()).has_value()) {
@@ -2471,10 +2483,11 @@ void TypeChecker::declare_self_attribute_placeholder(const std::string& qualifie
 }
 
 void TypeChecker::collect_self_attribute_placeholders(const std::string& qualified_name,
+                                                       const std::string& receiver_name,
                                                        const std::vector<ast::StmtPtr>& body) {
     for (const ast::StmtPtr& statement : body) {
         if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
-            declare_self_attribute_placeholder(qualified_name, assign->target(),
+            declare_self_attribute_placeholder(qualified_name, receiver_name, assign->target(),
                                                assign->span().start_line,
                                                /*annotated_statement=*/nullptr);
         } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
@@ -2497,22 +2510,49 @@ void TypeChecker::collect_self_attribute_placeholders(const std::string& qualifi
             // placeholder's LINE is still this statement's own, so
             // self_member_state's disambiguation is untouched. Passing the
             // node (rather than a bool) is what carries both halves.
-            declare_self_attribute_placeholder(qualified_name, ann_assign->target(),
+            declare_self_attribute_placeholder(qualified_name, receiver_name, ann_assign->target(),
                                                ann_assign->span().start_line,
                                                /*annotated_statement=*/ann_assign);
         } else if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
-            collect_self_attribute_placeholders(qualified_name, if_stmt->body());
-            collect_self_attribute_placeholders(qualified_name, if_stmt->orelse());
+            collect_self_attribute_placeholders(qualified_name, receiver_name, if_stmt->body());
+            collect_self_attribute_placeholders(qualified_name, receiver_name, if_stmt->orelse());
         } else if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
-            collect_self_attribute_placeholders(qualified_name, while_stmt->body());
-            collect_self_attribute_placeholders(qualified_name, while_stmt->orelse());
+            collect_self_attribute_placeholders(qualified_name, receiver_name, while_stmt->body());
+            collect_self_attribute_placeholders(qualified_name, receiver_name, while_stmt->orelse());
         } else if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
-            collect_self_attribute_placeholders(qualified_name, for_stmt->body());
-            collect_self_attribute_placeholders(qualified_name, for_stmt->orelse());
+            collect_self_attribute_placeholders(qualified_name, receiver_name, for_stmt->body());
+            collect_self_attribute_placeholders(qualified_name, receiver_name, for_stmt->orelse());
+        } else if (const auto* nested_def =
+                       dynamic_cast<const ast::FunctionDef*>(statement.get())) {
+            // A closure CAPTURES the enclosing method's first parameter, and
+            // mypy attributes a store through it to the method's own binding
+            // at ANY nesting depth -- measured 2026-09-12: a reader ABOVE a
+            // closure that assigns `self.q` is mypy Success and CPython
+            // prints 1, where this scan's refusal to descend left the
+            // attribute undeclared until Phase 3's walk reached it, i.e.
+            // AFTER the reader.
+            //
+            // Unless the nested def REBINDS the name, in which case the
+            // store is not the method's. The shadowing parameter's
+            // ANNOTATION is irrelevant: `def inner(self: Bag)` inside a Bag
+            // method is still not a declaration, and mypy reports at both
+            // the store and the read. So the test is rebinding alone.
+            bool shadows = false;
+            for (const ast::Parameter& param : nested_def->params()) {
+                if (param.name == receiver_name) {
+                    shadows = true;
+                    break;
+                }
+            }
+            if (!shadows) {
+                collect_self_attribute_placeholders(qualified_name, receiver_name,
+                                                    nested_def->body());
+            }
         }
-        // A nested FunctionDef/ClassDef is a new scope -- 'self' there may be
-        // shadowed or simply absent -- so it is out of this scan's reach,
-        // matching pre_bind_function_body's own scope boundary.
+        // A nested ClassDef is still out of reach, and deliberately: its
+        // methods' first parameter is the INNER class's, so a store there
+        // declares onto that class, not this one. Both oracles reject a
+        // program that assumes otherwise.
     }
 }
 

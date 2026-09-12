@@ -1382,6 +1382,213 @@ TEST(TypeChecker, AnAnnotatedAttributeOnANonSelfReceiverDeclaresNothing) {
     EXPECT_EQ(error.line, 6) << "the READ reports; the annotated store itself stays silent";
 }
 
+// Defect 4. A method's first parameter need not be spelled `self` -- mypy
+// keys on which BINDING the receiver resolves to, not the literal name.
+// Measured 2026-09-12: mypy --strict is Success and CPython prints 1, while
+// this checker reported TWO errors (one for the store, one for the read).
+TEST(TypeChecker, AMethodsFirstParameterNeedNotBeNamedSelf) {
+    expect_clean("class Bag:\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.q\n"
+                 "\n"
+                 "    def m(this) -> None:\n"
+                 "        this.q = 1\n");
+}
+
+// Defect 2, B1: the reader sits ABOVE the closure that declares. This is the
+// direction that was broken; the sibling case (reader BELOW, see
+// AClosureCapturingAMethodsSelfStillDeclaresOntoItsClass above) was already
+// clean, which is why it survived the tests written for the closure case.
+TEST(TypeChecker, AClosureAssignedAttributeIsVisibleToAReaderAbove) {
+    expect_clean("class Bag:\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.q\n"
+                 "\n"
+                 "    def m(self) -> None:\n"
+                 "        def inner() -> None:\n"
+                 "            self.q = 1\n"
+                 "        inner()\n");
+}
+
+// B3: depth is irrelevant -- mypy attributes the store through ANY number of
+// capturing closures, and so must the pre-pass that makes a reader above see
+// it.
+TEST(TypeChecker, AnAttributeAssignedTwoClosuresDeepIsStillDeclared) {
+    expect_clean("class Bag:\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.q\n"
+                 "\n"
+                 "    def m(self) -> None:\n"
+                 "        def mid() -> None:\n"
+                 "            def inner() -> None:\n"
+                 "                self.q = 1\n"
+                 "            inner()\n"
+                 "        mid()\n");
+}
+
+// B6: the ANNOTATED form through a closure. The guard has a second call site
+// in visit(AnnAssign), so a fix applied to only one site passes a test set
+// that exercises only the other.
+TEST(TypeChecker, AnAnnotatedClosureAssignedAttributeIsDeclared) {
+    expect_clean("class Bag:\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.q\n"
+                 "\n"
+                 "    def m(self) -> None:\n"
+                 "        def inner() -> None:\n"
+                 "            self.q: int = 1\n"
+                 "        inner()\n");
+}
+
+// B17: control-flow nesting around the closure is irrelevant.
+TEST(TypeChecker, AClosureInsideAForStillDeclares) {
+    expect_clean("class Bag:\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.q\n"
+                 "\n"
+                 "    def m(self, xs: list[int]) -> None:\n"
+                 "        for x in xs:\n"
+                 "            def inner() -> None:\n"
+                 "                self.q = 1\n"
+                 "            inner()\n");
+}
+
+// B10 combined with the closure: the captured name is `this`, not `self`.
+TEST(TypeChecker, AClosureCapturingANonSelfNamedReceiverDeclares) {
+    expect_clean("class Bag:\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.q\n"
+                 "\n"
+                 "    def m(this) -> None:\n"
+                 "        def inner() -> None:\n"
+                 "            this.q = 1\n"
+                 "        inner()\n");
+}
+
+// Controls that must keep reporting. Each differs from the clean shapes above
+// in exactly one dimension.
+
+// B4: the nested def REBINDS the name, so the store is not the method's.
+// Differs from AClosureAssignedAttributeIsVisibleToAReaderAbove ONLY in
+// whether `inner` takes a parameter named `self`.
+//
+// Measured against the built binary 2026-09-12: this is NOT a plain
+// attr-defined TypeError as originally assumed. The shadowing parameter is
+// typed `int` (a builtin, not this class), so `self.q = 1` there falls
+// through to the ordinary (non-self) attribute-assignment path, which
+// reports the builtin-member NotImplementedError instead:
+//   probe.py:4:13: error: NotImplementedError: methods on builtin types are
+//   not supported
+TEST(TypeChecker, ANestedDefShadowingSelfDoesNotDeclareOntoTheClass) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner(self: int) -> None:\n"
+                                         "            self.q = 1\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "methods on builtin types are not supported");
+    EXPECT_EQ(error.line, 4);
+}
+
+// B5: THE ANNOTATION IS IRRELEVANT. Shadowing blocks declaration even when
+// the shadowing parameter is annotated as the enclosing class ITSELF. This
+// control differs from B4 only in that annotation, which is precisely the
+// dimension a wrong guard would key on.
+//
+// Measured against the built binary 2026-09-12: this shape draws TWO
+// diagnostics, not one -- the read() above (never declared, since the
+// shadowed `self` never binds "q" onto Bag) AND the store itself (which,
+// unlike B4, resolves to Class("Bag") so it takes the ordinary self-shaped
+// attribute path and reports attr-defined rather than the builtin-member
+// error). only_error() would fail here for the wrong reason, so both are
+// pinned instead, matching the existing
+// ANestedDefsSelfDoesNotDeclareOntoTheEnclosingClass regression test's shape.
+TEST(TypeChecker, ANestedDefShadowingSelfAsTheClassStillDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner(self: Bag) -> None:\n"
+                                         "            self.q = 1\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].line, 7) << "the store, inside the shadowing nested def";
+}
+
+// B7: a nested CLASS's `self` is the inner class's, not Bag's. Both oracles
+// reject this program.
+//
+// Measured: only ONE diagnostic. `self.q = 1` inside Inner.go declares "q" on
+// Inner (go's own `self` is a real method_self binding, just for the wrong
+// class), so only the read() above -- which asks about Bag -- ever reports.
+TEST(TypeChecker, ANestedClassMethodDoesNotDeclareOntoTheOuterClass) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "\n"
+                                         "    def m(self) -> None:\n"
+                                         "        class Inner:\n"
+                                         "            def go(self) -> None:\n"
+                                         "                self.q = 1\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(error.line, 3);
+}
+
+// B8: attribution is via the BINDING, not the receiver's static type -- a
+// differently-named parameter annotated as Bag does not declare.
+//
+// Measured: TWO diagnostics, the same shape as B5 -- the read() above and the
+// store through `other`, which types as Bag but is not a method_self binding.
+TEST(TypeChecker, AClosureAssigningThroughANonSelfParameterDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner(other: Bag) -> None:\n"
+                                         "            other.q = 1\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].line, 7) << "the store, through the non-self parameter";
+}
+
+// B15: paths are compared SYNTACTICALLY, so an alias does not follow. Same
+// rule NarrowingMap documents, and for the same reason.
+//
+// Measured: TWO diagnostics, the same shape as B5/B8.
+TEST(TypeChecker, AnAliasOfSelfDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "\n"
+                                         "    def m(self) -> None:\n"
+                                         "        alias = self\n"
+                                         "        alias.q = 1\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].line, 7) << "the store, through the alias";
+}
+
 // Reproduced against the built binary
 // before this fix: `class D: x = 5` then `d.x` reported a false "D has no
 // attribute x" -- only the AnnAssign path ever called declare_member; a bare

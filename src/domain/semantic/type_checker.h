@@ -382,14 +382,17 @@ private:
     // body's own nested classes are reached by declare_class_recursive
     // instead, which calls back into this function per class body.
     //
-    // collect_self_attribute_placeholders has the SAME boundary (it recurses
-    // If/While/For, never a nested ClassDef/FunctionDef, for the analogous
-    // reason that `self` there may be shadowed or simply absent) and so
-    // could be re-expressed in terms of this walk -- a simplification worth
-    // naming, though not one taken here, so that a maintainer adding a new
-    // compound statement node knows both walks encode the same rule and must
-    // both change together, rather than believing they differ and updating
-    // only one.
+    // collect_self_attribute_placeholders no longer shares this boundary
+    // (Task 2, 2026-09-12): it still never descends into a nested ClassDef
+    // (that body's own first parameter belongs to a DIFFERENT class), but it
+    // DOES descend into a nested FunctionDef, conditionally -- unless that
+    // def rebinds the receiver name as one of its own parameters. mypy
+    // attributes a `self.x = ...` store through a capturing closure to the
+    // enclosing method's own binding at any depth, so a scan that stopped at
+    // every FunctionDef the way this walk does left the attribute undeclared
+    // until Phase 3's real walk reached it -- i.e. AFTER a reader sitting
+    // above the closure. See collect_self_attribute_placeholders' own
+    // comment for the exact rule.
     //
     // `visitor` is invoked for every statement in `body` and in every nested
     // control-flow block, in source order, INCLUDING the If/While/For
@@ -659,14 +662,15 @@ private:
 
     // The recursive walk
     // pre_collect_class_body runs over EVERY method's own body (If/While/For
-    // recursed into, matching pre_bind_function_body's scope boundary -- a
-    // nested def is NOT recursed into, since 'self' there may be shadowed or
-    // simply absent) looking for `self.x = ...` -- a plain Assign OR an
-    // AnnAssign (`self.x: T = ...`, and the value-less `self.x: T` too)
-    // whose target is an Attribute on a bare Name spelled "self". The
-    // ANNOTATED form IS resolved here, and the resolution is CACHED in
-    // self_annotation_types_ (see there) so visit(AnnAssign) reuses it
-    // instead of resolving a second time; the plain form has no annotation
+    // recursed into, matching pre_bind_function_body's scope boundary)
+    // looking for `receiver_name.x = ...` -- a plain Assign OR an
+    // AnnAssign (`receiver_name.x: T = ...`, and the value-less
+    // `receiver_name.x: T` too) whose target is an Attribute on a bare Name
+    // spelled `receiver_name`, the method's own first parameter (see the call
+    // site: it is always that method's `params().front().name`, whatever it
+    // is spelled). The ANNOTATED form IS resolved here, and the resolution is
+    // CACHED in self_annotation_types_ (see there) so visit(AnnAssign) reuses
+    // it instead of resolving a second time; the plain form has no annotation
     // to resolve and stays Unknown. The FIRST such
     // occurrence for a given attribute name (in this same top-to-bottom scan
     // order) that names neither an existing member NOR an existing method is
@@ -677,14 +681,27 @@ private:
     // rather than mistaking it for either a genuinely new declaration (there
     // is no "genuinely new" left once every attribute is placeholder-declared
     // up front) or a second, real conflicting assignment.
+    //
+    // A nested def IS recursed into (Task 2, 2026-09-12) -- unless it REBINDS
+    // `receiver_name` as one of its own parameters, in which case that
+    // parameter is a different binding and the scan must not descend. mypy
+    // attributes a store through a captured receiver to the enclosing
+    // method's own binding at ANY closure depth (measured: a reader ABOVE
+    // such a closure is mypy `Success` and CPython runs it), so this scan's
+    // refusal to descend used to leave the attribute undeclared until Phase
+    // 3's real walk reached it -- i.e. AFTER a reader sitting above. A nested
+    // ClassDef is still never recursed into: its methods' own first
+    // parameter belongs to the INNER class, so a store there declares onto
+    // that class, not this one.
     void collect_self_attribute_placeholders(const std::string& qualified_name,
+                                             const std::string& receiver_name,
                                              const std::vector<ast::StmtPtr>& body);
 
     // One statement's worth of the scan above, shared by its plain-Assign and
     // its AnnAssign arm so the two forms cannot drift into recognising
     // different sets of targets. A no-op unless `target` is an Attribute on a
-    // bare Name spelled "self" whose attribute name has neither a member nor
-    // a method already.
+    // bare Name spelled exactly `receiver_name` whose attribute name has
+    // neither a member nor a method already.
     //
     // `annotated_statement` is the AnnAssign for the annotated form and
     // nullptr for the plain one -- the node itself rather than a bool,
@@ -705,14 +722,17 @@ private:
     // the annotation expression alone, and every class is already declared.
     // Resolving it TWICE is the hazard, and the cache is what prevents it.
     //
-    // Note this does NOT resolve `self` through ScopeStack the way
+    // Note this does NOT resolve the receiver through ScopeStack the way
     // self_attribute_receiver_type does -- it CANNOT, since no scope is
     // pushed during a pre-pass. Its scope discipline is structural instead:
-    // collect_self_attribute_placeholders never recurses into a nested
-    // def/class, so the only `self` it can see is the enclosing method's own
-    // first parameter. The real walk re-checks the binding properly before
-    // filling any placeholder in, so a shadowed `self` still declares
-    // nothing real.
+    // collect_self_attribute_placeholders recurses into a nested def only
+    // when that def does not rebind `receiver_name`, and never into a nested
+    // class, so the only receiver this scan can see is either the enclosing
+    // method's own first parameter or a closure over it that does not shadow
+    // it. The real walk re-checks the binding properly (via `method_self`)
+    // before filling any placeholder in, so a shadowing parameter still
+    // declares nothing real regardless of what this structural scan alone
+    // could tell.
     //
     // WHICH GUARD, and it depends on whether the form is annotated -- the
     // two forms are not one rule. Measured against mypy 1.18.1:
@@ -739,6 +759,7 @@ private:
     // base's method name is genuinely taken, and nothing measured here says
     // otherwise.
     void declare_self_attribute_placeholder(const std::string& qualified_name,
+                                            const std::string& receiver_name,
                                             const ast::Expr& target, int line,
                                             const ast::AnnAssign* annotated_statement);
 
@@ -962,8 +983,11 @@ private:
     // attribute the first time TypeChecker's own single-pass visitation
     // encounters it for a given name -- checked FIRST, syntactically plus one
     // ScopeStack::resolve (never typed, so this check alone cannot itself
-    // report anything): the receiver is a bare Name spelled "self" AND it
-    // currently resolves to Class(current_class_qualified_name_). Only once
+    // report anything): the receiver is a bare Name -- whatever it is spelled,
+    // not necessarily "self" -- that currently resolves to
+    // Class(current_class_qualified_name_) through its OWN method_self
+    // binding (see self_attribute_receiver_type and Binding::method_self).
+    // Only once
     // ClassTable confirms the member/method does not already exist (from an
     // earlier assignment in THIS class, or inherited from a base) does this
     // take the declare-a-new-member path, inferring the type from the value
@@ -1029,9 +1053,12 @@ private:
     //
     // Purely syntactic plus one ScopeStack::resolve (the receiver is never
     // itself typed here, so this check alone can never report anything): the
-    // receiver must be a bare Name spelled "self" that resolves to a binding
-    // which BOTH has type Class(current_class_qualified_name_) AND is a
-    // method's own first parameter (Binding::method_self).
+    // receiver must be a bare Name -- resolved by ITS OWN spelling, whatever
+    // that is, not the literal "self" (measured 2026-09-12: a method's first
+    // parameter named `this` is mypy `Success` and CPython runs it, where
+    // keying on the spelling "self" reported twice) -- that resolves to a
+    // binding which BOTH has type Class(current_class_qualified_name_) AND is
+    // a method's own first parameter (Binding::method_self).
     //
     // BOTH conditions are load-bearing, and the second was added only after
     // the first alone proved insufficient. The type check stops a
