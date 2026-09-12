@@ -6344,5 +6344,119 @@ TEST(TypeChecker, ABreakInAnIfElseArmBlocksTheLoopElse) {
     EXPECT_EQ(error.line, 1);
 }
 
+// FIX ROUND 1, Finding 1: contains_reachable_break's break scan is reached
+// from statement_always_leaves's While/For arms, which check_suite calls at
+// MODULE and CLASS scope too, not only from a FunctionDef's own body. A
+// `return` at module scope is not legal Python at all (mypy: `"return"
+// outside function [misc]`; CPython: `SyntaxError: 'return' outside
+// function`), so it must not be treated as "always leaves" there. Measured
+// 2026-09-12, second round: hardcoding in_function=true in that scan once
+// made `while True: return / break` at module scope silently swallow the
+// diagnostic for the incompatible assignment that follows it.
+TEST(TypeChecker, AReturnAtModuleScopeDoesNotSuppressALaterAssignmentError) {
+    const Checked checked = check_module("while True:\n"
+                                         "    return\n"
+                                         "    break\n"
+                                         "x: int = \"s\"\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"str\", variable has "
+              "type \"int\")");
+    EXPECT_EQ(error.line, 4);
+}
+
+// FIX ROUND 1, Finding 2, shape 1: an if/else where BOTH arms return still
+// makes the trailing break dead code. mypy: Success. CPython prints 1.
+TEST(TypeChecker, AnIfWhereBothArmsReturnDoesNotBlockTheLoopElse) {
+    expect_clean("def f(xs: list[int], c: bool) -> int:\n"
+                 "    for x in xs:\n"
+                 "        if c:\n"
+                 "            return 1\n"
+                 "        else:\n"
+                 "            return 2\n"
+                 "        break\n"
+                 "    else:\n"
+                 "        return 3\n");
+}
+
+// FIX ROUND 1, Finding 2, shape 2: a nested `while True: pass` with no break
+// of its own never falls through to the trailing break. mypy: Success.
+TEST(TypeChecker, ANestedWhileTrueWithNoBreakDoesNotBlockTheLoopElse) {
+    expect_clean("def f(xs: list[int]) -> int:\n"
+                 "    for x in xs:\n"
+                 "        while True:\n"
+                 "            pass\n"
+                 "        break\n"
+                 "    else:\n"
+                 "        return 3\n");
+}
+
+// FIX ROUND 1, Finding 2, shape 3: a nested `for ... else: return` guarantees
+// its own return before the trailing break can ever run. mypy: Success.
+TEST(TypeChecker, ANestedForElseThatReturnsDoesNotBlockTheOuterLoopElse) {
+    expect_clean("def f(xs: list[int], ys: list[int]) -> int:\n"
+                 "    for x in xs:\n"
+                 "        for y in ys:\n"
+                 "            pass\n"
+                 "        else:\n"
+                 "            return 1\n"
+                 "        break\n"
+                 "    else:\n"
+                 "        return 3\n");
+}
+
+// FIX ROUND 1, Finding 2, shape 4: an if/else where one arm returns and the
+// other continues also always leaves, so the trailing break is dead too.
+// mypy: Success.
+TEST(TypeChecker, AnIfReturningOrContinuingDoesNotBlockTheLoopElse) {
+    expect_clean("def f(xs: list[int], c: bool) -> int:\n"
+                 "    for x in xs:\n"
+                 "        if c:\n"
+                 "            return 1\n"
+                 "        else:\n"
+                 "            continue\n"
+                 "        break\n"
+                 "    else:\n"
+                 "        return 3\n");
+}
+
+// FIX ROUND 1, Finding 2 control: an `if` with NO `else`, even though its one
+// arm returns, does not always leave (an `if` with no `else` can always fall
+// through), so the trailing break IS still reachable and must still report.
+// mypy agrees: `Missing return statement`.
+TEST(TypeChecker, AnIfWithNoElseStillLeavesTheTrailingBreakReachable) {
+    const Checked checked = check_module("def f(xs: list[int], c: bool) -> int:\n"
+                                         "    for x in xs:\n"
+                                         "        if c:\n"
+                                         "            return 1\n"
+                                         "        break\n"
+                                         "    else:\n"
+                                         "        return 3\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "missing return statement");
+    EXPECT_EQ(error.line, 1);
+}
+
+// FIX ROUND 1, Finding 4: every existing reachable-break control used a
+// `for`; this pins the While arm's own break-suppression independently, not
+// just its clean case (AWhileElseThatReturnsIsNotAMissingReturn, above).
+// mypy agrees: `Missing return statement`.
+TEST(TypeChecker, AWhileReachableBreakMakesAReturningLoopElseAMissingReturn) {
+    const Checked checked = check_module("def f(c: bool) -> int:\n"
+                                         "    while c:\n"
+                                         "        break\n"
+                                         "    else:\n"
+                                         "        return 3\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "missing return statement");
+    EXPECT_EQ(error.line, 1);
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

@@ -2884,7 +2884,8 @@ void TypeChecker::visit(const ast::Return& node) {
     }
 }
 
-bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body) {
+bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body,
+                                           bool in_function) {
     for (const ast::StmtPtr& statement : body) {
         if (dynamic_cast<const ast::Break*>(statement.get()) != nullptr) {
             return true;
@@ -2892,64 +2893,90 @@ bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body
         if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
             // An `if` is not a loop, so a break inside one still belongs to
             // THIS enclosing loop -- look through it.
-            if (contains_reachable_break(if_stmt->body()) ||
-                contains_reachable_break(if_stmt->orelse())) {
+            if (contains_reachable_break(if_stmt->body(), in_function) ||
+                contains_reachable_break(if_stmt->orelse(), in_function)) {
                 return true;
             }
-            continue;
-        }
-        // A nested For/While's own BODY is
-        // deliberately not recursed into -- a break there can only ever
-        // escape THAT loop, never this one. But its ORELSE is the opposite
-        // case: a loop's `else` clause runs OUTSIDE the loop's own break
-        // scope (that is precisely why `for x in []: pass` / `else: break`
-        // is a top-level `SyntaxError: 'break' outside loop` -- the `else`
-        // is not inside the loop it is attached to), so a `break` written
-        // there targets the ENCLOSING loop and must count here. The previous
-        // version of this comment claimed a break in ANY nested loop
-        // construct "can only ever escape that inner loop" -- true of the
-        // body, false of the orelse, and this is the fix for that false
-        // claim.
-        if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
-            if (contains_reachable_break(for_stmt->orelse())) {
+        } else if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
+            // A nested For/While's own BODY is
+            // deliberately not recursed into -- a break there can only ever
+            // escape THAT loop, never this one. But its ORELSE is the
+            // opposite case: a loop's `else` clause runs OUTSIDE the loop's
+            // own break scope (that is precisely why `for x in []: pass` /
+            // `else: break` is a top-level `SyntaxError: 'break' outside
+            // loop` -- the `else` is not inside the loop it is attached to),
+            // so a `break` written there targets the ENCLOSING loop and must
+            // count here. The previous version of this comment claimed a
+            // break in ANY nested loop construct "can only ever escape that
+            // inner loop" -- true of the body, false of the orelse, and this
+            // is the fix for that false claim.
+            if (contains_reachable_break(for_stmt->orelse(), in_function)) {
                 return true;
             }
-            continue;
-        }
-        if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
-            if (contains_reachable_break(while_stmt->orelse())) {
+        } else if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
+            if (contains_reachable_break(while_stmt->orelse(), in_function)) {
                 return true;
             }
-            continue;
         }
-        // Anything else -- Return, ExprStmt, Assign, Continue, ... -- that
-        // always leaves makes everything AFTER it in this suite dead code,
-        // which mypy prunes before ever asking about a break: `for x in xs:
-        // return 1 / break` with a returning `else` is mypy-clean (measured
-        // 2026-09-12), where a plain textual scan would still find that
-        // `break` and wrongly call the `else` skippable. in_function/in_loop
-        // are both true here by construction: this scan only ever runs over
-        // a LOOP BODY, and a loop body inside a function is the only place a
-        // `break` this predicate cares about can legally appear at all.
+        // Anything that always leaves -- a Return, a Continue, or a
+        // compound If/For/While whose OWN break-search above just failed
+        // and which itself always leaves (e.g. `if c: return 1 else: return
+        // 2`, or a nested `while True: pass` with no break, or a nested
+        // `for ... else: return 1`) -- makes everything AFTER it in this
+        // suite dead code, which mypy prunes before ever asking about a
+        // break: `for x in xs: return 1 / break` with a returning `else` is
+        // mypy-clean (measured 2026-09-12), where a plain textual scan would
+        // still find that `break` and wrongly call the `else` skippable.
+        // Four compound shapes -- an if/else where BOTH arms return, a
+        // nested `while True: pass`, a nested `for...else: return`, and an
+        // `if c: return 1 else: continue` -- all measured mypy-`Success` and
+        // running correctly under CPython, and ALL FOUR previously still
+        // drew a false "missing return statement" here, because the old
+        // version of this check ran only after the If/For/While arms had
+        // each already unconditionally `continue`d past it: the stop was
+        // dead code for exactly the compound shapes that matter most
+        // (measured 2026-09-12, second round). Restructured as an
+        // if/else-if chain (rather than each arm ending in its own
+        // `continue`) so every statement kind -- compound or not -- falls
+        // through to this ONE check after its own break-search has already
+        // had its chance.
         //
-        // Deliberately checked ONLY here, after the Break/If/For/While arms
-        // above have already had their chance to find a nested break: a
-        // bare `break` is itself a statement that "always leaves" (in_loop
-        // is true), and a conditional `if c: break` with no other arm, or
-        // `if c: break else: return 1` with a leaving other arm, must still
-        // report the break as reachable (measured against mypy 1.18.1 --
-        // both keep "missing return statement"). Testing
-        // statement_always_leaves on every statement BEFORE the Break/If
-        // arms, as it may look like it should be ordered, would return early
-        // on the break itself, or skip descending into an If whose arms
-        // both leave, and silently stop finding real, reachable breaks.
-        if (statement_always_leaves(*statement, /*in_function=*/true, /*in_loop=*/true)) {
+        // Checked ONLY here, after the break-search above: a bare `break` is
+        // itself a statement that "always leaves" (in_loop is true), and a
+        // conditional `if c: break` with no other arm, or `if c: break else:
+        // return 1` with a leaving other arm, must still report the break as
+        // reachable (measured against mypy 1.18.1 -- both keep "missing
+        // return statement"). Testing statement_always_leaves on every
+        // statement BEFORE the Break/If/For/While arms, as it may look like
+        // it should be ordered, would return early on the break itself, or
+        // skip descending into an If whose arms both leave, and silently
+        // stop finding real, reachable breaks.
+        //
+        // `in_function` is a REAL parameter (see the declaration), NOT
+        // hardcoded `true`: this predicate is reached from
+        // statement_always_leaves's own While/For arms, which check_suite
+        // calls at MODULE and CLASS scope too, where a `return` is not
+        // legal Python at all. Hardcoding `true` here once made a `return`
+        // sitting at module scope (itself a blocking error under both
+        // oracles) silently "always leave", suppressing a real diagnostic
+        // after it -- measured 2026-09-12, second round: `while True: return
+        // / break` then `x: int = "s"` at module scope used to report
+        // nothing at all; mypy says `"return" outside function [misc]` and
+        // CPython raises `SyntaxError: 'return' outside function`, so both
+        // oracles reject it and this checker must not silently swallow the
+        // (admittedly different) diagnostic it used to give for the bad
+        // assignment. `in_loop` stays hardcoded `true`, unlike `in_function`:
+        // this scan only ever runs over a loop's own body, so that flag is
+        // correct by construction at every call site, and there is nothing
+        // to thread.
+        //
+        // FunctionDef/ClassDef bodies are new scopes a `break` cannot reach
+        // out of at all (and could not legally appear there either), so
+        // they are skipped here too -- statement_always_leaves already
+        // answers false for both.
+        if (statement_always_leaves(*statement, in_function, /*in_loop=*/true)) {
             return false;
         }
-        // FunctionDef/ClassDef bodies are new scopes a `break` cannot reach
-        // out of at all (and could not legally appear there either), so they
-        // are skipped -- statement_always_leaves already answers false for
-        // both, so the check above never trips on them.
     }
     return false;
 }
@@ -2969,9 +2996,16 @@ bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body
 // deliberately reused rather than reimplemented: a break in a NESTED loop's
 // body can never escape this loop and must not count (mypy: clean), while one
 // in that nested loop's ORELSE targets this loop and must (mypy: error).
+// Passes contains_reachable_break's `in_function` as a hardcoded `true`, not
+// threaded through as a parameter of its own: this helper is called only
+// from always_returns, which is itself only ever invoked on a FunctionDef's
+// own body (see always_returns' own comment) -- so `true` is the ONE correct
+// value here, unlike at contains_reachable_break's OTHER call sites inside
+// statement_always_leaves, which is reached from module/class scope too.
 bool TypeChecker::loop_else_always_returns(const std::vector<ast::StmtPtr>& body,
                                            const std::vector<ast::StmtPtr>& orelse) {
-    return !orelse.empty() && !contains_reachable_break(body) && always_returns(orelse);
+    return !orelse.empty() && !contains_reachable_break(body, /*in_function=*/true) &&
+           always_returns(orelse);
 }
 
 bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
@@ -2987,8 +3021,10 @@ bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
             continue;
         }
         if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
+            // always_returns only ever runs on a FunctionDef's own body (see
+            // its own declaration comment), so in_function=true here too.
             if (is_literal_true(while_stmt->condition()) &&
-                !contains_reachable_break(while_stmt->body())) {
+                !contains_reachable_break(while_stmt->body(), /*in_function=*/true)) {
                 return true;
             }
             if (loop_else_always_returns(while_stmt->body(), while_stmt->orelse())) {
@@ -3052,7 +3088,7 @@ bool TypeChecker::statement_always_leaves(const ast::Stmt& statement, bool in_fu
     }
     if (const auto* while_stmt = dynamic_cast<const ast::While*>(&statement)) {
         if (is_literal_true(while_stmt->condition()) &&
-            !contains_reachable_break(while_stmt->body())) {
+            !contains_reachable_break(while_stmt->body(), in_function)) {
             // Never exits, so it never falls through to the merge either.
             // No terminator is involved, so this arm needs no context check:
             // `while True: pass` is legal wherever a statement is legal.
@@ -3062,12 +3098,18 @@ bool TypeChecker::statement_always_leaves(const ast::Stmt& statement, bool in_fu
         // there targets the ENCLOSING construct -- which is also why the
         // orelse recursion passes THIS suite's context through unchanged
         // rather than in_loop=true; the `else` itself always runs whenever
-        // the body cannot break out.
-        return !contains_reachable_break(while_stmt->body()) &&
+        // the body cannot break out. contains_reachable_break gets THIS
+        // arm's own real `in_function`, not a hardcoded `true`: check_suite
+        // calls statement_always_leaves (and so this arm) at module and
+        // class scope too, where `in_function` is false and a `return`
+        // inside `while_stmt->body()` is not actually "always leaving" --
+        // measured 2026-09-12, second round; see contains_reachable_break's
+        // own comment for the reproduction.
+        return !contains_reachable_break(while_stmt->body(), in_function) &&
                always_leaves_branch(while_stmt->orelse(), in_function, in_loop);
     }
     if (const auto* for_stmt = dynamic_cast<const ast::For*>(&statement)) {
-        return !contains_reachable_break(for_stmt->body()) &&
+        return !contains_reachable_break(for_stmt->body(), in_function) &&
                always_leaves_branch(for_stmt->orelse(), in_function, in_loop);
     }
     // A nested loop's own BODY is never recursed into: a `break` or

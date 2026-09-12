@@ -97,9 +97,15 @@ namespace cythonpp::domain::semantic {
 // is always assumed skippable (false).
 //
 // This is a syntactic approximation of mypy's real reachability analysis, and
-// it does NOT err in only one direction. All three of the following were
-// reachable, verified against mypy 1.18.1 -- the third is now fixed, the
-// first two remain:
+// it does NOT err in only one direction. All FOUR of the following were
+// reachable, verified against mypy 1.18.1 -- the third and fourth are now
+// fixed, the first two remain (the fourth was a defect in the very fix for
+// the third, caught by adversarial review of that same commit the same day
+// -- it is its own bullet rather than folded silently into the third's text,
+// because an earlier version of this comment claimed "the one remaining
+// known gap" the moment the third was fixed, while the fourth was ALSO still
+// open at that point; state the count the review actually found, not the
+// count assumed while writing the fix):
 //   - mypy reports "missing return statement"; we do not: `while True: / for
 //     x in xs: pass / else: break` with no return after it. A loop's else
 //     runs outside that loop's own break scope, so mypy sees the `break`
@@ -113,8 +119,9 @@ namespace cythonpp::domain::semantic {
 //     has no reachability analysis -- contains_reachable_break finds the
 //     `break` textually regardless of the `if False:` guard around it -- so
 //     it judges the `while True` skippable and reports a spurious "missing
-//     return statement" mypy would not. STILL OPEN; this is the one
-//     remaining known gap in this predicate. Re-measured 2026-09-12 with no
+//     return statement" mypy would not. STILL OPEN as of this round -- see
+//     the intro sentence above for why this comment no longer calls it "the
+//     one remaining" gap on its own. Re-measured 2026-09-12 with no
 //     trailing statement after the loop (the discriminating shape -- a
 //     trailing `return 1` after the loop would be clean either way,
 //     regardless of whether the break folds, so it proves nothing): mypy's
@@ -152,11 +159,37 @@ namespace cythonpp::domain::semantic {
 //     early on a bare `break` itself (in_loop makes a Break "always leave"
 //     too) and on an If whose arms both leave, silently missing a real,
 //     reachable break in either case.
+//   - A FOURTH failure mode, found by adversarial review of the very commit
+//     that fixed the third, THE SAME DAY, and now also FIXED: the reachable-
+//     break stop the third bullet just described was placed after the
+//     Break/If/For/While arms textually, but each of those arms still ended
+//     in an unconditional `continue` -- so control never actually REACHED
+//     the stop for any compound statement, only for a bare Return/Continue/
+//     leaf. Four shapes were measured mypy-`Success`, running correctly
+//     under CPython, and still drawing a false "missing return statement"
+//     here: an `if`/`else` where BOTH arms return, a nested `while True:
+//     pass` with no break of its own, a nested `for ... else: return`, and
+//     an `if c: return 1 else: continue` -- each followed by a `break` that
+//     can now never run, exactly the "mypy prunes a dead break, a textual
+//     scan does not" defect the third bullet's fix exists to close, just for
+//     a compound statement instead of a leaf one. Fixed by restructuring the
+//     Break/If/For/While arms into one if/else-if chain so every statement
+//     kind, compound or not, falls through to the SAME trailing
+//     statement_always_leaves check after its own break-search has already
+//     had its chance -- not by adding a second, duplicated check inside each
+//     arm. The same round also threaded contains_reachable_break's
+//     `in_function` as a REAL parameter instead of a hardcoded `true`: that
+//     stop is reached from statement_always_leaves's While/For arms, which
+//     check_suite calls at MODULE and CLASS scope too, where a `return` is
+//     not legal Python at all, and hardcoding `true` there once silently
+//     suppressed a real diagnostic after `while True: return / break` at
+//     module scope -- see contains_reachable_break's own comment for both
+//     measurements.
 // This ships anyway because building real reachability analysis (constant
 // folding, unreachable-code pruning) is out of scope for this task -- the
 // syntactic rule catches the overwhelmingly common shapes correctly and the
-// one remaining known failure mode requires an artificial exercise in dead
-// code to trigger.
+// second bullet above is the only failure mode still open, requiring an
+// artificial exercise in dead code to trigger.
 //
 // Checked once per FunctionDef, at the very end of its body walk, ONLY when
 // the function has a return annotation that is neither None nor Unknown --
@@ -1078,7 +1111,21 @@ private:
     // break there targets the enclosing loop. Recurses into If's body/orelse
     // unconditionally (an `if` is not a loop at all, so a break inside one
     // always still belongs to the enclosing loop).
-    static bool contains_reachable_break(const std::vector<ast::StmtPtr>& body);
+    //
+    // `in_function` is a REAL parameter, not hardcoded, because this is
+    // reached from two different contexts that disagree: always_returns and
+    // loop_else_always_returns only ever run on a FunctionDef's own body (see
+    // always_returns' own comment), so `true` is correct there, but
+    // statement_always_leaves's While/For arms are reached from
+    // check_suite at MODULE and CLASS scope too, where a `return` is not
+    // legal at all -- see the definition's own comment for the measured
+    // regression this fixes (in_function=true hardcoded here once silently
+    // suppressed a real diagnostic after `while True: return / break` at
+    // module scope, where both mypy and CPython reject the `return` outright
+    // as a blocking error). `in_loop` is NOT threaded the same way: this
+    // scan only ever runs over a loop's own body, so `true` stays correct by
+    // construction everywhere it is called from.
+    static bool contains_reachable_break(const std::vector<ast::StmtPtr>& body, bool in_function);
 
     // "Does control ALWAYS leave this branch rather than falling through to
     // the statement after the enclosing `if`?" -- used ONLY by visit(If)'s
