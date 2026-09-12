@@ -210,6 +210,76 @@ bool same_type_up_to_union_order(const Type& left, const Type& right) {
     return true;
 }
 
+// True if `target` -- an assignment target, so a bare Name or a TupleExpr of
+// them (`a, b = ...`) -- binds `name` anywhere in it. Recurses into a
+// TupleExpr's elements because unpacking assignment can rebind a name just as
+// plainly as a direct one (`self, x = Bag(), 1` rebinds `self` exactly like
+// `self = Bag()` does); a nested TupleExpr (`(self, x), y = ...`) is walked
+// the same way.
+bool target_binds_name(const ast::Expr& target, const std::string& name) {
+    if (const auto* bare_name = dynamic_cast<const ast::Name*>(&target)) {
+        return bare_name->identifier() == name;
+    }
+    if (const auto* tuple = dynamic_cast<const ast::TupleExpr*>(&target)) {
+        for (const ast::ExprPtr& element : tuple->elements()) {
+            if (target_binds_name(*element, name)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// True if `name` is bound by an ordinary assignment, an annotated
+// assignment, or a `for` target ANYWHERE in `body`'s own scope -- Task 2's
+// Finding 1 fix. Python rebinds a name in a function's scope by ANY
+// assignment to it, not just by appearing as a parameter: `def inner():
+// self = Bag(); self.q = 1` makes `self` a local of `inner` exactly as a
+// parameter named `self` would, and mypy correctly refuses to attribute that
+// store to the enclosing method's own receiver. Missing this made the
+// nested-def descent in collect_self_attribute_placeholders placeholder-
+// declare the attribute as Unknown regardless -- silently accepting a
+// program BOTH oracles reject (mypy: two attr-defined errors; CPython:
+// AttributeError at runtime) -- worse than never descending at all.
+//
+// Recurses into If/While/For bodies (not new scopes, matching
+// collect_self_attribute_placeholders' own boundary) but never into a
+// nested FunctionDef or ClassDef: a name assigned inside THOSE is a
+// different scope's own local and does not rebind this one.
+bool receiver_rebound_in_own_scope(const std::string& name, const std::vector<ast::StmtPtr>& body) {
+    for (const ast::StmtPtr& statement : body) {
+        if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
+            if (target_binds_name(assign->target(), name)) {
+                return true;
+            }
+        } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
+            if (target_binds_name(ann_assign->target(), name)) {
+                return true;
+            }
+        } else if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
+            if (target_binds_name(for_stmt->target(), name) ||
+                receiver_rebound_in_own_scope(name, for_stmt->body()) ||
+                receiver_rebound_in_own_scope(name, for_stmt->orelse())) {
+                return true;
+            }
+        } else if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
+            if (receiver_rebound_in_own_scope(name, if_stmt->body()) ||
+                receiver_rebound_in_own_scope(name, if_stmt->orelse())) {
+                return true;
+            }
+        } else if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
+            if (receiver_rebound_in_own_scope(name, while_stmt->body()) ||
+                receiver_rebound_in_own_scope(name, while_stmt->orelse())) {
+                return true;
+            }
+        }
+        // A nested FunctionDef/ClassDef is a different scope -- deliberately
+        // not descended into here, matching every other reason this file
+        // stops at that same boundary.
+    }
+    return false;
+}
+
 } // namespace
 
 TypeChecker::TypeChecker(diagnostics::DiagnosticSink& sink)
@@ -2537,12 +2607,30 @@ void TypeChecker::collect_self_attribute_placeholders(const std::string& qualifi
             // ANNOTATION is irrelevant: `def inner(self: Bag)` inside a Bag
             // method is still not a declaration, and mypy reports at both
             // the store and the read. So the test is rebinding alone.
+            //
+            // Rebinding is not just a PARAMETER, though -- Task 2 Finding 1
+            // (2026-09-12): Python makes a name local to a function scope by
+            // ANY assignment to it there, not only by it appearing as a
+            // parameter. `def inner(): self = Bag(); self.q = 1` rebinds
+            // `self` to a local exactly as a shadowing parameter would, and
+            // mypy refuses to attribute that store to the enclosing method's
+            // receiver (two attr-defined errors) while CPython raises
+            // AttributeError -- checking parameters alone let this scan
+            // descend anyway and placeholder-declare "q" as Unknown, which is
+            // absorbing and so silently accepted a program BOTH oracles
+            // reject. receiver_rebound_in_own_scope covers Assign, AnnAssign
+            // and a `for` target, recursing through If/While/For but never
+            // into a further nested def/class, matching this scan's own
+            // scope boundary.
             bool shadows = false;
             for (const ast::Parameter& param : nested_def->params()) {
                 if (param.name == receiver_name) {
                     shadows = true;
                     break;
                 }
+            }
+            if (!shadows) {
+                shadows = receiver_rebound_in_own_scope(receiver_name, nested_def->body());
             }
             if (!shadows) {
                 collect_self_attribute_placeholders(qualified_name, receiver_name,

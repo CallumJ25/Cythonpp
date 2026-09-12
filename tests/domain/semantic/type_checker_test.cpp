@@ -1472,23 +1472,45 @@ TEST(TypeChecker, AClosureCapturingANonSelfNamedReceiverDeclares) {
 // Differs from AClosureAssignedAttributeIsVisibleToAReaderAbove ONLY in
 // whether `inner` takes a parameter named `self`.
 //
-// Measured against the built binary 2026-09-12: this is NOT a plain
-// attr-defined TypeError as originally assumed. The shadowing parameter is
-// typed `int` (a builtin, not this class), so `self.q = 1` there falls
-// through to the ordinary (non-self) attribute-assignment path, which
-// reports the builtin-member NotImplementedError instead:
-//   probe.py:4:13: error: NotImplementedError: methods on builtin types are
-//   not supported
+// Round 1 fix (Finding 3): the ORIGINAL version of this test (no read()
+// above, `only_error`) did NOT discriminate the shadow guard at all -- it
+// passed identically with `shadows` forced false and with the wrong
+// annotation-keyed guard, because the shadowing parameter is typed `int` (a
+// builtin), so `self.q = 1` there is independently blocked by
+// self_attribute_receiver_type's own TYPE check (int != Bag) regardless of
+// what the pre-pass's shadow decision was. That store-side diagnostic was a
+// red herring for what this test claimed to cover. Adding a `read()` above
+// (the same shape B5 uses) makes the shadow guard observable: if the
+// pre-pass wrongly descends into `inner` anyway, it placeholder-declares "q"
+// as Unknown and the read's diagnostic silently disappears. Verified by
+// temporarily forcing the descent unconditionally: only the store's
+// (guard-independent) NotImplementedError survived, confirming this shape
+// now genuinely exercises the guard.
+//
+// Measured against the built binary 2026-09-12: TWO diagnostics -- the
+// read() above (never declared, since the shadowed `self` never binds "q"
+// onto Bag) and the store itself (typed `int`, so it takes the ordinary,
+// non-self attribute path and reports the builtin-member NotImplementedError
+// rather than attr-defined). mypy reports three errors on this program
+// (`Returning Any`, attr-defined at the read, attr-defined at the store);
+// cythonpp's own wording differs at the store (NotImplementedError, since
+// this compiler does not model builtin-type attribute access at all) but
+// still reports something at both positions -- not silent acceptance.
 TEST(TypeChecker, ANestedDefShadowingSelfDoesNotDeclareOntoTheClass) {
     const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
                                          "    def m(self) -> None:\n"
                                          "        def inner(self: int) -> None:\n"
                                          "            self.q = 1\n");
 
-    const diagnostics::Diagnostic error = only_error(checked);
-    EXPECT_EQ(error.code, "NotImplementedError");
-    EXPECT_EQ(error.message, "methods on builtin types are not supported");
-    EXPECT_EQ(error.line, 4);
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "NotImplementedError");
+    EXPECT_EQ(checked.diagnostics[1].message, "methods on builtin types are not supported");
+    EXPECT_EQ(checked.diagnostics[1].line, 6) << "the store, independent of the shadow guard";
 }
 
 // B5: THE ANNOTATION IS IRRELEVANT. Shadowing blocks declaration even when
@@ -1522,12 +1544,23 @@ TEST(TypeChecker, ANestedDefShadowingSelfAsTheClassStillDoesNotDeclare) {
     EXPECT_EQ(checked.diagnostics[1].line, 7) << "the store, inside the shadowing nested def";
 }
 
-// B7: a nested CLASS's `self` is the inner class's, not Bag's. Both oracles
-// reject this program.
+// B7: a nested CLASS's `self` is the inner class's, not Bag's.
 //
-// Measured: only ONE diagnostic. `self.q = 1` inside Inner.go declares "q" on
-// Inner (go's own `self` is a real method_self binding, just for the wrong
-// class), so only the read() above -- which asks about Bag -- ever reports.
+// Round 1 fix (Finding 4): this comment used to claim "Both oracles reject
+// this program" -- wrong, and the exact "a CPython verdict on a function
+// body is worthless unless the probe CALLS the function" trap CLAUDE.md
+// warns about. This test's source (like every other check_module fixture
+// here) never calls `m()`, so CPython never executes the `class Inner` body
+// at all and has no opinion -- measured, CPython exits 0 on this exact
+// source. Only mypy rejects it (`"Bag" has no attribute "q"` plus
+// `Returning Any`). Driving it (`Bag().m()` then reading) DOES make CPython
+// raise the same AttributeError mypy predicts, but that is a fact about a
+// DIFFERENT, driven program, not this one.
+//
+// Measured: only ONE diagnostic from cythonpp. `self.q = 1` inside Inner.go
+// declares "q" on Inner (go's own `self` is a real method_self binding, just
+// for the wrong class), so only the read() above -- which asks about Bag --
+// ever reports.
 TEST(TypeChecker, ANestedClassMethodDoesNotDeclareOntoTheOuterClass) {
     const Checked checked = check_module("class Bag:\n"
                                          "    def read(self) -> int:\n"
@@ -1587,6 +1620,109 @@ TEST(TypeChecker, AnAliasOfSelfDoesNotDeclare) {
     EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
     EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
     EXPECT_EQ(checked.diagnostics[1].line, 7) << "the store, through the alias";
+}
+
+// Fix round 1, Finding 1 -- a REGRESSION the initial landing introduced.
+// Python makes a name local to a function's scope by ANY assignment to it
+// there, not only by it appearing as a parameter: `def inner(): self =
+// Bag(); self.q = 1` rebinds `self` to a local of `inner` exactly as a
+// shadowing parameter would. Measured 2026-09-12 against mypy 1.18.1 and
+// CPython 3.14: mypy reports attr-defined at BOTH the store and the read
+// (plus a `Returning Any`), and CPython raises `AttributeError: 'Bag' object
+// has no attribute 'q'` -- both oracles reject this program. The parameter-
+// only shadow check let collect_self_attribute_placeholders descend into
+// `inner` anyway and placeholder-declare "q" as Unknown, which is absorbing,
+// so this compiler reported NOTHING AT ALL: silent acceptance of a program
+// both oracles reject, strictly worse than never descending into a closure
+// in the first place.
+TEST(TypeChecker, ARebindingAssignmentInAClosureDoesNotDeclareOntoTheClass) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            self = Bag()\n"
+                                         "            self.q = 1\n"
+                                         "        inner()\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].line, 7) << "the store, after inner() rebinds self";
+}
+
+// The `for`-target variant of the same rebinding: `for self in [1, 2]:`
+// inside the closure makes `self` local to `inner` exactly as `self =
+// Bag()` does. Measured: mypy reports attr-defined at both the store (typed
+// "int", since the loop variable's declared type comes from the iterable)
+// and the read (plus `Returning Any`); CPython raises `AttributeError: 'int'
+// object has no attribute 'q' and no __dict__ for setting new attributes`.
+// Here the store itself was NEVER silent -- assigning an attribute on a
+// builtin-typed receiver already draws its own NotImplementedError,
+// independent of this guard -- but the READ above it used to come back
+// clean, because the pre-pass still wrongly placeholder-declared "q".
+TEST(TypeChecker, ARebindingForTargetInAClosureDoesNotDeclareOntoTheClass) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            for self in [1, 2]:\n"
+                                         "                self.q = 1\n"
+                                         "        inner()\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read() -- this is what Finding 1b covers";
+    EXPECT_EQ(checked.diagnostics[1].code, "NotImplementedError");
+    EXPECT_EQ(checked.diagnostics[1].message, "methods on builtin types are not supported");
+    EXPECT_EQ(checked.diagnostics[1].line, 7) << "the store, through the for-target's int type";
+}
+
+// Fix round 1, Finding 2 -- the commit's headline change (Step 3, resolving
+// the receiver by its own spelling in self_attribute_receiver_type) was
+// pinned by zero tests: every clean test and every control up to this point
+// stays clean/reporting even with Step 3 reverted, because Steps 4-6's
+// pre-pass placeholder alone is enough to avoid a "no attribute" error, and
+// Unknown is absorbing enough that nothing asked what type the attribute
+// actually got. This test asks that question: `read()`'s declared return
+// type is "str", but the attribute was only ever assigned an int, so the
+// REAL type has to have propagated for this to fire. Measured against mypy
+// 1.18.1: `Incompatible return value type (got "int", expected "str")`.
+TEST(TypeChecker, ANonSelfNamedReceiversAttributeKeepsItsRealTypeNotUnknown) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def m(this) -> None:\n"
+                                         "        this.q = 1\n"
+                                         "    def read(self) -> str:\n"
+                                         "        return self.q\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "incompatible return value type (got \"int\", expected \"str\")");
+    EXPECT_EQ(error.line, 5);
+}
+
+// The closure sibling of the test above: the attribute is assigned through a
+// CAPTURED self inside a closure, and must still carry its real type (int),
+// not Unknown, once the closure's own store is reached. Measured against
+// mypy 1.18.1: same message as above.
+TEST(TypeChecker, AClosureAssignedAttributeKeepsItsRealTypeNotUnknown) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            self.q = 1\n"
+                                         "        inner()\n"
+                                         "    def read(self) -> str:\n"
+                                         "        return self.q\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "incompatible return value type (got \"int\", expected \"str\")");
+    EXPECT_EQ(error.line, 7);
 }
 
 // Reproduced against the built binary
