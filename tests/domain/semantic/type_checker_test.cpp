@@ -1472,20 +1472,20 @@ TEST(TypeChecker, AClosureCapturingANonSelfNamedReceiverDeclares) {
 // Differs from AClosureAssignedAttributeIsVisibleToAReaderAbove ONLY in
 // whether `inner` takes a parameter named `self`.
 //
-// Round 1 fix (Finding 3): the ORIGINAL version of this test (no read()
-// above, `only_error`) did NOT discriminate the shadow guard at all -- it
-// passed identically with `shadows` forced false and with the wrong
-// annotation-keyed guard, because the shadowing parameter is typed `int` (a
-// builtin), so `self.q = 1` there is independently blocked by
+// A version of this test with no read() above (asserting only the store's
+// own diagnostic via `only_error`) would NOT discriminate the shadow guard
+// at all -- it passes identically whether `shadows` is computed correctly or
+// forced false, because the shadowing parameter is typed `int` (a builtin),
+// so `self.q = 1` there is independently blocked by
 // self_attribute_receiver_type's own TYPE check (int != Bag) regardless of
-// what the pre-pass's shadow decision was. That store-side diagnostic was a
-// red herring for what this test claimed to cover. Adding a `read()` above
+// what the pre-pass's shadow decision was. That store-side diagnostic is a
+// red herring for what this test needs to cover. Adding a `read()` above
 // (the same shape B5 uses) makes the shadow guard observable: if the
 // pre-pass wrongly descends into `inner` anyway, it placeholder-declares "q"
 // as Unknown and the read's diagnostic silently disappears. Verified by
 // temporarily forcing the descent unconditionally: only the store's
 // (guard-independent) NotImplementedError survived, confirming this shape
-// now genuinely exercises the guard.
+// genuinely exercises the guard.
 //
 // Measured against the built binary 2026-09-12: TWO diagnostics -- the
 // read() above (never declared, since the shadowed `self` never binds "q"
@@ -1546,16 +1546,15 @@ TEST(TypeChecker, ANestedDefShadowingSelfAsTheClassStillDoesNotDeclare) {
 
 // B7: a nested CLASS's `self` is the inner class's, not Bag's.
 //
-// Round 1 fix (Finding 4): this comment used to claim "Both oracles reject
-// this program" -- wrong, and the exact "a CPython verdict on a function
-// body is worthless unless the probe CALLS the function" trap CLAUDE.md
-// warns about. This test's source (like every other check_module fixture
-// here) never calls `m()`, so CPython never executes the `class Inner` body
-// at all and has no opinion -- measured, CPython exits 0 on this exact
-// source. Only mypy rejects it (`"Bag" has no attribute "q"` plus
-// `Returning Any`). Driving it (`Bag().m()` then reading) DOES make CPython
-// raise the same AttributeError mypy predicts, but that is a fact about a
-// DIFFERENT, driven program, not this one.
+// This test's source (like every other check_module fixture here) never
+// calls `m()`, so CPython never executes the `class Inner` body at all and
+// has no opinion on it -- measured, CPython exits 0 on this exact source,
+// the exact "a CPython verdict on a function body is worthless unless the
+// probe CALLS the function" trap CLAUDE.md warns about. Only mypy rejects
+// it (`"Bag" has no attribute "q"` plus `Returning Any`). Driving it
+// (`Bag().m()` then reading) DOES make CPython raise the same AttributeError
+// mypy predicts, but that is a fact about a DIFFERENT, driven program, not
+// this one.
 //
 // Measured: only ONE diagnostic from cythonpp. `self.q = 1` inside Inner.go
 // declares "q" on Inner (go's own `self` is a real method_self binding, just
@@ -1622,19 +1621,19 @@ TEST(TypeChecker, AnAliasOfSelfDoesNotDeclare) {
     EXPECT_EQ(checked.diagnostics[1].line, 7) << "the store, through the alias";
 }
 
-// Fix round 1, Finding 1 -- a REGRESSION the initial landing introduced.
 // Python makes a name local to a function's scope by ANY assignment to it
 // there, not only by it appearing as a parameter: `def inner(): self =
 // Bag(); self.q = 1` rebinds `self` to a local of `inner` exactly as a
-// shadowing parameter would. Measured 2026-09-12 against mypy 1.18.1 and
-// CPython 3.14: mypy reports attr-defined at BOTH the store and the read
-// (plus a `Returning Any`), and CPython raises `AttributeError: 'Bag' object
-// has no attribute 'q'` -- both oracles reject this program. The parameter-
-// only shadow check let collect_self_attribute_placeholders descend into
-// `inner` anyway and placeholder-declare "q" as Unknown, which is absorbing,
-// so this compiler reported NOTHING AT ALL: silent acceptance of a program
-// both oracles reject, strictly worse than never descending into a closure
-// in the first place.
+// shadowing parameter would. A shadow check that inspects only parameters
+// misses this and lets collect_self_attribute_placeholders descend into
+// `inner` anyway, placeholder-declaring "q" as Unknown -- and Unknown is
+// absorbing, so it silences BOTH the store and every reader, reporting
+// NOTHING AT ALL. Measured 2026-09-12 against mypy 1.18.1 and CPython 3.14:
+// mypy reports attr-defined at BOTH the store and the read (plus a
+// `Returning Any`), and CPython raises `AttributeError: 'Bag' object has no
+// attribute 'q'` -- both oracles reject this program, so a parameter-only
+// shadow check is strictly worse than never descending into a closure at
+// all.
 TEST(TypeChecker, ARebindingAssignmentInAClosureDoesNotDeclareOntoTheClass) {
     const Checked checked = check_module("class Bag:\n"
                                          "    def read(self) -> int:\n"
@@ -1683,16 +1682,17 @@ TEST(TypeChecker, ARebindingForTargetInAClosureDoesNotDeclareOntoTheClass) {
     EXPECT_EQ(checked.diagnostics[1].line, 7) << "the store, through the for-target's int type";
 }
 
-// Fix round 1, Finding 2 -- the commit's headline change (Step 3, resolving
-// the receiver by its own spelling in self_attribute_receiver_type) was
-// pinned by zero tests: every clean test and every control up to this point
-// stays clean/reporting even with Step 3 reverted, because Steps 4-6's
-// pre-pass placeholder alone is enough to avoid a "no attribute" error, and
-// Unknown is absorbing enough that nothing asked what type the attribute
-// actually got. This test asks that question: `read()`'s declared return
-// type is "str", but the attribute was only ever assigned an int, so the
-// REAL type has to have propagated for this to fire. Measured against mypy
-// 1.18.1: `Incompatible return value type (got "int", expected "str")`.
+// self_attribute_receiver_type resolving the receiver by its own spelling
+// (rather than the literal "self") has a TYPE-PRECISION signature, not a
+// silence signature -- a test that only asserts "no diagnostic" cannot pin
+// it, because the self-attribute pre-pass's own placeholder is Unknown, and
+// Unknown is absorbing enough to keep every clean test and every "does it
+// still report" control passing whether or not the receiver is resolved
+// correctly. The question that DOES distinguish the two is what type the
+// attribute actually ends up with: `read()`'s declared return type is "str",
+// but the attribute was only ever assigned an int, so the REAL type has to
+// have propagated for this to fire. Measured against mypy 1.18.1:
+// `Incompatible return value type (got "int", expected "str")`.
 TEST(TypeChecker, ANonSelfNamedReceiversAttributeKeepsItsRealTypeNotUnknown) {
     const Checked checked = check_module("class Bag:\n"
                                          "    def m(this) -> None:\n"
