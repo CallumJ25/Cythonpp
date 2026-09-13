@@ -1814,6 +1814,67 @@ TEST(TypeChecker, AFunctionDefRebindingTheReceiverInAClosureDoesNotDeclare) {
     EXPECT_EQ(checked.diagnostics[1].line, 8) << "the store, through the shadowing def's Callable type";
 }
 
+// The other half of receiver_rebound_in_own_scope's rule -- never descending
+// INTO a nested def/class's own BODY -- has no test of its own anywhere
+// above: every existing shape puts the rebinding directly in the nested
+// def's own scope (a parameter, an Assign, a for-target, or the def/class's
+// own name), never one level deeper. A rebinding buried inside a FURTHER
+// nested def must NOT be treated as shadowing the outer closure's receiver,
+// because it rebinds only ITS OWN scope, not `inner`'s. Measured 2026-09-12
+// against mypy 1.18.1 and CPython 3.14 (driven with `b = Bag(); b.m();
+// print(b.read())`): mypy `Success`, CPython prints `1` at exit 0 -- `self`
+// inside `deeper` is a local of `deeper` alone, so `self.q = 1` in `inner`
+// still refers to the method's own receiver and legitimately declares "q".
+TEST(TypeChecker, ARebindingInAFurtherNestedDefDoesNotShadowTheOuterClosure) {
+    expect_clean("class Bag:\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.q\n"
+                 "    def m(self) -> None:\n"
+                 "        def inner() -> None:\n"
+                 "            def deeper() -> None:\n"
+                 "                self = 5\n"
+                 "            self.q = 1\n"
+                 "        inner()\n");
+}
+
+// The same rule with an extra layer of control flow around the buried
+// rebinding: a further nested def's own body is still a different scope
+// even when the rebinding inside it sits under an `if`. Measured 2026-09-12
+// against mypy 1.18.1 and CPython 3.14 (driven the same way): mypy
+// `Success`, CPython prints `1` at exit 0.
+TEST(TypeChecker, ARebindingInAnIfInsideAFurtherNestedDefDoesNotShadow) {
+    expect_clean("class Bag:\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.q\n"
+                 "    def m(self) -> None:\n"
+                 "        def inner() -> None:\n"
+                 "            def deeper() -> None:\n"
+                 "                if True:\n"
+                 "                    self = 5\n"
+                 "            self.q = 1\n"
+                 "        inner()\n");
+}
+
+// The ClassDef sibling: a rebinding of the receiver name inside a nested
+// class's own BODY (a class-body assignment, not the class's own name) is
+// that class's own attribute, in that class's own scope -- it must not
+// shadow the outer closure's receiver either. Measured 2026-09-12 against
+// mypy 1.18.1 and CPython 3.14 (driven the same way): mypy `Success`,
+// CPython prints `1` at exit 0 -- `Holder.self` is a class attribute of
+// `Holder`, entirely unrelated to the `self` `inner` still resolves outward
+// to declare "q" through.
+TEST(TypeChecker, ARebindingInsideANestedClassBodyDoesNotShadow) {
+    expect_clean("class Bag:\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.q\n"
+                 "    def m(self) -> None:\n"
+                 "        def inner() -> None:\n"
+                 "            class Holder:\n"
+                 "                self = 1\n"
+                 "            self.q = 1\n"
+                 "        inner()\n");
+}
+
 // Reproduced against the built binary
 // before this fix: `class D: x = 5` then `d.x` reported a false "D has no
 // attribute x" -- only the AnnAssign path ever called declare_member; a bare
