@@ -616,11 +616,25 @@ bool ClassTable::inherits_builtin_class(const std::string& qualified_name) const
         qualified_name, [](const std::string& canonical, const Entry& entry) -> std::optional<bool> {
             // object is excluded unconditionally, exactly as inherits_builtin
             // excludes it: it IS a seeded row (bounded constructor arity
-            // (0, 0)), and every class conceptually derives from it, so
-            // counting it here would make every class chain "reach a seeded
-            // builtin" and delete this whole check -- `class Plain: pass`
-            // and `class Plain(object): pass` must both keep reporting
-            // `p.nope` as a genuine attr-defined TypeError.
+            // (0, 0)). This only matters for a chain that EXPLICITLY reaches
+            // object -- `class Plain(object): pass`, or `class Mid(object):
+            // pass` / `class Leaf(Mid): pass` reaching it transitively.
+            // A class with NO bases at all (`class Plain: pass`) never
+            // visits object's entry in the first place (there is nothing to
+            // walk), so it stays a genuine attr-defined TypeError with or
+            // without this line -- it is not evidence for this exclusion,
+            // only for is_seeded_builtin being false on an ordinary
+            // undeclared row. What this line actually prevents: every class
+            // conceptually derives from object, so counting it as an
+            // ancestor's answer would make every class whose chain reaches
+            // it (directly or transitively) "inherit a seeded builtin" and
+            // delete this whole check for that whole shape of program.
+            // Measured (ClassTable.InheritsBuiltinClassExcludesObject,
+            // ClassTable.InheritsBuiltinClassExcludesObjectTransitively,
+            // ExpressionTyper.AMissingAttributeOnAClassWithAnExplicitObjectBaseStaysATypeError):
+            // removing this line flips exactly those three, and leaves the
+            // bare-Plain case (ExpressionTyper.AMissingAttributeOnAPlainClassStaysATypeError)
+            // unaffected either way.
             if (canonical == "object") {
                 return std::nullopt;
             }

@@ -810,6 +810,21 @@ TEST(ClassTable, InheritsBuiltinClassExcludesObject) {
     EXPECT_FALSE(table.inherits_builtin_class("Widget"));
 }
 
+// The test above only pins object as a class's own DIRECT base. The
+// exclusion inside inherits_builtin_class's chain walk fires at every entry
+// the walk visits, not only the root, so a class that reaches object only
+// TRANSITIVELY -- through an intermediate class that itself does nothing but
+// name object as its base -- must be excluded too, or Leaf would answer true
+// via Mid's entry alone. Confirmed by neutering: removing the exclusion
+// flips this test as well as the direct-base one above.
+TEST(ClassTable, InheritsBuiltinClassExcludesObjectTransitively) {
+    ClassTable table;
+    table.declare("Mid", {Type::object()});
+    table.declare("Leaf", {Type::class_of("Mid")});
+
+    EXPECT_FALSE(table.inherits_builtin_class("Leaf"));
+}
+
 // declare() must clear Entry::is_seeded_builtin for a name a real `class`
 // statement shadows, exactly as it clears builtin_arity -- otherwise
 // `class slice: pass` then `s.nope`, or `class Exception: pass` then a

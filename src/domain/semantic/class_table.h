@@ -338,10 +338,20 @@ public:
     // `object` is excluded from the walk, unconditionally, mirroring
     // inherits_builtin's own carve-out and for the identical reason: `object`
     // IS a seeded row (bounded constructor arity (0, 0)), and every class
-    // conceptually derives from it, so counting it here would make EVERY
-    // class chain "reach a seeded builtin" and delete this whole check --
-    // `class Plain: pass` and `class Plain(object): pass` must both keep
-    // reporting `p.nope` as a genuine TypeError.
+    // conceptually derives from it, so counting it as an ancestor's answer
+    // would make every class chain that EXPLICITLY reaches `object` --
+    // `class Plain(object): pass`, or transitively through an intermediate
+    // class (`class Mid(object): pass` / `class Leaf(Mid): pass`) -- "reach a
+    // seeded builtin" and delete this whole check for that shape of program.
+    // An ordinary class with NO bases at all (`class Plain: pass`) never
+    // visits `object`'s entry in the first place, so it is unaffected by this
+    // exclusion either way -- it keeps reporting `p.nope` as a genuine
+    // TypeError purely because `is_seeded_builtin` is false on its own,
+    // undeclared entry, not because of this line. Both shapes are pinned:
+    // ClassTable.InheritsBuiltinClassExcludesObject and
+    // ClassTable.InheritsBuiltinClassExcludesObjectTransitively for the
+    // predicate directly, and the two `ExpressionTyper` tests of the same
+    // names end-to-end through the actual report site.
     bool inherits_builtin_class(const std::string& qualified_name) const;
 
 private:

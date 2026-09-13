@@ -892,12 +892,31 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
     // method, and others. The accepted cost is the identical MISSED-error
     // trade the carve-out above already makes: `super().nope()` and
     // `MyErr().nope` (both genuine mypy attr-defined errors) now report
-    // NotImplementedError instead of TypeError -- still exit 1, not a
-    // regression from accepting the program. NOT the same predicate as
-    // inherits_builtin: that one is false for a seeded CLASS base by
-    // design (see its own test, InheritsBuiltinIsFalseForASeededExceptionBase)
-    // precisely because a Class base is what this second carve-out exists to
-    // cover instead.
+    // NotImplementedError instead of TypeError. In REACHABLE code that is a
+    // wash (exit 1 either way); inside UNREACHABLE code it is a real, if
+    // sanctioned, tightening rather than a no-op -- TypeCheckerTypeError is
+    // Suppressible and NotImplementedError is not (diagnostic_kind.h), so a
+    // `MyErr().nope` sitting after a `return` used to be dropped silently
+    // (exit 0) and is now reported (exit 1). Not a union-rule violation
+    // (NotImplementedError is sanctioned regardless of reachability), and the
+    // pre-existing inherits_builtin carve-out above already has the same
+    // property, but say what actually happens rather than "no regression".
+    // NOT the same predicate as inherits_builtin: that one is false for a
+    // seeded CLASS base by design (see its own test,
+    // InheritsBuiltinIsFalseForASeededExceptionBase) precisely because a
+    // Class base is what this second carve-out exists to cover instead.
+    //
+    // kBuiltinMemberMessage's wording ("methods on builtin types are not
+    // supported") was written for the carve-out above, where the missing
+    // member usually IS a method (xs.append, s.upper). Reused here as-is
+    // rather than given its own string: `MyErr().nope`, `super().__init__`
+    // and `Exception("x").args` are read/called through a USER-DEFINED
+    // class, and `.args` in particular is DATA, not a method -- neither noun
+    // fits precisely. Left unremarked nowhere else in this file, so noted
+    // here rather than silently reused: widening the wording is a genuine
+    // option, just not one this change makes, since several corpus samples
+    // (deferred_builtin_member_access.py and friends) already pin the exact
+    // string for the carve-out above and would need updating in lockstep.
     if (classes_.inherits_builtin_class(receiver.name)) {
         return error(attribute, DiagnosticKind::NotImplementedError, kBuiltinMemberMessage);
     }

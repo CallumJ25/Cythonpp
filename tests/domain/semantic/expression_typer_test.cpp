@@ -1154,6 +1154,50 @@ TEST(ExpressionTyper, AMissingAttributeOnAClassShadowingABuiltinSpellingStaysATy
     EXPECT_EQ(error.message, "\"slice\" has no attribute \"nope\"");
 }
 
+// THE end-to-end control for the most consequential exclusion in
+// inherits_builtin_class: an ordinary class with NO bases at all. Its chain
+// walk never visits an `object` entry either way (there is nothing to walk),
+// so this control passes whether or not the `canonical == "object"` line in
+// class_table.cpp exists -- it is NOT evidence for that exclusion (see
+// AMissingAttributeOnAClassWithAnExplicitObjectBaseStaysATypeError below for
+// the shape that actually is). It exists anyway because both oracles reject
+// this program (mypy attr-defined, CPython AttributeError) and nothing else
+// in this file pins it end-to-end through the second carve-out's own report
+// site.
+TEST(ExpressionTyper, AMissingAttributeOnAPlainClassStaysATypeError) {
+    ClassTable table;
+    table.declare("Plain", {});
+
+    const Typed typed = type_expression("p.nope", {{"p", Type::class_of("Plain")}},
+                                        Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Plain\" has no attribute \"nope\"");
+    EXPECT_EQ(error.line, 1);
+}
+
+// UNLIKE the bare-Plain control above, this one DOES exercise the
+// `canonical == "object"` exclusion inside inherits_builtin_class's chain
+// walk: `object` is Plain's own recorded base here, so the walk visits its
+// entry (is_seeded_builtin true) and the exclusion is what stops that entry
+// from answering. Proven by neutering: removing the exclusion flips this
+// test (and ClassTable.InheritsBuiltinClassExcludesObject) from TypeError to
+// a false NotImplementedError, while
+// AMissingAttributeOnAPlainClassStaysATypeError above is unaffected either
+// way. Both oracles reject this program identically to the bare-Plain case
+// (mypy attr-defined, CPython AttributeError).
+TEST(ExpressionTyper, AMissingAttributeOnAClassWithAnExplicitObjectBaseStaysATypeError) {
+    ClassTable table;
+    table.declare("Plain", {Type::object()});
+
+    const Typed typed = type_expression("p.nope", {{"p", Type::class_of("Plain")}},
+                                        Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Plain\" has no attribute \"nope\"");
+    EXPECT_EQ(error.line, 1);
+}
+
 // Verified: xs.append(1), s.upper() and d.keys() are ALL mypy-clean. With no
 // typeshed, reporting attr-defined here would be a false TypeError on one of
 // the most common lines in Python.
