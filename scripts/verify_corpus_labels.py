@@ -346,14 +346,16 @@ def constructor_arity(names):
             # "every unbounded row also accepts ZERO arguments ... there is
             # no row needing 'min 3, max unbounded'". kUnboundedArity is a
             # single sentinel standing in for BOTH ends of the band, and
-            # class_table.cpp's seeding discards min_args entirely whenever
-            # max_args == kUnboundedArity -- so a row accepted at, say,
-            # {2..8} would silently collapse to "no constraint at all"
-            # instead of "at least 2", turning a real lower bound into
-            # unconditional silence. Latent today (every one of the 83
-            # unbounded rows measured 2026-09-12 really does start at 0), but
-            # a future typeshed change introducing one must fail loudly here
-            # rather than be silently mis-stored.
+            # class_table.cpp's SEEDING stores both min_args and max_args
+            # unconditionally -- it is CONSUMPTION (constructor_check's
+            # has_unbounded_arity check) that looks at max_args alone and
+            # never asks what min_args said. So a row accepted at, say,
+            # {2..8} would seed correctly but still be treated as wholly
+            # unconstrained wherever the band is read, silently turning a
+            # real lower bound of 2 into unconditional silence. Latent today
+            # (every one of the 83 unbounded rows measured 2026-09-12 really
+            # does start at 0), but a future typeshed change introducing one
+            # must fail loudly here rather than be silently mis-stored.
             raise SystemExit(
                 f"{name} is unbounded above (accepts {_MAX_PROBED_ARITY}) but its minimum "
                 f"is {low}, not 0. The kUnboundedArity sentinel cannot represent a nonzero "

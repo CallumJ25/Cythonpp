@@ -172,6 +172,19 @@ void ClassTable::declare(std::string qualified_name, std::vector<Type> bases) {
     // (unbounded) band survived and routed the shadowing class through
     // constructor_check's Unchecked fallback.
     entry.builtin_arity.reset();
+    // `members`/`methods` get the same treatment, defensively: nothing in
+    // ClassTable's own constructor populates either for a seeded builtin row
+    // today (only `bases` and `builtin_arity`), so this is a no-op right
+    // now, and declare() is always called before Phase 2 ever calls
+    // declare_member/declare_method for the SAME qualified_name, so a
+    // freshly declared class has nothing of its own to lose either. But
+    // leaving this unstated invites exactly the bug class `builtin_arity`
+    // above exists to close, the moment a future change seeds either map for
+    // a builtin row: clearing here means a shadowing class can never inherit
+    // stale state through EITHER map, not just the one this task happened to
+    // add.
+    entry.members.clear();
+    entry.methods.clear();
 }
 
 void ClassTable::declare_member(const std::string& qualified_name, std::string member, Type type,
@@ -358,26 +371,28 @@ Type ClassTable::constructor_type(const std::string& qualified_name) const {
     } else {
         // No DECLARED __init__ anywhere in the chain. Ordinarily that means
         // a genuine zero-arg constructor (params stays empty, defaulted 0),
-        // which is correct for an ordinary user class. But the RESOLVED
-        // class itself may be a seeded builtin row carrying its own bounded
-        // arity band (`Entry::builtin_arity`, set by the constructor above
-        // and reset by `declare()` if a user class shadows the spelling) --
-        // `memoryview`, `property`, `staticmethod`, the bounded exception
-        // classes, and so on, none of which declare a real `__init__` this
-        // model can see. Only the RESOLVED entry is consulted here, not the
-        // whole chain: a user subclass of a bounded builtin with no
-        // `__init__` of its own is intentionally left at the ordinary
-        // zero-arg default rather than inheriting the base's band, which is
-        // outside this fix's scope. An UNBOUNDED band (kUnboundedArity)
-        // never reaches here in practice, since constructor_check routes
-        // that case to Unchecked before this signature's param count is ever
-        // consulted for an arity check -- but leaving it at zero-arg here
-        // regardless is harmless either way.
-        const auto entry_it = classes_.find(resolved);
-        if (entry_it != classes_.end() && entry_it->second.builtin_arity.has_value() &&
-            entry_it->second.builtin_arity->second != kUnboundedArity) {
-            const int min_args = entry_it->second.builtin_arity->first;
-            const int max_args = entry_it->second.builtin_arity->second;
+        // which is correct for an ordinary user class. But the chain may
+        // reach a seeded builtin row carrying its own bounded arity band
+        // (`Entry::builtin_arity`, set by the constructor above and reset by
+        // `declare()` if a user class shadows the spelling) -- `memoryview`,
+        // `property`, `staticmethod`, the bounded exception classes, and so
+        // on, none of which declare a real `__init__` this model can see.
+        // `find_builtin_arity` walks the WHOLE chain, not just the resolved
+        // class's own entry: `class cached(property): pass` (no `__init__`
+        // of its own) must still inherit `property`'s (0, 4) band, or
+        // `cached(getter)` is a false "too many arguments" -- measured
+        // mypy-clean and CPython-clean. Only a genuinely seeded row ever
+        // carries a band at all (declare() resets it for any shadowed
+        // name), so this cannot pick up a false band from an ordinary user
+        // ancestor. An UNBOUNDED band (kUnboundedArity) never reaches here
+        // in practice, since constructor_check routes that case to Unchecked
+        // before this signature's param count is ever consulted for an
+        // arity check -- but leaving it at zero-arg here regardless is
+        // harmless either way.
+        const std::optional<std::pair<int, int>> arity = find_builtin_arity(resolved);
+        if (arity.has_value() && arity->second != kUnboundedArity) {
+            const int min_args = arity->first;
+            const int max_args = arity->second;
             params.assign(static_cast<std::size_t>(max_args), Type::unknown());
             defaulted = static_cast<std::size_t>(max_args - min_args);
         }
@@ -474,15 +489,24 @@ ClassTable::constructor_check(const std::string& qualified_name) const {
     // changes behaviour: `complex(1)` would flip from the sanctioned
     // `NotImplementedError` (via BuiltinKindBase, since `complex` is an
     // unbounded row and would hit Unchecked first if checked ahead of it) to
-    // silent acceptance. Both lookups consult only the RESOLVED class's own
-    // entry, never a base along the chain -- a subclass with no
-    // `__init__`/`__new__` of its own but a bounded builtin ancestor is left
-    // at the ordinary zero-arg default (or, via the BaseException arm,
-    // Unchecked) rather than inheriting the ancestor's own band, which is
-    // outside this fix's scope.
-    const auto entry_it = classes_.find(resolved);
-    const std::optional<std::pair<int, int>> own_arity =
-        entry_it != classes_.end() ? entry_it->second.builtin_arity : std::nullopt;
+    // silent acceptance.
+    //
+    // `find_builtin_arity` walks the WHOLE chain (not just the resolved
+    // class's own entry): a subclass with no `__init__`/`__new__` of its own
+    // but a bounded builtin ancestor must still inherit that ancestor's own
+    // band -- `class cached(property): pass` and `class
+    // MyU(UnicodeDecodeError): pass` are both mypy-clean/CPython-clean
+    // (`cached`) or both-oracles-reject (`MyU(1)`), and an earlier,
+    // resolved-entry-only version of this lookup left the first a false
+    // "too many arguments" and the second silent. Safe to run this late,
+    // same as the resolved-entry-only version it replaces: only a genuinely
+    // SEEDED builtin row ever carries a band, and declare() resets it to
+    // nullopt for any name a real `class` statement writes over, so no
+    // ordinary user class -- Singleton, Pair, Point, MyInt, Mixin, and so on
+    // -- can ever short-circuit this walk with a false band of its own; each
+    // of those still exits at DeclaredInit/BuiltinKindBase/the __new__
+    // fallback above, before this walk is ever consulted.
+    const std::optional<std::pair<int, int>> own_arity = find_builtin_arity(resolved);
     const bool has_unbounded_arity = own_arity.has_value() && own_arity->second == kUnboundedArity;
     const bool has_bounded_arity = own_arity.has_value() && !has_unbounded_arity;
 

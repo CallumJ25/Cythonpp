@@ -524,6 +524,62 @@ TEST(ClassTable, DeclaringOverAnUnboundedBuiltinNameIsCheckedNotUnchecked) {
     EXPECT_EQ(type_name(table.constructor_type("slice")), "Callable[[], slice]");
 }
 
+// ---------------------------------------------------------------------------
+// A subclass with no `__init__`/`__new__` of its own must INHERIT its
+// nearest builtin ancestor's arity band, not fall to the ordinary zero-arg
+// default. An earlier version of this fix consulted only the RESOLVED
+// class's own entry (to avoid the DeclaredInit-hijack Critical 1 named), and
+// that also removed this inheritance -- so a subclass of a bounded row was
+// newly broken by the very fix that closed the hijack. Both cases below
+// cover a GRANDCHILD too, two plain classes down from the seeded row.
+// ---------------------------------------------------------------------------
+
+// FALSE POSITIVE if unfixed: `class cached(property): pass` used as
+// `cached(getter)` (one argument) is mypy Success and CPython-clean.
+// Three-way history: `8fa41a8` (pre-feature) reported "too many arguments";
+// `9f1f3ca` (the synthetic-__init__ hijack) was accidentally silent, since
+// `property`'s hijacked entry was found by the OLD chain-based walk;
+// `69e2b57` (resolved-entry-only) reported again, for a different reason --
+// `cached` itself has no band, and the walk no longer reached `property`'s.
+TEST(ClassTable, ASubclassOfABoundedNonKindRowInheritsItsBand) {
+    ClassTable table;
+    table.declare("cached", {Type::class_of("property")});
+    EXPECT_EQ(table.constructor_check("cached"), ClassTable::ConstructorCheck::Checked);
+    EXPECT_EQ(type_name(table.constructor_type("cached")),
+              "Callable[[Unknown, Unknown, Unknown, Unknown], cached]");
+
+    // Grandchild: two plain classes between the query and the seeded row.
+    table.declare("Mid", {Type::class_of("cached")});
+    table.declare("Grandchild", {Type::class_of("Mid")});
+    EXPECT_EQ(table.constructor_check("Grandchild"), ClassTable::ConstructorCheck::Checked);
+    EXPECT_EQ(type_name(table.constructor_type("Grandchild")),
+              "Callable[[Unknown, Unknown, Unknown, Unknown], Grandchild]");
+}
+
+// MISSED ERROR if unfixed: `class MyU(UnicodeDecodeError): pass` then
+// `MyU(1)` -- mypy reports (incl.) `Too few arguments for "MyU"`, CPython
+// `TypeError: function takes exactly 5 arguments (1 given)`, both oracles
+// reject it. `9f1f3ca` reported the right thing here (the hijacked entry
+// was found via the chain walk too); the resolved-entry-only version of
+// this fix (`69e2b57`) went SILENT, a genuine regression inside this range,
+// since `MyU` reaches `BaseExceptionBase` through its own base chain and its
+// own entry (not `UnicodeDecodeError`'s) is what a resolved-entry-only
+// lookup would have consulted.
+TEST(ClassTable, ASubclassOfABoundedExceptionRowInheritsItsBand) {
+    ClassTable table;
+    table.declare("MyU", {Type::class_of("UnicodeDecodeError")});
+    EXPECT_EQ(table.constructor_check("MyU"), ClassTable::ConstructorCheck::Checked);
+    EXPECT_EQ(type_name(table.constructor_type("MyU")),
+              "Callable[[Unknown, Unknown, Unknown, Unknown, Unknown], MyU]");
+
+    // Grandchild, same shape as the property case above.
+    table.declare("Mid2", {Type::class_of("MyU")});
+    table.declare("Grandchild2", {Type::class_of("Mid2")});
+    EXPECT_EQ(table.constructor_check("Grandchild2"), ClassTable::ConstructorCheck::Checked);
+    EXPECT_EQ(type_name(table.constructor_type("Grandchild2")),
+              "Callable[[Unknown, Unknown, Unknown, Unknown, Unknown], Grandchild2]");
+}
+
 // The same rule for an exception base. Verified against mypy 1.18.1 with the
 // same Mixin: `class MyErr(Exception, Mixin): pass` then MyErr("boom", 42) is
 // `Success` and CPython prints `('boom', 42)`, where the whole-chain search

@@ -333,13 +333,25 @@ private:
         // false positives on `class Singleton(object)` with its own
         // `__new__`, and on `class Pair(float)`/`class Point(tuple[int,
         // int])` (both should defer to Unmodellable, not be arity-checked).
-        // `constructor_check` and `constructor_type` both consult this field
-        // ONLY at their own final fallback, once every more specific arm (a
-        // declared `__init__` anywhere in the chain, a builtin-kind base, a
-        // BaseException base, a declared `__new__` anywhere in the chain)
-        // has already missed -- see constructor_check's own comment for why
-        // moving that consultation earlier is observably wrong
-        // (`complex(1)` silently stops being NotImplementedError).
+        //
+        // Read through `find_builtin_arity`, a WHOLE-CHAIN walk (not a
+        // resolved-entry-only lookup: an earlier version of this fix used
+        // one, and it left a subclass with no `__init__`/`__new__` of its
+        // own -- `class cached(property): pass`, `class
+        // MyU(UnicodeDecodeError): pass` -- unable to inherit its nearest
+        // seeded ancestor's own band at all). `constructor_check` consults
+        // it at TWO of its own arms -- the final `!reached.has_value()`
+        // fallback AND the `BaseExceptionBase` arm, the latter needed
+        // because the five bounded exception classes reach `BaseException`
+        // through their OWN base chain before the first fallback is ever
+        // reached -- and `constructor_type` consults it once, in its own
+        // no-declared-`__init__` branch. All three consultations run only
+        // once every more specific arm (a declared `__init__` anywhere in
+        // the chain, a builtin-kind base, a `BaseException` base, a declared
+        // `__new__` anywhere in the chain) has already missed -- see
+        // constructor_check's own comment for why moving any of them
+        // earlier is observably wrong (`complex(1)` silently stops being
+        // NotImplementedError).
         std::optional<std::pair<int, int>> builtin_arity;
     };
 
@@ -506,6 +518,33 @@ private:
     std::optional<Result> walk_chain(const std::string& name, std::vector<std::string>& visited,
                                       const Extract& extract) const {
         return walk_resolved<Result>(canonical_name(name), visited, extract);
+    }
+
+    // The constructor arity band, found by walking the WHOLE base chain --
+    // positional, first-branch-wins, exactly like the __init__ and __new__
+    // searches constructor_check/constructor_type already do -- rather than
+    // consulting only the resolved class's own entry. Only a genuinely
+    // SEEDED builtin row ever carries a band (see Entry::builtin_arity), and
+    // declare() resets it to nullopt for any name a real `class` statement
+    // writes over, so an ordinary user class's own entry can never itself
+    // hold one and short-circuit this walk with a false answer. Consulting
+    // only the resolved entry (an earlier version of this fix did exactly
+    // that) meant `class cached(property): pass` and `class
+    // MyU(UnicodeDecodeError): pass` -- neither of which is itself a seeded
+    // row -- got the ordinary zero-arg default instead of inheriting
+    // `property`'s (0, 4) or `UnicodeDecodeError`'s (5, 5) band. Called only
+    // from the SAME late position constructor_check/constructor_type already
+    // called the resolved-entry-only version from, so the "consulted last"
+    // contract (see constructor_check's own comment) is unchanged -- a
+    // declared __init__/builtin-kind base/__new__ anywhere in the chain is
+    // still checked, and still wins, before either caller ever reaches this.
+    std::optional<std::pair<int, int>> find_builtin_arity(const std::string& resolved) const {
+        std::vector<std::string> visited;
+        return walk_chain<std::pair<int, int>>(
+            resolved, visited,
+            [](const std::string&, const Entry& entry) -> std::optional<std::pair<int, int>> {
+                return entry.builtin_arity;
+            });
     }
 
     std::map<std::string, Entry> classes_;
