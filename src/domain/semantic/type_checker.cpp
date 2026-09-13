@@ -3203,8 +3203,12 @@ bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
         // A For with a returning else (or a While with any non-`True`
         // condition and a returning else) is now handled above via
         // loop_else_always_returns. A For/While with NO else, or one whose
-        // else does not return, is assumed skippable (false) -- the
-        // syntactic approximation the brief settles on. This can only ever
+        // else does not return, is assumed skippable (false) -- a
+        // deliberately conservative, purely syntactic approximation: a loop
+        // that might not run at all (an ordinary `while c:`/`for x in xs:`
+        // with no else, or an else that itself falls through) genuinely
+        // might not always leave, so answering false is the honest reading
+        // without modelling the loop's iteration count. This can only ever
         // answer false where mypy answers true (a missed error), never the
         // reverse.
     }
