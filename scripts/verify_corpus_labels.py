@@ -341,6 +341,24 @@ def constructor_arity(names):
                 "The two-int band this table stores cannot represent it; see "
                 "the header comment before widening the representation."
             )
+        if high == _MAX_PROBED_ARITY and low != 0:
+            # The header states this as MEASURED FACT, not merely assumed:
+            # "every unbounded row also accepts ZERO arguments ... there is
+            # no row needing 'min 3, max unbounded'". kUnboundedArity is a
+            # single sentinel standing in for BOTH ends of the band, and
+            # class_table.cpp's seeding discards min_args entirely whenever
+            # max_args == kUnboundedArity -- so a row accepted at, say,
+            # {2..8} would silently collapse to "no constraint at all"
+            # instead of "at least 2", turning a real lower bound into
+            # unconditional silence. Latent today (every one of the 83
+            # unbounded rows measured 2026-09-12 really does start at 0), but
+            # a future typeshed change introducing one must fail loudly here
+            # rather than be silently mis-stored.
+            raise SystemExit(
+                f"{name} is unbounded above (accepts {_MAX_PROBED_ARITY}) but its minimum "
+                f"is {low}, not 0. The kUnboundedArity sentinel cannot represent a nonzero "
+                "lower bound; widen the representation before seeding this row."
+            )
         arities[name] = (low, -1 if high == _MAX_PROBED_ARITY else high)
     return arities
 

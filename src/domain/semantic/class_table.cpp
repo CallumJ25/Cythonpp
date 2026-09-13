@@ -47,36 +47,29 @@ ClassTable::ClassTable() {
             entry.bases.push_back(base_type_for_name(base));
         }
 
-        // A bounded row gets a synthetic __init__ so both existing paths
-        // start answering correctly, with no new checking path:
-        // constructor_check now reaches DeclaredInit and returns Checked
-        // (which is what fixes an exception class's silence -- it previously
-        // reached the BaseException arm and went Unchecked), and
-        // constructor_type rebuilds the band through the existing
-        // defaulted_params machinery (which is what fixes the zero-arg
-        // default behind `too many arguments for "memoryview"`).
-        //
-        // Parameters are Unknown, which is absorbing, so ONLY arity is
-        // modelled here and no argument-type claim is introduced.
-        //
-        // An unbounded row must NOT fall through to the zero-arg default
-        // this loop would otherwise leave it with -- see
-        // Entry::unbounded_constructor and constructor_check's own use of
-        // it: "no arity recorded" and "arity unconstrained" are different
-        // claims, and this table used to collapse them.
-        if (builtin.max_args != kUnboundedArity) {
-            // params is [self, arg...]; Type::callable appends the return
-            // slot itself, and constructor_type strips both ends before
-            // handing the signature to a caller.
-            std::vector<Type> params(static_cast<std::size_t>(builtin.max_args) + 1,
-                                     Type::unknown());
-            entry.methods.emplace(
-                "__init__",
-                Type::callable(std::move(params), Type::none(),
-                               static_cast<std::size_t>(builtin.max_args - builtin.min_args)));
-        } else {
-            entry.unbounded_constructor = true;
-        }
+        // The constructor arity band, stored as ITS OWN field rather than a
+        // synthetic entry in `methods["__init__"]` -- an earlier version of
+        // this seeding did the latter, and it hijacked
+        // `constructor_check`'s walk: that walk's per-entry lambda tests
+        // `entry.methods.find("__init__")` FIRST, so a synthetic entry made
+        // the walk return `Reached::DeclaredInit` (and hence `Checked`)
+        // for ANY subclass whose base chain reaches a seeded row -- BEFORE
+        // the `BuiltinKindBase -> Unmodellable` arm and BEFORE the
+        // whole-chain `__new__` fallback, both of which must keep winning
+        // over a seeded band. Measured: `class Singleton(object): def
+        // __new__(cls, tag: int) -> "Singleton": ...` is mypy-clean and
+        // CPython-clean, and the synthetic-__init__ version reported a false
+        // `too many arguments for "Singleton"` by hijacking DeclaredInit via
+        // `object`'s own seeded row; `class Pair(float)` / `class
+        // Point(tuple[int, int])`, each with their own `__new__`, turned the
+        // sanctioned `NotImplementedError` (BuiltinKindBase) into the same
+        // false TypeError. Storing the band on `Entry::builtin_arity`
+        // instead and consulting it ONLY at `constructor_check`'s final
+        // `!reached.has_value()` fallback (see that function) restores the
+        // exact positional contract: a declared `__init__`, a builtin-kind
+        // base, a `BaseException` base and a declared `__new__` all still
+        // win over a seeded band, anywhere in the chain.
+        entry.builtin_arity = std::make_pair(builtin.min_args, builtin.max_args);
     }
 }
 
@@ -165,6 +158,20 @@ std::vector<Type> ClassTable::bases_of(const std::string& name) const {
 void ClassTable::declare(std::string qualified_name, std::vector<Type> bases) {
     Entry& entry = classes_[std::move(qualified_name)];
     entry.bases = std::move(bases);
+    // A real `class` statement SHADOWING a builtin spelling (`class slice:
+    // pass`) reuses this same pre-seeded Entry -- see this constructor's own
+    // comment on `bases` for why an entry is pre-seeded at all. `bases` is
+    // overwritten above for exactly that reason; `builtin_arity` must be
+    // reset alongside it, or the shadowing class silently inherits the
+    // builtin's own arity band instead of getting an ordinary, fresh
+    // zero-arg constructor. Measured both directions: `class memoryview:
+    // pass` / `memoryview()` is mypy-clean and CPython-clean but reported a
+    // false `too few arguments for "memoryview"` with the band left in
+    // place, and `class slice: pass` / `slice(1, 2, 3)` -- both oracles
+    // reject it -- went silent instead of reporting, because the
+    // (unbounded) band survived and routed the shadowing class through
+    // constructor_check's Unchecked fallback.
+    entry.builtin_arity.reset();
 }
 
 void ClassTable::declare_member(const std::string& qualified_name, std::string member, Type type,
@@ -348,6 +355,32 @@ Type ClassTable::constructor_type(const std::string& qualified_name) const {
             params.push_back(init->args[i]);
         }
         defaulted = std::min(init->defaulted_params, params.size());
+    } else {
+        // No DECLARED __init__ anywhere in the chain. Ordinarily that means
+        // a genuine zero-arg constructor (params stays empty, defaulted 0),
+        // which is correct for an ordinary user class. But the RESOLVED
+        // class itself may be a seeded builtin row carrying its own bounded
+        // arity band (`Entry::builtin_arity`, set by the constructor above
+        // and reset by `declare()` if a user class shadows the spelling) --
+        // `memoryview`, `property`, `staticmethod`, the bounded exception
+        // classes, and so on, none of which declare a real `__init__` this
+        // model can see. Only the RESOLVED entry is consulted here, not the
+        // whole chain: a user subclass of a bounded builtin with no
+        // `__init__` of its own is intentionally left at the ordinary
+        // zero-arg default rather than inheriting the base's band, which is
+        // outside this fix's scope. An UNBOUNDED band (kUnboundedArity)
+        // never reaches here in practice, since constructor_check routes
+        // that case to Unchecked before this signature's param count is ever
+        // consulted for an arity check -- but leaving it at zero-arg here
+        // regardless is harmless either way.
+        const auto entry_it = classes_.find(resolved);
+        if (entry_it != classes_.end() && entry_it->second.builtin_arity.has_value() &&
+            entry_it->second.builtin_arity->second != kUnboundedArity) {
+            const int min_args = entry_it->second.builtin_arity->first;
+            const int max_args = entry_it->second.builtin_arity->second;
+            params.assign(static_cast<std::size_t>(max_args), Type::unknown());
+            defaulted = static_cast<std::size_t>(max_args - min_args);
+        }
     }
     return Type::callable(std::move(params), Type::class_of(resolved), defaulted);
 }
@@ -431,6 +464,28 @@ ClassTable::constructor_check(const std::string& qualified_name) const {
         return ConstructorCheck::Unchecked;
     }
 
+    // CONSULTED LAST, DELIBERATELY, in BOTH arms below -- this is THE ENTIRE
+    // POINT of storing the band on `Entry::builtin_arity` instead of in
+    // `methods["__init__"]` (see the constructor's own comment): a declared
+    // `__init__` anywhere in the chain, a builtin-kind base and a declared
+    // `__new__` anywhere in the chain (all three checked above, unconditionally,
+    // before either arm below runs at all) must always win over a seeded
+    // band. Moving either lookup below any earlier in this function silently
+    // changes behaviour: `complex(1)` would flip from the sanctioned
+    // `NotImplementedError` (via BuiltinKindBase, since `complex` is an
+    // unbounded row and would hit Unchecked first if checked ahead of it) to
+    // silent acceptance. Both lookups consult only the RESOLVED class's own
+    // entry, never a base along the chain -- a subclass with no
+    // `__init__`/`__new__` of its own but a bounded builtin ancestor is left
+    // at the ordinary zero-arg default (or, via the BaseException arm,
+    // Unchecked) rather than inheriting the ancestor's own band, which is
+    // outside this fix's scope.
+    const auto entry_it = classes_.find(resolved);
+    const std::optional<std::pair<int, int>> own_arity =
+        entry_it != classes_.end() ? entry_it->second.builtin_arity : std::nullopt;
+    const bool has_unbounded_arity = own_arity.has_value() && own_arity->second == kUnboundedArity;
+    const bool has_bounded_arity = own_arity.has_value() && !has_unbounded_arity;
+
     if (!reached.has_value()) {
         // Nothing along the chain settled the question: no declared
         // __init__, no builtin-kind or BaseException base, no __new__. For
@@ -441,17 +496,28 @@ ClassTable::constructor_check(const std::string& qualified_name) const {
         // verdict on its constructor is unconstrained, not zero-arg, and
         // reporting one would be a false "too many arguments" on
         // `slice(1)`/`type(1)`, both mypy-clean and both running under
-        // CPython. Consulted last, so a subclass with its own declared
-        // __init__ or a builtin-kind base still gets the Checked/Unmodellable
-        // answer above and never sees this at all.
-        const auto entry_it = classes_.find(resolved);
-        if (entry_it != classes_.end() && entry_it->second.unbounded_constructor) {
+        // CPython. A BOUNDED row reaching here (`memoryview`, `property`,
+        // `staticmethod`, `classmethod`, `object`) needs no override: Checked
+        // is already the right answer, and constructor_type separately
+        // consults the same band to build the real (non-zero-arg) signature.
+        if (has_unbounded_arity) {
             return ConstructorCheck::Unchecked;
         }
         return ConstructorCheck::Checked;
     }
     // Only BaseExceptionBase can still reach here: DeclaredInit returned
-    // above, and BuiltinKindBase returned above too.
+    // above, and BuiltinKindBase returned above too. The default for a
+    // class whose chain reaches BaseException with no declared __init__ is
+    // Unchecked (a genuinely variadic *args constructor, matching
+    // Exception/ValueError/a user subclass of either) -- but the five
+    // bounded builtin exception classes (BaseExceptionGroup, ExceptionGroup,
+    // the three Unicode*Error classes) reach BaseException through their OWN
+    // base chain before this walk ever asks whether the RESOLVED root itself
+    // carries a real signature, and they must still be arity-checked against
+    // it rather than silently accepted at any arity.
+    if (has_bounded_arity) {
+        return ConstructorCheck::Checked;
+    }
     return ConstructorCheck::Unchecked;
 }
 

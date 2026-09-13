@@ -5,6 +5,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "class_lookup.h"
@@ -318,17 +319,28 @@ private:
         std::map<std::string, Member> members;
         std::map<std::string, Type> methods;
 
-        // Set at seeding time for a builtin row whose constructor arity is
-        // UNBOUNDED (kBuiltinClasses' max_args == kUnboundedArity): "no
-        // arity recorded" and "arity unconstrained" are different claims,
-        // and collapsing them made a builtin with no bounded band -- `slice`,
-        // `type` -- fall through to the zero-arg default a class with
-        // genuinely no __init__ and no base gets, reporting a false "too many
-        // arguments" for `slice(1)`/`type(1)`. constructor_check consults
-        // this only once every other, more specific arm (a declared
-        // __init__, a builtin-kind base, BaseException, __new__) has already
-        // missed, so it can never override a real signature.
-        bool unbounded_constructor = false;
+        // The constructor arity band for a SEEDED BUILTIN row (min_args,
+        // max_args; max_args == kUnboundedArity means unconstrained),
+        // std::nullopt for an ordinary user class OR for a builtin spelling a
+        // user `class` statement has shadowed (declare() resets this to
+        // nullopt for exactly that reason -- see its own comment).
+        //
+        // Deliberately its OWN field, not a synthetic entry in `methods`:
+        // `constructor_check`'s walk tests `methods.find("__init__")` FIRST,
+        // so a synthetic method there hijacked the DeclaredInit arm for ANY
+        // subclass whose base chain reaches this row, before the
+        // BuiltinKindBase/`__new__`/BaseException arms ever ran -- measured
+        // false positives on `class Singleton(object)` with its own
+        // `__new__`, and on `class Pair(float)`/`class Point(tuple[int,
+        // int])` (both should defer to Unmodellable, not be arity-checked).
+        // `constructor_check` and `constructor_type` both consult this field
+        // ONLY at their own final fallback, once every more specific arm (a
+        // declared `__init__` anywhere in the chain, a builtin-kind base, a
+        // BaseException base, a declared `__new__` anywhere in the chain)
+        // has already missed -- see constructor_check's own comment for why
+        // moving that consultation earlier is observably wrong
+        // (`complex(1)` silently stops being NotImplementedError).
+        std::optional<std::pair<int, int>> builtin_arity;
     };
 
     // Canonicalises, then looks the entry up directly (no transitive walk).

@@ -7040,5 +7040,27 @@ TEST(TypeChecker, AZeroArgBoundedBuiltinStillReportsTooManyArguments) {
     EXPECT_EQ(error.line, 1);
 }
 
+// PINS the "consulted last" contract directly: `ClassTable::constructor_check`
+// must check a seeded row's own arity band ONLY after a declared __init__, a
+// builtin-kind base and a declared __new__ have all already missed. `complex`
+// is an UNBOUNDED row (like `slice`/`type`), but unlike them it is also a
+// model KIND (TypeKind::Complex), so its own entry hits the BuiltinKindBase
+// arm immediately -- BEFORE the band is ever consulted -- and the answer must
+// stay the sanctioned `NotImplementedError`, never silence. Moving the band
+// lookup any earlier (even to the very top of the function) flips this: an
+// unbounded row would answer Unchecked before BuiltinKindBase ever runs,
+// silently accepting `complex(1)`, which is a genuinely bounded overload set
+// neither oracle would accept at every arity.
+TEST(TypeChecker, AnUnboundedModelKindConstructorStillDefersRatherThanGoingSilent) {
+    const Checked checked = check_module("complex(1)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message,
+              "calls to 'complex', which inherits an overloaded builtin constructor, are not "
+              "supported");
+    EXPECT_EQ(error.line, 1);
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

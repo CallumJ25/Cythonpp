@@ -443,6 +443,87 @@ TEST(ClassTable, ADeclaredInitLeftOfABuiltinBaseWins) {
     EXPECT_EQ(type_name(table.constructor_type("MyInt")), "Callable[[str], MyInt]");
 }
 
+// ---------------------------------------------------------------------------
+// A seeded builtin row's own constructor arity band (Entry::builtin_arity)
+// must NEVER hijack the DeclaredInit/BuiltinKindBase/__new__ arms for a
+// SUBCLASS whose base chain merely reaches that row. An earlier version of
+// this seeding wrote the band into `methods["__init__"]` instead of its own
+// field, which made the walk's `methods.find("__init__")` check hit at the
+// builtin row and answer DeclaredInit -- before the BuiltinKindBase arm and
+// before the whole-chain __new__ fallback, both of which must still win.
+// Measured 2026-09-12 against mypy 1.18.1 and CPython:
+//   class Singleton(object):
+//       def __new__(cls, tag: int) -> "Singleton": ...
+//   Singleton(7)
+// is mypy Success and CPython prints the object cleanly -- the synthetic-
+// __init__ version reported a false `too many arguments for "Singleton"` by
+// hijacking DeclaredInit via `object`'s own seeded (0, 0) row.
+TEST(ClassTable, ANewOverAnObjectBaseWithNoInitIsUncheckedNotHijacked) {
+    ClassTable table;
+    table.declare("Singleton", {Type::object()});
+    table.declare_method(
+        "Singleton", "__new__",
+        Type::callable({Type::class_of("Singleton"), Type::int_()}, Type::class_of("Singleton")));
+    EXPECT_EQ(table.constructor_check("Singleton"), ClassTable::ConstructorCheck::Unchecked);
+}
+
+// The same hijack, but over a MODEL-KIND base (`float`), where the correct
+// answer without the hijack is Unmodellable (a bounded overload set this
+// model cannot spell), not Checked and not Unchecked. Measured: `class
+// Pair(float): def __new__(cls, a: int, b: int) -> "Pair": ...` then
+// `Pair(1, 2)` is mypy Success and CPython-clean; the synthetic-__init__
+// version reported a false `too many arguments for "Pair"` by hijacking
+// DeclaredInit via `float`'s own seeded (0, 1) row, before ever reaching the
+// BuiltinKindBase arm that `float` (a model kind) would otherwise take.
+TEST(ClassTable, ANewOverAFloatBaseWithNoInitStaysUnmodellableNotHijacked) {
+    ClassTable table;
+    table.declare("Pair", {Type::float_()});
+    table.declare_method(
+        "Pair", "__new__",
+        Type::callable({Type::class_of("Pair"), Type::int_(), Type::int_()}, Type::class_of("Pair")));
+    EXPECT_EQ(table.constructor_check("Pair"), ClassTable::ConstructorCheck::Unmodellable);
+}
+
+// The same hijack over `tuple`, the other model-kind bounded row (seeded
+// (0, 1)). Measured: `class Point(tuple): def __new__(cls, a: int, b: int)
+// -> "Point": ...` then `Point(1, 2)` is mypy Success and CPython-clean.
+TEST(ClassTable, ANewOverATupleBaseWithNoInitStaysUnmodellableNotHijacked) {
+    ClassTable table;
+    table.declare("Point", {Type::tuple_of({})});
+    table.declare_method("Point", "__new__",
+                         Type::callable({Type::class_of("Point"), Type::int_(), Type::int_()},
+                                        Type::class_of("Point")));
+    EXPECT_EQ(table.constructor_check("Point"), ClassTable::ConstructorCheck::Unmodellable);
+}
+
+// ---------------------------------------------------------------------------
+// declare() must reset a shadowed builtin row's arity band, exactly as it
+// already resets `bases` (see declare()'s own comment) -- a real `class`
+// statement reusing a builtin spelling is legal Python and gets a genuinely
+// FRESH entry, not the builtin's leftover state.
+// ---------------------------------------------------------------------------
+
+// FALSE POSITIVE if unfixed: `class memoryview: pass` / `memoryview()` is
+// mypy Success and CPython-clean, but inheriting the seeded (1, 1) band
+// reports a false `too few arguments for "memoryview"`.
+TEST(ClassTable, DeclaringOverABoundedBuiltinNameGetsAFreshZeroArgConstructor) {
+    ClassTable table;
+    table.declare("memoryview", {});
+    EXPECT_EQ(table.constructor_check("memoryview"), ClassTable::ConstructorCheck::Checked);
+    EXPECT_EQ(type_name(table.constructor_type("memoryview")), "Callable[[], memoryview]");
+}
+
+// MISSED ERROR if unfixed: `class slice: pass` / `slice(1, 2, 3)` -- mypy
+// `Too many arguments`, CPython `TypeError: slice() takes no arguments` --
+// both oracles reject it, but inheriting the seeded unbounded band routes
+// the shadowing class through Unchecked instead of Checked, going silent.
+TEST(ClassTable, DeclaringOverAnUnboundedBuiltinNameIsCheckedNotUnchecked) {
+    ClassTable table;
+    table.declare("slice", {});
+    EXPECT_EQ(table.constructor_check("slice"), ClassTable::ConstructorCheck::Checked);
+    EXPECT_EQ(type_name(table.constructor_type("slice")), "Callable[[], slice]");
+}
+
 // The same rule for an exception base. Verified against mypy 1.18.1 with the
 // same Mixin: `class MyErr(Exception, Mixin): pass` then MyErr("boom", 42) is
 // `Success` and CPython prints `('boom', 42)`, where the whole-chain search
