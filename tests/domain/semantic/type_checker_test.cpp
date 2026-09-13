@@ -725,6 +725,147 @@ TEST(TypeChecker, AFunctionLocalUseBeforeDefinitionIsAViolation) {
     EXPECT_EQ(error.message, "name 'x' is used before definition");
 }
 
+// pre_bind_function_body did not recurse into If/While/For bodies, so a name
+// whose only forward binding in a function's own scope sat inside one of
+// those was silently treated as never-local at all -- an ENCLOSING binding of
+// the same name is essential to this reproduction (see the comment on
+// for_each_own_scope_binding), since without one the read would fall through
+// to the (already-correct) "not defined" case and mask the defect entirely.
+// Measured against mypy 1.18.1 and CPython 3.14 (driven with `outer()`
+// called at module level, `outer` binding `x` at module scope so the read
+// resolves to something rather than nothing): mypy `Name "x" is used before
+// definition  [used-before-def]`, CPython `UnboundLocalError: cannot access
+// local variable 'x' where it is not associated with a value` -- both
+// oracles reject a program this compiler used to accept silently.
+TEST(TypeChecker, AReadBeforeAConditionallyAssignedFunctionLocalIsAViolation) {
+    const Checked checked = check_module("x: int = 1\n"
+                                         "def f(c: bool) -> None:\n"
+                                         "    print(x)\n"
+                                         "    if c:\n"
+                                         "        x = 5\n"
+                                         "f(True)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'x' is used before definition");
+    EXPECT_EQ(error.line, 3);
+}
+
+// The exact shape CLAUDE.md recorded as open: a `for` target is a binding
+// form pre_bind_function_body did not recognise at all (recursion aside), so
+// a read of a name whose only forward binding is a LATER `for`-loop rebind
+// was invisible even with no control-flow nesting in play. Measured against
+// mypy 1.18.1 and CPython 3.14 (driven with `b = Bag(); b.m()`): mypy `Name
+// "self" is used before definition  [used-before-def]` at the store inside
+// `inner`, CPython `UnboundLocalError: cannot access local variable 'self'
+// where it is not associated with a value` at the same line.
+TEST(TypeChecker, AForTargetRebindMakesAnEarlierReadInTheSameScopeAViolation) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            self.q = 1\n"
+                                         "            for self in [1, 2]:\n"
+                                         "                pass\n"
+                                         "        inner()\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'self' is used before definition");
+    EXPECT_EQ(error.line, 4);
+}
+
+// A nested `def`'s own name is likewise pre_bind_function_body's business,
+// and recursion makes it reachable from inside an `if` too -- both the
+// binding form and the control-flow recursion are exercised by one fixture.
+// An ENCLOSING `g` (module-level) is required for the same reason as the
+// Assign case above. Measured against mypy 1.18.1 and CPython 3.14 (driven
+// with `outer(True)`): mypy `Name "g" is used before definition
+// [used-before-def]`, CPython `UnboundLocalError`.
+TEST(TypeChecker, AConditionalNestedDefMakesAnEarlierReadAViolation) {
+    const Checked checked = check_module("def g() -> int:\n"
+                                         "    return 0\n"
+                                         "def outer(c: bool) -> None:\n"
+                                         "    print(g)\n"
+                                         "    if c:\n"
+                                         "        def g() -> int:\n"
+                                         "            return 1\n"
+                                         "    print(g)\n"
+                                         "outer(True)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'g' is used before definition");
+    EXPECT_EQ(error.line, 4);
+}
+
+// CONTROL, and the one this fix is most likely to break if it goes too far:
+// a read that resolves OUTWARD to an ENCLOSING scope, with no local rebind
+// anywhere in the reader's own scope, must stay clean -- mypy's rule is that
+// an outward-resolving read is never order-checked, and pre_bind_function_body
+// must not manufacture a placeholder for a name this scope never itself
+// binds. This is the closure fixture AClosureMayReadALocalAssignedAfterItsOwnDef
+// already pins elsewhere in this file; repeated here as the direct control
+// for THIS fix, differing from the violation tests above in exactly one
+// dimension -- the read is in a scope that never binds the name itself.
+TEST(TypeChecker, AClosureReadOfAnOuterLocalWithNoLocalRebindStaysClean) {
+    expect_clean("def o() -> int:\n"
+                 "    def i() -> int:\n"
+                 "        return v\n"
+                 "    v: int = 1\n"
+                 "    return i()\n");
+}
+
+// CONTROL: the one-line `for` suite reading its own target must stay clean
+// EVEN INSIDE A FUNCTION -- this is the exact hazard order_exempt exists to
+// prevent, now reachable through the placeholder-fill branch for the first
+// time (a `for` target used to always take assign_name's FRESH-bind branch,
+// since nothing pre-bound it; now it takes the placeholder-fill branch, which
+// must thread order_exempt through rather than silently dropping it).
+TEST(TypeChecker, AOneLineForSuiteInsideAFunctionReadingItsOwnTargetStaysClean) {
+    expect_clean("def f() -> None:\n"
+                 "    for i in range(3): print(i)\n"
+                 "f()\n");
+}
+
+// The multi-line form, and the tuple-target form -- both share the same
+// placeholder-fill path once pre-bound, so both need the order_exempt fix,
+// not just the plain Name-target one-liner above.
+TEST(TypeChecker, AMultiLineForSuiteInsideAFunctionReadingItsOwnTargetStaysClean) {
+    expect_clean("def f() -> None:\n"
+                 "    for i in range(3):\n"
+                 "        print(i)\n"
+                 "f()\n");
+}
+
+TEST(TypeChecker, ATupleForTargetInsideAFunctionIsStillUnsupportedNotACrash) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    for a, b in [(1, 2)]:\n"
+                                         "        pass\n"
+                                         "f()\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "tuple targets in for loops are not supported");
+}
+
+// The one-line form, reading an element right back on the SAME line as the
+// `for`: a tuple for-target's own elements are pre-bound now too (since
+// pre_bind_function_body routes through for_each_bound_name, which descends
+// into a TupleExpr the same way a plain Name target's enumeration does), so
+// this must still take the order_exempt=true path the direct-bind block in
+// visit(For) was given for exactly this reason -- ONE diagnostic (the
+// existing NotImplementedError), never a SECOND, false "used before
+// definition" on `a`.
+TEST(TypeChecker, AOneLineTupleForSuiteInsideAFunctionIsUnsupportedNotAFalsePositive) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    for a, b in [(1, 2)]: print(a)\n"
+                                         "f()\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "tuple targets in for loops are not supported");
+}
+
 // Reproduced against the built binary before this fix:
 // `def f(x: int) -> None: print(x)` reported a false "used before
 // definition" on `x`, because a one-line suite's body statement sits on the
@@ -1812,6 +1953,209 @@ TEST(TypeChecker, AFunctionDefRebindingTheReceiverInAClosureDoesNotDeclare) {
     EXPECT_EQ(checked.diagnostics[1].code, "NotImplementedError");
     EXPECT_EQ(checked.diagnostics[1].message, "methods on builtin types are not supported");
     EXPECT_EQ(checked.diagnostics[1].line, 8) << "the store, through the shadowing def's Callable type";
+}
+
+// THE METHOD-LEVEL (no closure at all) sibling of the two tests above:
+// `class self: pass` written DIRECTLY in `m`'s own body, with no nested def
+// in between. Until 2026-09-13 this was a genuine UNION-RULE VIOLATION, not
+// merely a missed refinement like the closure variant's residual store gap --
+// receiver_rebound_in_own_scope was only ever consulted when
+// collect_self_attribute_placeholders decided whether to DESCEND INTO a
+// nested def, never for a rebinding at the SAME level as the self.x = ...
+// statement being scanned, so this exact shape was COMPLETELY SILENT (0
+// diagnostics) where mypy reports `Name "self" already defined on line 4
+// [no-redef]` and CPython raises `AttributeError: 'Bag' object has no
+// attribute 'q'` when driven. Fixed by two independent changes landing
+// together: (1) the same shadow check now also runs before scanning a
+// method's OWN body, not only before descending into a nested one, so the
+// attribute placeholder is no longer wrongly declared; (2) visit(ClassDef)
+// now reports a redefinition directly when a function-local class's name
+// collides with an existing same-scope binding (here, the `self` parameter)
+// -- a check with no precedent before this fix, since a class's own name is
+// never otherwise compared against anything. TWO diagnostics here, not one:
+// this compiler does not need to match mypy's count, only refuse to stay
+// silent on a program mypy rejects.
+TEST(TypeChecker, AClassDefRebindingTheReceiverAtMethodLevelReportsBoth) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        class self:\n"
+                                         "            pass\n"
+                                         "        self.q = 1\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read() above m()";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "name \"self\" already defined on line 4");
+    EXPECT_EQ(checked.diagnostics[1].line, 5) << "the class statement itself, colliding with the parameter";
+}
+
+// mypy's redefinition rule is POSITION-INDEPENDENT: a reader placed BELOW
+// `m` (rather than above it, as in the test above) still collides, because
+// `m`'s own real per-statement walk (unaffected by this fix, since it is a
+// completely separate code path from the placeholder pre-pass) declares "q"
+// through the ordinary self.x = ... handling before the reader below it is
+// ever reached -- so only the redefinition itself is left to report, and it
+// still is, because receiver_rebound_in_own_scope's check does not depend on
+// there being a reader at all. Measured against mypy 1.18.1 and CPython 3.14
+// (driven with `b = Bag(); b.m(); print(b.read())`): mypy `no-redef` at the
+// class statement, CPython prints `1` then raises nothing -- wait, CPython
+// actually raises nothing here at all (`AttributeError` was the closure
+// variant's story; here the ordinary store legitimately runs before the
+// class statement rebinds the name, so `b.read()` sees a real attribute) --
+// the class statement is REACHED regardless, but the ATTRIBUTE was already
+// set through the actual parameter before the shadowing class statement runs.
+// mypy still rejects (a static check, unaffected by runtime order), so the
+// union rule requires cythonpp to report too.
+TEST(TypeChecker, AClassDefRebindingTheReceiverReportsRegardlessOfReaderPosition) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def m(self) -> None:\n"
+                                         "        class self:\n"
+                                         "            pass\n"
+                                         "        self.q = 1\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"self\" already defined on line 2");
+    EXPECT_EQ(error.line, 3);
+}
+
+// mypy's rule needs no reader at all: the collision is between the class
+// statement and the parameter, not between anything and an attribute read.
+TEST(TypeChecker, AClassDefRebindingTheReceiverReportsWithNoReaderAtAll) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def m(self) -> None:\n"
+                                         "        class self:\n"
+                                         "            pass\n"
+                                         "        self.q = 1\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"self\" already defined on line 2");
+    EXPECT_EQ(error.line, 3);
+}
+
+// And POSITION-independent the other way too: the store can sit ABOVE the
+// rebinding class statement. mypy still reports (its redefinition check does
+// not care which comes first textually), and CPython actually runs this
+// clean (`self.q = 1` executes through the real parameter before the class
+// statement ever reassigns the local), so this is a case where ONLY mypy
+// objects -- exactly the shape the union rule still requires a report for.
+TEST(TypeChecker, AClassDefRebindingAfterTheStoreStillReports) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def m(self) -> None:\n"
+                                         "        self.q = 1\n"
+                                         "        class self:\n"
+                                         "            pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"self\" already defined on line 2");
+    EXPECT_EQ(error.line, 4);
+}
+
+// CONTROL: rebinding a DIFFERENT name must not suppress the attribute or
+// trip the new redefinition check -- differs from the test above in exactly
+// one dimension, the rebound name.
+TEST(TypeChecker, AClassDefRebindingADifferentNameStaysClean) {
+    expect_clean("class Bag:\n"
+                 "    def read(self) -> int:\n"
+                 "        return self.q\n"
+                 "    def m(self) -> None:\n"
+                 "        class other:\n"
+                 "            pass\n"
+                 "        self.q = 1\n");
+}
+
+// CONTROL: a rebinding in a DIFFERENT method must not affect `m`/`read` at
+// all -- receiver_rebound_in_own_scope and the new ClassDef redefinition
+// check are both scoped to the ONE method's own body being scanned. Differs
+// from AClassDefRebindingTheReceiverAtMethodLevelReportsBoth in exactly one
+// dimension, which method the class statement sits in.
+TEST(TypeChecker, AClassDefRebindingInADifferentMethodDoesNotAffectAnother) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        self.q = 1\n"
+                                         "    def other(self) -> None:\n"
+                                         "        class self:\n"
+                                         "            pass\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "name \"self\" already defined on line 6")
+        << "other()'s OWN parameter, on other()'s own def line -- not m()'s";
+    EXPECT_EQ(error.line, 7) << "other()'s own collision, unrelated to m()/read()";
+}
+
+// The Assign sibling of the tests above, AT METHOD LEVEL rather than inside a
+// closure: `self = Bag()` directly in `m`'s own body. UNLIKE the ClassDef
+// shape, mypy is CLEAN on this one (an ordinary variable rebinding, not a
+// `[no-redef]`-eligible definition), so there is no redefinition diagnostic
+// to gain here -- ONLY the attribute placeholder fix applies, and this shape
+// is mypy-clean/CPython-AttributeError, so per the corpus harness's own gate
+// it belongs in a unit test, not the labelled corpus. Measured against mypy
+// 1.18.1: `Success`. CPython (driven): `AttributeError: 'Bag' object has no
+// attribute 'q'`.
+TEST(TypeChecker, AnAssignRebindingTheReceiverAtMethodLevelDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        self = Bag()\n"
+                                         "        self.q = 1\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(error.line, 3);
+}
+
+// The `for` target sibling, AT METHOD LEVEL: `for self in [Bag(), Bag()]:`
+// directly in `m`'s own body. Also mypy-clean (`Success`), so a unit test
+// rather than a corpus sample, for the same reason as the Assign sibling
+// above. CPython (driven): `AttributeError: 'Bag' object has no attribute
+// 'q'`.
+TEST(TypeChecker, AForTargetRebindingTheReceiverAtMethodLevelDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        for self in [Bag(), Bag()]:\n"
+                                         "            pass\n"
+                                         "        self.q = 1\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(error.line, 3);
+}
+
+// A `this`-named receiver (not spelled "self") rebound the same way,
+// confirming the fix is keyed on the BINDING (a method's own first
+// parameter), not the literal spelling "self" -- matches
+// self_attribute_receiver_type's own naming independence elsewhere in this
+// file.
+TEST(TypeChecker, AClassDefRebindingAThisNamedReceiverReportsBoth) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(this) -> int:\n"
+                                         "        return this.q\n"
+                                         "    def m(this) -> None:\n"
+                                         "        class this:\n"
+                                         "            pass\n"
+                                         "        this.q = 1\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "name \"this\" already defined on line 4");
 }
 
 // The other half of receiver_rebound_in_own_scope's rule -- never descending
@@ -6776,7 +7120,18 @@ TEST(TypeChecker, AConditionalNestedDefOverAnAliasWithAParameterIsStillClean) {
 // about whether the program is bad.
 TEST(TypeChecker, TheSixCollisionClassesThatMustKeepReportingStillDo) {
     // 1. conditional def, then a FLAT def. mypy `:5: Name "g" already
-    //    defined on line 3  [no-redef]`.
+    //    defined on line 3  [no-redef]`. Re-measured 2026-09-13: this row's
+    //    line pair used to be the reversed cosmetic divergence the class
+    //    comment describes (reported at line 3, "already defined on line 5"),
+    //    because pre_bind_function_body did not recurse into the `if` body
+    //    that declares the conditional `def` at line 3, so only the FLAT def
+    //    at line 5 was ever pre-bound and the conditional one collided
+    //    against IT when the real walk reached it first. Now that the
+    //    pre-bind pass recurses into If/While/For bodies (closing Defect B),
+    //    the conditional def at line 3 is pre-bound first (textual order),
+    //    the real walk fills that placeholder in cleanly, and the FLAT def at
+    //    line 5 is the one that collides -- matching mypy's own line pair
+    //    exactly, not merely still reporting.
     const Checked cond_then_flat = check_module("def f(c: bool) -> None:\n"
                                                 "    if c:\n"
                                                 "        def g() -> int:\n"
@@ -6786,8 +7141,8 @@ TEST(TypeChecker, TheSixCollisionClassesThatMustKeepReportingStillDo) {
                                                 "    print(g())\n");
     const diagnostics::Diagnostic cond_then_flat_error = only_error(cond_then_flat);
     EXPECT_EQ(cond_then_flat_error.code, "TypeError");
-    EXPECT_EQ(cond_then_flat_error.message, "name \"g\" already defined on line 5");
-    EXPECT_EQ(cond_then_flat_error.line, 3);
+    EXPECT_EQ(cond_then_flat_error.message, "name \"g\" already defined on line 3");
+    EXPECT_EQ(cond_then_flat_error.line, 5);
 
     // 2. def, then a VARIABLE. mypy `:4: Name "g" already defined on line 2
     //    [no-redef]`.

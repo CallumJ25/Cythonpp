@@ -210,105 +210,119 @@ bool same_type_up_to_union_order(const Type& left, const Type& right) {
     return true;
 }
 
-// True if `target` -- an assignment target, so a bare Name or a TupleExpr of
-// them (`a, b = ...`) -- binds `name` anywhere in it. Recurses into a
-// TupleExpr's elements because unpacking assignment can rebind a name just as
-// plainly as a direct one (`self, x = Bag(), 1` rebinds `self` exactly like
-// `self = Bag()` does); a nested TupleExpr (`(self, x), y = ...`) is walked
-// the same way.
-bool target_binds_name(const ast::Expr& target, const std::string& name) {
+// Invokes `visit(name)` for every bare Name an assignment target binds --
+// itself a Name, or a TupleExpr of them (`a, b = ...`, including a nested
+// TupleExpr, `(self, x), y = ...`) -- because unpacking assignment can rebind
+// a name just as plainly as a direct one (`self, x = Bag(), 1` rebinds `self`
+// exactly like `self = Bag()` does).
+void for_each_bound_name(const ast::Expr& target,
+                        const std::function<void(const std::string&)>& visit_name) {
     if (const auto* bare_name = dynamic_cast<const ast::Name*>(&target)) {
-        return bare_name->identifier() == name;
+        visit_name(bare_name->identifier());
+        return;
     }
     if (const auto* tuple = dynamic_cast<const ast::TupleExpr*>(&target)) {
         for (const ast::ExprPtr& element : tuple->elements()) {
-            if (target_binds_name(*element, name)) {
-                return true;
-            }
+            for_each_bound_name(*element, visit_name);
         }
     }
-    return false;
 }
 
-// True if `name` is bound by an ordinary assignment, an annotated
-// assignment, or a `for` target ANYWHERE in `body`'s own scope. Python
-// rebinds a name in a function's scope by ANY assignment to it, not just by
-// appearing as a parameter: `def inner():
-// self = Bag(); self.q = 1` makes `self` a local of `inner` exactly as a
-// parameter named `self` would, and mypy correctly refuses to attribute that
-// store to the enclosing method's own receiver. Missing this made the
-// nested-def descent in collect_self_attribute_placeholders placeholder-
-// declare the attribute as Unknown regardless -- silently accepting a
-// program BOTH oracles reject (mypy: two attr-defined errors; CPython:
-// AttributeError at runtime) -- worse than never descending at all.
+// What kind of statement bound a name, for for_each_own_scope_binding's
+// callers to filter by: receiver_rebound_in_own_scope treats every kind as a
+// shadow (a class's own name rebinds exactly as an assignment does -- see its
+// own comment), while pre_bind_function_body deliberately excludes
+// NestedClass -- see pre_bind_function_body's own comment for why.
+enum class OwnScopeBindingKind { Assign, AnnAssign, ForTarget, NestedDef, NestedClass };
+
+// Invokes `visit(name, line, kind)` for every name bound directly in `body`'s
+// own scope: an ordinary assignment, an annotated assignment, a `for` target
+// (Name or TupleExpr), or a nested def/class's own name. Python rebinds a
+// name in a function's scope by ANY of these, not just by appearing as a
+// parameter: `def inner(): self = Bag(); self.q = 1` makes `self` a local of
+// `inner` exactly as a parameter named `self` would, and mypy correctly
+// refuses to attribute that store to the enclosing method's own receiver (or,
+// for pre_bind_function_body's own use, correctly reports a same-scope read
+// above the rebind as "used before definition" rather than resolving it
+// outward).
 //
-// Recurses into If/While/For bodies (not new scopes, matching
-// collect_self_attribute_placeholders' own boundary). A nested FunctionDef or
-// ClassDef is two DIFFERENT things, not one: its BODY is a different scope
-// and is never descended into (a name assigned inside THAT body is a
-// different scope's own local and does not rebind this one), but
-// `def self(): ...` / `class self: ...` ITSELF binds "self" in the ENCLOSING
-// scope -- the same scope this function is scanning -- exactly as
+// Recurses into If/While/For bodies and their `else` clauses (not new
+// scopes). A nested FunctionDef or ClassDef is two DIFFERENT things, not one:
+// its BODY is a different scope and is never descended into (a name bound
+// inside THAT body is a different scope's own local and does not rebind this
+// one), but `def self(): ...` / `class self: ...` ITSELF binds "self" in the
+// ENCLOSING scope -- the same scope this function is scanning -- exactly as
 // `self = Bag()` does. Conflating those two questions -- "does the body
 // rebind the name" versus "does the definition's own name rebind it" -- is
 // exactly what made `class self: pass` followed by `self.q = 1` (or the
-// `def self(): pass` sibling) completely silent (2026-09-12): mypy reports
-// attr-defined at both the read above and the store itself (CPython raises
-// AttributeError), and this scan, checking only Assign/AnnAssign/For at the
-// time, reported nothing at all, because the pre-pass still thought "self"
-// was unshadowed and placeholder-declared "q" on Bag. NOTE this closes the
-// placeholder half only: ScopeStack deliberately never binds a class's own
-// name (see "Class names are deliberately NOT bound into ScopeStack"
-// elsewhere in this file), so self_attribute_receiver_type's own real-walk
-// resolution still cannot see this particular shadow either -- the STORE
-// itself may still go unreported for that separate, structural reason, but
-// the pre-pass no longer manufactures a placeholder that hides the READ
-// above it.
+// `def self(): pass` sibling) completely silent for receiver_rebound_in_own_
+// scope's original purpose (2026-09-12): mypy reports attr-defined at both
+// the read above and the store itself (CPython raises AttributeError), and
+// that scan, checking only Assign/AnnAssign/For at the time, reported
+// nothing at all, because the pre-pass still thought "self" was unshadowed
+// and placeholder-declared "q" on Bag.
 //
-// Augmented assignment to the receiver (`self += 1`) needs no arm here: the
+// Augmented assignment to a target (`self += 1`) needs no arm here: the
 // parser rejects it outright with its own SyntaxError before this scan ever
 // runs, so there is no silent case to cover.
-bool receiver_rebound_in_own_scope(const std::string& name, const std::vector<ast::StmtPtr>& body) {
+void for_each_own_scope_binding(
+    const std::vector<ast::StmtPtr>& body,
+    const std::function<void(const std::string&, int, OwnScopeBindingKind)>& visit) {
     for (const ast::StmtPtr& statement : body) {
         if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
-            if (target_binds_name(assign->target(), name)) {
-                return true;
-            }
+            const int line = assign->span().start_line;
+            for_each_bound_name(assign->target(), [&](const std::string& name) {
+                visit(name, line, OwnScopeBindingKind::Assign);
+            });
         } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
-            if (target_binds_name(ann_assign->target(), name)) {
-                return true;
+            if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
+                visit(target_name->identifier(), ann_assign->span().start_line,
+                      OwnScopeBindingKind::AnnAssign);
             }
         } else if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
-            if (target_binds_name(for_stmt->target(), name) ||
-                receiver_rebound_in_own_scope(name, for_stmt->body()) ||
-                receiver_rebound_in_own_scope(name, for_stmt->orelse())) {
-                return true;
-            }
+            const int line = for_stmt->span().start_line;
+            for_each_bound_name(for_stmt->target(), [&](const std::string& name) {
+                visit(name, line, OwnScopeBindingKind::ForTarget);
+            });
+            for_each_own_scope_binding(for_stmt->body(), visit);
+            for_each_own_scope_binding(for_stmt->orelse(), visit);
         } else if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
-            if (receiver_rebound_in_own_scope(name, if_stmt->body()) ||
-                receiver_rebound_in_own_scope(name, if_stmt->orelse())) {
-                return true;
-            }
+            for_each_own_scope_binding(if_stmt->body(), visit);
+            for_each_own_scope_binding(if_stmt->orelse(), visit);
         } else if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
-            if (receiver_rebound_in_own_scope(name, while_stmt->body()) ||
-                receiver_rebound_in_own_scope(name, while_stmt->orelse())) {
-                return true;
-            }
+            for_each_own_scope_binding(while_stmt->body(), visit);
+            for_each_own_scope_binding(while_stmt->orelse(), visit);
         } else if (const auto* nested_def = dynamic_cast<const ast::FunctionDef*>(statement.get())) {
-            if (nested_def->name() == name) {
-                return true;
-            }
+            visit(nested_def->name(), nested_def->span().start_line, OwnScopeBindingKind::NestedDef);
             // Its BODY is a different scope -- deliberately not descended
             // into, matching every other reason this file stops at that
             // boundary.
         } else if (const auto* nested_class = dynamic_cast<const ast::ClassDef*>(statement.get())) {
-            if (nested_class->name() == name) {
-                return true;
-            }
+            visit(nested_class->name(), nested_class->span().start_line,
+                  OwnScopeBindingKind::NestedClass);
             // Its BODY is a different scope, for the same reason.
         }
     }
-    return false;
+}
+
+// True if `name` is bound anywhere in `body`'s own scope -- see
+// for_each_own_scope_binding for exactly which statement forms count and
+// where the recursion stops. NOTE this closes the placeholder half only:
+// ScopeStack deliberately never binds a class's own name (see "Class names
+// are deliberately NOT bound into ScopeStack" elsewhere in this file), so
+// self_attribute_receiver_type's own real-walk resolution still cannot see a
+// `class self: ...` shadow either -- the STORE itself may still go
+// unreported for that separate, structural reason, but the pre-pass no
+// longer manufactures a placeholder that hides the READ above it.
+bool receiver_rebound_in_own_scope(const std::string& name, const std::vector<ast::StmtPtr>& body) {
+    bool shadowed = false;
+    for_each_own_scope_binding(body,
+                              [&](const std::string& bound_name, int, OwnScopeBindingKind) {
+        if (bound_name == name) {
+            shadowed = true;
+        }
+    });
+    return shadowed;
 }
 
 } // namespace
@@ -896,29 +910,49 @@ void TypeChecker::pre_bind_target(const ast::Expr& target, int line) {
 }
 
 void TypeChecker::pre_bind_function_body(const std::vector<ast::StmtPtr>& body) {
-    for (const ast::StmtPtr& statement : body) {
-        if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
-            pre_bind_target(assign->target(), assign->span().start_line);
-        } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
-            if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
-                if (!scopes_.bound_in_current_scope(target_name->identifier())) {
-                    scopes_.bind(target_name->identifier(),
-                                Binding{Type::unknown(), ann_assign->span().start_line,
-                                        /*annotated=*/false});
-                }
-            }
-        } else if (const auto* nested_def = dynamic_cast<const ast::FunctionDef*>(statement.get())) {
-            if (!scopes_.bound_in_current_scope(nested_def->name())) {
-                scopes_.bind(nested_def->name(),
-                            Binding{Type::unknown(), nested_def->span().start_line,
-                                    /*annotated=*/false});
-            }
+    // Routed through for_each_own_scope_binding -- shared with
+    // receiver_rebound_in_own_scope -- so this placeholder pass and that
+    // shadow check cannot recognise different binding forms. Closes a
+    // measured gap (2026-09-13): the pre-refactor version only covered a
+    // top-level Assign/AnnAssign/nested-def, never recursed into If/While/For
+    // bodies, and never covered a `for` target at all, so
+    //   def m() -> None:
+    //       def inner() -> None:
+    //           self.q = 1
+    //           for self in [1, 2]:
+    //               pass
+    //       inner()
+    // (with `self` a bound name in an ENCLOSING scope, so the read did not
+    // simply fall through to "not defined") was silently accepted --
+    // mypy reports `Name "self" is used before definition  [used-before-def]`
+    // at the store, and CPython raises the matching UnboundLocalError -- both
+    // oracles reject a program this compiler accepted.
+    for_each_own_scope_binding(body, [this](const std::string& name, int line,
+                                           OwnScopeBindingKind kind) {
+        if (kind == OwnScopeBindingKind::NestedClass) {
+            // Deliberately UNBOUND, not merely unhandled. A nested class's
+            // own name is a genuine same-scope binding form too (measured:
+            // `class Local: pass` above `def f(): print(Local); class
+            // Local: pass` is mypy `used-before-def` and CPython
+            // `UnboundLocalError`, and this compiler is silent on it), but
+            // placeholder-binding it here would break every "is_class(name)
+            // implies scopes_.resolve(name) is null" carve-out this compiler
+            // already depends on elsewhere (type_of_name's bare-class-value
+            // branch, ExpressionTyper::class_object_receiver, and the bare
+            // `C()` constructor branch in expression_typer_calls.cpp) the
+            // moment the class's own definition is reached -- ScopeStack has
+            // no removal primitive to restore the invariant afterward, and
+            // filling the placeholder with the class's constructor type
+            // (the one value that would keep those carve-outs' ANSWER
+            // correct) still leaves them looking at a non-null binding, which
+            // is the fact they key on, not the type. Left open; see the
+            // dated entry in CLAUDE.md.
+            return;
         }
-        // A ClassDef nested directly in a function body is out of this
-        // task's tested scope; it binds nothing into ScopeStack anywhere
-        // else either (see class_lookup/ClassTable), so there is nothing to
-        // placeholder-bind for one here.
-    }
+        if (!scopes_.bound_in_current_scope(name)) {
+            scopes_.bind(name, Binding{Type::unknown(), line, /*annotated=*/false});
+        }
+    });
 }
 
 TypeChecker::AnnotationBinding TypeChecker::bind_annotation(const ast::Name& target,
@@ -1155,11 +1189,22 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
     const Resolution existing = scopes_.resolve(target.identifier());
     if (is_unfilled_placeholder(*existing.binding, line)) {
         // This statement owns a still-unfilled placeholder from
-        // pre_bind_assignment_targets (or is re-visiting its own earlier
-        // tuple element within the same statement) -- this IS the first
-        // real assignment, so fill it in rather than compare against the
-        // Unknown placeholder.
-        scopes_.rebind(target.identifier(), Binding{value_type, line, /*annotated=*/false});
+        // pre_bind_assignment_targets/pre_bind_function_body (or is
+        // re-visiting its own earlier tuple element within the same
+        // statement) -- this IS the first real assignment, so fill it in
+        // rather than compare against the Unknown placeholder.
+        //
+        // order_exempt is threaded through here, not hardcoded false: a `for`
+        // target's placeholder (pre_bind_function_body, since 2026-09-13)
+        // shares this exact fill path, and its real bind always passes
+        // order_exempt=true (see visit(For)) -- a one-line suite reading the
+        // target right back (`for i in range(3): print(i)`, now reachable
+        // through this branch once the target is pre-bound) would otherwise
+        // lose the flag and misfire a false "used before definition" exactly
+        // like the bug order_exempt exists to prevent. An ordinary Assign's
+        // own placeholder-fill call never passes true, so this is a no-op for
+        // every pre-existing caller.
+        scopes_.rebind(target.identifier(), Binding{value_type, line, /*annotated=*/false, order_exempt});
         return;
     }
     // A genuine reassignment (including a one-line def's parameter, whose
@@ -2367,6 +2412,38 @@ void TypeChecker::visit(const ast::ClassDef& node) {
         // change. Outside that function the alias is gone, so a
         // module-level `L()` after the `def f` that declares `class L` still
         // reports the NameError mypy reports for it.
+        //
+        // A class's own name is never bound into ScopeStack (see the
+        // class-level comment for why two other checks depend on that),
+        // so this class statement is otherwise invisible to every
+        // redefinition check in this file -- but a SAME-scope binding this
+        // class's name collides with (a parameter, most commonly a method's
+        // own `self`/`this`) is very much visible, right here, before
+        // isolation ever runs. Measured 2026-09-13: `class self: pass`
+        // written directly in a method's own body, colliding with that
+        // method's own first parameter, is mypy `Name "self" already defined
+        // on line N  [no-redef]` regardless of whether anything ever reads an
+        // attribute through the shadowed name afterward (unlike the
+        // self-attribute placeholder half of this same defect, fixed
+        // separately in pre_collect_class_body -- see
+        // receiver_rebound_in_own_scope's own comment -- this check does not
+        // depend on there being a reader at all, or on the store coming
+        // before or after this statement: mypy's redefinition rule is
+        // POSITION-INDEPENDENT, and bound_in_current_scope already reflects
+        // the whole scope by the time any statement in it is reached). Scoped
+        // deliberately narrow: this only ever fires against a binding
+        // ScopeStack actually holds (a parameter, a plain assignment, a
+        // nested def), never against ANOTHER class of the same name, since
+        // no class's name is ever bound here for a second one to collide
+        // with -- that broader gap (two same-named classes, or two same-named
+        // methods, colliding with each other) is a separate, still-open
+        // defect; see CLAUDE.md.
+        if (scopes_.bound_in_current_scope(node.name())) {
+            const Resolution existing = scopes_.resolve(node.name());
+            report(node, DiagnosticKind::SemanticAnalyzerTypeError,
+                  "name \"" + node.name() + "\" already defined on line " +
+                      std::to_string(existing.binding->declared_line));
+        }
         qualified_name = declare_isolated_class(
             node, "<local-class>#" + std::to_string(node.span().start_line) + "#" + node.name());
         if (!local_class_alias_frames_.empty()) {
@@ -2483,9 +2560,28 @@ void TypeChecker::pre_collect_class_body(const ast::ClassDef& node,
             const Type signature = resolve_method_signature(*function_def, qualified_name);
             class_method_signatures_.emplace(function_def, signature);
             classes_.declare_method(qualified_name, function_def->name(), signature);
-            collect_self_attribute_placeholders(qualified_name,
-                                                function_def->params().front().name,
-                                                function_def->body());
+            // The receiver can be rebound directly in THIS method's own body
+            // too, not only inside a closure nested within it -- measured
+            // 2026-09-13: `class self: pass` (or `self = Bag()`, or `for self
+            // in [Bag(), Bag()]:`) anywhere in `m`'s own body, with a reader
+            // method `read` placed above it, was COMPLETELY SILENT here even
+            // though mypy reports (`no-redef`, or is outright clean for the
+            // Assign/For forms while CPython still raises AttributeError) and
+            // CPython raises AttributeError at the read -- because the
+            // shadow check below was only ever consulted when deciding
+            // whether to DESCEND INTO a nested def, never for a rebinding at
+            // the SAME level as the self.x = ... this pre-pass is about to
+            // scan. receiver_rebound_in_own_scope is position-independent
+            // (mypy's own redefinition check is: a store BEFORE the rebind
+            // statement is caught exactly like one after), so this check
+            // must run before scanning the method's body at all, not only
+            // before descending into a nested one.
+            if (!receiver_rebound_in_own_scope(function_def->params().front().name,
+                                               function_def->body())) {
+                collect_self_attribute_placeholders(qualified_name,
+                                                    function_def->params().front().name,
+                                                    function_def->body());
+            }
         } else if (const auto* assign = dynamic_cast<const ast::Assign*>(&statement)) {
             if (const auto* target_name = dynamic_cast<const ast::Name*>(&assign->target())) {
                 // A plain class-body Assign
@@ -2945,9 +3041,26 @@ void TypeChecker::visit(const ast::For& node) {
         // for the same reason the Name-target arm below needs it: bound
         // before the body runs, so a one-line suite reading one right back
         // can never be a genuine use-before-definition.
+        //
+        // A tuple for-target's own elements are pre-bound too, since
+        // 2026-09-13 (pre_bind_function_body routes through the same
+        // for_each_bound_name a plain Name target uses), so the ordinary
+        // fresh-bind branch below no longer fires for one inside a function
+        // body -- this must fill THAT placeholder in directly, exactly as
+        // assign_name's own is_unfilled_placeholder branch does for a plain
+        // Name target, or the element's order_exempt=false placeholder would
+        // survive untouched and misfire the same false "used before
+        // definition" order_exempt exists to prevent.
         for (const ast::ExprPtr& element : tuple_target->elements()) {
             if (const auto* name = dynamic_cast<const ast::Name*>(element.get())) {
-                if (!scopes_.bound_in_current_scope(name->identifier())) {
+                if (scopes_.bound_in_current_scope(name->identifier())) {
+                    const Resolution existing = scopes_.resolve(name->identifier());
+                    if (is_unfilled_placeholder(*existing.binding, line)) {
+                        scopes_.rebind(name->identifier(),
+                                       Binding{Type::unknown(), line, /*annotated=*/false,
+                                              /*order_exempt=*/true});
+                    }
+                } else {
                     scopes_.bind(name->identifier(),
                                  Binding{Type::unknown(), line, /*annotated=*/false,
                                         /*order_exempt=*/true});

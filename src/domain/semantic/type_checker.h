@@ -1111,10 +1111,14 @@ private:
     // true: like a parameter, it is bound before its body ever runs, so a
     // one-line suite (`for i in range(3): print(i)`) reading it within that
     // same body can never be a genuine use-before-definition, only a false
-    // positive from the ordinary `declared_line >= read_line` check. Only
-    // the FRESH-bind branch honours this flag -- the placeholder-fill and
-    // reassignment branches never build a new Binding, so there is nothing
-    // for it to change there.
+    // positive from the ordinary `declared_line >= read_line` check. The
+    // FRESH-bind branch honours this flag directly; the placeholder-fill
+    // branch threads it through too (since 2026-09-13, when
+    // pre_bind_function_body started pre-binding a `for` target the same way
+    // it already pre-bound an Assign/AnnAssign target, which made that branch
+    // reachable for a `for` target for the first time) -- the reassignment
+    // branch never builds a new Binding, so there is nothing for it to change
+    // there.
     void assign_name(const ast::Name& target, const Type& value_type, int line,
                      bool order_exempt = false);
 
