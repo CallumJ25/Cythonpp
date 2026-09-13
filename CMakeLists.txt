@@ -108,6 +108,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/semantic/builtin_class_table_test.cpp
         tests/domain/semantic/builtin_class_genericity_test.cpp
         tests/domain/semantic/builtin_function_table_test.cpp
+        tests/domain/semantic/builtin_object_member_table_test.cpp
         tests/domain/semantic/class_table_test.cpp
         tests/domain/semantic/scope_stack_test.cpp
         tests/domain/semantic/narrowing_map_test.cpp

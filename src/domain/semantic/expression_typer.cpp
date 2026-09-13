@@ -920,6 +920,30 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
     if (classes_.inherits_builtin_class(receiver.name)) {
         return error(attribute, DiagnosticKind::NotImplementedError, kBuiltinMemberMessage);
     }
+    // THE THIRD CARVE-OUT, and unlike the two above, not a chain walk at all:
+    // `object`'s OWN real members (builtin_object_member_table.h's GENERATED
+    // set, e.g. __class__/__repr__/__hash__/__str__) are not modelled
+    // anywhere, and neither of the carve-outs above can reach them --
+    // inherits_builtin_class's walk deliberately excludes `object` itself
+    // (every class conceptually derives from it; see that function's own
+    // comment), and a plain `class Plain: pass` records no bases at all, so
+    // the walk never runs in the first place. Measured (mypy 1.18.1,
+    // CPython): `class Plain: pass` / `p = Plain()` / `print(p.__class__)`
+    // is `mypy --strict` Success and CPython prints
+    // `<class '__main__.Plain'>`, and cythonpp reported a false
+    // `"Plain" has no attribute "__class__"` before this check existed --
+    // reachable identically on `object()` used directly, since ClassTable
+    // seeds `object`'s own entry with no member-map entries either.
+    // `is_object_member` is a fixed name-set membership test rather than
+    // anything keyed on `receiver.name`, on purpose: `object`'s member set is
+    // the same for every receiver, seeded or not, so there is nothing to
+    // canonicalise or walk. Checked LAST, after every class-specific lookup
+    // above has already missed, so a class that legitimately overrides one of
+    // these names (`def __repr__(self) -> str: ...`) still resolves through
+    // method_type first and never reaches this fallback at all.
+    if (ClassTable::is_object_member(attribute.attribute())) {
+        return Type::unknown();
+    }
     // Every base is an ordinary user-class-shaped entry (neither a modelled
     // TypeKind nor a seeded builtin class row), so a miss here is a genuine
     // mypy attr-defined error.

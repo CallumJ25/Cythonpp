@@ -14,6 +14,7 @@ needed mypy, so the script's dependency set is unchanged.
 Usage:
     python scripts/verify_corpus_labels.py --generate-class-table
     python scripts/verify_corpus_labels.py --generate-function-table
+    python scripts/verify_corpus_labels.py --generate-object-member-table
     python scripts/verify_corpus_labels.py --check-corpus     # added in Task 24
 """
 
@@ -488,6 +489,152 @@ def generate_function_table() -> str:
     )
 
 
+OBJECT_MEMBER_HEADER = """#ifndef CYTHONPP_DOMAIN_SEMANTIC_BUILTIN_OBJECT_MEMBER_TABLE_H
+#define CYTHONPP_DOMAIN_SEMANTIC_BUILTIN_OBJECT_MEMBER_TABLE_H
+
+#include <cstddef>
+
+namespace cythonpp::domain::semantic {{
+
+// Every name `dir(object)` reports, MINUS any name `mypy --strict` rejects
+// when it is read (not called) as a plain attribute off an ordinary
+// no-base instance. GENERATED -- do not edit by hand. Regenerate with:
+//
+//     python scripts/verify_corpus_labels.py --generate-object-member-table
+//
+// Extracted from Python {version} on {system}, filtered against {mypy_version}.
+//
+// WHY THIS FILE EXISTS. `object`'s own members are modelled nowhere: a plain
+// user class (`class Plain: pass`) records no bases at all, so
+// ClassTable::inherits_builtin_class's chain walk -- the fix for the sibling
+// defect of a class reaching a SEEDED builtin row -- never runs on it, and
+// `object` is deliberately excluded from that walk anyway (every class
+// conceptually derives from it; see that function's own comment). So
+// `p.__class__`, `p.__repr__`, `p.__hash__` and the rest of `object`'s real
+// member set were false `TypeError`s on programs both mypy --strict and
+// CPython accept and run -- and the identical false positive reaches
+// `object()` used directly, since ClassTable seeds `object` itself with no
+// member map entries either.
+//
+// WHY EXTRACTED RATHER THAN CURATED, the same reason builtin_class_table.h
+// and builtin_function_table.h both give: a hand-picked list has exactly one
+// failure mode -- a forgotten name -- and it is silent.
+//
+// WHY FILTERED AGAINST MYPY, AND WHY FIVE NAMES OF THE TWENTY-FOUR IN
+// `dir(object)` ARE MISSING HERE. `__init__` is read directly:
+// `Accessing "__init__" on an instance is unsound, since instance.__init__
+// could be from an incompatible subclass  [misc]` under mypy --strict, so the
+// union rule already covers it and this compiler must keep reporting there,
+// not go silent. `__lt__`, `__le__`, `__gt__` and `__ge__` are a second,
+// distinct case: CPython's `object` genuinely carries all four as slot
+// wrappers (`p.__lt__` returns one at runtime, no error), but typeshed's
+// `object` stub omits them so total ordering is not accidentally assumed --
+// mypy's `--strict` verdict on a bare `p.__ge__` read is `Unsupported left
+// operand type for ">=" ("Plain")  [operator]`, an error, even though nothing
+// is being compared. Both are cases where mypy rejects and CPython accepts,
+// so the union rule says reject, and this table must not paper over that by
+// including them.
+//
+// TWO NAMES A PRIOR (WRONG) DRAFT OF THIS FIX INCLUDED, AND WHY THEY ARE NOT
+// HERE. `__dict__` and `__module__` are NOT in `dir(object)` at all --
+// `object()` itself raises `AttributeError: 'object' object has no attribute
+// '__dict__'` at runtime, measured directly. An ordinary subclass instance
+// (`Plain()`) does carry both, but that is a property of the CLASS MACHINERY
+// (every class without `__slots__` gets an instance `__dict__`, and every
+// class gets a `__module__`), not of `object`'s own member set -- and seeding
+// them here would make `object().__dict__` a false CLEAN when CPython
+// rejects it outright. That is a separate, unmodelled defect (every ordinary
+// class implicitly carries `__dict__`/`__module__`/`__weakref__`/
+// `__annotations__`), not this one.
+//
+// THIS FILE CARRIES NO SIGNATURES, deliberately, the same choice
+// builtin_function_table.h makes and for the same reason: several of
+// object's real signatures use type machinery this model does not have
+// (`Self`, overloaded `SupportsIndex`, `type[Self]`), and guessing one wrong
+// would be a false claim. A name found here resolves to Unknown, which is
+// absorbing, so the access is clean and no type claim is made.
+
+constexpr const char* kObjectMembers[] = {{
+{rows}
+}};
+
+constexpr std::size_t kObjectMemberCount =
+    sizeof(kObjectMembers) / sizeof(kObjectMembers[0]);
+
+}} // namespace cythonpp::domain::semantic
+
+#endif // CYTHONPP_DOMAIN_SEMANTIC_BUILTIN_OBJECT_MEMBER_TABLE_H
+"""
+
+
+def object_member_names():
+    """Every `dir(object)` name that mypy --strict does not reject when read
+    (never called) as a plain attribute off a fresh no-base class instance.
+
+    One probe file, one name per line, so a single mypy invocation settles
+    all twenty-four at once -- the same one-shot-probe idiom
+    accepts_type_arguments and constructor_arity already use, for the same
+    reason: a per-name subprocess would be slower and no more precise.
+    """
+    names = sorted(dir(object))
+    with tempfile.TemporaryDirectory() as tmpdir:
+        probe = pathlib.Path(tmpdir) / "object_member_probe.py"
+        lines = ["class Plain:", "    pass", "", "p = Plain()"]
+        first = len(lines) + 1
+        lines.extend(f"print(p.{name})" for name in names)
+        probe.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result = subprocess.run(
+            ["mypy", "--strict", "--no-color-output", "--no-error-summary", probe.name],
+            cwd=tmpdir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode >= 2:
+            raise SystemExit(
+                f"mypy --strict exited {result.returncode} on the object-member probe; "
+                f"cannot derive object member names\n{result.stdout}{result.stderr}"
+            )
+        rejected_lines = set()
+        for line in result.stdout.splitlines():
+            parts = line.split(":", 2)
+            if len(parts) < 3 or not parts[1].isdigit():
+                continue
+            rejected_lines.add(int(parts[1]))
+
+    # The `python -m mypy` vacuous-invocation trap constructor_arity's own
+    # comment records (exit 0, empty output, every arity silently accepted)
+    # has an identical failure mode here: an empty rejected_lines set reads as
+    # "mypy accepted all 24", indistinguishable from a genuine clean verdict.
+    # __init__ is the known-rejected control -- assert it actually rejected.
+    init_line = first + names.index("__init__")
+    if init_line not in rejected_lines:
+        raise SystemExit(
+            "vacuous object-member probe: mypy must reject a bare `p.__init__` read "
+            f"(misc: unsound instance access); got no error on line {init_line}. Is the "
+            "standalone `mypy` executable on PATH, not `python -m mypy`?"
+        )
+
+    accepted = [
+        name for index, name in enumerate(names) if (first + index) not in rejected_lines
+    ]
+    return accepted
+
+
+def _mypy_version() -> str:
+    result = subprocess.run(["mypy", "--version"], capture_output=True, text=True)
+    return result.stdout.strip() or result.stderr.strip()
+
+
+def generate_object_member_table() -> str:
+    rows = [f'    "{name}",' for name in object_member_names()]
+    return OBJECT_MEMBER_HEADER.format(
+        version=sys.version.split()[0],
+        system=platform.system(),
+        mypy_version=_mypy_version(),
+        rows="\n".join(rows),
+    )
+
+
 def corpus_dir() -> pathlib.Path:
     # Relative to this script's own location, never a hardcoded absolute
     # path -- this file is tracked, so it must work on any machine's clone.
@@ -867,6 +1014,7 @@ def main() -> int:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--generate-class-table", action="store_true")
     group.add_argument("--generate-function-table", action="store_true")
+    group.add_argument("--generate-object-member-table", action="store_true")
     group.add_argument(
         "--check-corpus",
         action="store_true",
@@ -881,6 +1029,9 @@ def main() -> int:
         return 0
     if args.generate_function_table:
         sys.stdout.write(generate_function_table())
+        return 0
+    if args.generate_object_member_table:
+        sys.stdout.write(generate_object_member_table())
         return 0
     if args.check_corpus:
         return check_corpus()

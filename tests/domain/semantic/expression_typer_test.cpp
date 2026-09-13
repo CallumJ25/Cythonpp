@@ -1198,6 +1198,89 @@ TEST(ExpressionTyper, AMissingAttributeOnAClassWithAnExplicitObjectBaseStaysATyp
     EXPECT_EQ(error.line, 1);
 }
 
+// THE THIRD CARVE-OUT's own end-to-end control, the key pair with the
+// AMissingAttributeOnAPlainClassStaysATypeError test above: the SAME
+// receiver (a bare, no-base Plain), but a member `object` genuinely has.
+// Verified against mypy 1.18.1 (Success, reveals `type[Plain]`) and CPython
+// (`print(p.__class__)` prints `<class '__main__.Plain'>`, exit 0) -- both
+// oracles accept and run this program, so a TypeError here was the false
+// positive this fix closes. Proven by neutering: commenting out the
+// is_object_member check in expression_typer.cpp's type_of_class_attribute
+// flips this test to report "Plain" has no attribute "__class__" (the exact
+// message AMissingAttributeOnAPlainClassStaysATypeError pins for "nope"),
+// while that sibling test is unaffected either way.
+TEST(ExpressionTyper, AnObjectOwnMemberOnAPlainClassIsCleanAndUnknown) {
+    ClassTable table;
+    table.declare("Plain", {});
+
+    const Typed typed = type_expression("p.__class__", {{"p", Type::class_of("Plain")}},
+                                        Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "expected no diagnostics, got " << only_error(typed).message;
+    EXPECT_EQ(typed.printed, "Unknown");
+}
+
+// The identical member access reaches `object` used DIRECTLY, not only
+// through a plain subclass: `o = object(); o.__class__` is likewise mypy
+// Success / CPython-clean. inherits_builtin_class("object") answers false
+// for object queried about ITSELF too (it excludes `object` unconditionally,
+// not only as an ancestor), so without this carve-out the receiver falls
+// through to the same false TypeError as the Plain case.
+TEST(ExpressionTyper, AnObjectOwnMemberOnObjectItselfIsCleanAndUnknown) {
+    const Typed typed = type_expression("o.__class__", {{"o", Type::class_of("object")}});
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "expected no diagnostics, got " << only_error(typed).message;
+    EXPECT_EQ(typed.printed, "Unknown");
+}
+
+// A genuinely missing attribute on `object` itself must still report --
+// this carve-out is a fixed name SET, not "anything goes once the receiver
+// is object". `o.nope` is a genuine attr-defined error under mypy and an
+// AttributeError under CPython.
+TEST(ExpressionTyper, AMissingAttributeOnObjectItselfStaysATypeError) {
+    const Typed typed = type_expression("o.nope", {{"o", Type::class_of("object")}});
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"object\" has no attribute \"nope\"");
+    EXPECT_EQ(error.line, 1);
+}
+
+// `__init__` looks like the same shape as `__class__` (both are in
+// dir(object)) but is NOT part of this carve-out: mypy --strict rejects a
+// bare instance read of it ("Accessing \"__init__\" on an instance is
+// unsound ... [misc]"), so the union rule requires cythonpp to keep
+// reporting here, not go silent -- this pins that is_object_member's
+// generated table really excludes it rather than the omission being
+// untested.
+TEST(ExpressionTyper, PDunderInitStaysATypeError) {
+    ClassTable table;
+    table.declare("Plain", {});
+
+    const Typed typed = type_expression("p.__init__", {{"p", Type::class_of("Plain")}},
+                                        Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Plain\" has no attribute \"__init__\"");
+}
+
+// A class that reaches a SEEDED BUILTIN ROW must keep its EXISTING
+// NotImplementedError from inherits_builtin_class, not fall through to the
+// new object-member carve-out -- inherits_builtin_class is checked first and
+// returns before is_object_member is ever consulted, so this must stay
+// unchanged by this fix. MyErr(ValueError) reaching `__str__` (a real object
+// member AND a name every seeded builtin row could plausibly override) is
+// the sharpest control for that ordering.
+TEST(ExpressionTyper, AnObjectMemberNameOnASeededBuiltinRowStaysDeferred) {
+    ClassTable table;
+    table.declare("MyErr", {Type::class_of("ValueError")});
+
+    const Typed typed = type_expression("e.__str__", {{"e", Type::class_of("MyErr")}},
+                                        Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "methods on builtin types are not supported");
+}
+
 // Verified: xs.append(1), s.upper() and d.keys() are ALL mypy-clean. With no
 // typeshed, reporting attr-defined here would be a false TypeError on one of
 // the most common lines in Python.

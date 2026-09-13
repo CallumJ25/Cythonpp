@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "domain/semantic/builtin_class_table.h"
+#include "domain/semantic/builtin_object_member_table.h"
 #include "domain/semantic/builtin_type_names.h"
 #include "domain/semantic/type_compatibility.h"
 
@@ -644,6 +645,15 @@ bool ClassTable::inherits_builtin_class(const std::string& qualified_name) const
             return std::nullopt;
         });
     return found.has_value() && *found;
+}
+
+bool ClassTable::is_object_member(const std::string& member) {
+    for (std::size_t index = 0; index < kObjectMemberCount; ++index) {
+        if (member == kObjectMembers[index]) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace cythonpp::domain::semantic

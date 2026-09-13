@@ -840,6 +840,24 @@ TEST(ClassTable, DeclaringOverASeededBuiltinNameClearsTheSeededFlag) {
     EXPECT_FALSE(table.inherits_builtin_class("MyErr"));
 }
 
+// is_object_member is a fixed name-set membership test (builtin_object_
+// member_table.h's GENERATED kObjectMembers), not a chain walk keyed on any
+// particular class -- so it takes no qualified_name argument at all and must
+// answer identically regardless of what ClassTable otherwise knows. Three
+// real object members and three deliberate non-members, one drawn from each
+// of the two reasons a dir(object) name is excluded: __init__ (mypy rejects
+// reading it -- "unsound instance access") and __ge__ (typeshed's object
+// omits total ordering; mypy rejects a bare read of it too), plus a name that
+// simply is not a Python dunder at all.
+TEST(ClassTable, IsObjectMemberRecognisesRealMembersAndRejectsUnsoundOnes) {
+    EXPECT_TRUE(ClassTable::is_object_member("__class__"));
+    EXPECT_TRUE(ClassTable::is_object_member("__repr__"));
+    EXPECT_TRUE(ClassTable::is_object_member("__hash__"));
+    EXPECT_FALSE(ClassTable::is_object_member("__init__"));
+    EXPECT_FALSE(ClassTable::is_object_member("__ge__"));
+    EXPECT_FALSE(ClassTable::is_object_member("nope"));
+}
+
 // EnvironmentError, IOError and WindowsError are not distinct classes from
 // OSError -- getattr(builtins, "IOError") is builtins.OSError in CPython --
 // so both x: IOError = OSError() and y: OSError = IOError() are mypy-clean.

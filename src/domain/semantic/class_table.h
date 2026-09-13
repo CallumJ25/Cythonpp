@@ -354,6 +354,25 @@ public:
     // names end-to-end through the actual report site.
     bool inherits_builtin_class(const std::string& qualified_name) const;
 
+    // Whether `member` is one of `object`'s own real members (builtin_object_
+    // member_table.h's GENERATED kObjectMembers) -- the universal-lookup
+    // sibling to inherits_builtin_class above, for the OTHER reason a class
+    // can carry no member-table entry for a name it still legitimately has.
+    // inherits_builtin_class answers "does this class's chain reach a SEEDED
+    // BUILTIN ROW", which is false for `object` deliberately (see that
+    // function's own comment) and false for an ordinary no-base user class,
+    // since neither ever walks anywhere. Every receiver still has `object`'s
+    // OWN members, though -- `p.__class__`, `p.__repr__`, `p.__hash__` -- and
+    // this is a plain name-set membership check, not a chain walk, precisely
+    // because `object` is nobody's declared base in this model (`ClassTable`
+    // never seeds it as an ancestor of anyone) and there is no chain to walk:
+    // it must answer identically for a completely plain `class Plain: pass`
+    // AND for `object` used directly. Takes no `qualified_name` at all,
+    // unlike its siblings -- unlike a seeded row's members, which vary
+    // class-to-class, `object`'s own member set is the same fixed set for
+    // every receiver, so there is nothing to canonicalise or walk.
+    static bool is_object_member(const std::string& member);
+
 private:
     struct Member {
         Type type;
