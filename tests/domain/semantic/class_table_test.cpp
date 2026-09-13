@@ -615,11 +615,16 @@ TEST(ClassTable, TheSameProgramWithBasesSwappedStaysUnchecked) {
     EXPECT_EQ(table.constructor_check("C"), ClassTable::ConstructorCheck::Unchecked);
 }
 
-// CONTROL: `object` constructed DIRECTLY must keep reporting -- the
-// carve-out excludes `object` only when it is reached as an ANCESTOR of a
-// different resolved class, never when it is the class actually being asked
-// about. Mirrors TypeChecker.AZeroArgBoundedBuiltinStillReportsTooManyArguments
-// one layer down, at the ClassTable level the carve-out itself lives at.
+// CONTROL: `object` constructed DIRECTLY must keep reporting. This pins the
+// OUTCOME, not the carve-out's `canonical != resolved` clause specifically --
+// measured, the outcome holds even with that clause removed (an unconditional
+// `canonical == "object"` exclusion leaves this test passing too), since a
+// "no band found" answer and object's own `(0, 0)` band are indistinguishable
+// at both consumers. See find_builtin_arity's own comment for why the clause
+// is kept anyway (defensive, not load-bearing today) and what would make it
+// start mattering. Mirrors
+// TypeChecker.AZeroArgBoundedBuiltinStillReportsTooManyArguments one layer
+// down, at the ClassTable level the carve-out itself lives at.
 TEST(ClassTable, ObjectConstructedDirectlyStaysBoundedAtZeroArgs) {
     const ClassTable table;
     EXPECT_EQ(table.constructor_check("object"), ClassTable::ConstructorCheck::Checked);

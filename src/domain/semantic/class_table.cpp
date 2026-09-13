@@ -184,17 +184,30 @@ void ClassTable::declare(std::string qualified_name, std::vector<Type> bases) {
     // THE INVARIANT THIS TRADES ON, and why the trade is safe: declare() is
     // NOT idempotent with respect to accumulated members the way it might
     // look -- declare("K") / declare_member("K", "v") / declare("K") again
-    // would silently drop "v". That sequence never happens. declare() is
-    // called from exactly two sites, both in the Phase 1 class-declaration
-    // walk (declare_isolated_class, declare_class_recursive), each visiting
-    // a given qualified_name exactly once per compilation; declare_member/
-    // declare_method are only ever called afterwards, from Phase 2's member
-    // collection and Phase 3's ordinary walk, and neither phase calls
-    // declare() again for a name Phase 1 already declared. If a future
-    // change ever calls declare() a second time for the same class -- to
-    // support re-opening one, say -- this clearing must move or be
-    // conditioned on that being the class's first declaration, or it will
-    // silently erase real members Phase 2 already collected.
+    // would silently drop "v". That sequence never happens, but for two
+    // DIFFERENT reasons at declare()'s two call sites, not one blanket rule:
+    //
+    //  - `classes_.declare(...)` inside declare_class_recursive is Phase 1's
+    //    own call (from collect_classes' module-wide walk), and it declares
+    //    a given qualified_name exactly once per compilation, strictly
+    //    before Phase 2/3 ever call declare_member/declare_method for that
+    //    same name.
+    //  - `classes_.declare(...)` inside declare_isolated_class is NOT a
+    //    Phase 1 call at all, despite the name -- it runs from Phase 3's
+    //    visit(ClassDef), for exactly two cases: a top-level class that LOST
+    //    a same-name collision, or a class lexically inside a `def`. Both
+    //    isolate the class under a SYNTHETIC key embedding '#' plus the
+    //    declaration's own source line (a character no Python identifier can
+    //    contain), so each call's key is one Phase 1/2 never declared or
+    //    populated -- there is nothing on it yet to lose -- and
+    //    visit(ClassDef) walks straight into that same class's own
+    //    pre_collect_class_body/check_suite immediately afterward, which is
+    //    what populates it for the first and only time.
+    //
+    // If a future change ever calls declare() a second time for a class
+    // whose members already exist -- to support re-opening one, say -- this
+    // clearing must move or be conditioned on that being the class's first
+    // declaration, or it will silently erase real members already collected.
     entry.members.clear();
     entry.methods.clear();
 }

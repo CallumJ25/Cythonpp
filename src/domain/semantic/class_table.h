@@ -551,15 +551,27 @@ private:
     // signature. ORDER-SENSITIVE, which is exactly the tie-break showing
     // its teeth: `class C(Exception, M): pass` (bases swapped) is clean,
     // since `Exception`'s base chain is walked first and its own band is
-    // unbounded. So `object` is excluded here UNLESS it is the class
-    // actually being asked about -- the same carve-out
-    // `constructor_check`'s own positional walk and `inherits_builtin`
-    // both already make, and for the identical reason: every class
-    // conceptually derives from `object`, so counting it as an ancestor's
-    // answer would make it answer for everyone. `object(1)` itself must
-    // keep reporting `too many arguments`, so the exclusion is keyed on
-    // whether `object` is the ancestor being asked ABOUT ON BEHALF OF a
-    // different resolved class, not on the name `object` alone.
+    // unbounded. So `object` is excluded here as an ancestor's answer --
+    // the same carve-out `constructor_check`'s own positional walk and
+    // `inherits_builtin` both already make, and for the identical reason:
+    // every class conceptually derives from `object`, so counting it as an
+    // ancestor's answer would make it answer for everyone.
+    //
+    // The `canonical != resolved` half of the condition below -- excluding
+    // `object` only when it is reached as somebody ELSE's ancestor, not when
+    // it is the class actually being queried -- is DEFENSIVE, not
+    // load-bearing today: measured directly, replacing it with an
+    // unconditional `canonical == "object"` (so `object` is excluded even
+    // from answering for ITSELF) leaves every `ClassTable`/`TypeChecker` test
+    // passing, `object(1)` included, because with no band found either way,
+    // `constructor_check`'s `!reached` arm answers `Checked` regardless and
+    // `constructor_type` builds the identical empty parameter list -- the
+    // "no band" default and `object`'s own `(0, 0)` band are indistinguishable
+    // at every consumer. Kept anyway, because it is the more precise, safer
+    // formulation and is what the two sibling carve-outs already do. It would
+    // stop being redundant and start actually mattering the moment either of
+    // two things changes: `object`'s own recorded band stops being `(0, 0)`,
+    // or the no-band default stops being a zero-arg `Checked` answer.
     std::optional<std::pair<int, int>> find_builtin_arity(const std::string& resolved) const {
         std::vector<std::string> visited;
         return walk_chain<std::pair<int, int>>(
