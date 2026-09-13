@@ -243,9 +243,31 @@ bool target_binds_name(const ast::Expr& target, const std::string& name) {
 // AttributeError at runtime) -- worse than never descending at all.
 //
 // Recurses into If/While/For bodies (not new scopes, matching
-// collect_self_attribute_placeholders' own boundary) but never into a
-// nested FunctionDef or ClassDef: a name assigned inside THOSE is a
-// different scope's own local and does not rebind this one.
+// collect_self_attribute_placeholders' own boundary). A nested FunctionDef or
+// ClassDef is two DIFFERENT things, not one: its BODY is a different scope
+// and is never descended into (a name assigned inside THAT body is a
+// different scope's own local and does not rebind this one), but
+// `def self(): ...` / `class self: ...` ITSELF binds "self" in the ENCLOSING
+// scope -- the same scope this function is scanning -- exactly as
+// `self = Bag()` does. Conflating those two questions -- "does the body
+// rebind the name" versus "does the definition's own name rebind it" -- is
+// exactly what made `class self: pass` followed by `self.q = 1` (or the
+// `def self(): pass` sibling) completely silent (2026-09-12): mypy reports
+// attr-defined at both the read above and the store itself (CPython raises
+// AttributeError), and this scan, checking only Assign/AnnAssign/For at the
+// time, reported nothing at all, because the pre-pass still thought "self"
+// was unshadowed and placeholder-declared "q" on Bag. NOTE this closes the
+// placeholder half only: ScopeStack deliberately never binds a class's own
+// name (see "Class names are deliberately NOT bound into ScopeStack"
+// elsewhere in this file), so self_attribute_receiver_type's own real-walk
+// resolution still cannot see this particular shadow either -- the STORE
+// itself may still go unreported for that separate, structural reason, but
+// the pre-pass no longer manufactures a placeholder that hides the READ
+// above it.
+//
+// Augmented assignment to the receiver (`self += 1`) needs no arm here: the
+// parser rejects it outright with its own SyntaxError before this scan ever
+// runs, so there is no silent case to cover.
 bool receiver_rebound_in_own_scope(const std::string& name, const std::vector<ast::StmtPtr>& body) {
     for (const ast::StmtPtr& statement : body) {
         if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
@@ -272,10 +294,19 @@ bool receiver_rebound_in_own_scope(const std::string& name, const std::vector<as
                 receiver_rebound_in_own_scope(name, while_stmt->orelse())) {
                 return true;
             }
+        } else if (const auto* nested_def = dynamic_cast<const ast::FunctionDef*>(statement.get())) {
+            if (nested_def->name() == name) {
+                return true;
+            }
+            // Its BODY is a different scope -- deliberately not descended
+            // into, matching every other reason this file stops at that
+            // boundary.
+        } else if (const auto* nested_class = dynamic_cast<const ast::ClassDef*>(statement.get())) {
+            if (nested_class->name() == name) {
+                return true;
+            }
+            // Its BODY is a different scope, for the same reason.
         }
-        // A nested FunctionDef/ClassDef is a different scope -- deliberately
-        // not descended into here, matching every other reason this file
-        // stops at that same boundary.
     }
     return false;
 }
@@ -2618,10 +2649,13 @@ void TypeChecker::collect_self_attribute_placeholders(const std::string& qualifi
             // AttributeError -- checking parameters alone let this scan
             // descend anyway and placeholder-declare "q" as Unknown, which is
             // absorbing and so silently accepted a program BOTH oracles
-            // reject. receiver_rebound_in_own_scope covers Assign, AnnAssign
-            // and a `for` target, recursing through If/While/For but never
-            // into a further nested def/class, matching this scan's own
-            // scope boundary.
+            // reject. receiver_rebound_in_own_scope covers Assign, AnnAssign,
+            // a `for` target, and a nested def/class's OWN name (`def self():
+            // ...` / `class self: ...` inside the closure rebinds "self" in
+            // the closure's own scope exactly as an assignment would), while
+            // still never descending into that nested def/class's OWN body --
+            // see the helper's own comment for what conflating those two
+            // questions made silent.
             bool shadows = false;
             for (const ast::Parameter& param : nested_def->params()) {
                 if (param.name == receiver_name) {

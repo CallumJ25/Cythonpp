@@ -1725,6 +1725,94 @@ TEST(TypeChecker, AClosureAssignedAttributeKeepsItsRealTypeNotUnknown) {
     EXPECT_EQ(error.line, 7);
 }
 
+// Rebinding the receiver is not only an Assign/AnnAssign/for-target -- a
+// nested `class self: ...` binds "self" in the ENCLOSING scope (inner's own
+// scope) exactly as an assignment would, and this is a distinct rebinding
+// form from the one Assign/AnnAssign/For alone can see: a nested ClassDef or
+// FunctionDef's OWN NAME rebinds the enclosing scope, while everything
+// bound INSIDE that nested def/class's own body is a different scope and
+// must keep being ignored. Conflating "does the nested def/class's body
+// rebind the name" with "does the nested def/class's own name rebind it" is
+// the trap this test guards against.
+//
+// Measured against mypy 1.18.1 (driven with `b = Bag(); b.m(); print(b.read())`
+// at module level): THREE errors -- `Returning Any`, attr-defined at the read
+// (line 2) and attr-defined at the store (line 6, `"type[self]" has no
+// attribute "q"` -- mypy treats the shadowing `self` as the class object
+// itself). CPython raises `AttributeError: 'Bag' object has no attribute
+// 'q'`. Before this fix cythonpp was COMPLETELY SILENT (0 diagnostics) --
+// the pre-pass didn't see `class self:` as a shadow at all and wrongly
+// placeholder-declared "q" on Bag.
+//
+// After this fix: only ONE diagnostic, the read. The store itself is NOT
+// caught, for a separate, structural reason this fix does not (and should
+// not try to) touch: ScopeStack deliberately never binds a class's own name
+// (see "Class names are deliberately NOT bound into ScopeStack" elsewhere in
+// this file, load-bearing for two unrelated checks), so
+// self_attribute_receiver_type's own real-walk resolution of "self" still
+// cannot see that `class self:` shadowed it, and treats the store as a
+// legitimate new declaration onto Bag. That gap is recorded separately in
+// CLAUDE.md rather than fixed here -- what this test pins is that the
+// pre-pass no longer manufactures the placeholder that hid the READ above
+// it, which is the exact silent-acceptance shape a nested def/class's own
+// name must be checked for.
+TEST(TypeChecker, AClassDefRebindingTheReceiverInAClosureDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            class self:\n"
+                                         "                pass\n"
+                                         "            self.q = 1\n"
+                                         "        inner()\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(error.line, 3);
+}
+
+// The FunctionDef sibling of the test above: `def self(): ...` inside the
+// closure also binds "self" in the enclosing (inner's) scope. Unlike a
+// nested ClassDef, an ordinary nested `def` DOES get bound into ScopeStack
+// at its lexical position (ClassDef names deliberately do not -- see the
+// test above), so self_attribute_receiver_type's own real-walk resolution
+// CAN see this particular shadow: it resolves "self" to the shadowing def's
+// own Callable type, which is not Class("Bag"), so the store falls through
+// to the ordinary (non-self) attribute path -- the SAME builtin-member-style
+// NotImplementedError this compiler already reports for any attribute
+// access on a Callable receiver, independent of this fix. So this shape is
+// fully closed by this fix: both the read (now correctly attr-defined,
+// where before it was silently swallowed by the wrongly-placeholder-declared
+// attribute) and the store (already reported before this fix, unaffected)
+// come back with a diagnostic.
+//
+// Measured against mypy 1.18.1: THREE errors -- `Returning Any`, attr-defined
+// at the read (line 2), and attr-defined at the store (line 6,
+// `"Callable[[], None]" has no attribute "q"`). CPython raises the same
+// `AttributeError: 'Bag' object has no attribute 'q'` at the read (since it
+// is reached first).
+TEST(TypeChecker, AFunctionDefRebindingTheReceiverInAClosureDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            def self() -> None:\n"
+                                         "                pass\n"
+                                         "            self.q = 1\n"
+                                         "        inner()\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "NotImplementedError");
+    EXPECT_EQ(checked.diagnostics[1].message, "methods on builtin types are not supported");
+    EXPECT_EQ(checked.diagnostics[1].line, 8) << "the store, through the shadowing def's Callable type";
+}
+
 // Reproduced against the built binary
 // before this fix: `class D: x = 5` then `d.x` reported a false "D has no
 // attribute x" -- only the AnnAssign path ever called declare_member; a bare
