@@ -1875,6 +1875,201 @@ TEST(TypeChecker, ARebindingInsideANestedClassBodyDoesNotShadow) {
                  "        inner()\n");
 }
 
+// receiver_rebound_in_own_scope's AnnAssign arm: `self: Bag = Bag()` rebinds
+// exactly as the plain `self = Bag()` form does, and is a genuinely separate
+// arm from it in the scan (a distinct AST node, ast::AnnAssign rather than
+// ast::Assign). Measured against mypy 1.18.1 and CPython 3.14 (driven with
+// `b = Bag(); b.m(); print(b.read())` at module level): mypy reports THREE
+// errors (`Returning Any`, attr-defined at the read on line 3, attr-defined
+// at the store on line 7); CPython raises `AttributeError: 'Bag' object has
+// no attribute 'q'` at the read, exit 1 -- both oracles reject.
+TEST(TypeChecker, AnAnnotatedRebindingInAClosureDoesNotDeclareOntoTheClass) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            self: Bag = Bag()\n"
+                                         "            self.q = 1\n"
+                                         "        inner()\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].line, 7) << "the store, after inner() rebinds self via AnnAssign";
+}
+
+// receiver_rebound_in_own_scope's If-body recursion arm: a rebinding sitting
+// under an `if` is still in `inner`'s own scope (an If body is not a new
+// scope), so it must be found by recursing into the branch rather than only
+// scanning `inner`'s own top-level statements. Measured against mypy 1.18.1
+// and CPython 3.14 (driven the same way): mypy reports THREE errors
+// (`Returning Any`, attr-defined at the read on line 3, attr-defined at the
+// store on line 8); CPython raises the same AttributeError at the read,
+// exit 1 -- both oracles reject.
+TEST(TypeChecker, ARebindingInsideAnIfBodyInAClosureDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            if True:\n"
+                                         "                self = Bag()\n"
+                                         "            self.q = 1\n"
+                                         "        inner()\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].line, 8) << "the store, after the if body rebinds self";
+}
+
+// receiver_rebound_in_own_scope's If-orelse recursion arm: the same
+// rebinding, now sitting in the `else` arm rather than the `if` body -- a
+// distinct branch of the same node, and a distinct recursive call in the
+// scan. Measured against mypy 1.18.1 and CPython 3.14 (driven the same way):
+// mypy reports THREE errors (`Returning Any`, attr-defined at the read on
+// line 3, attr-defined at the store on line 10); CPython raises the same
+// AttributeError at the read, exit 1 -- both oracles reject.
+TEST(TypeChecker, ARebindingInsideAnIfsElseArmInAClosureDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            if False:\n"
+                                         "                pass\n"
+                                         "            else:\n"
+                                         "                self = Bag()\n"
+                                         "            self.q = 1\n"
+                                         "        inner()\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].line, 10) << "the store, after the if's else arm rebinds self";
+}
+
+// receiver_rebound_in_own_scope's While-body recursion arm, the same
+// question as the If-body arm for a different compound statement. Measured
+// against mypy 1.18.1 and CPython 3.14 (driven the same way): mypy reports
+// THREE errors (`Returning Any`, attr-defined at the read on line 3,
+// attr-defined at the store on line 9); CPython raises the same
+// AttributeError at the read, exit 1 -- both oracles reject.
+TEST(TypeChecker, ARebindingInsideAWhileBodyInAClosureDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            while True:\n"
+                                         "                self = Bag()\n"
+                                         "                break\n"
+                                         "            self.q = 1\n"
+                                         "        inner()\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].line, 9) << "the store, after the while body rebinds self";
+}
+
+// receiver_rebound_in_own_scope's While-orelse recursion arm: a `while`'s
+// `else` runs when the loop condition becomes false without a `break`, and
+// is a distinct branch (and a distinct recursive call) from the body.
+// Measured against mypy 1.18.1 and CPython 3.14 (driven the same way): mypy
+// reports THREE errors (`Returning Any`, attr-defined at the read on line 3,
+// attr-defined at the store on line 10); CPython raises the same
+// AttributeError at the read, exit 1 -- both oracles reject.
+TEST(TypeChecker, ARebindingInsideAWhilesElseArmInAClosureDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            while False:\n"
+                                         "                pass\n"
+                                         "            else:\n"
+                                         "                self = Bag()\n"
+                                         "            self.q = 1\n"
+                                         "        inner()\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].line, 10) << "the store, after the while's else arm rebinds self";
+}
+
+// receiver_rebound_in_own_scope's For-body recursion arm, the same question
+// as the If/While body arms for a `for` loop's own body. Measured against
+// mypy 1.18.1 and CPython 3.14 (driven the same way): mypy reports THREE
+// errors (`Returning Any`, attr-defined at the read on line 3, attr-defined
+// at the store on line 8); CPython raises the same AttributeError at the
+// read, exit 1 -- both oracles reject.
+TEST(TypeChecker, ARebindingInsideAForBodyInAClosureDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            for i in [1]:\n"
+                                         "                self = Bag()\n"
+                                         "            self.q = 1\n"
+                                         "        inner()\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].line, 8) << "the store, after the for body rebinds self";
+}
+
+// receiver_rebound_in_own_scope's For-orelse recursion arm: a `for`'s `else`
+// runs when the loop completes without a `break`, and is a distinct branch
+// (and a distinct recursive call) from the body, exactly as While's own
+// orelse arm is. Measured against mypy 1.18.1 and CPython 3.14 (driven the
+// same way): mypy reports THREE errors (`Returning Any`, attr-defined at the
+// read on line 3, attr-defined at the store on line 10); CPython raises the
+// same AttributeError at the read, exit 1 -- both oracles reject.
+TEST(TypeChecker, ARebindingInsideAForsElseArmInAClosureDoesNotDeclare) {
+    const Checked checked = check_module("class Bag:\n"
+                                         "    def read(self) -> int:\n"
+                                         "        return self.q\n"
+                                         "    def m(self) -> None:\n"
+                                         "        def inner() -> None:\n"
+                                         "            for i in [1]:\n"
+                                         "                pass\n"
+                                         "            else:\n"
+                                         "                self = Bag()\n"
+                                         "            self.q = 1\n"
+                                         "        inner()\n");
+
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read()";
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message, "\"Bag\" has no attribute \"q\"");
+    EXPECT_EQ(checked.diagnostics[1].line, 10) << "the store, after the for's else arm rebinds self";
+}
+
 // Reproduced against the built binary
 // before this fix: `class D: x = 5` then `d.x` reported a false "D has no
 // attribute x" -- only the AnnAssign path ever called declare_member; a bare
