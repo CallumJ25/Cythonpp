@@ -1676,7 +1676,8 @@ TEST(TypeChecker, ARebindingForTargetInAClosureDoesNotDeclareOntoTheClass) {
     ASSERT_EQ(checked.diagnostics.size(), 2u);
     EXPECT_EQ(checked.diagnostics[0].code, "TypeError");
     EXPECT_EQ(checked.diagnostics[0].message, "\"Bag\" has no attribute \"q\"");
-    EXPECT_EQ(checked.diagnostics[0].line, 3) << "the read, from read() -- this is what Finding 1b covers";
+    EXPECT_EQ(checked.diagnostics[0].line, 3)
+        << "the read, from read() -- which the store's own diagnostic below does not cover";
     EXPECT_EQ(checked.diagnostics[1].code, "NotImplementedError");
     EXPECT_EQ(checked.diagnostics[1].message, "methods on builtin types are not supported");
     EXPECT_EQ(checked.diagnostics[1].line, 7) << "the store, through the for-target's int type";

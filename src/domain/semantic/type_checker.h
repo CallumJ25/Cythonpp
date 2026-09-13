@@ -382,11 +382,11 @@ private:
     // body's own nested classes are reached by declare_class_recursive
     // instead, which calls back into this function per class body.
     //
-    // collect_self_attribute_placeholders no longer shares this boundary
-    // (Task 2, 2026-09-12): it still never descends into a nested ClassDef
-    // (that body's own first parameter belongs to a DIFFERENT class), but it
-    // DOES descend into a nested FunctionDef, conditionally -- unless that
-    // def rebinds the receiver name as one of its own parameters. mypy
+    // collect_self_attribute_placeholders no longer shares this boundary: it
+    // still never descends into a nested ClassDef (that body's own first
+    // parameter belongs to a DIFFERENT class), but it DOES descend into a
+    // nested FunctionDef, conditionally -- unless that def rebinds the
+    // receiver name as one of its own parameters. mypy
     // attributes a `self.x = ...` store through a capturing closure to the
     // enclosing method's own binding at any depth, so a scan that stopped at
     // every FunctionDef the way this walk does left the attribute undeclared
@@ -682,8 +682,8 @@ private:
     // is no "genuinely new" left once every attribute is placeholder-declared
     // up front) or a second, real conflicting assignment.
     //
-    // A nested def IS recursed into (Task 2, 2026-09-12) -- unless it REBINDS
-    // `receiver_name` as one of its own parameters, in which case that
+    // A nested def IS recursed into -- unless it REBINDS `receiver_name` as
+    // one of its own parameters, in which case that
     // parameter is a different binding and the scan must not descend. mypy
     // attributes a store through a captured receiver to the enclosing
     // method's own binding at ANY closure depth (measured: a reader ABOVE

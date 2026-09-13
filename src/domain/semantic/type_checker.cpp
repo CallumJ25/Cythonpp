@@ -231,9 +231,9 @@ bool target_binds_name(const ast::Expr& target, const std::string& name) {
 }
 
 // True if `name` is bound by an ordinary assignment, an annotated
-// assignment, or a `for` target ANYWHERE in `body`'s own scope -- Task 2's
-// Finding 1 fix. Python rebinds a name in a function's scope by ANY
-// assignment to it, not just by appearing as a parameter: `def inner():
+// assignment, or a `for` target ANYWHERE in `body`'s own scope. Python
+// rebinds a name in a function's scope by ANY assignment to it, not just by
+// appearing as a parameter: `def inner():
 // self = Bag(); self.q = 1` makes `self` a local of `inner` exactly as a
 // parameter named `self` would, and mypy correctly refuses to attribute that
 // store to the enclosing method's own receiver. Missing this made the
@@ -1249,10 +1249,10 @@ std::optional<Type> TypeChecker::self_attribute_receiver_type(const ast::Attribu
     // method's self through any number of capturing closures (see
     // Binding::method_self for both measurements).
     //
-    // collect_self_attribute_placeholders now DOES descend into a nested def
-    // (Task 2, 2026-09-12), matching this real walk: a reader ABOVE a closure
-    // that captures the method's own receiver must see the attribute the
-    // closure declares, exactly as method_self lets the real walk attribute
+    // collect_self_attribute_placeholders now DOES descend into a nested def,
+    // matching this real walk: a reader ABOVE a closure that captures the
+    // method's own receiver must see the attribute the closure declares,
+    // exactly as method_self lets the real walk attribute
     // the store through any number of scopes. The pre-pass stops descending
     // only at a def that REBINDS the receiver name (a real shadow) or at a
     // nested class (a different `self` entirely) -- see
@@ -2639,10 +2639,10 @@ void TypeChecker::collect_self_attribute_placeholders(const std::string& qualifi
             // method is still not a declaration, and mypy reports at both
             // the store and the read. So the test is rebinding alone.
             //
-            // Rebinding is not just a PARAMETER, though -- Task 2 Finding 1
-            // (2026-09-12): Python makes a name local to a function scope by
-            // ANY assignment to it there, not only by it appearing as a
-            // parameter. `def inner(): self = Bag(); self.q = 1` rebinds
+            // Rebinding is not just a PARAMETER, though: Python makes a name
+            // local to a function scope by ANY assignment to it there, not
+            // only by it appearing as a parameter. `def inner(): self =
+            // Bag(); self.q = 1` rebinds
             // `self` to a local exactly as a shadowing parameter would, and
             // mypy refuses to attribute that store to the enclosing method's
             // receiver (two attr-defined errors) while CPython raises
