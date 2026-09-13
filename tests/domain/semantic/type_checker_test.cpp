@@ -6951,5 +6951,94 @@ TEST(TypeChecker, AWhileReachableBreakMakesAReturningLoopElseAMissingReturn) {
     EXPECT_EQ(error.line, 1);
 }
 
+// ---------------------------------------------------------------------------
+// Builtin constructor arities. Ten violations, one root cause: the generated
+// class table recorded no arity at all, so a builtin with no __init__ and no
+// base defaulted to a zero-arg Callable (reporting a false "too many
+// arguments"), while an exception class reached constructor_check's
+// BaseException arm and went Unchecked (silently accepting a bad call).
+// Measurements 2026-09-12, mypy 1.18.1 (compiled: yes) / Python 3.14.2.
+// ---------------------------------------------------------------------------
+
+// Five false positives: mypy --strict is clean and CPython runs each of
+// these, while this checker reported `too many arguments`. The generated
+// table recorded no arity, so a builtin with no __init__ defaulted to
+// zero-arg.
+TEST(TypeChecker, BuiltinConstructorsWithRealAritiesAreNotTooManyArguments) {
+    expect_clean("memoryview(b\"ab\")\n");
+    expect_clean("property(None)\n");
+    expect_clean("slice(1)\n");
+    expect_clean("staticmethod(len)\n");
+    expect_clean("type(1)\n");
+}
+
+// Five false negatives: BOTH oracles reject each of these and this checker
+// was silent, because an exception class reached constructor_check's
+// BaseException arm and returned Unchecked.
+TEST(TypeChecker, AnExceptionGroupWithTooFewArgumentsIsReported) {
+    const Checked checked = check_module("ExceptionGroup(1)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "too few arguments for \"ExceptionGroup\"");
+    EXPECT_EQ(error.line, 1);
+}
+
+TEST(TypeChecker, AUnicodeDecodeErrorWithTooFewArgumentsIsReported) {
+    const Checked checked = check_module("UnicodeDecodeError(1)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "too few arguments for \"UnicodeDecodeError\"");
+    EXPECT_EQ(error.line, 1);
+}
+
+// The band has an upper edge too: UnicodeTranslateError is (4, 4).
+TEST(TypeChecker, AUnicodeTranslateErrorWithTooManyArgumentsIsReported) {
+    const Checked checked =
+        check_module("UnicodeTranslateError(1, 2, 3, 4, 5)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "too many arguments for \"UnicodeTranslateError\"");
+    EXPECT_EQ(error.line, 1);
+}
+
+// CONTROL: an unbounded row must stay unconstrained. ValueError takes *args
+// and both oracles accept any count -- this differs from the rows above in
+// exactly one dimension, whether the row is bounded.
+TEST(TypeChecker, AnUnboundedBuiltinConstructorIsStillUnchecked) {
+    expect_clean("ValueError(1, 2, 3)\n");
+    expect_clean("OSError()\n");
+}
+
+// `type` accepts exactly {1, 3} and BOTH oracles reject arity 2 -- a hole no
+// (min, max) band can represent. Under the [call-arg] filter `type` reads
+// unbounded, so this stays silent: a MISSED ERROR in the safe direction, not
+// a false positive. Pinned so the choice is visible rather than accidental.
+TEST(TypeChecker, AnOverloadedBuiltinConstructorArityIsDeliberatelyUnchecked) {
+    expect_clean("type(1, 2)\n");
+}
+
+// slice and type read UNBOUNDED under the [call-arg] filter, so seeding
+// bounded rows alone does NOT fix them -- they fall through to the zero-arg
+// default. Both are mypy Success and both run clean under CPython.
+TEST(TypeChecker, AnUnboundedBuiltinConstructorDoesNotDefaultToZeroArg) {
+    expect_clean("slice(1)\n");
+    expect_clean("type(1)\n");
+}
+
+// CONTROL: object is BOUNDED (0, 0), so it must keep reporting. Differs from
+// the two above in exactly one dimension -- whether the row is bounded. Both
+// oracles reject object(1).
+TEST(TypeChecker, AZeroArgBoundedBuiltinStillReportsTooManyArguments) {
+    const Checked checked = check_module("object(1)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "too many arguments for \"object\"");
+    EXPECT_EQ(error.line, 1);
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

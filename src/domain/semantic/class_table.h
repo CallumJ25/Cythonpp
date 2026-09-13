@@ -317,6 +317,18 @@ private:
         std::vector<Type> bases;
         std::map<std::string, Member> members;
         std::map<std::string, Type> methods;
+
+        // Set at seeding time for a builtin row whose constructor arity is
+        // UNBOUNDED (kBuiltinClasses' max_args == kUnboundedArity): "no
+        // arity recorded" and "arity unconstrained" are different claims,
+        // and collapsing them made a builtin with no bounded band -- `slice`,
+        // `type` -- fall through to the zero-arg default a class with
+        // genuinely no __init__ and no base gets, reporting a false "too many
+        // arguments" for `slice(1)`/`type(1)`. constructor_check consults
+        // this only once every other, more specific arm (a declared
+        // __init__, a builtin-kind base, BaseException, __new__) has already
+        // missed, so it can never override a real signature.
+        bool unbounded_constructor = false;
     };
 
     // Canonicalises, then looks the entry up directly (no transitive walk).

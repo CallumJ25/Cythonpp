@@ -35,6 +35,13 @@ HEADER = """#ifndef CYTHONPP_DOMAIN_SEMANTIC_BUILTIN_CLASS_TABLE_H
 
 namespace cythonpp::domain::semantic {{
 
+// max_args == kUnboundedArity means "no arity constraint this model
+// records". Measured 2026-09-12: every row this generator classifies as
+// unbounded also accepts ZERO arguments under the probe below, so unbounded
+// always means unconstrained -- there is no row needing "min 3, max
+// unbounded".
+constexpr int kUnboundedArity = -1;
+
 // Every name in Python's `builtins` module that is a class, with its direct
 // bases. GENERATED -- do not edit by hand. Regenerate with:
 //
@@ -100,6 +107,16 @@ struct BuiltinClass {{
     // interpreter-derived, and builtin_class_genericity.h for the one
     // consumer.
     bool accepts_type_arguments;
+
+    // The constructor arity band mypy accepts, derived by probing
+    // `NAME(a(), a(), ...)` with `def a() -> Any: ...` so argument TYPES
+    // cannot mask an arity verdict, and filtering to the `[call-arg]` code.
+    // An overload mismatch is `[call-overload]` and deliberately does NOT
+    // count, so an overloaded class (`type`, which accepts exactly {{1, 3}})
+    // reads as unbounded -- a missed error, the safe direction, never a
+    // false positive.
+    int min_args;
+    int max_args;
 }};
 
 constexpr BuiltinClass kBuiltinClasses[] = {{
@@ -248,10 +265,91 @@ def accepts_type_arguments(names):
     return generic
 
 
+_MAX_PROBED_ARITY = 8
+
+
+def constructor_arity(names):
+    """name -> (min_args, max_args), by asking `mypy --strict` directly.
+
+    Argument TYPES are neutralised with `Any` rather than chosen per name: a
+    sweep using a literal value makes mypy reject on [arg-type] grounds for
+    some names, which scores an arity defect as "both report" and hides it.
+    Only [call-arg] counts -- an overload mismatch is [call-overload], and
+    counting it would make the accepted set non-contiguous (`type` accepts
+    exactly {1, 3}) and risks reporting where the mismatch is really about
+    types. Excluding it leaves overloaded classes unbounded, which is a
+    missed error -- the safe direction -- never a false positive.
+
+    mypy alone is a sufficient oracle here: under the union rule, silence
+    where mypy accepts can never be a false positive, and reporting where
+    mypy rejects can never be unsound.
+
+    max_args is -1 (kUnboundedArity) when the accepted set reaches
+    _MAX_PROBED_ARITY, meaning this probe found no upper bound at all.
+    """
+    accepted = {name: set() for name in names}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for k in range(_MAX_PROBED_ARITY + 1):
+            args = ", ".join(["a()"] * k)
+            lines = ["from typing import Any", "def a() -> Any: ..."]
+            first = len(lines) + 1
+            lines.extend(f"{name}({args})" for name in names)
+            probe = pathlib.Path(tmpdir) / f"arity_{k}.py"
+            probe.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            result = subprocess.run(
+                ["mypy", "--strict", "--no-color-output", "--no-error-summary", probe.name],
+                cwd=tmpdir,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode >= 2:
+                raise SystemExit(
+                    f"mypy --strict exited {result.returncode} on the arity probe; "
+                    f"cannot derive constructor arities\n{result.stdout}{result.stderr}"
+                )
+            rejected = set()
+            for line in result.stdout.splitlines():
+                parts = line.split(":", 2)
+                if len(parts) < 3 or not parts[1].isdigit():
+                    continue
+                if "[call-arg]" in parts[2]:
+                    rejected.add(int(parts[1]))
+            for index, name in enumerate(names):
+                if first + index not in rejected:
+                    accepted[name].add(k)
+
+    # An early draft of this probe invoked `python -m mypy`, which does not
+    # exist on the reference machine: it exited 0 with EMPTY output and
+    # scored EVERY arity as accepted, for all names, silently. These
+    # assertions are what make that failure loud instead of a silently
+    # vacuous table.
+    if 1 not in accepted["bool"] or _MAX_PROBED_ARITY in accepted["bool"]:
+        raise SystemExit(
+            "vacuous arity probe: bool must accept 1 argument and reject "
+            f"{_MAX_PROBED_ARITY}; got {sorted(accepted['bool'])}"
+        )
+
+    arities = {}
+    for name in names:
+        ks = accepted[name]
+        if not ks:
+            raise SystemExit(f"{name} accepts no arity in 0..{_MAX_PROBED_ARITY}")
+        low, high = min(ks), max(ks)
+        if ks != set(range(low, high + 1)):
+            raise SystemExit(
+                f"{name} has a NON-CONTIGUOUS accepted arity set {sorted(ks)}. "
+                "The two-int band this table stores cannot represent it; see "
+                "the header comment before widening the representation."
+            )
+        arities[name] = (low, -1 if high == _MAX_PROBED_ARITY else high)
+    return arities
+
+
 def generate_class_table() -> str:
     names = class_names()
     known = set(names)
     generic = accepts_type_arguments(names)
+    arities = constructor_arity(names)
     rows = []
     for name in names:
         cls = getattr(builtins, name)
@@ -268,7 +366,8 @@ def generate_class_table() -> str:
         padded = bases + [None] * (MAX_BASES - len(bases))
         rendered = ", ".join("nullptr" if b is None else f'"{b}"' for b in padded)
         flag = "true" if generic[name] else "false"
-        rows.append(f'    {{"{name}", {{{rendered}}}, {flag}}},')
+        low, high = arities[name]
+        rows.append(f'    {{"{name}", {{{rendered}}}, {flag}, {low}, {high}}},')
 
     alias_rows = [
         f'    {{"{alias}", "{canonical}"}},' for alias, canonical in find_aliases(names)

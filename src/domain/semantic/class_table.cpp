@@ -46,6 +46,37 @@ ClassTable::ClassTable() {
             // AnnotationResolver, so a parametric base keeps its arguments.
             entry.bases.push_back(base_type_for_name(base));
         }
+
+        // A bounded row gets a synthetic __init__ so both existing paths
+        // start answering correctly, with no new checking path:
+        // constructor_check now reaches DeclaredInit and returns Checked
+        // (which is what fixes an exception class's silence -- it previously
+        // reached the BaseException arm and went Unchecked), and
+        // constructor_type rebuilds the band through the existing
+        // defaulted_params machinery (which is what fixes the zero-arg
+        // default behind `too many arguments for "memoryview"`).
+        //
+        // Parameters are Unknown, which is absorbing, so ONLY arity is
+        // modelled here and no argument-type claim is introduced.
+        //
+        // An unbounded row must NOT fall through to the zero-arg default
+        // this loop would otherwise leave it with -- see
+        // Entry::unbounded_constructor and constructor_check's own use of
+        // it: "no arity recorded" and "arity unconstrained" are different
+        // claims, and this table used to collapse them.
+        if (builtin.max_args != kUnboundedArity) {
+            // params is [self, arg...]; Type::callable appends the return
+            // slot itself, and constructor_type strips both ends before
+            // handing the signature to a caller.
+            std::vector<Type> params(static_cast<std::size_t>(builtin.max_args) + 1,
+                                     Type::unknown());
+            entry.methods.emplace(
+                "__init__",
+                Type::callable(std::move(params), Type::none(),
+                               static_cast<std::size_t>(builtin.max_args - builtin.min_args)));
+        } else {
+            entry.unbounded_constructor = true;
+        }
     }
 }
 
@@ -401,6 +432,22 @@ ClassTable::constructor_check(const std::string& qualified_name) const {
     }
 
     if (!reached.has_value()) {
+        // Nothing along the chain settled the question: no declared
+        // __init__, no builtin-kind or BaseException base, no __new__. For
+        // an ordinary user class that is the honest "Checked against a
+        // zero-arg constructor" answer. But a builtin seeded with NO bounded
+        // arity at all -- `slice`, `type` -- reaches exactly this point too,
+        // and for it "Checked, zero-arg" is the wrong claim: mypy's own
+        // verdict on its constructor is unconstrained, not zero-arg, and
+        // reporting one would be a false "too many arguments" on
+        // `slice(1)`/`type(1)`, both mypy-clean and both running under
+        // CPython. Consulted last, so a subclass with its own declared
+        // __init__ or a builtin-kind base still gets the Checked/Unmodellable
+        // answer above and never sees this at all.
+        const auto entry_it = classes_.find(resolved);
+        if (entry_it != classes_.end() && entry_it->second.unbounded_constructor) {
+            return ConstructorCheck::Unchecked;
+        }
         return ConstructorCheck::Checked;
     }
     // Only BaseExceptionBase can still reach here: DeclaredInit returned

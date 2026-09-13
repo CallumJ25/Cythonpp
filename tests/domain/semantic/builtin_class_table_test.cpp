@@ -1,6 +1,8 @@
 #include <cstddef>
+#include <map>
 #include <set>
 #include <string>
+#include <utility>
 
 #include <gtest/gtest.h>
 
@@ -126,6 +128,32 @@ TEST(BuiltinClassTable, AcceptsTypeArgumentsIsTrueForExactlyTheSeventeenGenericN
         ASSERT_NE(entry, nullptr) << name;
         EXPECT_FALSE(entry->accepts_type_arguments) << name;
     }
+}
+
+// Pinned verbatim from `mypy --strict` 1.18.1, 2026-09-12, probing each
+// class with k arguments of type Any for k in 0..8 and filtering [call-arg].
+// ctest cannot run mypy, so this table is the record that the generated
+// header matches what mypy actually said.
+TEST(BuiltinClassTable, BoundedConstructorAritiesMatchMypy) {
+    const std::map<std::string, std::pair<int, int>> expected = {
+        {"BaseExceptionGroup", {2, 2}}, {"ExceptionGroup", {2, 2}},
+        {"UnicodeDecodeError", {5, 5}}, {"UnicodeEncodeError", {5, 5}},
+        {"UnicodeTranslateError", {4, 4}}, {"bool", {0, 1}},
+        {"classmethod", {1, 1}}, {"enumerate", {1, 2}},
+        {"float", {0, 1}}, {"memoryview", {1, 1}},
+        {"object", {0, 0}}, {"property", {0, 4}},
+        {"staticmethod", {1, 1}}, {"tuple", {0, 1}},
+    };
+
+    std::map<std::string, std::pair<int, int>> actual;
+    for (std::size_t i = 0; i < kBuiltinClassCount; ++i) {
+        const BuiltinClass& row = kBuiltinClasses[i];
+        if (row.max_args != kUnboundedArity) {
+            actual.emplace(row.name, std::make_pair(row.min_args, row.max_args));
+        }
+    }
+
+    EXPECT_EQ(actual, expected);
 }
 
 } // namespace
