@@ -656,4 +656,12 @@ bool ClassTable::is_object_member(const std::string& member) {
     return false;
 }
 
+bool ClassTable::is_object_itself(const std::string& qualified_name) const {
+    if (canonical_name(qualified_name) != "object") {
+        return false;
+    }
+    const Entry* entry = find_entry(qualified_name);
+    return entry != nullptr && entry->is_seeded_builtin;
+}
+
 } // namespace cythonpp::domain::semantic

@@ -373,6 +373,20 @@ public:
     // every receiver, so there is nothing to canonicalise or walk.
     static bool is_object_member(const std::string& member);
 
+    // Whether `qualified_name` resolves to `object` ITSELF -- the SEEDED
+    // builtin row, not merely a name spelled "object". A user `class object:
+    // pass` occupies the identical ClassTable key but resets
+    // `Entry::is_seeded_builtin` to false (declare()'s own comment), and such
+    // a class is an ordinary declared class like any other, not the builtin
+    // -- so this checks the FLAG, not the spelling. The one caller
+    // (ExpressionTyper's instance-machinery-member carve-out, `__dict__`/
+    // `__module__`) needs exactly this distinction: those two names are
+    // per-class-instance machinery present on any DECLARED class's instance,
+    // but `object()` itself genuinely raises `AttributeError` for both at
+    // runtime, so "the receiver is spelled object" is not sufficient on its
+    // own to decide which answer applies.
+    bool is_object_itself(const std::string& qualified_name) const;
+
 private:
     struct Member {
         Type type;

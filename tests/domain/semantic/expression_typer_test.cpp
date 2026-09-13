@@ -1245,6 +1245,82 @@ TEST(ExpressionTyper, AMissingAttributeOnObjectItselfStaysATypeError) {
     EXPECT_EQ(error.line, 1);
 }
 
+// INSTANCE-MACHINERY MEMBERS (`__dict__`, `__module__`): present on any
+// instance of a DECLARED class, but NOT part of object's own member set
+// (builtin_object_member_table.h deliberately excludes both -- neither is in
+// `dir(object)`), so is_object_member alone cannot clear them; this is a
+// SEPARATE carve-out. Verified against mypy 1.18.1 (Success) and CPython
+// (`p.__dict__` prints `{}`, `p.__module__` prints `__main__`, exit 0 for
+// both). Proven by neutering: commenting out the `bind_self &&
+// !classes_.is_object_itself(...)` check in expression_typer.cpp flips both
+// to the same `"Plain" has no attribute "..."` TypeError
+// AMissingAttributeOnAPlainClassStaysATypeError pins for "nope".
+TEST(ExpressionTyper, AnInstanceMachineryMemberOnAPlainClassIsCleanAndUnknown) {
+    ClassTable table;
+    table.declare("Plain", {});
+
+    for (const char* member : {"p.__dict__", "p.__module__"}) {
+        const Typed typed =
+            type_expression(member, {{"p", Type::class_of("Plain")}}, Type::unknown(), &table);
+        EXPECT_TRUE(typed.diagnostics.empty())
+            << member << ": expected no diagnostics, got " << only_error(typed).message;
+        EXPECT_EQ(typed.printed, "Unknown") << member;
+    }
+}
+
+// THE PRECISE BOUNDARY: `object` used DIRECTLY keeps reporting for both
+// names, unlike every other declared class. Measured directly: CPython's
+// `object()` raises `AttributeError: 'object' object has no attribute
+// '__dict__'` (and the same for `__module__`) -- neither name is in
+// `dir(object)` at all, so this is a property of the class MACHINERY every
+// OTHER class gets, not of `object`'s own member set. is_object_itself is
+// the guard that draws this line; proven by neutering it out (replacing the
+// call with `false`), which flips this test to CLEAN -- a false negative on
+// a program CPython actually rejects.
+TEST(ExpressionTyper, AnInstanceMachineryMemberOnObjectItselfStaysATypeError) {
+    for (const char* member : {"o.__dict__", "o.__module__"}) {
+        const Typed typed = type_expression(member, {{"o", Type::class_of("object")}});
+        const diagnostics::Diagnostic error = only_error(typed);
+        EXPECT_EQ(error.code, "TypeError") << member;
+        EXPECT_EQ(error.line, 1) << member;
+    }
+    {
+        const Typed typed = type_expression("o.__dict__", {{"o", Type::class_of("object")}});
+        EXPECT_EQ(only_error(typed).message, "\"object\" has no attribute \"__dict__\"");
+    }
+}
+
+// CONTROL, the other half of the boundary: a user class that SHADOWS the
+// spelling "object" (`class object: pass`) is an ordinary declared class,
+// not the builtin -- is_object_itself keys on Entry::is_seeded_builtin, not
+// the name string, precisely so this stays clean. Measured against mypy
+// 1.18.1 (Success) and CPython (`o.__dict__` prints `{}`, exit 0) --
+// re-declaring "object" as a plain class really does give its instances a
+// `__dict__`, unlike the builtin.
+TEST(ExpressionTyper, AnInstanceMachineryMemberOnAClassShadowingObjectIsCleanAndUnknown) {
+    ClassTable table;
+    table.declare("object", {});
+
+    const Typed typed =
+        type_expression("o.__dict__", {{"o", Type::class_of("object")}}, Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "expected no diagnostics, got " << only_error(typed).message;
+    EXPECT_EQ(typed.printed, "Unknown");
+}
+
+// A genuinely missing attribute must still report -- this carve-out is a
+// fixed TWO-NAME set, not "anything goes for a declared-class instance".
+TEST(ExpressionTyper, AMissingAttributeThatIsNotInstanceMachineryStaysATypeError) {
+    ClassTable table;
+    table.declare("Plain", {});
+
+    const Typed typed = type_expression("p.__weakref__", {{"p", Type::class_of("Plain")}},
+                                        Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"Plain\" has no attribute \"__weakref__\"");
+}
+
 // `__init__` looks like the same shape as `__class__` (both are in
 // dir(object)) but is NOT part of this carve-out: mypy --strict rejects a
 // bare instance read of it ("Accessing \"__init__\" on an instance is

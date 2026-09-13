@@ -845,6 +845,35 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
         // erase with nothing to remember to carry across.
         return bound;
     }
+    // INSTANCE-MACHINERY MEMBERS: `__dict__` and `__module__`, present on any
+    // instance of a DECLARED class (every class without `__slots__` gets an
+    // instance `__dict__`, and every class gets a `__module__`) -- a
+    // property of the class MACHINERY, not of `object`'s own member set,
+    // which is why builtin_object_member_table.h's GENERATED kObjectMembers
+    // deliberately excludes both (see that file's own "TWO NAMES A PRIOR
+    // (WRONG) DRAFT OF THIS FIX INCLUDED" comment). Measured (mypy 1.18.1,
+    // CPython): `class Plain: pass` / `p = Plain()` / `print(p.__dict__)` /
+    // `print(p.__module__)` is `mypy --strict` Success and CPython prints
+    // `{}` then `__main__`, and this compiler reported a false
+    // `"Plain" has no attribute "__dict__"` before this check existed.
+    // `bind_self` gates this to an INSTANCE receiver only (`Plain().__dict__`,
+    // not the class-object `Plain.__dict__`, which this change does not
+    // measure and does not touch). `is_object_itself` is the one guard that
+    // keeps this from also clearing `object()` itself: CPython's `object()`
+    // genuinely raises `AttributeError: 'object' object has no attribute
+    // '__dict__'` (measured directly -- `object` carries neither name in
+    // `dir(object)`), so a receiver that resolves to the SEEDED builtin `object`
+    // row must keep falling through to the ordinary miss below, while every
+    // OTHER declared class (including one that merely inherits from `object`,
+    // explicitly or not) gets the clean answer. See
+    // ClassTable::is_object_itself's own comment for why this is a flag
+    // check, not a name comparison: a user `class object: pass` is an
+    // ordinary declared class, not the builtin, and must get the clean answer
+    // too.
+    if (bind_self && !classes_.is_object_itself(receiver.name) &&
+        (attribute.attribute() == "__dict__" || attribute.attribute() == "__module__")) {
+        return Type::unknown();
+    }
     // A class may define __getattr__ to make ARBITRARY attribute access
     // clean. Verified against mypy 1.18.1: `class G: def __getattr__(self,
     // name: str) -> int: ...` then `g.anything` is mypy-CLEAN, revealing
