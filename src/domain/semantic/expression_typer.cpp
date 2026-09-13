@@ -413,8 +413,34 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
     // this is a real exemption, not a workaround: changing `>=` to `>`
     // instead would silently break AReadOnItsOwnBindingLineIsAViolation's
     // `x = x + 1` case, which relies on `>=` firing at module/local scope.
+    // THE LOOP BACK-EDGE EXEMPTION: a read whose own line falls at or after
+    // the START of the SAME `for`/`while` loop that the binding it is being
+    // checked against was found inside is never order-checked either, on top
+    // of order_exempt -- Binding::loop_start_line's own comment has the full
+    // regression this closes (a read textually ABOVE a same-loop-body
+    // binding can still execute AFTER it, on a later iteration, which a
+    // plain line-number comparison cannot see). No UPPER bound
+    // (`statement_line_ <= loop_end_line`) is checked, deliberately: this arm
+    // is only ever reached when `declared_line >= statement_line_` already
+    // holds (the surrounding `if`'s own condition, checked below), and
+    // `declared_line` is itself always `<= loop_end_line` by construction --
+    // pre_bind_function_body only ever tags a placeholder with a loop's
+    // bounds when the placeholder's own line came from inside that exact
+    // loop's recursive walk. So `statement_line_ <= declared_line <=
+    // loop_end_line` is an invariant, not something this arm needs to assert;
+    // adding it back would be dead code no neuter could ever prove
+    // load-bearing. GATED on the name ALSO resolving in an ENCLOSING scope:
+    // without one, mypy itself rejects the identical shape (`Cannot
+    // determine type of "x"  [has-type]`), so the union rule still requires
+    // a report there and this exemption must not fire -- only
+    // Binding::loop_start_line being set is not sufficient on its own, see
+    // bound_in_an_enclosing_scope's own comment.
+    const bool loop_back_edge_exemption =
+        resolution.binding->loop_start_line != 0 &&
+        statement_line_ >= resolution.binding->loop_start_line &&
+        scopes_.bound_in_an_enclosing_scope(name.identifier());
     if (resolution.in_own_scope && !resolution.binding->order_exempt &&
-        resolution.binding->declared_line >= statement_line_) {
+        !loop_back_edge_exemption && resolution.binding->declared_line >= statement_line_) {
         return error(name, DiagnosticKind::NameError,
                      "name '" + name.identifier() + "' is used before definition");
     }
@@ -845,34 +871,60 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
         // erase with nothing to remember to carry across.
         return bound;
     }
-    // INSTANCE-MACHINERY MEMBERS: `__dict__` and `__module__`, present on any
-    // instance of a DECLARED class (every class without `__slots__` gets an
-    // instance `__dict__`, and every class gets a `__module__`) -- a
-    // property of the class MACHINERY, not of `object`'s own member set,
-    // which is why builtin_object_member_table.h's GENERATED kObjectMembers
-    // deliberately excludes both (see that file's own "TWO NAMES A PRIOR
-    // (WRONG) DRAFT OF THIS FIX INCLUDED" comment). Measured (mypy 1.18.1,
-    // CPython): `class Plain: pass` / `p = Plain()` / `print(p.__dict__)` /
+    // INSTANCE-MACHINERY MEMBERS: `__dict__` and `__module__`, present on
+    // both an INSTANCE of a DECLARED class and the class OBJECT itself --
+    // measured directly, `Plain.__dict__`/`Plain.__module__` (a CLASS-OBJECT
+    // receiver, `bind_self == false`) are `mypy --strict` Success and CPython
+    // prints normally, exactly like the instance reading -- a property of the
+    // class MACHINERY, not of `object`'s own member set, which is why
+    // builtin_object_member_table.h's GENERATED kObjectMembers deliberately
+    // excludes both (see that file's own "TWO NAMES A PRIOR (WRONG) DRAFT OF
+    // THIS FIX INCLUDED" comment). Measured (mypy 1.18.1, CPython):
+    // `class Plain: pass` / `p = Plain()` / `print(p.__dict__)` /
     // `print(p.__module__)` is `mypy --strict` Success and CPython prints
     // `{}` then `__main__`, and this compiler reported a false
     // `"Plain" has no attribute "__dict__"` before this check existed.
-    // `bind_self` gates this to an INSTANCE receiver only (`Plain().__dict__`,
-    // not the class-object `Plain.__dict__`, which this change does not
-    // measure and does not touch). `is_object_itself` is the one guard that
-    // keeps this from also clearing `object()` itself: CPython's `object()`
-    // genuinely raises `AttributeError: 'object' object has no attribute
-    // '__dict__'` (measured directly -- `object` carries neither name in
-    // `dir(object)`), so a receiver that resolves to the SEEDED builtin `object`
-    // row must keep falling through to the ordinary miss below, while every
-    // OTHER declared class (including one that merely inherits from `object`,
-    // explicitly or not) gets the clean answer. See
-    // ClassTable::is_object_itself's own comment for why this is a flag
-    // check, not a name comparison: a user `class object: pass` is an
-    // ordinary declared class, not the builtin, and must get the clean answer
-    // too.
-    if (bind_self && !classes_.is_object_itself(receiver.name) &&
-        (attribute.attribute() == "__dict__" || attribute.attribute() == "__module__")) {
-        return Type::unknown();
+    //
+    // `is_object_itself` is the one guard that keeps this from also clearing
+    // `object` (used directly, either as an instance via `object()` or as
+    // the class object `object` itself -- both measured, both still raise
+    // `AttributeError` for `__dict__`/`__module__` under CPython, and
+    // `object` carries neither name in `dir(object)`), so a receiver that
+    // resolves to the SEEDED builtin `object` row must keep falling through
+    // to the ordinary miss below, while every OTHER declared class
+    // (including one that merely inherits from `object`, explicitly or not)
+    // gets the clean answer. See ClassTable::is_object_itself's own comment
+    // for why this is a flag check, not a name comparison: a user
+    // `class object: pass` is an ordinary declared class, not the builtin,
+    // and must get the clean answer too.
+    //
+    // `__dict__` ALONE (not `__module__`, and not a CLASS-OBJECT receiver's
+    // own `__dict__` -- the class's own mappingproxy, unaffected by
+    // `__slots__`, measured: `Slotted.__dict__` is clean regardless) is
+    // further gated on the receiver's OWN class body NOT declaring
+    // `__slots__` -- an instance of a class that does has no `__dict__` at
+    // all, a CPython AttributeError this compiler used to catch and, without
+    // this gate, would have started silently accepting. Measured: `class
+    // Slotted: __slots__ = ("a",)` / `s = Slotted()` / `print(s.__dict__)` is
+    // `mypy --strict` Success and CPython `AttributeError: 'Slotted' object
+    // has no attribute '__dict__'`, exit 1 -- mypy is silent, so the union
+    // rule still requires a report. `own_member_type`, not the chain-walking
+    // `member_type`: a SUBCLASS that does not itself declare `__slots__`
+    // gets its own `__dict__` regardless of whether an ancestor is slotted
+    // (measured: `class Sub(Slotted): pass` / `Sub().__dict__` prints `{}`
+    // cleanly), so only the receiver's OWN body's declaration -- not its
+    // whole base chain -- decides this.
+    if ((attribute.attribute() == "__dict__" || attribute.attribute() == "__module__") &&
+        !classes_.is_object_itself(receiver.name)) {
+        const bool instance_is_slotted =
+            bind_self && attribute.attribute() == "__dict__" &&
+            classes_.own_member_type(receiver.name, "__slots__").has_value();
+        if (!instance_is_slotted) {
+            return Type::unknown();
+        }
+        // Falls through to the ordinary miss handling below, exactly as if
+        // this whole carve-out did not exist for this one receiver/name
+        // pair.
     }
     // A class may define __getattr__ to make ARBITRARY attribute access
     // clean. Verified against mypy 1.18.1: `class G: def __getattr__(self,

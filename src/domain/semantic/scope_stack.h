@@ -142,6 +142,69 @@ struct Binding {
     // ABOVE this member for the same reason -- appending it below would have
     // pushed `param_names` off the end of the positional prefix.)
     std::vector<std::string> param_names;
+
+    // The source-line where the OUTERMOST enclosing `for`/`while` loop this
+    // binding's PLACEHOLDER (pre_bind_function_body) was created inside
+    // begins, or 0 if it was not created inside a loop at all. 0 is a safe
+    // sentinel: every real source line is 1-based (domain/lexer's own
+    // convention). OUTERMOST, not innermost, deliberately: a read at an
+    // OUTER loop's own nesting level can be checking a name a further-NESTED
+    // inner loop assigns, and the two still share that OUTER loop's own
+    // back-edge (measured: `for x in xs: (if started: print(total)); for y
+    // in ys: total = y; started = True` -- read at the outer level, write
+    // inside the inner `for` -- is mypy `Success`, CPython exit 0; tagging
+    // with the INNER loop's start line alone left this one a false
+    // positive).
+    //
+    // EXISTS TO FIX A REGRESSION: widening pre_bind_function_body to recurse
+    // into If/While/For bodies (closing a genuine union-rule violation, see
+    // CLAUDE.md) made the ordering check fire across a LOOP BACK-EDGE, where
+    // it must not -- a loop body is not a straight line, so a read
+    // TEXTUALLY ABOVE a same-scope binding inside the SAME loop body can
+    // still execute AFTER it, on a later iteration. Measured against mypy
+    // 1.18.1 and CPython 3.14, the canonical shape:
+    //
+    //   total = 0
+    //   def run(xs: list[int]) -> None:
+    //       started = False
+    //       for x in xs:
+    //           if started:
+    //               print(total)
+    //           total = x
+    //           started = True
+    //
+    // is mypy `Success` and CPython prints `1`, `2` at exit 0 -- both oracles
+    // accept a program the widened pre-bind pass alone would reject. mypy's
+    // own `used-before-def` check is flow-sensitive here (a loop-head JOIN),
+    // not line-based, and does not fire for ANY read/write pair confined to
+    // one loop body regardless of a guard, of the read being unconditional, or
+    // of the read and write sharing one line (`total = total + x`) --
+    // measured all three, all `Success`. This field is the line-number-only
+    // approximation of that join: ExpressionTyper::type_of_name treats a read
+    // as exempt from the ordering check when its own line is `>=` this one.
+    // No upper bound is stored or checked -- a binding's own `declared_line`
+    // is always `<= ` the true end of whatever loop `loop_start_line` names,
+    // by construction, and this arm is only ever reached when `declared_line
+    // >= ` the read's line already, so the read's line is trapped below
+    // `declared_line` too; storing a redundant upper bound would be untestable
+    // dead data.
+    //
+    // GATED, in the READER (not here), on the name ALSO resolving in an
+    // ENCLOSING scope (ScopeStack::bound_in_an_enclosing_scope) -- this field
+    // alone is not sufficient (see the guard's own comment for why):
+    // without an outer binding, mypy itself reports `Cannot determine type of
+    // "x"  [has-type]` for the identical loop shape, a real rejection this
+    // compiler must not silently paper over just because the write happens to
+    // sit in a loop.
+    //
+    // Deliberately NOT preserved once a placeholder is filled in (assign_name/
+    // visit(For)'s tuple-target block build a fresh Binding with the field
+    // unset): by the time the real per-statement walk reaches the statement
+    // that fills the placeholder, every read on an EARLIER line has already
+    // been typed against this exact placeholder in the same single
+    // top-to-bottom pass check_suite performs, so nothing downstream ever
+    // needs to consult this field on the filled-in Binding.
+    int loop_start_line = 0;
 };
 
 // What a lookup found, and WHERE, because the ordering rule (3b) depends on
@@ -194,6 +257,25 @@ public:
 
     // True only for the current scope, for the redefinition check.
     bool bound_in_current_scope(const std::string& name) const;
+
+    // True when `name` resolves to something in an ENCLOSING scope --
+    // deliberately IGNORING the current scope's own binding, unlike
+    // `resolve()`, which returns the current scope's entry the moment it
+    // finds one and never even looks further out. Runs the identical
+    // outward walk `resolve()` falls back to (skipping every Class scope on
+    // the way), just unconditionally rather than only on a current-scope
+    // miss.
+    //
+    // The one caller (ExpressionTyper's loop-back-edge exemption, see
+    // Binding::loop_start_line) needs exactly this: a placeholder the CURRENT
+    // scope already holds is not evidence either way about whether an OUTER
+    // scope also binds the name, and that question decides whether mypy
+    // itself has anything to say about a loop-scoped read/write pair at all
+    // (`Cannot determine type of "x"  [has-type]` when there is no outer
+    // binding, silence when there is) -- so the answer must come from a
+    // fresh, current-scope-blind walk, not from anything `resolve()` already
+    // returned.
+    bool bound_in_an_enclosing_scope(const std::string& name) const;
 
 private:
     struct Scope {

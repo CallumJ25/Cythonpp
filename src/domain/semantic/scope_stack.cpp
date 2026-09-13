@@ -76,4 +76,22 @@ bool ScopeStack::bound_in_current_scope(const std::string& name) const {
     return scopes_.back().bindings.count(name) > 0;
 }
 
+bool ScopeStack::bound_in_an_enclosing_scope(const std::string& name) const {
+    // The identical outward walk resolve()'s own fallback performs -- see
+    // that function's comment for why every Class scope is skipped -- just
+    // run unconditionally, ignoring whatever the current scope holds, rather
+    // than only when the current scope misses.
+    for (std::size_t i = scopes_.size() - 1; i > 0;) {
+        --i;
+        const Scope& scope = scopes_[i];
+        if (scope.kind == ScopeKind::Class) {
+            continue;
+        }
+        if (scope.bindings.count(name) > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace cythonpp::domain::semantic

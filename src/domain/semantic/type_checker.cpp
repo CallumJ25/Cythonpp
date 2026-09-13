@@ -235,16 +235,16 @@ void for_each_bound_name(const ast::Expr& target,
 // NestedClass -- see pre_bind_function_body's own comment for why.
 enum class OwnScopeBindingKind { Assign, AnnAssign, ForTarget, NestedDef, NestedClass };
 
-// Invokes `visit(name, line, kind)` for every name bound directly in `body`'s
-// own scope: an ordinary assignment, an annotated assignment, a `for` target
-// (Name or TupleExpr), or a nested def/class's own name. Python rebinds a
-// name in a function's scope by ANY of these, not just by appearing as a
-// parameter: `def inner(): self = Bag(); self.q = 1` makes `self` a local of
-// `inner` exactly as a parameter named `self` would, and mypy correctly
-// refuses to attribute that store to the enclosing method's own receiver (or,
-// for pre_bind_function_body's own use, correctly reports a same-scope read
-// above the rebind as "used before definition" rather than resolving it
-// outward).
+// Invokes `visit(name, line, kind, loop_start_line, loop_end_line)` for every
+// name bound directly in `body`'s own scope: an ordinary assignment, an
+// annotated assignment, a `for` target (Name or TupleExpr), or a nested
+// def/class's own name. Python rebinds a name in a function's scope by ANY
+// of these, not just by appearing as a parameter: `def inner(): self =
+// Bag(); self.q = 1` makes `self` a local of `inner` exactly as a parameter
+// named `self` would, and mypy correctly refuses to attribute that store to
+// the enclosing method's own receiver (or, for pre_bind_function_body's own
+// use, correctly reports a same-scope read above the rebind as "used before
+// definition" rather than resolving it outward).
 //
 // Recurses into If/While/For bodies and their `else` clauses (not new
 // scopes). A nested FunctionDef or ClassDef is two DIFFERENT things, not one:
@@ -262,44 +262,67 @@ enum class OwnScopeBindingKind { Assign, AnnAssign, ForTarget, NestedDef, Nested
 // nothing at all, because the pre-pass still thought "self" was unshadowed
 // and placeholder-declared "q" on Bag.
 //
+// `enclosing_loop_start_line` (default 0, "no enclosing loop") carries the
+// OUTERMOST `for`/`while` currently open as the walk descends, so
+// pre_bind_function_body's own consumer can tag a placeholder with it -- see
+// Binding::loop_start_line's own comment for the regression this closes and
+// why the tag lives on the Binding rather than being computed some other
+// way. Set to a FOR/While's own start line the moment recursion enters that
+// loop's body/orelse, but ONLY when no loop already encloses it (`0` is the
+// signal "not yet inside one") -- the OUTERMOST loop is deliberately what
+// wins on further nesting, not the innermost: a read at an OUTER loop's own
+// level (guarded by a flag, say) can be checking a name a further-NESTED
+// inner loop assigns, and the two share the SAME outer back-edge, so the
+// outer loop's span is the one both the read and the write actually live
+// inside. Left UNCHANGED through an `If` (an `if` is not a loop and creates
+// no back-edge of its own), and passed through UNCHANGED to a `for` target's
+// own visit call (the target belongs to the loop's HEADER, evaluated once
+// per iteration before the body runs, not to the body it introduces).
+//
 // Augmented assignment to a target (`self += 1`) needs no arm here: the
 // parser rejects it outright with its own SyntaxError before this scan ever
 // runs, so there is no silent case to cover.
 void for_each_own_scope_binding(
     const std::vector<ast::StmtPtr>& body,
-    const std::function<void(const std::string&, int, OwnScopeBindingKind)>& visit) {
+    const std::function<void(const std::string&, int, OwnScopeBindingKind, int)>& visit,
+    int enclosing_loop_start_line = 0) {
     for (const ast::StmtPtr& statement : body) {
         if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
             const int line = assign->span().start_line;
             for_each_bound_name(assign->target(), [&](const std::string& name) {
-                visit(name, line, OwnScopeBindingKind::Assign);
+                visit(name, line, OwnScopeBindingKind::Assign, enclosing_loop_start_line);
             });
         } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
             if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
                 visit(target_name->identifier(), ann_assign->span().start_line,
-                      OwnScopeBindingKind::AnnAssign);
+                      OwnScopeBindingKind::AnnAssign, enclosing_loop_start_line);
             }
         } else if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
-            const int line = for_stmt->span().start_line;
+            const int loop_start =
+                enclosing_loop_start_line != 0 ? enclosing_loop_start_line : for_stmt->span().start_line;
             for_each_bound_name(for_stmt->target(), [&](const std::string& name) {
-                visit(name, line, OwnScopeBindingKind::ForTarget);
+                visit(name, for_stmt->span().start_line, OwnScopeBindingKind::ForTarget,
+                      enclosing_loop_start_line);
             });
-            for_each_own_scope_binding(for_stmt->body(), visit);
-            for_each_own_scope_binding(for_stmt->orelse(), visit);
+            for_each_own_scope_binding(for_stmt->body(), visit, loop_start);
+            for_each_own_scope_binding(for_stmt->orelse(), visit, loop_start);
         } else if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
-            for_each_own_scope_binding(if_stmt->body(), visit);
-            for_each_own_scope_binding(if_stmt->orelse(), visit);
+            for_each_own_scope_binding(if_stmt->body(), visit, enclosing_loop_start_line);
+            for_each_own_scope_binding(if_stmt->orelse(), visit, enclosing_loop_start_line);
         } else if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
-            for_each_own_scope_binding(while_stmt->body(), visit);
-            for_each_own_scope_binding(while_stmt->orelse(), visit);
+            const int loop_start = enclosing_loop_start_line != 0 ? enclosing_loop_start_line
+                                                                 : while_stmt->span().start_line;
+            for_each_own_scope_binding(while_stmt->body(), visit, loop_start);
+            for_each_own_scope_binding(while_stmt->orelse(), visit, loop_start);
         } else if (const auto* nested_def = dynamic_cast<const ast::FunctionDef*>(statement.get())) {
-            visit(nested_def->name(), nested_def->span().start_line, OwnScopeBindingKind::NestedDef);
+            visit(nested_def->name(), nested_def->span().start_line, OwnScopeBindingKind::NestedDef,
+                  enclosing_loop_start_line);
             // Its BODY is a different scope -- deliberately not descended
             // into, matching every other reason this file stops at that
             // boundary.
         } else if (const auto* nested_class = dynamic_cast<const ast::ClassDef*>(statement.get())) {
             visit(nested_class->name(), nested_class->span().start_line,
-                  OwnScopeBindingKind::NestedClass);
+                  OwnScopeBindingKind::NestedClass, enclosing_loop_start_line);
             // Its BODY is a different scope, for the same reason.
         }
     }
@@ -316,8 +339,8 @@ void for_each_own_scope_binding(
 // longer manufactures a placeholder that hides the READ above it.
 bool receiver_rebound_in_own_scope(const std::string& name, const std::vector<ast::StmtPtr>& body) {
     bool shadowed = false;
-    for_each_own_scope_binding(body,
-                              [&](const std::string& bound_name, int, OwnScopeBindingKind) {
+    for_each_own_scope_binding(
+        body, [&](const std::string& bound_name, int, OwnScopeBindingKind, int) {
         if (bound_name == name) {
             shadowed = true;
         }
@@ -928,7 +951,7 @@ void TypeChecker::pre_bind_function_body(const std::vector<ast::StmtPtr>& body) 
     // at the store, and CPython raises the matching UnboundLocalError -- both
     // oracles reject a program this compiler accepted.
     for_each_own_scope_binding(body, [this](const std::string& name, int line,
-                                           OwnScopeBindingKind kind) {
+                                           OwnScopeBindingKind kind, int loop_start_line) {
         if (kind == OwnScopeBindingKind::NestedClass) {
             // Deliberately UNBOUND, not merely unhandled. A nested class's
             // own name is a genuine same-scope binding form too (measured:
@@ -950,7 +973,16 @@ void TypeChecker::pre_bind_function_body(const std::vector<ast::StmtPtr>& body) 
             return;
         }
         if (!scopes_.bound_in_current_scope(name)) {
-            scopes_.bind(name, Binding{Type::unknown(), line, /*annotated=*/false});
+            // loop_start_line (0 when this binding sits outside any loop) is
+            // carried onto the placeholder itself -- see
+            // Binding::loop_start_line's own comment for the regression this
+            // closes: a read on an earlier LINE inside the same loop body
+            // can still execute AFTER this binding, on a later iteration, and
+            // the ordering check must not mistake that back-edge for a
+            // straight-line use-before-definition.
+            Binding placeholder{Type::unknown(), line, /*annotated=*/false};
+            placeholder.loop_start_line = loop_start_line;
+            scopes_.bind(name, placeholder);
         }
     });
 }

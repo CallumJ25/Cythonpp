@@ -1321,6 +1321,90 @@ TEST(ExpressionTyper, AMissingAttributeThatIsNotInstanceMachineryStaysATypeError
     EXPECT_EQ(error.message, "\"Plain\" has no attribute \"__weakref__\"");
 }
 
+// THE DELIBERATE DECISION on a CLASS-OBJECT receiver (`bind_self == false`):
+// measured directly (mypy 1.18.1 Success, CPython prints normally for both
+// `Plain.__dict__` and `Plain.__module__`), this reading is a false positive
+// too, exactly like the instance one, and gets the identical clean answer --
+// the carve-out is no longer gated on `bind_self` at all. Proven by
+// neutering: re-adding a `bind_self &&` gate flips this test to a TypeError.
+TEST(ExpressionTyper, AnInstanceMachineryMemberOnAClassObjectReceiverIsCleanAndUnknown) {
+    ClassTable table;
+    table.declare("Plain", {});
+
+    for (const char* expr : {"Plain.__dict__", "Plain.__module__"}) {
+        const Typed typed = type_expression(expr, {}, Type::unknown(), &table);
+        EXPECT_TRUE(typed.diagnostics.empty())
+            << expr << ": expected no diagnostics, got " << only_error(typed).message;
+        EXPECT_EQ(typed.printed, "Unknown") << expr;
+    }
+}
+
+// THE `__slots__` BOUNDARY: an INSTANCE of a class whose OWN body declares
+// `__slots__` has no `__dict__` at all -- a real CPython AttributeError this
+// compiler correctly reported before the instance-machinery carve-out
+// existed, and would have started silently swallowing without this gate.
+// Measured: mypy `--strict` Success (mypy is silent, so this is a case where
+// ONLY CPython objects, and the union rule still requires a report), CPython
+// `AttributeError: 'Slotted' object has no attribute '__dict__'`. `__module__`
+// is UNAFFECTED by `__slots__` (measured: `Slotted().__module__` prints
+// `__main__` cleanly) and is deliberately not part of this gate.
+TEST(ExpressionTyper, AnInstanceOfASlottedClassHasNoDictAndStillReports) {
+    ClassTable table;
+    table.declare("Slotted", {});
+    table.declare_member("Slotted", "__slots__", Type::tuple_of({Type::str()}), 2);
+
+    const Typed dict_typed = type_expression("s.__dict__", {{"s", Type::class_of("Slotted")}},
+                                             Type::unknown(), &table);
+    const diagnostics::Diagnostic dict_error = only_error(dict_typed);
+    EXPECT_EQ(dict_error.code, "TypeError");
+    EXPECT_EQ(dict_error.message, "\"Slotted\" has no attribute \"__dict__\"");
+
+    const Typed module_typed = type_expression("s.__module__", {{"s", Type::class_of("Slotted")}},
+                                               Type::unknown(), &table);
+    EXPECT_TRUE(module_typed.diagnostics.empty())
+        << "expected no diagnostics, got " << only_error(module_typed).message;
+}
+
+// CONTROL: a SUBCLASS of a slotted class that does NOT itself declare
+// `__slots__` gets its own instance `__dict__` regardless -- measured,
+// `class Sub(Slotted): pass` / `Sub().__dict__` prints `{}` cleanly under
+// CPython, and mypy is `Success`. This is why the gate asks
+// `own_member_type` (THIS class's own body only), never the chain-walking
+// `member_type`: an ancestor's `__slots__` must not decide the answer for a
+// receiver that is not itself slotted. Differs from the test above in
+// exactly one dimension -- `Sub` has no `__slots__` of its own, even though
+// its base does.
+TEST(ExpressionTyper, ASubclassOfASlottedClassWithNoOwnSlotsStillHasADict) {
+    ClassTable table;
+    table.declare("Slotted", {});
+    table.declare_member("Slotted", "__slots__", Type::tuple_of({Type::str()}), 2);
+    table.declare("Sub", {Type::class_of("Slotted")});
+
+    const Typed typed =
+        type_expression("s.__dict__", {{"s", Type::class_of("Sub")}}, Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "expected no diagnostics, got " << only_error(typed).message;
+    EXPECT_EQ(typed.printed, "Unknown");
+}
+
+// CONTROL: a slotted class's own CLASS-OBJECT `__dict__` (the class's own
+// mappingproxy) is UNAFFECTED by `__slots__` -- measured, `Slotted.__dict__`
+// is clean under both oracles regardless. The `__slots__` gate is
+// conjoined with `bind_self` for exactly this reason: it must not reach a
+// class-object receiver at all. Differs from
+// AnInstanceOfASlottedClassHasNoDictAndStillReports in exactly one
+// dimension -- the receiver is the class object, not an instance.
+TEST(ExpressionTyper, ASlottedClasssOwnClassObjectDictStaysClean) {
+    ClassTable table;
+    table.declare("Slotted", {});
+    table.declare_member("Slotted", "__slots__", Type::tuple_of({Type::str()}), 2);
+
+    const Typed typed = type_expression("Slotted.__dict__", {}, Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "expected no diagnostics, got " << only_error(typed).message;
+    EXPECT_EQ(typed.printed, "Unknown");
+}
+
 // `__init__` looks like the same shape as `__class__` (both are in
 // dir(object)) but is NOT part of this carve-out: mypy --strict rejects a
 // bare instance read of it ("Accessing \"__init__\" on an instance is
@@ -1355,6 +1439,25 @@ TEST(ExpressionTyper, AnObjectMemberNameOnASeededBuiltinRowStaysDeferred) {
     const diagnostics::Diagnostic error = only_error(typed);
     EXPECT_EQ(error.code, "NotImplementedError");
     EXPECT_EQ(error.message, "methods on builtin types are not supported");
+}
+
+// THE OVERRIDE HALF of is_object_member's own "checked LAST" ordering claim:
+// a class that legitimately overrides one of object's own names (here,
+// `__repr__`) must resolve through method_type FIRST and see its OWN real
+// return type, not fall through to is_object_member's absorbing `Unknown`.
+// Previously asserted only in the comment, unpinned by any test; this closes
+// that gap directly.
+TEST(ExpressionTyper, AClassOverridingAnObjectMemberNameSeesItsOwnRealType) {
+    ClassTable table;
+    table.declare("Plain", {});
+    table.declare_method("Plain", "__repr__",
+                         Type::callable({Type::class_of("Plain")}, Type::str()));
+
+    const Typed typed =
+        type_expression("p.__repr__", {{"p", Type::class_of("Plain")}}, Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "expected no diagnostics, got " << only_error(typed).message;
+    EXPECT_EQ(typed.printed, "Callable[[], str]") << "the override's own signature wins, self bound";
 }
 
 // Verified: xs.append(1), s.upper() and d.keys() are ALL mypy-clean. With no

@@ -815,6 +815,174 @@ TEST(TypeChecker, AClosureReadOfAnOuterLocalWithNoLocalRebindStaysClean) {
                  "    return i()\n");
 }
 
+// THE LOOP BACK-EDGE EXEMPTION, and the regression it fixes. Widening
+// pre_bind_function_body to recurse into For/While bodies (closing the
+// used-before-definition violations above) made the line-based ordering
+// check fire across a loop's own BACK-EDGE, where mypy's flow-sensitive
+// check does not -- a read textually ABOVE a same-loop-body binding can
+// still execute AFTER it, on a LATER iteration. Measured against mypy 1.18.1
+// and CPython 3.14 (driven with `run([1, 2, 3])`): mypy `Success`, CPython
+// prints `1` then `2` at exit 0 -- this exact accumulator pattern is
+// mypy-clean and CPython-clean, and was a FALSE POSITIVE this compiler
+// introduced by closing the violations above, not merely an unrelated
+// pre-existing gap.
+TEST(TypeChecker, ALoopCarriedAccumulatorGuardedByAFlagStaysClean) {
+    expect_clean("total = 0\n"
+                 "def run(xs: list[int]) -> None:\n"
+                 "    started = False\n"
+                 "    for x in xs:\n"
+                 "        if started:\n"
+                 "            print(total)\n"
+                 "        total = x\n"
+                 "        started = True\n"
+                 "run([1, 2, 3])\n");
+}
+
+// The `while` sibling of the accumulator above. Measured: mypy `Success`,
+// CPython exit 0.
+TEST(TypeChecker, AWhileLoopCarriedAccumulatorGuardedByAFlagStaysClean) {
+    expect_clean("total = 0\n"
+                 "def run(c: bool) -> None:\n"
+                 "    started = False\n"
+                 "    while c:\n"
+                 "        if started:\n"
+                 "            print(total)\n"
+                 "        total = 1\n"
+                 "        started = True\n"
+                 "        c = False\n"
+                 "run(True)\n");
+}
+
+// A `while` loop that never runs at all -- the exemption must not depend on
+// the loop actually executing (this is a purely STATIC, line-based check).
+// Measured: mypy `Success`, CPython exit 0 (the body, and the read inside
+// it, never execute).
+TEST(TypeChecker, AWhileLoopThatNeverRunsStillStaysClean) {
+    expect_clean("total = 0\n"
+                 "def run(c: bool) -> None:\n"
+                 "    while c:\n"
+                 "        print(total)\n"
+                 "        total = 1\n"
+                 "run(False)\n");
+}
+
+// The exemption must also cover a LATER binding that is itself a `for`
+// TARGET (this file's own new arm, not just a plain Assign) -- both are
+// reachable through the identical for_each_own_scope_binding walk, but a
+// for-target's binding takes a DIFFERENT real-walk path (visit(For)'s
+// Name-target arm) than a plain Assign, so this is not redundant with the
+// accumulator test above. Measured: mypy `Success`, CPython prints `1`,
+// `2` at exit 0.
+TEST(TypeChecker, ALaterBindingAsAForTargetInTheSameLoopStaysClean) {
+    expect_clean("total = 0\n"
+                 "def run(xs: list[int]) -> None:\n"
+                 "    started = False\n"
+                 "    for y in xs:\n"
+                 "        if started:\n"
+                 "            print(total)\n"
+                 "        for total in [y]:\n"
+                 "            pass\n"
+                 "        started = True\n"
+                 "run([1, 2, 3])\n");
+}
+
+// CONTROL, THE GATE: without an ENCLOSING binding, the exemption must NOT
+// fire. Measured against mypy 1.18.1 and CPython 3.14: mypy
+// `Cannot determine type of "total"  [has-type]` (a real rejection, a
+// DIFFERENT diagnostic from ours but still one), CPython actually runs this
+// fine (exit 0, prints `1`, `2`) -- so mypy is the ONLY oracle objecting
+// here, and the union rule still requires a report. Differs from
+// ALoopCarriedAccumulatorGuardedByAFlagStaysClean in exactly one dimension:
+// no module-level `total = 0` above the function.
+TEST(TypeChecker, ALoopCarriedReadWithNoEnclosingBindingStillReports) {
+    const Checked checked = check_module("def run(xs: list[int]) -> None:\n"
+                                         "    started = False\n"
+                                         "    for x in xs:\n"
+                                         "        if started:\n"
+                                         "            print(total)\n"
+                                         "        total = x\n"
+                                         "        started = True\n"
+                                         "run([1, 2, 3])\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'total' is used before definition");
+    EXPECT_EQ(error.line, 5);
+}
+
+// CONTROL, THE SPAN BOUNDARY: a read strictly BEFORE the loop even starts
+// (not inside its body at all) must keep reporting -- the exemption is keyed
+// on the read's own line falling WITHIN the loop's span, and a read above
+// the loop entirely is outside it. Measured against mypy 1.18.1: `Success`
+// (mypy is unsound here too, silent regardless), CPython
+// `UnboundLocalError: cannot access local variable 'total' where it is not
+// associated with a value` at exit 1 -- CPython is the only oracle
+// objecting, and the union rule still requires a report. This is also the
+// shape that IMPROVED as a side effect of the recursion fix: before it, this
+// exact program was silently accepted (pre_bind_function_body never saw a
+// `for`-body binding at all, so the read resolved outward to nothing local
+// and fell through clean); it is correctly rejected now.
+TEST(TypeChecker, ALoopCarriedReadStrictlyBeforeTheLoopStillReports) {
+    const Checked checked = check_module("total = 0\n"
+                                         "def run(xs: list[int]) -> None:\n"
+                                         "    print(total)\n"
+                                         "    for x in xs:\n"
+                                         "        total = x\n"
+                                         "run([1, 2, 3])\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'total' is used before definition");
+    EXPECT_EQ(error.line, 3);
+}
+
+// CONTROL, DIFFERENT LOOPS DO NOT SHARE AN EXEMPTION: a read inside ONE
+// loop's body and a binding inside a SEPARATE, sibling loop's body must
+// still report -- the exemption is scoped to the SAME loop's span
+// (Binding::loop_start_line/loop_end_line are the ONE loop the binding was
+// found inside), not "any loop in this function". Measured against mypy
+// 1.18.1: `Success` (mypy is unsound here too), CPython
+// `UnboundLocalError` at exit 1 -- the read runs, unconditionally, in the
+// FIRST loop, before the second loop (which does the only binding) ever
+// starts.
+TEST(TypeChecker, AReadInADifferentLoopFromTheBindingStillReports) {
+    const Checked checked = check_module("total = 0\n"
+                                         "def run(xs: list[int], ys: list[int]) -> None:\n"
+                                         "    for x in xs:\n"
+                                         "        print(total)\n"
+                                         "    for y in ys:\n"
+                                         "        total = y\n"
+                                         "run([1, 2, 3], [4, 5])\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'total' is used before definition");
+    EXPECT_EQ(error.line, 4);
+}
+
+// THE OUTERMOST-not-innermost CHOICE, and the false positive tagging by the
+// innermost loop alone would leave: a read at an OUTER loop's own nesting
+// level, guarded by a flag, checking a name that is actually assigned inside
+// a FURTHER-NESTED inner loop within that same outer loop. The read and the
+// write both live inside the OUTER loop's own back-edge, even though the
+// write's own immediately-enclosing loop is the inner one -- tagging the
+// placeholder with only the inner loop's start line left this a false
+// positive (the read's line falls before the inner loop even starts).
+// Measured against mypy 1.18.1 and CPython 3.14 (driven with
+// `run([1, 2], [3, 4])`): mypy `Success`, CPython prints `4` at exit 0.
+TEST(TypeChecker, AReadAtAnOuterLoopLevelGuardingAWriteInANestedInnerLoopStaysClean) {
+    expect_clean("total = 0\n"
+                 "def run(xs: list[int], ys: list[int]) -> None:\n"
+                 "    started = False\n"
+                 "    for x in xs:\n"
+                 "        if started:\n"
+                 "            print(total)\n"
+                 "        for y in ys:\n"
+                 "            total = y\n"
+                 "        started = True\n"
+                 "run([1, 2], [3, 4])\n");
+}
+
 // CONTROL: the one-line `for` suite reading its own target must stay clean
 // EVEN INSIDE A FUNCTION -- this is the exact hazard order_exempt exists to
 // prevent, now reachable through the placeholder-fill branch for the first
