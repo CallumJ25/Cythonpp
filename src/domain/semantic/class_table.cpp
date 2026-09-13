@@ -70,6 +70,10 @@ ClassTable::ClassTable() {
         // base, a `BaseException` base and a declared `__new__` all still
         // win over a seeded band, anywhere in the chain.
         entry.builtin_arity = std::make_pair(builtin.min_args, builtin.max_args);
+        // See Entry::is_seeded_builtin's own comment -- this is the ONE place
+        // a row is ever marked seeded; declare() is the one place that mark
+        // is ever removed.
+        entry.is_seeded_builtin = true;
     }
 }
 
@@ -172,6 +176,15 @@ void ClassTable::declare(std::string qualified_name, std::vector<Type> bases) {
     // (unbounded) band survived and routed the shadowing class through
     // constructor_check's Unchecked fallback.
     entry.builtin_arity.reset();
+    // `is_seeded_builtin` gets the identical treatment, for the identical
+    // reason: a shadowing `class slice: pass` or `class Exception: pass`
+    // must lose the "seeded" mark alongside the arity band and the stale
+    // bases, or inherits_builtin_class would keep answering true for a class
+    // this compiler can now see the real members of, and a genuine
+    // attr-defined error (`class slice: pass` then `s.nope`, `class
+    // Exception: pass` then a subclass then `e.nope` -- both oracles reject
+    // both) would silently downgrade to NotImplementedError instead.
+    entry.is_seeded_builtin = false;
     // `members`/`methods` get the same treatment, defensively: nothing in
     // ClassTable's own constructor populates either for a seeded builtin row
     // today (only `bases` and `builtin_arity`), so this is a no-op right
@@ -586,6 +599,32 @@ bool ClassTable::inherits_builtin(const std::string& qualified_name) const {
                 return std::nullopt;
             }
             if (builtin_type_kind(canonical).has_value()) {
+                return true;
+            }
+            return std::nullopt;
+        });
+    return found.has_value() && *found;
+}
+
+bool ClassTable::inherits_builtin_class(const std::string& qualified_name) const {
+    // Fallback included, same as inherits_builtin: nullopt here means "no
+    // seeded builtin row anywhere in this chain", which is exactly the miss
+    // that lets the attr-defined check fire. `true` only ever SUPPRESSES a
+    // diagnostic (into NotImplementedError), so this direction cannot
+    // manufacture a false one.
+    const std::optional<bool> found = query_chain<bool>(
+        qualified_name, [](const std::string& canonical, const Entry& entry) -> std::optional<bool> {
+            // object is excluded unconditionally, exactly as inherits_builtin
+            // excludes it: it IS a seeded row (bounded constructor arity
+            // (0, 0)), and every class conceptually derives from it, so
+            // counting it here would make every class chain "reach a seeded
+            // builtin" and delete this whole check -- `class Plain: pass`
+            // and `class Plain(object): pass` must both keep reporting
+            // `p.nope` as a genuine attr-defined TypeError.
+            if (canonical == "object") {
+                return std::nullopt;
+            }
+            if (entry.is_seeded_builtin) {
                 return true;
             }
             return std::nullopt;

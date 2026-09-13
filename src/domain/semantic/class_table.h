@@ -308,6 +308,42 @@ public:
     // than a genuine attr-defined error.
     bool inherits_builtin(const std::string& qualified_name) const;
 
+    // inherits_builtin's sibling for the OTHER half of the seeded table: a
+    // SEEDED BUILTIN CLASS ROW (Exception, OSError, slice, property,
+    // memoryview, type, super, ...), rather than a modelled TypeKind. Every
+    // one of the 97 rows in kBuiltinClasses carries a NAME and BASES but no
+    // MEMBERS at all -- the generated table has no typeshed -- so a member
+    // access on a value whose class chain is, or reaches, one of these rows
+    // is exactly as unmodellable as `Sub(int).nope` is for inherits_builtin,
+    // and for the identical reason: this compiler simply does not know what
+    // members the row has. Without this, `super().__init__()`,
+    // `Exception("x").args`, `class MyErr(ValueError): pass` then `e.args`,
+    // and 21 other measured shapes were false `TypeError`s on programs both
+    // mypy --strict and CPython accept and run.
+    //
+    // Whether `qualified_name` ITSELF is a seeded row is answered too, not
+    // only its ancestors -- `super().__init__()`'s receiver resolves directly
+    // to `Class("super")`, with no intervening subclass at all, so the walk's
+    // very first entry (the resolved root) must be able to answer yes.
+    //
+    // Seeded-ness is read off `Entry::builtin_arity`'s sibling flag,
+    // `Entry::is_seeded_builtin` -- NOT a name lookup against kBuiltinClasses
+    // -- for the same reason `builtin_arity` is its own field and not a name
+    // check: `declare()` resets the flag for any name a real `class`
+    // statement writes over, so `class slice: pass` then `s.nope`, or
+    // `class Exception: pass` then a subclass then `e.nope`, still resolve
+    // to an ordinary user-class entry and still report a genuine attr-defined
+    // TypeError, exactly as both oracles require.
+    //
+    // `object` is excluded from the walk, unconditionally, mirroring
+    // inherits_builtin's own carve-out and for the identical reason: `object`
+    // IS a seeded row (bounded constructor arity (0, 0)), and every class
+    // conceptually derives from it, so counting it here would make EVERY
+    // class chain "reach a seeded builtin" and delete this whole check --
+    // `class Plain: pass` and `class Plain(object): pass` must both keep
+    // reporting `p.nope` as a genuine TypeError.
+    bool inherits_builtin_class(const std::string& qualified_name) const;
+
 private:
     struct Member {
         Type type;
@@ -353,6 +389,25 @@ private:
         // earlier is observably wrong (`complex(1)` silently stops being
         // NotImplementedError).
         std::optional<std::pair<int, int>> builtin_arity;
+
+        // Whether THIS entry was seeded from kBuiltinClasses, as opposed to
+        // being an ordinary user `class` statement's declare() -- the
+        // discriminator inherits_builtin_class reads. A bool rather than a
+        // name lookup for the same reason builtin_arity is a field and not a
+        // recomputed answer: declare() resets it to false for any name a
+        // real `class` statement writes over (see declare()'s own comment),
+        // so `class slice: pass` or `class Exception: pass` shadowing a
+        // builtin spelling loses this flag along with the arity band and the
+        // stale bases -- it must NOT be derived by re-checking the name
+        // against kBuiltinClasses at read time, which cannot see that a user
+        // class has shadowed it.
+        //
+        // Deliberately NOT the same field as builtin_arity: only 14 of the 97
+        // seeded rows carry a bounded arity, so a caller cannot use
+        // `builtin_arity.has_value()` as a stand-in for "is this row seeded
+        // at all" -- the other 83 (Exception, OSError, slice, super, ...)
+        // would be silently missed.
+        bool is_seeded_builtin = false;
     };
 
     // Canonicalises, then looks the entry up directly (no transitive walk).
@@ -465,10 +520,11 @@ private:
     // instead, an implicit exclusion would silently become a false "too
     // few arguments", while an explicit list simply would not include it.
     //
-    // Applied to the four queries that answer "does this class have this
-    // member": member_type, member_declared_line, method_type and
-    // inherits_builtin. is_class, bases_of and constructor_type are
-    // deliberately excluded, each for a different reason:
+    // Applied to the five queries that answer "does this class have this
+    // member": member_type, member_declared_line, method_type,
+    // inherits_builtin and inherits_builtin_class. is_class, bases_of and
+    // constructor_type are deliberately excluded, each for a different
+    // reason:
     //
     //  - is_class cannot miss in the first place while the alias points at
     //    a live isolated entry (declare_isolated_class always writes one,
@@ -483,7 +539,7 @@ private:
     //    local `class L: pass` would make the mypy-clean `L()` a false
     //    "too few arguments" -- exactly what the fallback exists to remove.
     //
-    // Safety of the fallback for the four that DO use it: it only ever runs
+    // Safety of the fallback for the five that DO use it: it only ever runs
     // where the lookup had ALREADY missed, and a miss on a Class receiver is
     // already a diagnostic (or an inherits_builtin suppression). So it can
     // turn a diagnostic into a different diagnostic, or into silence, but it

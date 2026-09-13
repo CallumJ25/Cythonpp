@@ -872,14 +872,38 @@ Type ExpressionTyper::type_of_class_attribute(const Type& receiver, const ast::A
     // Sub would be a false TypeError. The accepted cost is a MISSED error:
     // `Sub().nope` is a genuine mypy attr-defined error and this reports
     // NotImplementedError instead -- direction (b) loses attr-defined for
-    // builtin-inheriting classes only, and the hard invariant (never a false
-    // TypeError) holds.
+    // builtin-inheriting classes only.
     if (classes_.inherits_builtin(receiver.name)) {
         return error(attribute, DiagnosticKind::NotImplementedError, kBuiltinMemberMessage);
     }
-    // Every base is an ordinary user-class-shaped entry (including a seeded
-    // exception class -- inherits_builtin is deliberately false for those),
-    // so a miss here is a genuine mypy attr-defined error.
+    // THE SECOND CARVE-OUT, inherits_builtin's sibling for the other half of
+    // the seeded table: a class whose chain is, or reaches, one of the 97
+    // SEEDED BUILTIN CLASS ROWS (Exception, OSError, slice, property,
+    // memoryview, type, super, ...) has a name and bases recorded but no
+    // MEMBERS at all -- the generated table has no typeshed, exactly like the
+    // inherits_builtin carve-out just above, just for a Class-shaped row
+    // instead of a modelled TypeKind. Measured (mypy 1.18.1, CPython): this
+    // was 24 false TypeErrors on programs both oracles accept and run --
+    // `super().__init__()` (mypy: Success; CPython prints normally) is the
+    // most common one, since it is the idiomatic way to call a base
+    // constructor from every subclass `__init__`. Also closes
+    // `Exception("x").args`, `OSError().errno`, `class MyErr(ValueError):
+    // pass` then `e.args`, `self.args` read inside a ValueError subclass
+    // method, and others. The accepted cost is the identical MISSED-error
+    // trade the carve-out above already makes: `super().nope()` and
+    // `MyErr().nope` (both genuine mypy attr-defined errors) now report
+    // NotImplementedError instead of TypeError -- still exit 1, not a
+    // regression from accepting the program. NOT the same predicate as
+    // inherits_builtin: that one is false for a seeded CLASS base by
+    // design (see its own test, InheritsBuiltinIsFalseForASeededExceptionBase)
+    // precisely because a Class base is what this second carve-out exists to
+    // cover instead.
+    if (classes_.inherits_builtin_class(receiver.name)) {
+        return error(attribute, DiagnosticKind::NotImplementedError, kBuiltinMemberMessage);
+    }
+    // Every base is an ordinary user-class-shaped entry (neither a modelled
+    // TypeKind nor a seeded builtin class row), so a miss here is a genuine
+    // mypy attr-defined error.
     //
     // Routed through
     // strip_synthetic_class_prefix rather than quoting receiver.name raw --

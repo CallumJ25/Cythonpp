@@ -767,6 +767,64 @@ TEST(ClassTable, InheritsBuiltinIsFalseForASeededExceptionBase) {
     EXPECT_FALSE(table.inherits_builtin("MyError"));
 }
 
+// inherits_builtin_class is the sibling predicate for the Class-shaped half
+// of the seeded table -- exactly the case InheritsBuiltinIsFalseForA
+// SeededExceptionBase just above pins as false for inherits_builtin. A
+// class whose chain reaches a seeded row directly (the resolved root
+// itself, with no intervening subclass -- e.g. `super().__init__()`'s
+// receiver) must answer true too, not only an ancestor.
+TEST(ClassTable, InheritsBuiltinClassDetectsASeededRowDirectly) {
+    const ClassTable table;
+
+    EXPECT_TRUE(table.inherits_builtin_class("Exception"));
+    EXPECT_TRUE(table.inherits_builtin_class("super"));
+    EXPECT_TRUE(table.inherits_builtin_class("OSError"));
+}
+
+TEST(ClassTable, InheritsBuiltinClassDetectsASeededRowInTheBaseChain) {
+    ClassTable table;
+    table.declare("MyErr", {Type::class_of("ValueError")});
+    table.declare("Deep", {Type::class_of("MyErr")});
+
+    EXPECT_TRUE(table.inherits_builtin_class("MyErr"));
+    EXPECT_TRUE(table.inherits_builtin_class("Deep")) << "transitive";
+}
+
+TEST(ClassTable, InheritsBuiltinClassIsFalseForAnOrdinaryUserClass) {
+    ClassTable table;
+    table.declare("Plain", {});
+    table.declare("PlainChild", {Type::class_of("Plain")});
+
+    EXPECT_FALSE(table.inherits_builtin_class("Plain"));
+    EXPECT_FALSE(table.inherits_builtin_class("PlainChild"));
+}
+
+// object is excluded unconditionally, mirroring InheritsBuiltinExcludesObject
+// above: object IS a seeded row, and every class conceptually derives from
+// it, so counting it would make every class chain "reach a seeded builtin"
+// and delete the attr-defined check entirely.
+TEST(ClassTable, InheritsBuiltinClassExcludesObject) {
+    ClassTable table;
+    table.declare("Widget", {Type::object()});
+
+    EXPECT_FALSE(table.inherits_builtin_class("Widget"));
+}
+
+// declare() must clear Entry::is_seeded_builtin for a name a real `class`
+// statement shadows, exactly as it clears builtin_arity -- otherwise
+// `class slice: pass` then `s.nope`, or `class Exception: pass` then a
+// subclass then `e.nope` (both oracles reject both), would silently
+// downgrade from a genuine attr-defined TypeError to NotImplementedError.
+TEST(ClassTable, DeclaringOverASeededBuiltinNameClearsTheSeededFlag) {
+    ClassTable table;
+    table.declare("slice", {});
+    table.declare("Exception", {});
+    table.declare("MyErr", {Type::class_of("Exception")});
+
+    EXPECT_FALSE(table.inherits_builtin_class("slice"));
+    EXPECT_FALSE(table.inherits_builtin_class("MyErr"));
+}
+
 // EnvironmentError, IOError and WindowsError are not distinct classes from
 // OSError -- getattr(builtins, "IOError") is builtins.OSError in CPython --
 // so both x: IOError = OSError() and y: OSError = IOError() are mypy-clean.

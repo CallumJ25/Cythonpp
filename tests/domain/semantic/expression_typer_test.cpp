@@ -1092,6 +1092,68 @@ TEST(ExpressionTyper, ADeclaredMemberOnABuiltinInheritingClassStillResolves) {
     EXPECT_EQ(typed.printed, "str");
 }
 
+// inherits_builtin's sibling carve-out for a SEEDED BUILTIN CLASS ROW
+// (Exception, OSError, slice, property, memoryview, type, super, ...),
+// rather than a modelled TypeKind. Verified: `class MyErr(ValueError): pass`
+// then `e.args` is mypy-clean (`Success`) and CPython prints `('bad',)` --
+// this was a false TypeError before ClassTable::inherits_builtin_class
+// existed, since inherits_builtin is deliberately false for a Class base
+// (see InheritsBuiltinIsFalseForASeededExceptionBase in class_table_test.cpp).
+TEST(ExpressionTyper, AMissingAttributeOnASeededBuiltinClassBaseIsUnsupported) {
+    ClassTable table;
+    table.declare("MyErr", {Type::class_of("ValueError")});
+
+    const Typed typed = type_expression("e.args", {{"e", Type::class_of("MyErr")}},
+                                        Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "methods on builtin types are not supported");
+}
+
+// The seeded row itself, with no intervening user subclass at all --
+// `super().__init__()`'s receiver resolves directly to Class("super"), which
+// is exactly this shape. Verified: mypy --strict is Success and CPython
+// runs a subclass `__init__` calling `super().__init__()` cleanly.
+TEST(ExpressionTyper, AMissingAttributeOnASeededBuiltinClassItselfIsUnsupported) {
+    const ClassTable table;
+
+    const Typed typed = type_expression("s.__init__", {{"s", Type::class_of("super")}},
+                                        Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "NotImplementedError");
+    EXPECT_EQ(error.message, "methods on builtin types are not supported");
+}
+
+// A DECLARED member still wins over the second carve-out too, same as the
+// first (ADeclaredMemberOnABuiltinInheritingClassStillResolves above).
+TEST(ExpressionTyper, ADeclaredMemberOnASeededBuiltinClassBaseStillResolves) {
+    ClassTable table;
+    table.declare("MyErr", {Type::class_of("ValueError")});
+    table.declare_member("MyErr", "code", Type::int_(), 3);
+
+    const Typed typed =
+        type_expression("e.code", {{"e", Type::class_of("MyErr")}}, Type::unknown(), &table);
+    EXPECT_TRUE(typed.diagnostics.empty())
+        << "an implementation that returned the member AND reported the carve-out's "
+           "NotImplementedError would otherwise still pass";
+    EXPECT_EQ(typed.printed, "int");
+}
+
+// A class shadowing a builtin spelling (`class slice: pass`) must NOT gain
+// this carve-out -- declare() resets Entry::is_seeded_builtin, so a genuine
+// miss on it stays a genuine attr-defined TypeError, matching both oracles
+// (mypy: attr-defined; CPython: AttributeError).
+TEST(ExpressionTyper, AMissingAttributeOnAClassShadowingABuiltinSpellingStaysATypeError) {
+    ClassTable table;
+    table.declare("slice", {});
+
+    const Typed typed = type_expression("s.nope", {{"s", Type::class_of("slice")}},
+                                        Type::unknown(), &table);
+    const diagnostics::Diagnostic error = only_error(typed);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "\"slice\" has no attribute \"nope\"");
+}
+
 // Verified: xs.append(1), s.upper() and d.keys() are ALL mypy-clean. With no
 // typeshed, reporting attr-defined here would be a false TypeError on one of
 // the most common lines in Python.
