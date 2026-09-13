@@ -175,14 +175,26 @@ void ClassTable::declare(std::string qualified_name, std::vector<Type> bases) {
     // `members`/`methods` get the same treatment, defensively: nothing in
     // ClassTable's own constructor populates either for a seeded builtin row
     // today (only `bases` and `builtin_arity`), so this is a no-op right
-    // now, and declare() is always called before Phase 2 ever calls
-    // declare_member/declare_method for the SAME qualified_name, so a
-    // freshly declared class has nothing of its own to lose either. But
-    // leaving this unstated invites exactly the bug class `builtin_arity`
+    // now. Leaving it unstated invites exactly the bug class `builtin_arity`
     // above exists to close, the moment a future change seeds either map for
     // a builtin row: clearing here means a shadowing class can never inherit
-    // stale state through EITHER map, not just the one this task happened to
+    // stale state through EITHER map, not just the one this fix happened to
     // add.
+    //
+    // THE INVARIANT THIS TRADES ON, and why the trade is safe: declare() is
+    // NOT idempotent with respect to accumulated members the way it might
+    // look -- declare("K") / declare_member("K", "v") / declare("K") again
+    // would silently drop "v". That sequence never happens. declare() is
+    // called from exactly two sites, both in the Phase 1 class-declaration
+    // walk (declare_isolated_class, declare_class_recursive), each visiting
+    // a given qualified_name exactly once per compilation; declare_member/
+    // declare_method are only ever called afterwards, from Phase 2's member
+    // collection and Phase 3's ordinary walk, and neither phase calls
+    // declare() again for a name Phase 1 already declared. If a future
+    // change ever calls declare() a second time for the same class -- to
+    // support re-opening one, say -- this clearing must move or be
+    // conditioned on that being the class's first declaration, or it will
+    // silently erase real members Phase 2 already collected.
     entry.members.clear();
     entry.methods.clear();
 }

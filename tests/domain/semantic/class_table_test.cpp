@@ -580,6 +580,52 @@ TEST(ClassTable, ASubclassOfABoundedExceptionRowInheritsItsBand) {
               "Callable[[Unknown, Unknown, Unknown, Unknown, Unknown], Grandchild2]");
 }
 
+// ---------------------------------------------------------------------------
+// `object` is itself a SEEDED row and carries a BOUNDED band, (0, 0) -- not
+// merely "no band" the way an ordinary user class is -- so
+// find_builtin_arity's first-branch-wins walk can hand `object`'s band to a
+// completely unrelated chain that merely happens to pass through it as
+// SOMEONE ELSE's implicit ancestor. Measured 2026-09-13: `class M(object):
+// pass` / `class C(M, Exception): pass` then `C("boom")` is mypy-clean and
+// CPython-clean (prints "boom"), but the walk found `object`'s (0, 0) via
+// `M` before ever reaching `Exception`'s own unbounded band, flipping `C`'s
+// genuinely variadic BaseException constructor to Checked against a
+// zero-arg signature. Closed the same way `constructor_check`'s own
+// positional walk and `inherits_builtin` already exclude `object` as an
+// ancestor: it answers for the class actually asked about, never for one
+// reached only by walking through it.
+// ---------------------------------------------------------------------------
+
+TEST(ClassTable, AnObjectBaseReachedThroughAnUnrelatedAncestorDoesNotHijackAnExceptionBase) {
+    ClassTable table;
+    table.declare("M", {Type::object()});
+    table.declare("C", {Type::class_of("M"), Type::class_of("Exception")});
+    EXPECT_EQ(table.constructor_check("C"), ClassTable::ConstructorCheck::Unchecked);
+}
+
+// ORDER-SENSITIVE, the first-branch-wins tie-break showing its teeth: with
+// the bases swapped, `Exception`'s own (unbounded) band is found FIRST
+// regardless of the `object` carve-out, so this direction was already
+// correct -- pinned as a control so a future change to the tie-break cannot
+// silently reintroduce the hijack from this side without a test noticing.
+TEST(ClassTable, TheSameProgramWithBasesSwappedStaysUnchecked) {
+    ClassTable table;
+    table.declare("M", {Type::object()});
+    table.declare("C", {Type::class_of("Exception"), Type::class_of("M")});
+    EXPECT_EQ(table.constructor_check("C"), ClassTable::ConstructorCheck::Unchecked);
+}
+
+// CONTROL: `object` constructed DIRECTLY must keep reporting -- the
+// carve-out excludes `object` only when it is reached as an ANCESTOR of a
+// different resolved class, never when it is the class actually being asked
+// about. Mirrors TypeChecker.AZeroArgBoundedBuiltinStillReportsTooManyArguments
+// one layer down, at the ClassTable level the carve-out itself lives at.
+TEST(ClassTable, ObjectConstructedDirectlyStaysBoundedAtZeroArgs) {
+    const ClassTable table;
+    EXPECT_EQ(table.constructor_check("object"), ClassTable::ConstructorCheck::Checked);
+    EXPECT_EQ(type_name(table.constructor_type("object")), "Callable[[], object]");
+}
+
 // The same rule for an exception base. Verified against mypy 1.18.1 with the
 // same Mixin: `class MyErr(Exception, Mixin): pass` then MyErr("boom", 42) is
 // `Success` and CPython prints `('boom', 42)`, where the whole-chain search

@@ -538,11 +538,37 @@ private:
     // contract (see constructor_check's own comment) is unchanged -- a
     // declared __init__/builtin-kind base/__new__ anywhere in the chain is
     // still checked, and still wins, before either caller ever reaches this.
+    //
+    // `object` IS a seeded row and DOES carry a band -- bounded at exactly
+    // (0, 0) -- so "only a seeded row carries a band" does not by itself
+    // make this walk safe for it: `object` is also everyone's implicit
+    // ancestor, so a first-branch-wins walk can hand its (0, 0) to a
+    // completely unrelated chain. Measured: `class M(object): pass` /
+    // `class C(M, Exception): pass` then `C("boom")` is mypy-clean and
+    // CPython-clean, but the walk finds `object`'s band via `M` before ever
+    // reaching `Exception`'s own (unbounded) one, flipping `C`'s genuinely
+    // variadic BaseException constructor to Checked against a zero-arg
+    // signature. ORDER-SENSITIVE, which is exactly the tie-break showing
+    // its teeth: `class C(Exception, M): pass` (bases swapped) is clean,
+    // since `Exception`'s base chain is walked first and its own band is
+    // unbounded. So `object` is excluded here UNLESS it is the class
+    // actually being asked about -- the same carve-out
+    // `constructor_check`'s own positional walk and `inherits_builtin`
+    // both already make, and for the identical reason: every class
+    // conceptually derives from `object`, so counting it as an ancestor's
+    // answer would make it answer for everyone. `object(1)` itself must
+    // keep reporting `too many arguments`, so the exclusion is keyed on
+    // whether `object` is the ancestor being asked ABOUT ON BEHALF OF a
+    // different resolved class, not on the name `object` alone.
     std::optional<std::pair<int, int>> find_builtin_arity(const std::string& resolved) const {
         std::vector<std::string> visited;
         return walk_chain<std::pair<int, int>>(
             resolved, visited,
-            [](const std::string&, const Entry& entry) -> std::optional<std::pair<int, int>> {
+            [&resolved](const std::string& canonical,
+                        const Entry& entry) -> std::optional<std::pair<int, int>> {
+                if (canonical == "object" && canonical != resolved) {
+                    return std::nullopt;
+                }
                 return entry.builtin_arity;
             });
     }
