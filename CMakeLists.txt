@@ -120,6 +120,9 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/domain/codegen/emit_diagnostic_kind_test.cpp
         tests/runtime/int_test.cpp
+        tests/runtime/float_test.cpp
+        tests/runtime/str_test.cpp
+        tests/runtime/print_test.cpp
         tests/application/compile_pipeline_test.cpp
         tests/adapters/filesystem/filesystem_source_lister_test.cpp
         tests/adapters/cli/console_diagnostics_reporter_test.cpp
