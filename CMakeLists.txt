@@ -36,6 +36,8 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/semantic/builtin_call_table.cpp
     src/domain/semantic/type_checker.cpp
     src/domain/semantic/typed_printer.cpp
+    src/domain/codegen/name_mangler.cpp
+    src/domain/codegen/cpp_type_name.cpp
     src/application/compile_pipeline.cpp
     src/adapters/filesystem/filesystem_source_reader.cpp
     src/adapters/filesystem/filesystem_source_lister.cpp
@@ -119,6 +121,8 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/semantic/semantic_corpus_test.cpp
         tests/domain/diagnostics/diagnostic_sink_test.cpp
         tests/domain/codegen/emit_diagnostic_kind_test.cpp
+        tests/domain/codegen/cpp_type_name_test.cpp
+        tests/domain/codegen/name_mangler_test.cpp
         tests/runtime/int_test.cpp
         tests/runtime/float_test.cpp
         tests/runtime/str_test.cpp
