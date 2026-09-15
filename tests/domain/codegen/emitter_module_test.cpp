@@ -103,5 +103,50 @@ TEST(EmitterModule, ModuleLevelReassignmentDoesNotRedeclare) {
     EXPECT_EQ(count, 1u);
 }
 
+// FINAL-REVIEW CRITICAL 3, module half: a module-level `if`/`while` body is
+// the SAME Python scope as the module, so a name first assigned there is an
+// ordinary module variable and belongs in the file-scope prelude. This pass
+// used to walk module.body() alone, so the assignment inside the block
+// referenced a name declared nowhere at all.
+TEST(EmitterModule, AVariableFirstAssignedInsideAModuleLevelBlockIsStillFileScope) {
+    Fixture fixture = build("x: int = 1\nif x > 0:\n    y: int = 2\nelse:\n    y = 3\nprint(y)\n");
+    const std::string text = emit_module(fixture).value();
+
+    const std::size_t declaration = text.find("py::int_ cy_y;");
+    const std::size_t main_start = text.find("int main()");
+    ASSERT_NE(declaration, std::string::npos) << "cy_y must be declared at all";
+    ASSERT_NE(main_start, std::string::npos);
+    EXPECT_LT(declaration, main_start) << "and at FILE scope, not inside the if";
+}
+
+// FINAL-REVIEW CRITICAL 3, the decision half at MODULE scope. Hoisting alone
+// would happily emit this: `cy_y` default-constructs to 0 and `print(y)`
+// would say 0 where CPython raises NameError and exits 1. Both are programs
+// CPython REJECTS, so silently printing something is the never-acceptable
+// direction; the definite-assignment check refuses instead. (The exact shape
+// the review reported -- `if x > 0: y: int = 2` with no else -- is the first
+// entry here.)
+TEST(EmitterModule, AModuleVariableAssignedOnlyInOneBranchIsRefusedRatherThanDefaulted) {
+    for (const std::string source :
+         {std::string("x: int = 1\nif x > 0:\n    y: int = 2\nprint(y)\n"),
+          std::string("x: int = 1\nwhile x > 0:\n    y: int = 2\n    x = 0\nprint(y)\n"),
+          std::string("x: int = 1\nif x > 0:\n    y: int = 2\nelse:\n    print(y)\n")}) {
+        Fixture fixture = build(source);
+        EXPECT_FALSE(emit_module(fixture).has_value()) << source;
+        EXPECT_FALSE(fixture.emit_sink.empty()) << source;
+    }
+}
+
+// The same for a `while` body and for an `else` clause, which are the other
+// two suites the collection has to recurse into.
+TEST(EmitterModule, AVariableFirstAssignedInsideAModuleLevelLoopIsStillFileScope) {
+    Fixture fixture =
+        build("n: int = 0\nwhile n < 1:\n    n = n + 1\n    z: int = 5\nelse:\n    w: int = 6\n");
+    const std::string text = emit_module(fixture).value();
+
+    EXPECT_NE(text.find("py::int_ cy_z;"), std::string::npos);
+    EXPECT_NE(text.find("py::int_ cy_w;"), std::string::npos);
+}
+
 } // namespace
 } // namespace cythonpp::domain::codegen

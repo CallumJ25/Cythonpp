@@ -610,7 +610,13 @@ void Emitter::emit_call(const ast::Call& node) {
     // refused explicitly by name, so the diagnostic says which one, rather
     // than falling through to mangle() and emitting a call to a C++ function
     // that does not exist.
-    if (name == "print" || name == "len") {
+    //
+    // A builtin takes no widening: py::print has one overload per printable
+    // type and py::len one per sized type, so every in-slice argument type
+    // already has an exact match. Only a USER function has a DECLARED
+    // parameter type an argument must be raised into.
+    const bool builtin = name == "print" || name == "len";
+    if (builtin) {
         write(name == "print" ? "py::print" : "py::len");
     } else if (is_refused_builtin_call(name)) {
         refuse(node, "the builtin '" + name + "'");
@@ -623,14 +629,47 @@ void Emitter::emit_call(const ast::Call& node) {
         write(mangle(name));
     }
 
+    // FINAL-REVIEW CRITICAL 2: an argument must be widened against the
+    // PARAMETER's declared type, exactly as an assignment initializer and a
+    // `return` value already were. Python's numeric tower (bool <: int <:
+    // float) is a real subtyping relationship, so `def f(x: int)` called as
+    // `f(True)` is mypy-clean and CPython-clean -- but py::bool_ has no
+    // implicit conversion to py::int_ (int_.h's own comment: deliberate, so
+    // the add/sub/mul overload sets stay unambiguous), so the bare
+    // `cy_f(py::bool_(true))` this used to emit is `no matching function for
+    // call to 'cy_f'`. numeric_tower_widening.py missed it by one step: its
+    // own f(True) call has a BOOL parameter, needing no widening at all.
+    //
+    // The callee's signature comes from the TypeMap: ExpressionTyper records
+    // the callee Name's own type, and Type::callable holds
+    // [param..., return] with the return LAST. If it is absent, not a
+    // Callable, or does not have exactly one entry per argument plus the
+    // return, this REFUSES rather than emitting an unwidened argument -- an
+    // unwidened argument is either a compile error (visible) or, if some
+    // future conversion made it compile, a silently wrong value.
+    const semantic::Type* callee_type = builtin ? nullptr : type_of(node.callee());
+    if (!builtin) {
+        if (callee_type == nullptr || callee_type->kind != semantic::TypeKind::Callable ||
+            callee_type->args.size() != node.args().size() + 1) {
+            refuse(node, "a call whose parameter types are not available");
+            return;
+        }
+    }
+
     write("(");
     bool first = true;
+    std::size_t index = 0;
     for (const ast::ExprPtr& argument : node.args()) {
         if (!first) {
             write(", ");
         }
         first = false;
-        emit_expr(*argument);
+        if (builtin) {
+            emit_expr(*argument);
+        } else {
+            emit_value_widened(*argument, callee_type->args[index]);
+        }
+        ++index;
     }
     write(")");
 }

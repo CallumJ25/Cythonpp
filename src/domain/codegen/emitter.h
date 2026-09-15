@@ -3,6 +3,7 @@
 
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -165,13 +166,15 @@ private:
     // at worst.
     bool write_signature(const ast::FunctionDef& node);
 
-    // Step 3 of emit_module: walks module.body() for a module-level
-    // Assign/AnnAssign and writes a file-scope C++ declaration for each
-    // name's first occurrence, recording its type in module_declared_.
-    // Implemented in emitter_module.cpp; declared here (rather than kept
-    // file-local) purely because it is a member -- it has no callers outside
-    // that one file.
-    void emit_module_variable_declarations(const ast::Module& module);
+    // Step 3 of emit_module: writes a file-scope C++ declaration for every
+    // module-level variable (collect_scope_variables decides the set),
+    // recording each type in module_declared_ and each SOURCE identifier in
+    // `identifiers`, which emit_module then feeds to the module body's own
+    // definite-assignment check. Implemented in emitter_module.cpp; declared
+    // here (rather than kept file-local) purely because it is a member -- it
+    // has no callers outside that one file.
+    void emit_module_variable_declarations(const ast::Module& module,
+                                           std::set<std::string>& identifiers);
 
     // Emits `value`, wrapped in the runtime's explicit py::to_int/py::to_float
     // conversion when `value`'s own static type is a PROPER subtype of
@@ -185,14 +188,62 @@ private:
     // one: emit_assignment's initializer and visit(Return)'s value.
     void emit_value_widened(const ast::Expr& value, const semantic::Type& target);
 
-    // A function's parameter and return types (and an AnnAssign's declared
-    // type) come from ANNOTATIONS, not from an expression the checker typed
-    // -- TypeMap deliberately holds no annotation-subtree entries (see
-    // type_map.h's own comment). This resolves one through
-    // semantic::AnnotationResolver and feeds the result to cpp_type_name; see
-    // emitter_statements.cpp for the class-lookup stand-in and the sink this
-    // uses, and why both are safe for the scalar slice this stage admits.
-    std::optional<std::string> cpp_type_name_of_annotation(const ast::Expr& annotation) const;
+    // One variable a scope (a module body or one function body) must declare,
+    // in the source order its first assignment appears.
+    struct ScopeVariable {
+        std::string identifier; // as written in the Python source
+        std::string mangled;    // as written in the emitted C++
+        semantic::Type type;    // the type its C++ declaration carries
+    };
+
+    // FINAL-REVIEW CRITICAL 3, half one: every name a scope assigns ANYWHERE
+    // -- including inside an `if`/`while` body or its `else` clause, at any
+    // depth -- in the source order of its FIRST assignment. Python scoping is
+    // per-FUNCTION (and per-module), not per-block, so a name first assigned
+    // inside a block is still an ordinary local of the enclosing scope and its
+    // C++ declaration must sit at that scope's top rather than inside the
+    // block's braces. Emitting it at the first assignment gave it C++ BLOCK
+    // scope, so a read (or another branch's assignment) outside that block
+    // referenced a name no longer in scope: `use of undeclared identifier`.
+    //
+    // Never descends into a nested def or class -- those are different scopes,
+    // and this stage refuses both anyway. A target that is not a plain
+    // manglable Name is skipped rather than refused, so the ordinary
+    // per-statement walk reports it once with the right wording.
+    //
+    // Returns false (having already refused) if a collected name has no
+    // representable C++ type.
+    bool collect_scope_variables(const std::vector<ast::StmtPtr>& body,
+                                 const std::map<std::string, semantic::Type>& already_declared,
+                                 std::vector<ScopeVariable>& variables);
+
+    // FINAL-REVIEW CRITICAL 3, half two: a hoisted C++ declaration
+    // DEFAULT-CONSTRUCTS, so a name whose only assignment sits in a branch
+    // that does not run would read as 0/""/false in C++ where Python raises
+    // UnboundLocalError. That is silently wrong OUTPUT, the one failure this
+    // whole stage exists to prevent, so the shape is REFUSED rather than
+    // accepted -- see this wave's report for the full argument.
+    //
+    // A conservative, purely syntactic definite-assignment walk: statements in
+    // order, a name becomes bound at an assignment to it, an `if` contributes
+    // only the names BOTH arms bind (an arm that always leaves contributes
+    // nothing to intersect), and a loop body contributes nothing at all since
+    // it may run zero times. Every read of a scope-local name not yet
+    // definitely bound is refused by name. Only false refusals are possible:
+    // the walk never concludes "bound" where Python would not have bound.
+    //
+    // `bound` is in/out (seeded with a function's parameter names, empty for a
+    // module). Returns whether the suite always leaves via return/break/
+    // continue, which is what lets an `if` arm be excluded from the merge.
+    bool check_definite_assignment(const std::vector<ast::StmtPtr>& body,
+                                   const std::set<std::string>& locals,
+                                   std::set<std::string>& bound);
+
+    // Refuses every read, anywhere in `expr`, of a `locals` name not in
+    // `bound`. Walks the whole sub-tree, so a read nested in a call argument
+    // or an operand is seen.
+    void check_reads(const ast::Expr& expr, const std::set<std::string>& locals,
+                     const std::set<std::string>& bound);
 
     // Names already declared in the CURRENT function body, mapped to the C++
     // type each was declared with. Empty at module level, where declarations
@@ -230,6 +281,16 @@ private:
     // that has one, must still emit a bare `break;` rather than reference a
     // flag only the OUTER loop declared.
     bool loop_has_else_ = false;
+
+    // FINAL-REVIEW IMPORTANT 4: whether the statement currently being emitted
+    // sits inside an `if`/`while` suite rather than directly in its scope's
+    // own statement list. at_module_level_ alone cannot answer this -- it
+    // stays TRUE throughout a module-level `if` body, since that body is still
+    // emitted into main() -- so visit(FunctionDef)'s nested-def refusal never
+    // fired for `if True:` + a `def`, and C++ (which has no function
+    // definitions inside a block at all) rejected the result. Saved and
+    // restored around each suite exactly as loop_has_else_ is.
+    bool in_conditional_block_ = false;
 
     const semantic::TypeMap& types_;
     diagnostics::DiagnosticSink& sink_;

@@ -134,15 +134,134 @@ TEST(EmitterStatement, FunctionDefinition) {
               "}\n");
 }
 
-// A function-local variable IS declared at its first assignment, unlike a
-// module-level one.
-TEST(EmitterStatement, AFunctionLocalIsDeclaredAtFirstAssignmentAndAssignedAfter) {
+// FINAL-REVIEW CRITICAL 3: a function-local is declared at the top of the
+// FUNCTION, not at its first assignment, so every assignment to it is a plain
+// assignment -- matching Python's own per-function scoping. This test used to
+// assert the opposite ("declared at first assignment"), which is exactly the
+// behaviour that gave a variable first assigned inside an `if` C++ BLOCK
+// scope and left every read of it outside that block an undeclared
+// identifier.
+TEST(EmitterStatement, AFunctionLocalIsDeclaredAtTheTopOfTheFunctionNotAtFirstAssignment) {
     EXPECT_EQ(emitted("def f() -> None:\n    x: int = 1\n    x = 2\n").value(),
               "py::none_t cy_f() {\n"
-              "  py::int_ cy_x = py::int_(1);\n"
+              "  py::int_ cy_x;\n"
+              "  cy_x = py::int_(1);\n"
               "  cy_x = py::int_(2);\n"
               "  return py::none;\n"
               "}\n");
+}
+
+// The shape CRITICAL 3 was reported for, at function scope: `x` is assigned
+// in BOTH arms of an `if` and read after it. The declaration must sit above
+// the `if`, or the else-arm assignment and the read both reference a name
+// that went out of scope with the then-arm's closing brace.
+TEST(EmitterStatement, AVariableAssignedInBothBranchesIsDeclaredAboveTheIf) {
+    EXPECT_EQ(emitted("def f(c: bool) -> None:\n"
+                      "    if c:\n"
+                      "        x: int = 1\n"
+                      "    else:\n"
+                      "        x = 2\n"
+                      "    print(x)\n")
+                  .value(),
+              "py::none_t cy_f(py::bool_ cy_c) {\n"
+              "  py::int_ cy_x;\n"
+              "  if (py::truthy(cy_c)) {\n"
+              "    cy_x = py::int_(1);\n"
+              "  } else {\n"
+              "    cy_x = py::int_(2);\n"
+              "  }\n"
+              "  py::print(cy_x);\n"
+              "  return py::none;\n"
+              "}\n");
+}
+
+// A name assigned in a loop body is hoisted the same way -- and, unlike the
+// branch case above, a loop body may run zero times, so a name FIRST assigned
+// there and read afterwards is refused rather than silently read as a
+// default-constructed 0. See the refusal tests below.
+TEST(EmitterStatement, AVariableAssignedInsideALoopIsDeclaredAboveIt) {
+    EXPECT_EQ(emitted("def f(c: bool) -> None:\n"
+                      "    x: int = 0\n"
+                      "    while c:\n"
+                      "        x = 1\n"
+                      "        break\n"
+                      "    print(x)\n")
+                  .value(),
+              "py::none_t cy_f(py::bool_ cy_c) {\n"
+              "  py::int_ cy_x;\n"
+              "  cy_x = py::int_(0);\n"
+              "  while (py::truthy(cy_c)) {\n"
+              "    cy_x = py::int_(1);\n"
+              "    break;\n"
+              "  }\n"
+              "  py::print(cy_x);\n"
+              "  return py::none;\n"
+              "}\n");
+}
+
+// FINAL-REVIEW CRITICAL 3, the decision half. A hoisted declaration
+// DEFAULT-CONSTRUCTS, so a name assigned only in a branch that does not run
+// would read as 0 in C++ where Python raises UnboundLocalError -- silently
+// wrong output on a program CPython REJECTS. The definite-assignment check
+// refuses the shape instead, which keeps Decision 0 intact: emitted
+// correctly, or refused by name, never a third state. Only FALSE refusals are
+// possible; the check never concludes "bound" where Python would not have.
+TEST(EmitterStatement, AVariableAssignedOnlyInOneBranchIsRefusedRatherThanDefaulted) {
+    for (const std::string source :
+         {std::string("def f(c: bool) -> None:\n"
+                      "    if c:\n"
+                      "        x: int = 1\n"
+                      "    print(x)\n"),
+          // A loop body may run zero times, so it binds nothing definitely.
+          std::string("def f(c: bool) -> None:\n"
+                      "    while c:\n"
+                      "        x: int = 1\n"
+                      "    print(x)\n"),
+          // The read is in the OTHER arm, so the binding never precedes it.
+          std::string("def f(c: bool) -> None:\n"
+                      "    if c:\n"
+                      "        x: int = 1\n"
+                      "    else:\n"
+                      "        print(x)\n"),
+          // Nested one level deeper: only the inner branch binds.
+          std::string("def f(c: bool) -> None:\n"
+                      "    if c:\n"
+                      "        if c:\n"
+                      "            x: int = 1\n"
+                      "    print(x)\n")}) {
+        Fixture fixture = build(source);
+        EXPECT_FALSE(emitted(fixture).has_value()) << source;
+        EXPECT_FALSE(fixture.emit_sink.empty()) << source;
+    }
+}
+
+// The controls for the check above: each of these IS definitely assigned, and
+// must keep emitting. A parameter is bound on entry (so `x = x + 1` reads the
+// parameter, not an unassigned local); an arm that always LEAVES contributes
+// nothing to intersect, so the other arm's binding stands alone; and a read
+// inside the very branch that binds is fine.
+TEST(EmitterStatement, DefinitelyAssignedShapesAreNotRefused) {
+    for (const std::string source :
+         {std::string("def f(x: int) -> int:\n    x = x + 1\n    return x\n"),
+          std::string("def f(c: bool) -> int:\n"
+                      "    if c:\n"
+                      "        x: int = 1\n"
+                      "    else:\n"
+                      "        return 0\n"
+                      "    return x\n"),
+          std::string("def f(c: bool) -> None:\n"
+                      "    if c:\n"
+                      "        x: int = 1\n"
+                      "        print(x)\n"),
+          std::string("def f(c: bool) -> None:\n"
+                      "    x: int = 0\n"
+                      "    while c:\n"
+                      "        print(x)\n"
+                      "        x = x + 1\n")}) {
+        Fixture fixture = build(source);
+        EXPECT_TRUE(emitted(fixture).has_value()) << source;
+        EXPECT_TRUE(fixture.emit_sink.empty()) << source;
+    }
 }
 
 // A body already ending in a bare `return` still gets the trailing
@@ -179,7 +298,8 @@ TEST(EmitterStatement, BareReturn) {
 TEST(EmitterStatement, AnnotatedLocalDeclaresTheAnnotationsTypeNotTheValues) {
     EXPECT_EQ(emitted("def f() -> None:\n    x: float = 1\n    x = 2.5\n").value(),
               "py::none_t cy_f() {\n"
-              "  py::float_ cy_x = py::to_float(py::int_(1));\n"
+              "  py::float_ cy_x;\n"
+              "  cy_x = py::to_float(py::int_(1));\n"
               "  cy_x = py::float_(2.5);\n"
               "  return py::none;\n"
               "}\n");
@@ -196,7 +316,8 @@ TEST(EmitterStatement, AnnotatedLocalDeclaresTheAnnotationsTypeNotTheValues) {
 TEST(EmitterStatement, ReassigningALowerRankedValueToAnAlreadyDeclaredLocalWidensIt) {
     EXPECT_EQ(emitted("def f() -> None:\n    x: float = 1.0\n    x = 2\n").value(),
               "py::none_t cy_f() {\n"
-              "  py::float_ cy_x = py::float_(1.0);\n"
+              "  py::float_ cy_x;\n"
+              "  cy_x = py::float_(1.0);\n"
               "  cy_x = py::to_float(py::int_(2));\n"
               "  return py::none;\n"
               "}\n");
@@ -227,13 +348,76 @@ TEST(EmitterStatement, NestedFunctionDefinitionIsRefused) {
     EXPECT_FALSE(fixture.emit_sink.empty());
 }
 
-// A bare `x: int` (no value) declares nothing executable here -- Python binds
-// nothing either -- but must not crash resolving an annotation with no value
-// alongside it.
-TEST(EmitterStatement, BareAnnotationEmitsNothingExecutable) {
+// FINAL-REVIEW IMPORTANT 4: at_module_level_ stays TRUE inside a module-level
+// `if`/`while` body (that body is emitted into main()), so the nested-def
+// refusal above never fired for a CONDITIONAL def and C++ -- which has no
+// function definition inside a block at all -- rejected the result, with the
+// forward-declaration pass missing it too. Both a module-level `if` and a
+// module-level `while` reach this; a def inside a FUNCTION's `if` is caught
+// by the nested-def rule first.
+TEST(EmitterStatement, ConditionalFunctionDefinitionIsRefused) {
+    for (const std::string source :
+         {std::string("if True:\n    def h() -> int:\n        return 1\n"),
+          std::string("while True:\n    def h() -> int:\n        return 1\n"),
+          std::string("if True:\n    pass\nelse:\n    def h() -> int:\n        return 1\n")}) {
+        Fixture fixture = build(source);
+        Emitter emitter(fixture.types, fixture.emit_sink);
+        EXPECT_FALSE(emitter.emit_module(*fixture.module).has_value()) << source;
+        EXPECT_FALSE(fixture.emit_sink.empty()) << source;
+    }
+}
+
+// The control for the refusal above: it must be narrow enough that an
+// ordinary top-level `def` written near a block is untouched. (It does NOT
+// pin in_conditional_block_'s restore-on-every-path: emit_module emits every
+// definition in Step 5, BEFORE main() carries any module-level block in Step
+// 6, so a leaked flag could not reach a def anyway -- verified by neutering
+// the restore and watching all 86 codegen tests stay green. The restore is
+// written on every path for correctness, not because a test catches it.)
+TEST(EmitterStatement, ADefinitionAfterABlockIsNotRefused) {
+    for (const std::string source :
+         {std::string("n: int = 0\nwhile n < 1:\n    n = n + 1\n\n\n"
+                      "def h() -> int:\n    return 1\n\n\nprint(h())\n"),
+          std::string("n: int = 0\nwhile n < 1:\n    n = n + 1\nelse:\n    n = 9\n\n\n"
+                      "def h() -> int:\n    return 1\n\n\nprint(h())\n"),
+          std::string("if True:\n    pass\n\n\ndef h() -> int:\n    return 1\n\n\nprint(h())\n"),
+          std::string("if True:\n    pass\nelse:\n    pass\n\n\n"
+                      "def h() -> int:\n    return 1\n\n\nprint(h())\n")}) {
+        Fixture fixture = build(source);
+        Emitter emitter(fixture.types, fixture.emit_sink);
+        EXPECT_TRUE(emitter.emit_module(*fixture.module).has_value()) << source;
+        EXPECT_TRUE(fixture.emit_sink.empty()) << source;
+    }
+}
+
+// A bare `x: int` (no value) emits nothing executable -- Python binds nothing
+// either -- but it DOES declare, and FINAL-REVIEW IMPORTANT 5 is that a
+// function body used to record nothing for it at all while the module prelude
+// always did. So the declaration now appears in the function's own prologue,
+// carrying the ANNOTATION's type, and the statement itself is still a lone
+// `;`. Without the declaration, the next test's program does not compile.
+TEST(EmitterStatement, BareAnnotationDeclaresButEmitsNothingExecutable) {
     EXPECT_EQ(emitted("def f() -> None:\n    x: int\n").value(),
               "py::none_t cy_f() {\n"
+              "  py::int_ cy_x;\n"
               "  ;\n"
+              "  return py::none;\n"
+              "}\n");
+}
+
+// FINAL-REVIEW IMPORTANT 5, the shape it was reported for: a valueless
+// `x: float` must make the later `x = 1` widen into a FLOAT slot. Before the
+// fix the function recorded no declared type at all, so `x = 1` declared
+// `py::int_ cy_x` from the VALUE and the `x = 2.5` after it had no viable
+// `operator=`. The identical program at module level always worked, which is
+// what made this a module-vs-function inconsistency rather than a plain gap.
+TEST(EmitterStatement, AValuelessAnnotationInAFunctionRecordsItsDeclaredType) {
+    EXPECT_EQ(emitted("def f() -> None:\n    x: float\n    x = 1\n    x = 2.5\n").value(),
+              "py::none_t cy_f() {\n"
+              "  py::float_ cy_x;\n"
+              "  ;\n"
+              "  cy_x = py::to_float(py::int_(1));\n"
+              "  cy_x = py::float_(2.5);\n"
               "  return py::none;\n"
               "}\n");
 }

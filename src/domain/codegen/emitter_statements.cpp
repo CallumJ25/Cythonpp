@@ -1,7 +1,9 @@
 #include "domain/codegen/emitter.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,6 +19,7 @@
 #include "domain/ast/if.h"
 #include "domain/ast/name.h"
 #include "domain/ast/pass.h"
+#include "domain/ast/recursive_visitor.h"
 #include "domain/ast/return.h"
 #include "domain/ast/while.h"
 #include "domain/codegen/cpp_type_name.h"
@@ -48,9 +51,10 @@ namespace {
 // a user-defined class. Such a name resolves here to a NameError (discarded,
 // see below) and Type::unknown(), where the real ClassTable would have
 // resolved it to Type::class_of(...) instead -- but cpp_type_name has no
-// mapping for TypeKind::Class either way, so both answers are refused by
-// cpp_type_name_of_annotation's caller identically. A class annotation is
-// outside this slice regardless of which ClassLookup answered the question.
+// mapping for TypeKind::Class either way, so both answers are refused
+// identically by whichever caller passed the resolved Type to cpp_type_name.
+// A class annotation is outside this slice regardless of which ClassLookup
+// answered the question.
 class NullClassLookup : public semantic::ClassLookup {
 public:
     bool is_class(const std::string&) const override { return false; }
@@ -76,11 +80,18 @@ public:
 //      not a defect in the user's program, and reporting it to the user
 //      would be actively misleading.
 // Swallowing a genuine new error is not a risk either way: the real signal
-// for "this annotation's type is unsupported" is the nullopt
-// cpp_type_name_of_annotation returns, and every caller turns that into its
-// own correctly-worded refuse() against the REAL sink (e.g. "an unsupported
+// for "this annotation's type is unsupported" is the nullopt cpp_type_name
+// returns for the resolved Type, and every caller turns that into its own
+// correctly-worded refuse() against the REAL sink (e.g. "an unsupported
 // parameter type"), so the user still gets exactly one diagnostic, just from
 // the emitter's own reporting path rather than this scratch resolution.
+//
+// FINAL-REVIEW cleanup: a wrapper, Emitter::cpp_type_name_of_annotation,
+// used to spell that "resolve then name" pair in one call. Task 7's fix round
+// rewrote write_signature to need the resolved Type itself (to seed
+// return_type_ and function_declared_), not just its C++ spelling, and the
+// wrapper was orphaned -- declared, defined, and called from nowhere in src/
+// or tests/. Deleted; every caller resolves and names in two steps now.
 //
 // A MEMBER function (Emitter::resolve_annotation_type, defined below rather
 // than a free function local to this translation unit) so emitter_module.cpp
@@ -118,6 +129,41 @@ const char* numeric_widening_function(semantic::TypeKind from, semantic::TypeKin
     return to == semantic::TypeKind::Int ? "py::to_int" : "py::to_float";
 }
 
+// Every Name READ anywhere in an expression sub-tree, in source order.
+// A RecursiveVisitor (not a plain Visitor) precisely because the default
+// "recurse into everything else" is what is wanted here: a Name nested in a
+// call argument, an operand, or a comparison chain is still a read, and a
+// node this collector forgets costs a MISSED read rather than a wrong answer
+// -- and every expression node this slice can emit is reachable from the
+// defaults already.
+class NameReadCollector : public ast::RecursiveVisitor {
+public:
+    using ast::RecursiveVisitor::visit;
+    void visit(const ast::Name& node) override { names.push_back(&node); }
+
+    std::vector<const ast::Name*> names;
+};
+
+// The name an assignment statement binds, or nullptr when the statement binds
+// no plain name at all (a subscript/attribute target, a non-ASCII identifier,
+// or a bare `x: int` with no value -- which DECLARES in C++ but binds nothing
+// in Python, so it must not count as an assignment for definite-assignment
+// purposes).
+const ast::Name* bound_name_of(const ast::Stmt& statement) {
+    const ast::Expr* target = nullptr;
+    if (const auto* assign = dynamic_cast<const ast::Assign*>(&statement)) {
+        target = &assign->target();
+    } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(&statement)) {
+        if (!ann_assign->has_value()) {
+            return nullptr;
+        }
+        target = &ann_assign->target();
+    } else {
+        return nullptr;
+    }
+    return dynamic_cast<const ast::Name*>(target);
+}
+
 } // namespace
 
 semantic::Type Emitter::resolve_annotation_type(const ast::Expr& annotation) const {
@@ -138,6 +184,195 @@ const semantic::Type* Emitter::declared_type_for_assignment(const ast::Expr& tar
         return target_type;
     }
     return type_of(value);
+}
+
+// FINAL-REVIEW CRITICAL 3, half one. See emitter.h for why this recurses.
+bool Emitter::collect_scope_variables(const std::vector<ast::StmtPtr>& body,
+                                      const std::map<std::string, semantic::Type>& already_declared,
+                                      std::vector<ScopeVariable>& variables) {
+    for (const ast::StmtPtr& stmt : body) {
+        // An `if`/`while` body is the SAME Python scope as the statement list
+        // containing it, so its assignments belong to this collection. A
+        // nested def or class is a different scope and is deliberately not
+        // descended into (both are refused by this stage regardless).
+        if (const auto* branch = dynamic_cast<const ast::If*>(stmt.get())) {
+            if (!collect_scope_variables(branch->body(), already_declared, variables) ||
+                !collect_scope_variables(branch->orelse(), already_declared, variables)) {
+                return false;
+            }
+            continue;
+        }
+        if (const auto* loop = dynamic_cast<const ast::While*>(stmt.get())) {
+            if (!collect_scope_variables(loop->body(), already_declared, variables) ||
+                !collect_scope_variables(loop->orelse(), already_declared, variables)) {
+                return false;
+            }
+            continue;
+        }
+
+        const ast::Expr* target = nullptr;
+        const ast::Expr* value = nullptr;
+        const semantic::Type* declared_ptr = nullptr;
+        semantic::Type declared_storage;
+        if (const auto* assign = dynamic_cast<const ast::Assign*>(stmt.get())) {
+            target = &assign->target();
+            value = &assign->value();
+        } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(stmt.get())) {
+            target = &ann_assign->target();
+            declared_storage = resolve_annotation_type(ann_assign->annotation());
+            declared_ptr = &declared_storage;
+            if (ann_assign->has_value()) {
+                value = &ann_assign->value();
+            }
+        } else {
+            continue;
+        }
+
+        const auto* name = dynamic_cast<const ast::Name*>(target);
+        if (name == nullptr || !is_manglable_identifier(name->identifier())) {
+            // Refused later, once, by the ordinary per-statement walk, which
+            // has the correctly-worded diagnostic for each case.
+            continue;
+        }
+        const std::string mangled = mangle(name->identifier());
+        if (already_declared.find(mangled) != already_declared.end()) {
+            continue; // A parameter: already declared by the signature.
+        }
+        const auto seen = std::find_if(variables.begin(), variables.end(),
+                                       [&mangled](const ScopeVariable& variable) {
+                                           return variable.mangled == mangled;
+                                       });
+        if (seen != variables.end()) {
+            continue; // Not the first assignment; already collected.
+        }
+
+        // FINAL-REVIEW IMPORTANT 5: a bare `x: float` (no value) has no value
+        // Expr for declared_type_for_assignment's last fallback link, so that
+        // link is skipped and the annotation -- always present on an AnnAssign
+        // -- is used directly. Collecting it HERE is what fixes the
+        // module-vs-function inconsistency the review found: visit(AnnAssign)
+        // used to write a lone `;` and record nothing, so a later `x = 1`
+        // declared cy_x from the VALUE (py::int_) and the `x = 2.5` after it
+        // did not compile. The module prelude always did record it; now both
+        // scopes go through this one collector.
+        const semantic::Type* type =
+            value != nullptr ? declared_type_for_assignment(*target, *value, declared_ptr)
+                             : declared_ptr;
+        if (type == nullptr) {
+            refuse(*target, "an assignment whose type is unknown");
+            return false;
+        }
+        if (!cpp_type_name(*type).has_value()) {
+            refuse(*target, "an assignment of an unsupported type");
+            return false;
+        }
+        variables.push_back(ScopeVariable{name->identifier(), mangled, *type});
+    }
+    return true;
+}
+
+void Emitter::check_reads(const ast::Expr& expr, const std::set<std::string>& locals,
+                          const std::set<std::string>& bound) {
+    NameReadCollector collector;
+    expr.accept(collector);
+    for (const ast::Name* name : collector.names) {
+        const std::string& identifier = name->identifier();
+        if (locals.count(identifier) == 0 || bound.count(identifier) != 0) {
+            continue;
+        }
+        refuse(*name, "a read of '" + identifier +
+                          "', which this scope may not have assigned yet,");
+        return;
+    }
+}
+
+// FINAL-REVIEW CRITICAL 3, half two. See emitter.h for the full argument.
+bool Emitter::check_definite_assignment(const std::vector<ast::StmtPtr>& body,
+                                        const std::set<std::string>& locals,
+                                        std::set<std::string>& bound) {
+    for (const ast::StmtPtr& stmt : body) {
+        if (failed_) {
+            return false;
+        }
+        if (const auto* expression = dynamic_cast<const ast::ExprStmt*>(stmt.get())) {
+            check_reads(expression->value(), locals, bound);
+            continue;
+        }
+        if (const auto* returned = dynamic_cast<const ast::Return*>(stmt.get())) {
+            if (returned->has_value()) {
+                check_reads(returned->value(), locals, bound);
+            }
+            return true;
+        }
+        if (dynamic_cast<const ast::Break*>(stmt.get()) != nullptr ||
+            dynamic_cast<const ast::Continue*>(stmt.get()) != nullptr) {
+            return true;
+        }
+        if (const auto* branch = dynamic_cast<const ast::If*>(stmt.get())) {
+            check_reads(branch->condition(), locals, bound);
+            std::set<std::string> then_bound = bound;
+            const bool then_leaves = check_definite_assignment(branch->body(), locals, then_bound);
+            std::set<std::string> else_bound = bound;
+            const bool else_leaves =
+                check_definite_assignment(branch->orelse(), locals, else_bound);
+            if (then_leaves && else_leaves) {
+                return true;
+            }
+            // An arm that always leaves cannot be the one that falls through,
+            // so it contributes nothing to intersect -- the other arm's
+            // bindings stand alone. Only when BOTH fall through is the
+            // intersection the answer.
+            if (then_leaves) {
+                bound = else_bound;
+            } else if (else_leaves) {
+                bound = then_bound;
+            } else {
+                std::set<std::string> merged;
+                for (const std::string& name : then_bound) {
+                    if (else_bound.count(name) != 0) {
+                        merged.insert(name);
+                    }
+                }
+                bound = merged;
+            }
+            continue;
+        }
+        if (const auto* loop = dynamic_cast<const ast::While*>(stmt.get())) {
+            check_reads(loop->condition(), locals, bound);
+            // A loop body may run ZERO times, so nothing it binds is
+            // definitely bound afterwards -- and its own reads are checked
+            // against the state on the FIRST iteration, which is exactly the
+            // state CPython would raise UnboundLocalError from. Its `else`
+            // clause is checked the same way and likewise contributes nothing
+            // (it does not run when the loop is left by `break`).
+            std::set<std::string> body_bound = bound;
+            check_definite_assignment(loop->body(), locals, body_bound);
+            std::set<std::string> else_bound = bound;
+            check_definite_assignment(loop->orelse(), locals, else_bound);
+            continue;
+        }
+        // A nested def or class is a different scope whose body runs later (or
+        // never); this stage refuses both anyway. A `for` is refused too.
+        if (dynamic_cast<const ast::FunctionDef*>(stmt.get()) != nullptr ||
+            dynamic_cast<const ast::ClassDef*>(stmt.get()) != nullptr ||
+            dynamic_cast<const ast::For*>(stmt.get()) != nullptr ||
+            dynamic_cast<const ast::Pass*>(stmt.get()) != nullptr) {
+            continue;
+        }
+        // Whatever remains is an assignment form: its VALUE is evaluated
+        // before its target binds, so `x = x + 1` reads the OLD x.
+        if (const auto* assign = dynamic_cast<const ast::Assign*>(stmt.get())) {
+            check_reads(assign->value(), locals, bound);
+        } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(stmt.get())) {
+            if (ann_assign->has_value()) {
+                check_reads(ann_assign->value(), locals, bound);
+            }
+        }
+        if (const ast::Name* target = bound_name_of(*stmt)) {
+            bound.insert(target->identifier());
+        }
+    }
+    return false;
 }
 
 void Emitter::write_indent() {
@@ -170,10 +405,6 @@ std::optional<std::string> Emitter::emit_statement_for_test(const ast::Stmt& sta
     return out_;
 }
 
-std::optional<std::string> Emitter::cpp_type_name_of_annotation(const ast::Expr& annotation) const {
-    return cpp_type_name(resolve_annotation_type(annotation));
-}
-
 void Emitter::emit_value_widened(const ast::Expr& value, const semantic::Type& target) {
     const semantic::Type* value_type = type_of(value);
     const char* widen =
@@ -202,8 +433,14 @@ void Emitter::visit(const ast::Pass& node) {
     write_line(";");
 }
 
-// Declares on first assignment inside a function; at module level the
-// declaration is in the prelude (Task 8) and this is a plain assignment.
+// FINAL-REVIEW CRITICAL 3: this NEVER declares any more, at either scope.
+// Every variable a scope assigns is declared once, up front, by
+// collect_scope_variables (the module's file-scope prelude, or the prologue
+// visit(FunctionDef) writes), so by the time any assignment is emitted its
+// target already has a declaration at SCOPE level -- which is where Python's
+// own per-function/per-module scoping puts it. Declaring at the first
+// assignment instead gave the C++ variable BLOCK scope whenever that first
+// assignment sat inside an `if`/`while`.
 void Emitter::emit_assignment(const ast::Expr& target, const ast::Expr& value,
                               const semantic::Type* declared) {
     const auto* name = dynamic_cast<const ast::Name*>(&target);
@@ -258,12 +495,6 @@ void Emitter::emit_assignment(const ast::Expr& target, const ast::Expr& value,
     }
 
     write_indent();
-    const bool declare = !at_module_level_ && existing == nullptr;
-    if (declare) {
-        write(*cpp);
-        write(" ");
-        function_declared_.emplace(mangled, *type);
-    }
     write(mangled);
     write(" = ");
     // CRITICAL FIX (post-review round 1): the initializer must be WIDENED to
@@ -283,7 +514,11 @@ void Emitter::visit(const ast::AnnAssign& node) {
     if (!node.has_value()) {
         // A bare `x: int` declares a name without binding it. Python binds
         // nothing at all, so there is no value to emit and no C++ statement
-        // that corresponds; the prelude (Task 8) still declares it.
+        // that corresponds; the scope's own declaration prologue
+        // (collect_scope_variables) has already declared it -- at BOTH
+        // scopes now, which is FINAL-REVIEW IMPORTANT 5: the module prelude
+        // always did, and a function body did not, so the identical program
+        // compiled at module level and did not inside a `def`.
         write_line(";");
         return;
     }
@@ -299,9 +534,8 @@ void Emitter::visit(const ast::AnnAssign& node) {
     // type is float) would then emit `cy_x = py::float_(2.5);` against a
     // variable declared `py::int_` -- which does not compile, since
     // py::int_ has no assignment operator taking a py::float_. Resolving the
-    // annotation directly (cpp_type_name_of_annotation's sibling, returning
-    // the Type rather than its name) closes this at the source rather than
-    // leaving the fallback to guess from the value.
+    // annotation directly closes this at the source rather than leaving the
+    // fallback to guess from the value.
     const semantic::Type declared_type = resolve_annotation_type(node.annotation());
     emit_assignment(node.target(), node.value(), &declared_type);
 }
@@ -311,13 +545,21 @@ void Emitter::visit(const ast::If& node) {
     write("if (py::truthy(");
     emit_expr(node.condition());
     write(")) {\n");
+    // FINAL-REVIEW IMPORTANT 4: see in_conditional_block_'s own comment.
+    // Saved and restored rather than merely set, for the same reason
+    // loop_has_else_ is: blocks nest, and the statement AFTER an `if` is back
+    // at whatever level the `if` itself sat at.
+    const bool outer_conditional = in_conditional_block_;
+    in_conditional_block_ = true;
     emit_suite(node.body());
     if (node.orelse().empty()) {
+        in_conditional_block_ = outer_conditional;
         write_line("}");
         return;
     }
     write_line("} else {");
     emit_suite(node.orelse());
+    in_conditional_block_ = outer_conditional;
     write_line("}");
 }
 
@@ -348,7 +590,9 @@ void Emitter::visit(const ast::While& node) {
     // the wrong depth number entirely) instead of leaving the inner loop
     // named by nothing at all.
     const bool outer_loop_has_else = loop_has_else_;
+    const bool outer_conditional = in_conditional_block_;
     loop_has_else_ = has_else;
+    in_conditional_block_ = true;
     emit_suite(node.body());
     loop_has_else_ = outer_loop_has_else;
     --loop_depth_;
@@ -360,6 +604,10 @@ void Emitter::visit(const ast::While& node) {
         --indent_;
         write_line("}");
     }
+    // Restored on EVERY path, not only the has_else one -- a loop with no
+    // else is the common case, and leaving the flag set there would refuse
+    // every `def` after the first module-level loop in the file.
+    in_conditional_block_ = outer_conditional;
 }
 
 // The flag is set before the break so the enclosing else is skipped. When the
@@ -482,6 +730,19 @@ void Emitter::visit(const ast::FunctionDef& node) {
         refuse(node, "a nested function definition");
         return;
     }
+    // FINAL-REVIEW IMPORTANT 4: at_module_level_ stays TRUE inside a
+    // module-level `if`/`while` body -- that body is emitted into main(), so
+    // the flag is telling the truth about the SCOPE and simply cannot answer
+    // "is this statement inside a block". C++ has no function definition
+    // inside a block at all, and the module's forward-declaration pass walks
+    // only top-level statements, so `if True:` + a `def` emitted BOTH
+    // `function definition is not allowed here` and `use of undeclared
+    // identifier`. A conditional `def` is genuinely outside this slice, so it
+    // is refused by name -- the in-slice answer.
+    if (in_conditional_block_) {
+        refuse(node, "a conditional function definition");
+        return;
+    }
     if (!write_signature(node)) {
         return;
     }
@@ -514,14 +775,56 @@ void Emitter::visit(const ast::FunctionDef& node) {
     // at_module_level_'s own convention, so a future relaxation of the
     // nested-def refusal does not have to rediscover this.
     const bool outer_module_level = at_module_level_;
+    const bool outer_conditional = in_conditional_block_;
     std::map<std::string, semantic::Type> outer_declared;
     outer_declared.swap(function_declared_);
     const semantic::Type outer_return_type = return_type_;
     return_type_ = declared_return_type;
     at_module_level_ = false;
+    in_conditional_block_ = false;
     for (std::size_t i = 0; i < node.params().size(); ++i) {
         function_declared_.emplace(mangle(node.params()[i].name), parameter_types[i]);
     }
+
+    // FINAL-REVIEW CRITICAL 3: the body's own declaration prologue. Every
+    // local this function assigns ANYWHERE -- including inside an `if`/
+    // `while` -- is declared here, at FUNCTION scope, which is the scope
+    // Python itself gives it. Parameters are excluded: the signature already
+    // declared them.
+    std::vector<ScopeVariable> locals;
+    if (!collect_scope_variables(node.body(), function_declared_, locals)) {
+        at_module_level_ = outer_module_level;
+        in_conditional_block_ = outer_conditional;
+        return_type_ = outer_return_type;
+        function_declared_.swap(outer_declared);
+        return;
+    }
+    // The definite-assignment check runs BEFORE any of the body is emitted,
+    // seeded with the parameter names (bound on entry, so `x = x + 1` on a
+    // parameter is not a use-before-assignment).
+    std::set<std::string> local_names;
+    for (const ScopeVariable& local : locals) {
+        local_names.insert(local.identifier);
+    }
+    std::set<std::string> bound;
+    for (const ast::Parameter& parameter : node.params()) {
+        bound.insert(parameter.name);
+    }
+    check_definite_assignment(node.body(), local_names, bound);
+    if (failed_) {
+        at_module_level_ = outer_module_level;
+        in_conditional_block_ = outer_conditional;
+        return_type_ = outer_return_type;
+        function_declared_.swap(outer_declared);
+        return;
+    }
+    ++indent_;
+    for (const ScopeVariable& local : locals) {
+        write_line(*cpp_type_name(local.type) + " " + local.mangled + ";");
+        function_declared_.emplace(local.mangled, local.type);
+    }
+    --indent_;
+
     emit_suite(node.body());
     // CRITICAL FIX (post-review round 2): a `-> None` function is the ONE
     // return type mypy never requires an explicit return on every path for
@@ -550,6 +853,7 @@ void Emitter::visit(const ast::FunctionDef& node) {
         --indent_;
     }
     at_module_level_ = outer_module_level;
+    in_conditional_block_ = outer_conditional;
     return_type_ = outer_return_type;
     function_declared_.swap(outer_declared);
 

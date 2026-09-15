@@ -3,8 +3,10 @@
 
 #include <charconv>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <system_error>
 
 #include "fail.h"
 #include "int_.h"
@@ -45,7 +47,20 @@ public:
 
     // Valid only when is_integral() -- the exact value, with no precision
     // loss at all.
-    constexpr std::int64_t int_raw() const { return int_value_; }
+    //
+    // FINAL-REVIEW FIX: the precondition is CHECKED, not merely documented,
+    // and checked with fail() rather than assert() deliberately -- an
+    // NDEBUG build strips assert, and the failure this guards is a silently
+    // wrong NUMBER (a Float-tagged value's int_value_ is a leftover 0, not
+    // its value), the one outcome this whole design forbids. That costs the
+    // two accessors their constexpr-ness, which nothing in the runtime, the
+    // emitted code, or the tests ever relied on.
+    std::int64_t int_raw() const {
+        if (tag_ == NumericTag::Float) {
+            fail("SystemError: int_raw() on a float_ holding a real float");
+        }
+        return int_value_;
+    }
 
     // The value as a double regardless of tag. For an integral tag this is a
     // CONVERTING accessor: it can lose precision above 2**53, exactly like
@@ -60,8 +75,14 @@ public:
     }
 
     // The value as an int_, tag-preserving (Bool stays Bool). Valid only
-    // when is_integral().
-    constexpr int_ as_int() const { return int_(int_value_, tag_); }
+    // when is_integral() -- checked, see int_raw() above for why with fail()
+    // rather than assert().
+    int_ as_int() const {
+        if (tag_ == NumericTag::Float) {
+            fail("SystemError: as_int() on a float_ holding a real float");
+        }
+        return int_(int_value_, tag_);
+    }
 
 private:
     NumericTag tag_ = NumericTag::Float;
@@ -94,10 +115,37 @@ inline float_ to_float(bool_ v) {
 inline float_ to_float(int_ v) { return float_(v.raw(), v.tag()); }
 inline float_ to_float(float_ v) { return v; }
 
-// Python's float repr: the shortest string that round-trips, with a trailing
-// ".0" when the result would otherwise be indistinguishable from an int.
-// std::to_chars' shortest form supplies the round-trip guarantee; the suffix
-// rule supplies Python's presentation.
+// Python's float repr: the shortest string that round-trips, rendered fixed
+// or scientific by CPython's own rule, with a trailing ".0" when the fixed
+// form would otherwise be indistinguishable from an int.
+//
+// FINAL-REVIEW CRITICAL FIX. This used to call std::to_chars with NO format
+// argument, whose "general" form chooses fixed vs scientific by SHORTEST
+// CHARACTER COUNT. CPython chooses by DECIMAL EXPONENT, and the two disagree
+// constantly on perfectly ordinary values: print(100000.0) printed `1e+05`
+// where CPython prints `100000.0`, print(0.0001) printed `1e-04` where
+// CPython prints `0.0001`, and print(123456789012345678.0) printed
+// `123456789012345680.0` where CPython prints `1.2345678901234568e+17`.
+// Silently wrong OUTPUT on a program both oracles accept -- the worst class
+// of defect this project can ship. It survived because both pins in place at
+// the time (the scalar_repr corpus sample and ReprMatchesPython) happened to
+// use only values the two rules agree on.
+//
+// CPython's rule, from format_float_short in Python/pystrtod.c, repr mode:
+// take dtoa's shortest round-trip digit string and its decimal point
+// position `decpt` (the value is 0.<digits> * 10**decpt), then use
+// scientific notation iff `decpt <= -4 || decpt > 16`. The 16 is deliberate
+// in CPython too, with its own comment: converting at 1e17 instead gives
+// odd-looking results where a 16-digit shortest repr is padded with bogus
+// zeros.
+//
+// std::to_chars with chars_format::scientific supplies the same shortest
+// round-trip digits, and its own rendering already matches Python's
+// scientific spelling exactly (`1e+16`, `1.2345678901234568e+17`, `1e-05`,
+// `5e-324`, at least two exponent digits and a sign) -- so the scientific
+// branch returns that text verbatim and only the fixed branch reassembles.
+// `decpt` is recovered as `exponent + 1`, since to_chars writes the value as
+// d.ddd * 10**exponent while dtoa writes it as 0.dddd * 10**decpt.
 //
 // TASK 10B: this must render by TAG, not by the static C++ type -- a
 // float_ tagged Int or Bool is not a "real" float at all as far as the
@@ -120,11 +168,77 @@ inline std::string repr(float_ v) {
     if (std::isinf(d)) {
         return d > 0 ? "inf" : "-inf";
     }
-    char buffer[40];
-    const std::to_chars_result written = std::to_chars(buffer, buffer + sizeof(buffer), d);
-    std::string text(buffer, written.ptr);
-    if (text.find('.') == std::string::npos && text.find('e') == std::string::npos) {
+
+    char buffer[64];
+    const std::to_chars_result written =
+        std::to_chars(buffer, buffer + sizeof(buffer), d, std::chars_format::scientific);
+    // FINAL-REVIEW FIX: the result code used to be ignored, leaving the
+    // buffer's unspecified bytes to be read as a number on failure. 64 bytes
+    // cannot actually be too small for a double's shortest scientific form
+    // (the longest is 24 characters), so this is unreachable -- but "reads
+    // uninitialised memory and prints it as a number" is not a failure mode
+    // to leave resting on a size argument nobody rechecks.
+    if (written.ec != std::errc()) {
+        fail("SystemError: a float could not be formatted");
+    }
+    const std::string scientific(buffer, written.ptr);
+
+    // Split "[-]d[.ddd]e[+-]dd" into its sign, its significant digits (with
+    // the point removed) and its decimal exponent.
+    std::string sign;
+    std::size_t index = 0;
+    if (scientific[index] == '-') {
+        sign = "-";
+        ++index;
+    }
+    std::string digits;
+    int exponent = 0;
+    for (; index < scientific.size(); ++index) {
+        const char c = scientific[index];
+        if (c == '.') {
+            continue;
+        }
+        if (c != 'e') {
+            digits += c;
+            continue;
+        }
+        ++index;
+        bool negative_exponent = false;
+        if (index < scientific.size() && (scientific[index] == '+' || scientific[index] == '-')) {
+            negative_exponent = scientific[index] == '-';
+            ++index;
+        }
+        int magnitude = 0;
+        for (; index < scientific.size(); ++index) {
+            magnitude = magnitude * 10 + (scientific[index] - '0');
+        }
+        exponent = negative_exponent ? -magnitude : magnitude;
+        break;
+    }
+
+    const int decpt = exponent + 1;
+    if (decpt <= -4 || decpt > 16) {
+        return scientific;
+    }
+
+    const int length = static_cast<int>(digits.size());
+    std::string text = sign;
+    if (decpt <= 0) {
+        // 0.0001: digits "1", decpt -3 -> "0." + "000" + "1".
+        text += "0.";
+        text.append(static_cast<std::size_t>(-decpt), '0');
+        text += digits;
+    } else if (decpt >= length) {
+        // 100000.0: digits "1", decpt 6 -> "1" + "00000" + ".0". The ".0" is
+        // Python's rule that a float never renders as a bare integer.
+        text += digits;
+        text.append(static_cast<std::size_t>(decpt - length), '0');
         text += ".0";
+    } else {
+        // 12345.6789: digits "123456789", decpt 5 -> "12345" + "." + "6789".
+        text += digits.substr(0, static_cast<std::size_t>(decpt));
+        text += '.';
+        text += digits.substr(static_cast<std::size_t>(decpt));
     }
     return text;
 }
@@ -267,7 +381,16 @@ inline float_ mod(double a, double b) {
     // std::fmod takes the sign of the dividend; Python's takes the divisor's,
     // exactly as for int.
     double remainder = std::fmod(a, b);
-    if (remainder != 0.0 && ((remainder < 0.0) != (b < 0.0))) {
+    // FINAL-REVIEW FIX: a ZERO remainder takes the divisor's sign too, and
+    // the `remainder != 0.0` guard skipped the correction for exactly that
+    // case (0.0 == -0.0 compares equal, so the sign was whatever fmod left).
+    // Measured: `7 % -0.5` is -0.0 under CPython and was 0.0 here; `-2.5 %
+    // 2.5` is 0.0 and was -0.0. copysign is the whole fix, since a zero
+    // remainder needs no `+= b` -- the magnitude is already right.
+    if (remainder == 0.0) {
+        return float_(std::copysign(0.0, b));
+    }
+    if ((remainder < 0.0) != (b < 0.0)) {
         remainder += b;
     }
     return float_(remainder);

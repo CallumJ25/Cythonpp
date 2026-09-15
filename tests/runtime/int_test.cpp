@@ -95,4 +95,14 @@ TEST(RuntimeIntDeathTest, MinDividedByNegativeOneOverflows) {
                 ::testing::ExitedWithCode(1), "OverflowError");
 }
 
+// FINAL-REVIEW deferred minor 4: the MODULO half of that same pair is the
+// non-trapping branch -- the mathematical answer (0) IS representable, and
+// mod()'s guard exists purely because the C++ `%` operator is UB for this
+// pair. Its sibling floordiv has a death test; this branch, which is the one
+// that actually returns a value, had nothing. Measured: CPython's
+// `(-2**63) % -1` is 0.
+TEST(RuntimeInt, MinModuloNegativeOneIsZeroAndDoesNotTrap) {
+    EXPECT_EQ(py::mod(py::int_(INT64_MIN), py::int_(-1)).raw(), 0);
+}
+
 } // namespace

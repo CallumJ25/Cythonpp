@@ -16,72 +16,36 @@
 
 namespace cythonpp::domain::codegen {
 
-// TASK 8, Step 3: walks module.body() for Assign/AnnAssign whose target is a
-// plain Name, and for each name's FIRST such occurrence, writes its file-
-// scope C++ declaration (e.g. "py::int_ cy_total;") and records the type in
-// module_declared_ -- the record emit_assignment consults (Task 8 fix) so a
+// TASK 8, Step 3: writes a file-scope C++ declaration (e.g.
+// "py::int_ cy_total;") for every module-level variable and records its type
+// in module_declared_ -- the record emit_assignment consults (Task 8 fix) so a
 // LATER module-level reassignment widens against the DECLARED type rather
 // than its own value's type, exactly as function_declared_ already does for
 // a function-local variable.
 //
-// A target that is not a plain Name, or a name that is not manglable, is
-// silently skipped here rather than refused: the corresponding statement is
-// visited normally in main() (Step 6) through the ordinary
-// visit(Assign)/visit(AnnAssign) path, which already refuses both cases with
-// the correctly-worded diagnostic. Refusing here too would just be the same
-// diagnostic reported twice.
-void Emitter::emit_module_variable_declarations(const ast::Module& module) {
-    for (const ast::StmtPtr& stmt : module.body()) {
-        const ast::Expr* target = nullptr;
-        const ast::Expr* value = nullptr;
-        const semantic::Type* declared_ptr = nullptr;
-        semantic::Type declared_storage;
-
-        if (const auto* assign = dynamic_cast<const ast::Assign*>(stmt.get())) {
-            target = &assign->target();
-            value = &assign->value();
-        } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(stmt.get())) {
-            target = &ann_assign->target();
-            declared_storage = resolve_annotation_type(ann_assign->annotation());
-            declared_ptr = &declared_storage;
-            if (ann_assign->has_value()) {
-                value = &ann_assign->value();
-            }
-        } else {
-            continue;
-        }
-
-        const auto* name = dynamic_cast<const ast::Name*>(target);
-        if (name == nullptr || !is_manglable_identifier(name->identifier())) {
-            continue;
-        }
-        const std::string mangled = mangle(name->identifier());
-        if (module_declared_.find(mangled) != module_declared_.end()) {
-            continue; // Not the first occurrence; already declared.
-        }
-
-        // A bare `x: int` has no value at all -- resolve_assignment_type's
-        // fallback chain needs a value Expr for its last link, so that link
-        // is skipped entirely and the annotation (always present on an
-        // AnnAssign) is used directly.
-        const semantic::Type* type =
-            value != nullptr ? declared_type_for_assignment(*target, *value, declared_ptr)
-                             : declared_ptr;
-        if (type == nullptr) {
-            refuse(*target, "an assignment whose type is unknown");
-            continue;
-        }
-        const std::optional<std::string> cpp = cpp_type_name(*type);
-        if (!cpp.has_value()) {
-            refuse(*target, "an assignment of an unsupported type");
-            continue;
-        }
-
-        write(*cpp);
+// FILE SCOPE, not a local inside main(), because a `def` must be able to read
+// a module-level variable and a C++ local in main() is invisible to a free
+// function.
+//
+// FINAL-REVIEW CRITICAL 3: the collection itself now lives in the shared
+// collect_scope_variables, which RECURSES into `if`/`while` suites. This
+// function used to walk module.body() alone, so `if x > 0: y: int = 2`
+// followed by `print(y)` emitted an assignment to a name declared nowhere at
+// all. A module-level `if` body is the same Python scope as the module, so
+// its assignments belong in this prelude.
+void Emitter::emit_module_variable_declarations(const ast::Module& module,
+                                                std::set<std::string>& identifiers) {
+    std::vector<ScopeVariable> variables;
+    if (!collect_scope_variables(module.body(), module_declared_, variables)) {
+        return;
+    }
+    for (const ScopeVariable& variable : variables) {
+        write(*cpp_type_name(variable.type));
         write(" ");
-        write(mangled);
+        write(variable.mangled);
         write(";\n");
-        module_declared_.emplace(mangled, *type);
+        module_declared_.emplace(variable.mangled, variable.type);
+        identifiers.insert(variable.identifier);
     }
 }
 
@@ -102,6 +66,7 @@ std::optional<std::string> Emitter::emit_module(const ast::Module& module) {
     out_.clear();
     failed_ = false;
     at_module_level_ = true;
+    in_conditional_block_ = false;
     indent_ = 0;
     function_declared_.clear();
     module_declared_.clear();
@@ -110,9 +75,24 @@ std::optional<std::string> Emitter::emit_module(const ast::Module& module) {
     write("#include \"cythonpp/cythonpp.h\"\n\n");
 
     // Step 3: file-scope declarations for every module-level variable.
-    emit_module_variable_declarations(module);
+    std::set<std::string> module_names;
+    emit_module_variable_declarations(module, module_names);
     if (failed_) {
         return std::nullopt;
+    }
+
+    // FINAL-REVIEW CRITICAL 3, half two: the module body's own definite-
+    // assignment check, the exact counterpart of the one visit(FunctionDef)
+    // runs over a function body. Module-level statements execute in source
+    // order inside main(); a FunctionDef's BODY does not run here at all, and
+    // check_definite_assignment skips it for that reason. Nothing is bound on
+    // entry, so `bound` starts empty.
+    {
+        std::set<std::string> bound;
+        check_definite_assignment(module.body(), module_names, bound);
+        if (failed_) {
+            return std::nullopt;
+        }
     }
     if (!module_declared_.empty()) {
         write("\n");

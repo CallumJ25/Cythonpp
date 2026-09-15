@@ -273,5 +273,36 @@ TEST(Emitter, EqualityAcrossTheNumericTowerStaysClean) {
     EXPECT_EQ(emitted("True == 1\n").value(), "py::eq(py::bool_(true), py::int_(1))");
 }
 
+// FINAL-REVIEW CRITICAL 2: a call argument is widened against the PARAMETER's
+// declared type, exactly as an assignment initializer and a `return` value
+// already were. `bool <: int <: float` is real subtyping mypy enforces, so
+// every call below is mypy-clean and CPython-clean -- but py::bool_ has no
+// implicit conversion to py::int_, so the bare argument this used to emit was
+// `no matching function for call to 'cy_f'`.
+TEST(Emitter, CallArgumentsAreWidenedAgainstTheParameterType) {
+    EXPECT_EQ(emitted("def f(x: int) -> int:\n    return x\n\n\nf(True)\n").value(),
+              "cy_f(py::to_int(py::bool_(true)))");
+    EXPECT_EQ(emitted("def f(x: float) -> float:\n    return x\n\n\nf(1)\n").value(),
+              "cy_f(py::to_float(py::int_(1)))");
+    // Two parameters, widened INDEPENDENTLY and positionally -- a single
+    // shared decision would get one of these wrong.
+    EXPECT_EQ(
+        emitted("def f(a: float, b: int) -> int:\n    return b\n\n\nf(1, True)\n").value(),
+        "cy_f(py::to_float(py::int_(1)), py::to_int(py::bool_(true)))");
+}
+
+// Control: an argument whose type already matches its parameter gets no
+// wrapper at all, and a non-numeric parameter is untouched. Without this, a
+// "widen everything" implementation would pass the test above.
+TEST(Emitter, CallArgumentsNeedingNoWideningAreEmittedBare) {
+    EXPECT_EQ(emitted("def f(x: int) -> int:\n    return x\n\n\nf(1)\n").value(),
+              "cy_f(py::int_(1))");
+    EXPECT_EQ(emitted("def f(s: str) -> str:\n    return s\n\n\nf(\"a\")\n").value(),
+              "cy_f(py::str(std::string(\"\\141\", 1)))");
+    // A BUILTIN takes no widening: py::print has one overload per printable
+    // type, so a bool argument must stay a py::bool_ and print as `True`.
+    EXPECT_EQ(emitted("print(True)\n").value(), "py::print(py::bool_(true))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::codegen
