@@ -222,5 +222,56 @@ TEST(Emitter, AnUnsupportedBuiltinCallIsRefused) {
     EXPECT_FALSE(fixture.emit_sink.empty());
 }
 
+// --- Review round 1 fixes ---------------------------------------------------
+
+// Python's bool is an int subtype, so `True ** 2` is `1`. cpp_type_name(Bool)
+// is a valid mapping ("py::bool_"), so emit_power's base-representability
+// check alone let this through with no widening: py::pow has exactly two
+// overloads, pow(int_, int_) and pow(float_, int_), and bool_'s constructor
+// is explicit with no conversion operator, so the unwidened form does not
+// compile.
+TEST(Emitter, PowerWidensABoolBaseToInt) {
+    EXPECT_EQ(emitted("True ** 2\n").value(),
+              "py::pow(py::to_int(py::bool_(true)), py::int_(2))");
+}
+
+// str % anything is printf-style formatting: operator_rules.cpp's
+// modulo_result types it as Str (a genuine, mypy-agreeing judgement), so the
+// generic result-representability check let it through, but py::mod has no
+// overload accepting a str at all. Printf-style formatting is genuinely
+// outside this slice, so this refuses rather than emitting uncompilable code.
+TEST(Emitter, ModuloOnAStrLeftOperandIsRefused) {
+    Fixture fixture = build("\"x\" % 1\n");
+    EXPECT_FALSE(emit_last_expression(fixture).has_value());
+    EXPECT_FALSE(fixture.emit_sink.empty());
+}
+
+// A gap found during the round-1 sweep, beyond the two originally reported:
+// == and != are TOTAL in operator_rules.h ("any operands, always bool"), so
+// `"x" == 1` type-checks clean, but py::eq is a template over `.raw()` and
+// std::string has no operator== against int64_t -- no matching
+// instantiation exists.
+TEST(Emitter, EqualityBetweenStrAndNumericOperandsIsRefused) {
+    Fixture fixture = build("\"x\" == 1\n");
+    EXPECT_FALSE(emit_last_expression(fixture).has_value());
+    EXPECT_FALSE(fixture.emit_sink.empty());
+}
+
+// Same family: py::none_t has no raw() at all, so a comparison naming `None`
+// on either side of == has no matching py::eq instantiation, even though
+// operator_rules.h's total EQUAL/NOT_EQUAL case type-checks it clean.
+TEST(Emitter, EqualityInvolvingNoneIsRefused) {
+    Fixture fixture = build("1 == None\n");
+    EXPECT_FALSE(emit_last_expression(fixture).has_value());
+    EXPECT_FALSE(fixture.emit_sink.empty());
+}
+
+// Control: the numeric tower's raw types (bool, int64_t, double) freely
+// convert between each other, so a mixed-numeric-kind equality must NOT be
+// refused by the new comparability check.
+TEST(Emitter, EqualityAcrossTheNumericTowerStaysClean) {
+    EXPECT_EQ(emitted("True == 1\n").value(), "py::eq(py::bool_(true), py::int_(1))");
+}
+
 } // namespace
 } // namespace cythonpp::domain::codegen

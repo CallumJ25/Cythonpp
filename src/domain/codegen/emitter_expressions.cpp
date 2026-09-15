@@ -193,6 +193,41 @@ bool is_refused_builtin_call(const std::string& name) {
     return false;
 }
 
+// FIX (review round 1, gap found beyond the two originally reported): the
+// numeric tower (Bool, Int, Float) shares raw types (bool, int64_t, double)
+// that ordinary C++ comparison operators freely convert between; py::str's
+// raw type (std::string) compares only with itself; py::none_t has no raw()
+// at all. py::lt/le/gt/ge/eq/ne (compare.h) are templates over `.raw()`, so
+// a comparison between two operands outside one of those two groups has no
+// working instantiation.
+//
+// <,<=,>,>= already restrict TypeChecker's accepted combinations to "both
+// numeric" or "exactly matching kind" (operator_rules.cpp's ordered_result),
+// so within this slice's five in-slice scalar kinds this predicate can never
+// refuse a <,<=,>,>= pair that would otherwise have compiled. == and != are
+// different: operator_rules.h states plainly that they are TOTAL ("any
+// operands, always bool, never a report" -- mypy's strict-equality opt-in
+// check is explicitly out of scope), so `"x" == 1` and `1 == None` both
+// type-check clean yet have no matching runtime instantiation: std::string
+// has no operator== against bool/int64_t/double, and none_t has no raw() to
+// call at all. This predicate is checked per adjacent pair in visit(Compare)
+// so it fires only where an actual runtime call would fail to compile.
+bool is_numeric_tower_kind(semantic::TypeKind kind) {
+    return kind == semantic::TypeKind::Bool || kind == semantic::TypeKind::Int ||
+           kind == semantic::TypeKind::Float;
+}
+
+bool comparison_operands_are_runtime_comparable(const semantic::Type* left,
+                                                const semantic::Type* right) {
+    if (left == nullptr || right == nullptr) {
+        return false;
+    }
+    if (is_numeric_tower_kind(left->kind) && is_numeric_tower_kind(right->kind)) {
+        return true;
+    }
+    return left->kind == semantic::TypeKind::Str && right->kind == semantic::TypeKind::Str;
+}
+
 } // namespace
 
 Emitter::Emitter(const semantic::TypeMap& types, diagnostics::DiagnosticSink& sink)
@@ -346,6 +381,23 @@ void Emitter::visit(const ast::Compare& node) {
         refuse(node, "a comparison with no operator");
         return;
     }
+    // See comparison_operands_are_runtime_comparable's own comment: == and !=
+    // are total in operator_rules.h, so a pair like `"x" == 1` or `1 ==
+    // None` type-checks clean but has no matching py::eq/ne instantiation.
+    // Checked per ADJACENT pair, matching exactly what gets emitted below --
+    // a chain runs op[i] between operand[i] and operand[i+1], never all
+    // pairs.
+    {
+        const ast::Expr* previous_operand = &node.left();
+        for (const ast::Compare::Rest& link : node.rest()) {
+            if (!comparison_operands_are_runtime_comparable(type_of(*previous_operand),
+                                                             type_of(*link.operand))) {
+                refuse(node, "a comparison between these operand types");
+                return;
+            }
+            previous_operand = link.operand.get();
+        }
+    }
     if (node.rest().size() == 1) {
         const char* function = comparison_runtime_function(node.rest().front().op);
         if (function == nullptr) {
@@ -448,6 +500,25 @@ void Emitter::emit_binary(const ast::BinOp& node) {
         refuse(node, "an operand type");
         return;
     }
+    // FIX (review round 1): `%` on a Str left operand is printf-style string
+    // formatting. operator_rules.cpp's modulo_result types `str % anything`
+    // as Str -- a genuine, mypy-agreeing type judgement, not a modelling
+    // mistake -- so the check above alone lets it through (cpp_type_name(Str)
+    // is "py::str", a valid mapping). But py::mod (int_.h, float_.h) has no
+    // overload taking a str at all, so `"x" % 1` used to emit
+    // py::mod(py::str(...), py::int_(1)), which does not compile. Printf-
+    // style formatting is genuinely outside this slice (the spec puts
+    // str-format checking out of scope entirely), so this refuses rather
+    // than guessing at a runtime implementation. Gated on the LEFT operand
+    // only, matching modulo_result's own asymmetry: the right operand's kind
+    // never changes str's printf-style verdict.
+    if (node.op() == lexer::token_type::OP_PERCENT) {
+        const semantic::Type* left_type = type_of(node.left());
+        if (left_type != nullptr && left_type->kind == semantic::TypeKind::Str) {
+            refuse(node, "printf-style string formatting");
+            return;
+        }
+    }
     write(function);
     write("(");
     emit_operand_widened(node.left(), *result);
@@ -502,10 +573,27 @@ void Emitter::emit_power(const ast::BinOp& node) {
         refuse(node, "a power base type");
         return;
     }
+    // FIX (review round 1): the whole expression's result -- never Bool,
+    // since binary_result floors `**` at numeric_join's minimum rank, Int --
+    // is what emit_operand_widened needs to decide whether the BASE needs
+    // py::to_int wrapping. A Bool base (`True ** 2`) used to reach here with
+    // no widening at all: cpp_type_name(Bool) is "py::bool_", a valid
+    // mapping, so the `base` check above passed, and emit_expr(node.left())
+    // wrote a bare py::bool_(true) straight into py::pow(...) -- which has
+    // exactly two overloads, pow(int_, int_) and pow(float_, int_), and
+    // bool_'s constructor is explicit with no conversion operator, so that
+    // does not compile. Checking `result` (rather than reusing `base`) and
+    // routing the base through emit_operand_widened closes this the same way
+    // emit_binary already does for its own two operands.
+    const semantic::Type* result = type_of(node);
+    if (result == nullptr || !cpp_type_name(*result).has_value()) {
+        refuse(node, "a power result type");
+        return;
+    }
     write("py::pow(");
-    emit_expr(node.left());
+    emit_operand_widened(node.left(), *result);
     write(", ");
-    emit_expr(node.right());
+    emit_operand_widened(node.right(), *result);
     write(")");
 }
 
