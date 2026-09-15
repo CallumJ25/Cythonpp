@@ -15,7 +15,6 @@
 #include "domain/ast/for.h"
 #include "domain/ast/function_def.h"
 #include "domain/ast/if.h"
-#include "domain/ast/module.h"
 #include "domain/ast/name.h"
 #include "domain/ast/pass.h"
 #include "domain/ast/return.h"
@@ -82,12 +81,12 @@ public:
 // own correctly-worded refuse() against the REAL sink (e.g. "an unsupported
 // parameter type"), so the user still gets exactly one diagnostic, just from
 // the emitter's own reporting path rather than this scratch resolution.
-semantic::Type resolve_annotation_type(const ast::Expr& annotation) {
-    NullClassLookup classes;
-    diagnostics::DiagnosticSink discarded;
-    semantic::AnnotationResolver resolver(classes, discarded);
-    return resolver.resolve(annotation);
-}
+//
+// A MEMBER function (Emitter::resolve_annotation_type, defined below rather
+// than a free function local to this translation unit) so emitter_module.cpp
+// can resolve a module-level AnnAssign's annotation identically -- the
+// NullClassLookup stand-in stays a file-local implementation detail here,
+// since only this function ever constructs one.
 
 // CRITICAL FIX (post-review round 1): the runtime spelling of the explicit
 // conversion needed to raise a value of kind `from` into a variable/return
@@ -120,6 +119,26 @@ const char* numeric_widening_function(semantic::TypeKind from, semantic::TypeKin
 }
 
 } // namespace
+
+semantic::Type Emitter::resolve_annotation_type(const ast::Expr& annotation) const {
+    NullClassLookup classes;
+    diagnostics::DiagnosticSink discarded;
+    semantic::AnnotationResolver resolver(classes, discarded);
+    return resolver.resolve(annotation);
+}
+
+const semantic::Type* Emitter::declared_type_for_assignment(const ast::Expr& target,
+                                                            const ast::Expr& value,
+                                                            const semantic::Type* declared) const {
+    if (declared != nullptr) {
+        return declared;
+    }
+    const semantic::Type* target_type = type_of(target);
+    if (target_type != nullptr) {
+        return target_type;
+    }
+    return type_of(value);
+}
 
 void Emitter::write_indent() {
     for (int level = 0; level < indent_; ++level) {
@@ -205,21 +224,28 @@ void Emitter::emit_assignment(const ast::Expr& target, const ast::Expr& value,
     // and the C++ variable is still `py::float_`, so the second statement
     // must widen against Float even though `2` on its own types as Int. A
     // function-local lookup wins over the `declared`/type_of fallback chain
-    // below for exactly this reason; at module level there is no such
-    // record yet (Task 8 owns the prelude), so the lookup is skipped there.
+    // below for exactly this reason.
+    //
+    // TASK 8 FIX: at module level function_declared_ is empty (it exists
+    // only for the currently-emitting function's body), but a module-level
+    // reassignment needs the identical treatment -- `x: float = 1` then a
+    // later module-level `x = 2` must ALSO widen against the declared float,
+    // or the emitted global `py::float_ cy_x;` is assigned a bare
+    // `py::int_(2)`, which does not compile. module_declared_ (populated by
+    // emit_module's file-scope prelude before main() ever runs) is that
+    // record's module-scope counterpart.
     const semantic::Type* existing = nullptr;
-    if (!at_module_level_) {
-        const auto it = function_declared_.find(mangled);
-        if (it != function_declared_.end()) {
+    const std::map<std::string, semantic::Type>& declared_here =
+        at_module_level_ ? module_declared_ : function_declared_;
+    {
+        const auto it = declared_here.find(mangled);
+        if (it != declared_here.end()) {
             existing = &it->second;
         }
     }
     const semantic::Type* type = existing;
     if (type == nullptr) {
-        type = declared != nullptr ? declared : type_of(target);
-    }
-    if (type == nullptr) {
-        type = type_of(value);
+        type = declared_type_for_assignment(target, value, declared);
     }
     if (type == nullptr) {
         refuse(target, "an assignment whose type is unknown");
@@ -373,37 +399,36 @@ void Emitter::visit(const ast::Return& node) {
     write(";\n");
 }
 
-void Emitter::visit(const ast::FunctionDef& node) {
-    // IMPORTANT FIX (post-review round 1): standard C++ has no nested
-    // function definitions at all -- not even as a Clang extension -- while
-    // Python's are fully supported upstream (TypeChecker walks them, and a
-    // nested def can read/write an enclosing local via a closure). A `def`
-    // reached while already inside another function's body must be refused
-    // by name rather than emitting invalid syntax with no diagnostic at all.
-    // Checked first, before any of the checks below: none of them are
-    // meaningful for a construct this slice cannot represent regardless of
-    // how well-formed it is.
-    if (!at_module_level_) {
-        refuse(node, "a nested function definition");
-        return;
-    }
+// Writes "<return type> <mangled name>(<params>)" with no trailing ';' or
+// '{'. Shared by emit_module's forward-declaration pass (Task 8) and this
+// file's own visit(FunctionDef) below, so a forward declaration can never
+// disagree with its definition -- see this function's own declaration in
+// emitter.h for why that matters.
+//
+// Deliberately does NOT check at_module_level_ / "a nested function
+// definition": that refusal is about WHERE a FunctionDef sits in the tree,
+// which only visit(FunctionDef) (and never a forward-declaration pass, which
+// only ever walks top-level statements) can observe.
+bool Emitter::write_signature(const ast::FunctionDef& node) {
     if (!is_manglable_identifier(node.name())) {
         refuse(node, "a non-ASCII identifier");
-        return;
+        return false;
     }
     if (!node.has_return_annotation()) {
         refuse(node, "a function with no return annotation");
-        return;
+        return false;
     }
 
-    // Resolved once, as a Type (not just its cpp_type_name spelling), because
-    // visit(Return) needs the Type itself to decide whether a value needs
-    // widening -- see return_type_'s own comment.
+    // Resolved as a Type, not just its cpp_type_name spelling, because
+    // visit(FunctionDef) below re-derives it from this same annotation to
+    // seed return_type_ for the body walk -- see that call site's own
+    // comment for why re-resolving rather than threading it out is safe and
+    // cheap.
     const semantic::Type declared_return_type = resolve_annotation_type(node.return_annotation());
     const std::optional<std::string> return_type = cpp_type_name(declared_return_type);
     if (!return_type.has_value()) {
         refuse(node, "an unsupported return type");
-        return;
+        return false;
     }
 
     write_indent();
@@ -412,30 +437,24 @@ void Emitter::visit(const ast::FunctionDef& node) {
     write(mangle(node.name()));
     write("(");
     bool first = true;
-    // Parameter Types, matched positionally with node.params() below once
-    // every parameter has been validated -- collected before any name enters
-    // function_declared_, so a refusal partway through never leaves a
-    // partially-populated map for the (never-reached, since failed_ is now
-    // set) body walk to see.
-    std::vector<semantic::Type> parameter_types;
     for (const ast::Parameter& parameter : node.params()) {
         if (parameter.annotation == nullptr) {
             refuse(node, "a parameter with no annotation");
-            return;
+            return false;
         }
         if (parameter.default_value != nullptr) {
             refuse(node, "a parameter with a default value");
-            return;
+            return false;
         }
         if (!is_manglable_identifier(parameter.name)) {
             refuse(node, "a non-ASCII identifier");
-            return;
+            return false;
         }
-        semantic::Type parameter_declared_type = resolve_annotation_type(*parameter.annotation);
+        const semantic::Type parameter_declared_type = resolve_annotation_type(*parameter.annotation);
         const std::optional<std::string> parameter_type = cpp_type_name(parameter_declared_type);
         if (!parameter_type.has_value()) {
             refuse(node, "an unsupported parameter type");
-            return;
+            return false;
         }
         if (!first) {
             write(", ");
@@ -444,9 +463,48 @@ void Emitter::visit(const ast::FunctionDef& node) {
         write(*parameter_type);
         write(" ");
         write(mangle(parameter.name));
-        parameter_types.push_back(std::move(parameter_declared_type));
     }
-    write(") {\n");
+    write(")");
+    return true;
+}
+
+void Emitter::visit(const ast::FunctionDef& node) {
+    // IMPORTANT FIX (post-review round 1): standard C++ has no nested
+    // function definitions at all -- not even as a Clang extension -- while
+    // Python's are fully supported upstream (TypeChecker walks them, and a
+    // nested def can read/write an enclosing local via a closure). A `def`
+    // reached while already inside another function's body must be refused
+    // by name rather than emitting invalid syntax with no diagnostic at all.
+    // Checked first, before write_signature: none of write_signature's own
+    // checks are meaningful for a construct this slice cannot represent
+    // regardless of how well-formed it is.
+    if (!at_module_level_) {
+        refuse(node, "a nested function definition");
+        return;
+    }
+    if (!write_signature(node)) {
+        return;
+    }
+    write(" {\n");
+
+    // TASK 8: write_signature already validated that the return annotation
+    // and every parameter annotation resolve to a supported C++ type; this
+    // re-resolves the same annotations to get the Type VALUES themselves
+    // (not just their cpp_type_name spelling) to seed return_type_ and
+    // function_declared_ below. Resolving an annotation Expr is a pure
+    // computation with no side effects of its own (see
+    // resolve_annotation_type's own comment: a throwaway resolver over a
+    // scratch, discarded sink), so doing it twice costs a redundant call and
+    // nothing else -- the alternative, threading the Types back out of
+    // write_signature, would couple that function's signature to this
+    // caller's own bookkeeping needs, exactly what factoring it out was
+    // meant to avoid.
+    const semantic::Type declared_return_type = resolve_annotation_type(node.return_annotation());
+    std::vector<semantic::Type> parameter_types;
+    parameter_types.reserve(node.params().size());
+    for (const ast::Parameter& parameter : node.params()) {
+        parameter_types.push_back(resolve_annotation_type(*parameter.annotation));
+    }
 
     // A nested function would need its own declared-name map, return type,
     // and module-level flag saved and restored; this slice refuses nested
@@ -501,22 +559,6 @@ void Emitter::visit(const ast::FunctionDef& node) {
 void Emitter::visit(const ast::For& node) { refuse(node, "a for loop"); }
 void Emitter::visit(const ast::ClassDef& node) { refuse(node, "a class definition"); }
 
-// Minimal stubs carried forward from Task 5's scaffolding. Task 8 replaces
-// both with the real prelude/module-assembly logic (file-scope globals,
-// runtime includes, and so on); until then this is just enough for
-// emit_statement_for_test's callers (which build a Module via the real
-// parser/checker pipeline but never call emit_module itself) to link, and
-// for visit(Module) to exist at all -- ast::Visitor gives it no default.
-void Emitter::visit(const ast::Module& node) { emit_suite(node.body()); }
-
-std::optional<std::string> Emitter::emit_module(const ast::Module& module) {
-    out_.clear();
-    failed_ = false;
-    module.accept(*this);
-    if (failed_) {
-        return std::nullopt;
-    }
-    return out_;
-}
+// visit(Module) and emit_module now live in emitter_module.cpp (Task 8).
 
 } // namespace cythonpp::domain::codegen

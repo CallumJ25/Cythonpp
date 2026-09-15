@@ -133,6 +133,46 @@ private:
     void emit_assignment(const ast::Expr& target, const ast::Expr& value,
                          const semantic::Type* declared);
 
+    // A function/parameter/AnnAssign annotation Expr resolved to a Type via a
+    // throwaway AnnotationResolver -- see emitter_statements.cpp's own
+    // "HOLE (B)" comment for why a scratch ClassLookup and a discarded sink
+    // are safe for the scalar slice this stage admits. A MEMBER function
+    // (rather than a free function local to one translation unit) so
+    // emitter_module.cpp's file-scope variable prelude can resolve a
+    // module-level AnnAssign's annotation identically to emit_assignment,
+    // instead of re-deriving the same throwaway-resolver dance a second time.
+    semantic::Type resolve_annotation_type(const ast::Expr& annotation) const;
+
+    // The type an assignment TARGET's declaration should carry: `declared`
+    // when given (an AnnAssign's own resolved annotation), else
+    // type_of(target) (always nullptr for a Name target -- TypeMap holds no
+    // assignment-target entries, see type_map.h's own comment), else
+    // type_of(value). Factored out of emit_assignment so emit_module's
+    // module-level variable prelude computes the identical answer for the
+    // identical statement rather than a second, potentially-drifting copy of
+    // this fallback chain.
+    const semantic::Type* declared_type_for_assignment(const ast::Expr& target,
+                                                       const ast::Expr& value,
+                                                       const semantic::Type* declared) const;
+
+    // Writes a FunctionDef's return type, mangled name and parenthesised
+    // parameter list -- e.g. "py::int_ cy_f(py::int_ cy_n)" -- with no
+    // trailing ';' or '{'. Returns false (having already called refuse()) if
+    // any part of the signature is outside this slice. Shared by the
+    // forward-declaration pass and the real definition in emitter_module.cpp
+    // so the two can never disagree: a forward declaration that disagrees
+    // with its definition is a link error at best and a silently wrong call
+    // at worst.
+    bool write_signature(const ast::FunctionDef& node);
+
+    // Step 3 of emit_module: walks module.body() for a module-level
+    // Assign/AnnAssign and writes a file-scope C++ declaration for each
+    // name's first occurrence, recording its type in module_declared_.
+    // Implemented in emitter_module.cpp; declared here (rather than kept
+    // file-local) purely because it is a member -- it has no callers outside
+    // that one file.
+    void emit_module_variable_declarations(const ast::Module& module);
+
     // Emits `value`, wrapped in the runtime's explicit py::to_int/py::to_float
     // conversion when `value`'s own static type is a PROPER subtype of
     // `target` within Python's numeric tower (bool <: int <: float) -- a real
@@ -164,6 +204,18 @@ private:
     // cannot answer "declared as what".
     std::map<std::string, semantic::Type> function_declared_;
     bool at_module_level_ = true;
+
+    // The module-scope counterpart of function_declared_: the declared type
+    // of every module-level variable, populated once by emit_module's
+    // file-scope prelude before main() is emitted. function_declared_ is
+    // swapped out and empty at module level (it exists only for the
+    // CURRENTLY-EMITTING function's body), so a module-level reassignment
+    // (`x = 2` after `x: float = 1`) needs its OWN record to widen against --
+    // without it, emit_assignment's existing-declaration lookup finds
+    // nothing at module level and falls back to the value's own type,
+    // producing e.g. a bare `py::int_(2)` assigned into a `py::float_`
+    // global, which does not compile.
+    std::map<std::string, semantic::Type> module_declared_;
 
     // The enclosing function's declared return type, consulted by
     // visit(Return) to widen its value exactly as emit_assignment does for an

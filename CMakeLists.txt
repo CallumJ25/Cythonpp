@@ -40,6 +40,7 @@ set(CYTHONPP_LIB_SOURCES
     src/domain/codegen/cpp_type_name.cpp
     src/domain/codegen/emitter_expressions.cpp
     src/domain/codegen/emitter_statements.cpp
+    src/domain/codegen/emitter_module.cpp
     src/application/compile_pipeline.cpp
     src/adapters/filesystem/filesystem_source_reader.cpp
     src/adapters/filesystem/filesystem_source_lister.cpp
@@ -127,6 +128,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/codegen/name_mangler_test.cpp
         tests/domain/codegen/emitter_expression_test.cpp
         tests/domain/codegen/emitter_statement_test.cpp
+        tests/domain/codegen/emitter_module_test.cpp
         tests/runtime/int_test.cpp
         tests/runtime/float_test.cpp
         tests/runtime/str_test.cpp
