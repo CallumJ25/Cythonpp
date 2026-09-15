@@ -55,6 +55,23 @@ TEST(Emitter, StringEscapesAreDecodedBeforeReEncoding) {
     EXPECT_EQ(emitted("\"a\\nb\"\n").value(), "py::str(std::string(\"\\141\\012\\142\", 3))");
 }
 
+// Lexer::scan_string does not emit an error token for an unterminated string:
+// it just stops at the next unescaped newline, so source `"a\"` + newline (a
+// backslash immediately before what should be the closing quote) tokenizes
+// as a complete LITERAL_STRING whose lexeme is the 4 bytes `"`, `a`, `\`,
+// `"` -- the lexeme's LAST character happens to equal the quote character,
+// but it was consumed as the escape's target, not left as a real terminator.
+// Decoding it anyway would silently produce the wrong, shorter string
+// {'a', '"'}; this must be refused instead.
+TEST(Emitter, AStringLiteralWhoseTrailingBackslashConsumesTheClosingQuoteIsRefused) {
+    Fixture fixture = build("\"a\\\"\n");
+    const std::optional<std::string> text = emit_last_expression(fixture);
+
+    EXPECT_FALSE(text.has_value());
+    ASSERT_EQ(fixture.emit_sink.diagnostics().size(), 1U);
+    EXPECT_EQ(fixture.emit_sink.diagnostics().front().code, "NotImplementedError");
+}
+
 TEST(Emitter, NameIsMangled) {
     EXPECT_EQ(emitted("x: int = 1\nx\n").value(), "cy_x");
 }

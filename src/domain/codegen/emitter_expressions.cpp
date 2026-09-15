@@ -74,7 +74,21 @@ std::optional<std::string> decode_string_literal(const std::string& lexeme) {
             bytes += c;
             continue;
         }
-        if (index + 2 >= lexeme.size() + 1) {
+        // The escape's target (index + 1) must leave the lexeme's own last
+        // character -- the terminating quote -- unconsumed. If the target
+        // WOULD BE that last character, the "closing quote" the earlier
+        // `lexeme.back() == quote` check saw was actually eaten by this very
+        // escape, so there is no real terminator at all: Lexer::scan_string
+        // still emits a complete LITERAL_STRING token in that case (it only
+        // stops at an unescaped newline), so an unterminated literal like
+        // source `"a\"` + newline reaches here as the 4-byte lexeme `"a\"`
+        // rather than as an error token. Refuse rather than let the
+        // backslash silently swallow the terminator and decode a shorter,
+        // wrong string. Written as an addition (`index + 2 >= lexeme.size()`)
+        // rather than `index >= lexeme.size() - 2` so it cannot underflow for
+        // a short lexeme; the loop guard above already limits index so this
+        // can only ever be reached with lexeme.size() >= 3.
+        if (index + 2 >= lexeme.size()) {
             return std::nullopt;
         }
         const char escape = lexeme[++index];
