@@ -465,6 +465,32 @@ void Emitter::visit(const ast::FunctionDef& node) {
         function_declared_.emplace(mangle(node.params()[i].name), parameter_types[i]);
     }
     emit_suite(node.body());
+    // CRITICAL FIX (post-review round 2): a `-> None` function is the ONE
+    // return type mypy never requires an explicit return on every path for
+    // (TypeChecker's own end-of-FunctionDef check, further up this file's
+    // history, skips its missing-return diagnostic exactly when
+    // `return_type.kind == TypeKind::NoneType` -- "nothing to return, so
+    // fall-through is fine"). Every OTHER resolvable return kind is
+    // guaranteed a return on every path by that same check, and an
+    // UNRESOLVABLE one (Unknown) always carries a diagnostic of its own,
+    // which keeps such a module out of Fixture::build and the real pipeline
+    // alike -- see this round's report for the full argument. So a
+    // `py::none_t`-returning C++ function is the only shape whose body can
+    // legitimately fall off the end with nothing emitted for it, and doing
+    // so is not merely imprecise: falling off the end of a non-void C++
+    // function is undefined behaviour, and measured on this project's own
+    // clang++/-O0 it is a guaranteed `ud2` trap -- SIGILL at every call, for
+    // the ordinary common case of a `-> None` function whose last statement
+    // is a `print`, a bodyless `if`, a loop, or anything else that isn't a
+    // bare `return`. Appending one unconditionally (rather than tracking
+    // reachability to skip it when the body already ends in a return) trades
+    // a harmless unreachable statement -- legal C++, no diagnostic -- against
+    // a reachability model this stage does not otherwise need at all.
+    if (declared_return_type.kind == semantic::TypeKind::NoneType) {
+        ++indent_;
+        write_line("return py::none;");
+        --indent_;
+    }
     at_module_level_ = outer_module_level;
     return_type_ = outer_return_type;
     function_declared_.swap(outer_declared);

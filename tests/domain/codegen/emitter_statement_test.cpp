@@ -141,12 +141,19 @@ TEST(EmitterStatement, AFunctionLocalIsDeclaredAtFirstAssignmentAndAssignedAfter
               "py::none_t cy_f() {\n"
               "  py::int_ cy_x = py::int_(1);\n"
               "  cy_x = py::int_(2);\n"
+              "  return py::none;\n"
               "}\n");
 }
 
+// A body already ending in a bare `return` still gets the trailing
+// `return py::none;` appended (see CRITICAL FIX, post-review round 2, on
+// visit(FunctionDef) below) -- the second one is unreachable, which is legal
+// C++ with no diagnostic, and the alternative (skipping it here) would need
+// a reachability model this stage does not otherwise have.
 TEST(EmitterStatement, BareReturn) {
     EXPECT_EQ(emitted("def f() -> None:\n    return\n").value(),
               "py::none_t cy_f() {\n"
+              "  return py::none;\n"
               "  return py::none;\n"
               "}\n");
 }
@@ -174,6 +181,7 @@ TEST(EmitterStatement, AnnotatedLocalDeclaresTheAnnotationsTypeNotTheValues) {
               "py::none_t cy_f() {\n"
               "  py::float_ cy_x = py::to_float(py::int_(1));\n"
               "  cy_x = py::float_(2.5);\n"
+              "  return py::none;\n"
               "}\n");
 }
 
@@ -190,6 +198,7 @@ TEST(EmitterStatement, ReassigningALowerRankedValueToAnAlreadyDeclaredLocalWiden
               "py::none_t cy_f() {\n"
               "  py::float_ cy_x = py::float_(1.0);\n"
               "  cy_x = py::to_float(py::int_(2));\n"
+              "  return py::none;\n"
               "}\n");
 }
 
@@ -225,6 +234,62 @@ TEST(EmitterStatement, BareAnnotationEmitsNothingExecutable) {
     EXPECT_EQ(emitted("def f() -> None:\n    x: int\n").value(),
               "py::none_t cy_f() {\n"
               "  ;\n"
+              "  return py::none;\n"
+              "}\n");
+}
+
+// CRITICAL FIX (post-review round 2): a `-> None` function is the one return
+// kind mypy never requires an explicit return on every path for, so its body
+// can legitimately end in anything -- a bare expression statement, an `if`
+// with no `else`, a loop -- with no `return` anywhere at all. Before this
+// fix, visit(FunctionDef) emitted nothing to compensate, so the generated
+// C++ function fell off the end: undefined behaviour that the re-reviewer
+// measured as a guaranteed `ud2`/SIGILL trap on this project's own
+// clang++/-O0 for exactly this shape. See this file's round-2 fix report for
+// the compile-AND-RUN verification (a text-only test cannot detect a crash).
+// These three pin the three shapes the reviewer asked for explicitly.
+TEST(EmitterStatement, NoneFunctionEndingInAnExpressionStatementGetsATrailingReturn) {
+    EXPECT_EQ(emitted("def f() -> None:\n    print(1)\n").value(),
+              "py::none_t cy_f() {\n"
+              "  py::print(py::int_(1));\n"
+              "  return py::none;\n"
+              "}\n");
+}
+
+TEST(EmitterStatement, NoneFunctionEndingInAnIfWithNoElseGetsATrailingReturn) {
+    EXPECT_EQ(emitted("def f() -> None:\n    if True:\n        print(1)\n").value(),
+              "py::none_t cy_f() {\n"
+              "  if (py::truthy(py::bool_(true))) {\n"
+              "    py::print(py::int_(1));\n"
+              "  }\n"
+              "  return py::none;\n"
+              "}\n");
+}
+
+TEST(EmitterStatement, NoneFunctionEndingInAWhileLoopGetsATrailingReturn) {
+    EXPECT_EQ(emitted("def f() -> None:\n    while True:\n        break\n").value(),
+              "py::none_t cy_f() {\n"
+              "  while (py::truthy(py::bool_(true))) {\n"
+              "    break;\n"
+              "  }\n"
+              "  return py::none;\n"
+              "}\n");
+}
+
+// A non-None return type never reaches this point without a guaranteed
+// return on every path -- TypeChecker's own missing-return check
+// (type_checker.cpp, end of visit(FunctionDef)) reports unless
+// `return_type.kind` is NoneType or Unknown, and Unknown always carries its
+// own diagnostic (every Type::unknown() return in AnnotationResolver traces
+// back to an error() call), which keeps such a module out of both
+// Fixture::build and the real pipeline. So `-> int`/`-> bool`/`-> float`/
+// `-> str` are deliberately NOT given a trailing-return safety net: control
+// pinning that FunctionDefinition's existing single-`return`-statement output
+// is unaffected by this fix.
+TEST(EmitterStatement, ANonNoneReturnTypeGetsNoTrailingReturnInjected) {
+    EXPECT_EQ(emitted("def f(a: int) -> int:\n    return a\n").value(),
+              "py::int_ cy_f(py::int_ cy_a) {\n"
+              "  return cy_a;\n"
               "}\n");
 }
 
