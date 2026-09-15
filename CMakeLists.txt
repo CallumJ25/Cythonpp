@@ -129,6 +129,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/codegen/emitter_expression_test.cpp
         tests/domain/codegen/emitter_statement_test.cpp
         tests/domain/codegen/emitter_module_test.cpp
+        tests/domain/codegen/codegen_execution_test.cpp
         tests/runtime/int_test.cpp
         tests/runtime/float_test.cpp
         tests/runtime/str_test.cpp
@@ -142,7 +143,9 @@ if(CYTHONPP_BUILD_TESTS)
     target_include_directories(cythonpp_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_include_directories(cythonpp_tests PRIVATE ${CMAKE_SOURCE_DIR}/runtime)
     target_compile_definitions(cythonpp_tests PRIVATE
-        CYTHONPP_TEST_FILES_DIR="${CMAKE_SOURCE_DIR}/test_files")
+        CYTHONPP_TEST_FILES_DIR="${CMAKE_SOURCE_DIR}/test_files"
+        CYTHONPP_CXX_COMPILER="${CMAKE_CXX_COMPILER}"
+        CYTHONPP_RUNTIME_DIR="${CMAKE_SOURCE_DIR}/runtime")
 
     include(GoogleTest)
     gtest_discover_tests(cythonpp_tests)
