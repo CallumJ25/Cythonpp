@@ -131,5 +131,46 @@ TEST(CliAdapter, TypesFlagStillPrintsTheTypedTreeAndReportsErrorsForABadlyTypedF
     EXPECT_NE(out.find("(AnnAssign"), std::string::npos);
 }
 
+TEST(CliAdapter, EmitCppFlagWritesACppFileNextToASupportedInputAndExitsZero) {
+    TempPythonFile file("print(1)\n");
+    const std::filesystem::path expected_cpp =
+        std::filesystem::path(file.path()).replace_extension(".cpp");
+    std::filesystem::remove(expected_cpp);
+    std::string out;
+    std::string err;
+
+    const int exit_code = run_cli({"--emit-cpp", file.path()}, out, err);
+
+    EXPECT_EQ(exit_code, 0);
+    ASSERT_TRUE(std::filesystem::exists(expected_cpp));
+    std::ostringstream contents;
+    {
+        // Scoped so the handle is closed before the removal below --
+        // Windows refuses to remove a file that is still open.
+        std::ifstream written(expected_cpp);
+        contents << written.rdbuf();
+    }
+    EXPECT_NE(contents.str().find("int main()"), std::string::npos);
+
+    std::filesystem::remove(expected_cpp);
+}
+
+TEST(CliAdapter, EmitCppFlagWritesNoFileAndExitsNonZeroForAnUnsupportedInput) {
+    // A list literal type-checks clean but is outside the emitter's slice, so
+    // this exercises codegen's own refusal rather than the type checker's.
+    TempPythonFile file("xs: list[int] = []\n");
+    const std::filesystem::path expected_cpp =
+        std::filesystem::path(file.path()).replace_extension(".cpp");
+    std::filesystem::remove(expected_cpp);
+    std::string out;
+    std::string err;
+
+    const int exit_code = run_cli({"--emit-cpp", file.path()}, out, err);
+
+    EXPECT_NE(exit_code, 0);
+    EXPECT_NE(err.find("NotImplementedError"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(expected_cpp));
+}
+
 } // namespace
 } // namespace cythonpp::adapters::cli

@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "application/codegen_mode.h"
 #include "application/compile_pipeline.h"
 #include "domain/ast/ast_printer.h"
 #include "domain/ast/module.h"
@@ -62,7 +63,7 @@ TEST(CompilePipeline, CompileFileProducesASingleModuleKeyedByItsPath) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_file("a.py");
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Skip);
 
     ASSERT_EQ(result.modules.size(), 1u);
     ASSERT_EQ(result.modules.count("a.py"), 1u);
@@ -75,7 +76,7 @@ TEST(CompilePipeline, CompileFilePropagatesRuntimeErrorForAnUnreadableFile) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    EXPECT_THROW(pipeline.compile_file("missing.py"), std::runtime_error);
+    EXPECT_THROW(pipeline.compile_file("missing.py", CodegenMode::Skip), std::runtime_error);
 }
 
 TEST(CompilePipeline, CompileDirectoryProducesOneModulePerListedFile) {
@@ -84,7 +85,7 @@ TEST(CompilePipeline, CompileDirectoryProducesOneModulePerListedFile) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_directory("pkg");
+    const CompileResult result = pipeline.compile_directory("pkg", CodegenMode::Skip);
 
     ASSERT_EQ(result.modules.size(), 3u);
     EXPECT_EQ(result.modules.count("pkg/a.py"), 1u);
@@ -98,7 +99,7 @@ TEST(CompilePipeline, EachModuleHoldsItsOwnTokens) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_directory("");
+    const CompileResult result = pipeline.compile_directory("", CodegenMode::Skip);
 
     EXPECT_EQ(result.modules.at("a.py").tokens.at(0).lexeme(), "x");
     EXPECT_EQ(result.modules.at("b.py").tokens.at(0).lexeme(), "y");
@@ -111,7 +112,7 @@ TEST(CompilePipeline, ModuleKeysAreSortedRegardlessOfListerOrder) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_directory("");
+    const CompileResult result = pipeline.compile_directory("", CodegenMode::Skip);
 
     std::vector<std::string> keys;
     for (const auto& module : result.modules) {
@@ -126,7 +127,7 @@ TEST(CompilePipeline, CompileDirectoryWithNoSourceFilesProducesNoModules) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    EXPECT_TRUE(pipeline.compile_directory("empty").modules.empty());
+    EXPECT_TRUE(pipeline.compile_directory("empty", CodegenMode::Skip).modules.empty());
 }
 
 TEST(CompilePipeline, CompileDirectoryPropagatesRuntimeErrorFromAnyFile) {
@@ -135,7 +136,7 @@ TEST(CompilePipeline, CompileDirectoryPropagatesRuntimeErrorFromAnyFile) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    EXPECT_THROW(pipeline.compile_directory("pkg"), std::runtime_error);
+    EXPECT_THROW(pipeline.compile_directory("pkg", CodegenMode::Skip), std::runtime_error);
 }
 
 TEST(CompilePipeline, EveryModuleEndsWithAnEndOfFileToken) {
@@ -144,7 +145,7 @@ TEST(CompilePipeline, EveryModuleEndsWithAnEndOfFileToken) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_directory("");
+    const CompileResult result = pipeline.compile_directory("", CodegenMode::Skip);
 
     for (const auto& module : result.modules) {
         ASSERT_FALSE(module.second.tokens.empty()) << module.first;
@@ -160,7 +161,7 @@ TEST(CompilePipeline, ModuleTokensHaveBeenThroughTheIndentationPass) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_file("a.py");
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Skip);
 
     bool saw_indent = false;
     for (const domain::lexer::Token& token : result.modules.at("a.py").tokens) {
@@ -182,7 +183,7 @@ TEST(CompilePipeline, ACleanFileReportsNothingAndSetsNoErrorFlag) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_file("a.py");
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Skip);
 
     EXPECT_TRUE(reporter.entries.empty());
     EXPECT_FALSE(result.has_errors);
@@ -194,7 +195,7 @@ TEST(CompilePipeline, IndentationDiagnosticsAreReportedAgainstTheirSourcePath) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_file("pkg/bad.py");
+    const CompileResult result = pipeline.compile_file("pkg/bad.py", CodegenMode::Skip);
 
     ASSERT_EQ(reporter.entries.size(), 1u);
     EXPECT_EQ(reporter.entries.front().path, "pkg/bad.py");
@@ -208,7 +209,7 @@ TEST(CompilePipeline, HasErrorsIsSetWhenAnyModuleInADirectoryFails) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_directory("pkg");
+    const CompileResult result = pipeline.compile_directory("pkg", CodegenMode::Skip);
 
     EXPECT_EQ(result.modules.size(), 2u);
     EXPECT_TRUE(result.has_errors);
@@ -221,7 +222,7 @@ TEST(CompilePipeline, EachModuleCarriesAParsedAst) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_file("a.py");
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Skip);
 
     ASSERT_EQ(result.modules.count("a.py"), 1u);
     const CompiledModule& compiled = result.modules.at("a.py");
@@ -237,7 +238,7 @@ TEST(CompilePipeline, ParserDiagnosticsAreReportedAgainstTheirSourcePath) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_file("pkg/bad.py");
+    const CompileResult result = pipeline.compile_file("pkg/bad.py", CodegenMode::Skip);
 
     ASSERT_EQ(reporter.entries.size(), 1u);
     EXPECT_EQ(reporter.entries.front().path, "pkg/bad.py");
@@ -256,7 +257,7 @@ TEST(CompilePipeline, AFileWithIndentationErrorsIsStillParsed) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_file("a.py");
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Skip);
 
     ASSERT_NE(result.modules.at("a.py").ast, nullptr);
     EXPECT_TRUE(result.has_errors);
@@ -268,7 +269,7 @@ TEST(CompilePipeline, TheAstIsNeverNullEvenForAFileThatFailedEntirely) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_file("a.py");
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Skip);
 
     ASSERT_NE(result.modules.at("a.py").ast, nullptr);
     EXPECT_TRUE(result.modules.at("a.py").ast->body().empty());
@@ -283,7 +284,7 @@ TEST(CompilePipeline, ReportsSemanticDiagnosticsToTheReporter) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_file("a.py");
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Skip);
 
     ASSERT_EQ(reporter.entries.size(), 1u) << "the semantic diagnostic must reach the reporter";
     EXPECT_EQ(reporter.entries.front().path, "a.py");
@@ -297,7 +298,7 @@ TEST(CompilePipeline, PopulatesTheTypeMapForACleanFile) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_file("a.py");
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Skip);
 
     EXPECT_FALSE(result.has_errors);
     EXPECT_TRUE(reporter.entries.empty());
@@ -316,7 +317,7 @@ TEST(CompilePipeline, SkipsSemanticAnalysisWhenParsingFailed) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_file("a.py");
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Skip);
 
     EXPECT_TRUE(result.has_errors);
     EXPECT_EQ(result.modules.at("a.py").types.size(), 0u) << "the map must be empty";
@@ -331,7 +332,7 @@ TEST(CompilePipeline, ChecksEveryFileInADirectoryRun) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_directory(".");
+    const CompileResult result = pipeline.compile_directory(".", CodegenMode::Skip);
 
     EXPECT_TRUE(result.has_errors);
     EXPECT_GT(result.modules.at("a.py").types.size(), 0u);
@@ -352,9 +353,56 @@ TEST(CompilePipeline, TheTokenStreamCursorIsRewoundForTheCaller) {
     RecordingDiagnosticsReporter reporter;
     CompilePipeline pipeline(reader, lister, reporter);
 
-    const CompileResult result = pipeline.compile_file("a.py");
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Skip);
 
     EXPECT_EQ(result.modules.at("a.py").tokens.position(), 0u);
+}
+
+// Emission must not happen unless asked for. A program with an unsupported
+// construct is silent under Skip and reports under Emit -- which is the
+// whole reason CodegenMode exists as an explicit, non-defaulted parameter.
+TEST(CompilePipeline, SkipModeReportsNoCodegenDiagnostics) {
+    // A list literal type-checks clean but is outside the emitter's slice,
+    // so this fixture only exercises codegen's own refusal, never the type
+    // checker's.
+    FakeSourceReader reader({{"a.py", "xs: list[int] = []\n"}});
+    FakeSourceLister lister({});
+    RecordingDiagnosticsReporter reporter;
+    CompilePipeline pipeline(reader, lister, reporter);
+
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Skip);
+
+    EXPECT_TRUE(reporter.entries.empty());
+    EXPECT_FALSE(result.has_errors);
+    EXPECT_FALSE(result.modules.at("a.py").cpp.has_value());
+}
+
+TEST(CompilePipeline, EmitModeReportsTheCodegenRefusal) {
+    FakeSourceReader reader({{"a.py", "xs: list[int] = []\n"}});
+    FakeSourceLister lister({});
+    RecordingDiagnosticsReporter reporter;
+    CompilePipeline pipeline(reader, lister, reporter);
+
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Emit);
+
+    ASSERT_EQ(reporter.entries.size(), 1u);
+    EXPECT_EQ(reporter.entries.front().diagnostic.code, "NotImplementedError");
+    EXPECT_TRUE(result.has_errors);
+    EXPECT_FALSE(result.modules.at("a.py").cpp.has_value());
+}
+
+TEST(CompilePipeline, EmitModeProducesSourceForASupportedProgram) {
+    FakeSourceReader reader({{"a.py", "print(1)\n"}});
+    FakeSourceLister lister({});
+    RecordingDiagnosticsReporter reporter;
+    CompilePipeline pipeline(reader, lister, reporter);
+
+    const CompileResult result = pipeline.compile_file("a.py", CodegenMode::Emit);
+
+    EXPECT_TRUE(reporter.entries.empty());
+    EXPECT_FALSE(result.has_errors);
+    ASSERT_TRUE(result.modules.at("a.py").cpp.has_value());
+    EXPECT_NE(result.modules.at("a.py").cpp->find("int main()"), std::string::npos);
 }
 
 } // namespace

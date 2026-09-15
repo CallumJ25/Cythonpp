@@ -8,7 +8,8 @@
 namespace cythonpp::adapters::filesystem {
 
 // Concrete OutputWriter that writes generated code to the local filesystem.
-// Not yet wired into the pipeline; stubbed for the future codegen stage.
+// Wired in by CliAdapter's --emit-cpp flag, which is ports::OutputWriter's
+// first and only consumer.
 class FilesystemOutputWriter : public ports::OutputWriter {
 public:
     void write(const std::string& path, const std::string& contents) override;

@@ -7,8 +7,10 @@
 #include <string>
 
 #include "adapters/cli/console_diagnostics_reporter.h"
+#include "adapters/filesystem/filesystem_output_writer.h"
 #include "adapters/filesystem/filesystem_source_lister.h"
 #include "adapters/filesystem/filesystem_source_reader.h"
+#include "application/codegen_mode.h"
 #include "application/compile_pipeline.h"
 #include "domain/ast/ast_printer.h"
 #include "domain/ast/module.h"
@@ -87,10 +89,25 @@ void print_result(const application::CompileResult& result, OutputMode mode) {
     }
 }
 
+// Writes every module's emitted source to disk, at its own input path with
+// the extension replaced by ".cpp". Only called once the caller has already
+// confirmed the whole run is error-free, so `module.cpp` is always engaged
+// here -- CodegenMode::Skip and a refused emission both leave it nullopt, and
+// both are handled upstream by never reaching this function at all.
+void write_emitted_sources(const application::CompileResult& result) {
+    filesystem::FilesystemOutputWriter output_writer;
+    for (const auto& module : result.modules) {
+        std::filesystem::path output_path(module.first);
+        output_path.replace_extension(".cpp");
+        output_writer.write(output_path.string(), *module.second.cpp);
+    }
+}
+
 } // namespace
 
 int CliAdapter::run(int argc, char** argv) {
     OutputMode mode = OutputMode::Tree;
+    bool emit_cpp = false;
     std::string path;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
@@ -98,6 +115,11 @@ int CliAdapter::run(int argc, char** argv) {
             mode = OutputMode::Tokens;
         } else if (argument == "--types") {
             mode = OutputMode::Types;
+        } else if (argument == "--emit-cpp") {
+            // A separate flag, not a fourth OutputMode: the three existing
+            // modes all print a dump to stdout, while this one writes a
+            // file, and it can combine with any of them.
+            emit_cpp = true;
         } else if (path.empty()) {
             path = argument;
         } else {
@@ -106,8 +128,9 @@ int CliAdapter::run(int argc, char** argv) {
         }
     }
     if (path.empty()) {
-        std::cerr << "usage: cythonpp [--tokens|--types] <path-to-python-file-or-directory>"
-                   << std::endl;
+        std::cerr
+            << "usage: cythonpp [--tokens|--types] [--emit-cpp] <path-to-python-file-or-directory>"
+            << std::endl;
         return 1;
     }
 
@@ -116,15 +139,30 @@ int CliAdapter::run(int argc, char** argv) {
     ConsoleDiagnosticsReporter diagnostics_reporter;
     application::CompilePipeline pipeline(source_reader, source_lister, diagnostics_reporter);
 
+    // CodegenMode has no default (see codegen_mode.h) precisely so this
+    // choice cannot be forgotten: Skip for every other invocation, since
+    // running the emitter unconditionally would report codegen's own
+    // NotImplementedError refusals for a program the user only asked to see
+    // tokenized or typed, never to compile.
+    const application::CodegenMode codegen =
+        emit_cpp ? application::CodegenMode::Emit : application::CodegenMode::Skip;
+
     try {
         // Interpreting argv is this adapter's job. Asking the OS whether a
         // path is a directory needs <filesystem>, which the application
         // layer must not depend on -- so the choice is made here, at the
         // composition root, and the pipeline just exposes two verbs.
         const application::CompileResult result = std::filesystem::is_directory(path)
-                                                      ? pipeline.compile_directory(path)
-                                                      : pipeline.compile_file(path);
+                                                      ? pipeline.compile_directory(path, codegen)
+                                                      : pipeline.compile_file(path, codegen);
         print_result(result, mode);
+
+        // Refusing is always acceptable; writing a .cpp that does not
+        // compile never is -- so a file is written only when the WHOLE run
+        // is error-free, never per-module, and never at all on failure.
+        if (emit_cpp && !result.has_errors) {
+            write_emitted_sources(result);
+        }
 
         // The tree is still printed for a file with errors -- seeing the
         // output is exactly what helps when diagnosing one -- but the exit
