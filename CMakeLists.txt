@@ -130,6 +130,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/codegen/emitter_statement_test.cpp
         tests/domain/codegen/emitter_module_test.cpp
         tests/domain/codegen/codegen_execution_test.cpp
+        tests/domain/codegen/codegen_corpus_test.cpp
         tests/runtime/int_test.cpp
         tests/runtime/float_test.cpp
         tests/runtime/str_test.cpp
