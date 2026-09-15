@@ -16,6 +16,7 @@ Usage:
     python scripts/verify_corpus_labels.py --generate-function-table
     python scripts/verify_corpus_labels.py --generate-object-member-table
     python scripts/verify_corpus_labels.py --check-corpus     # added in Task 24
+    python scripts/verify_corpus_labels.py --check-codegen    # added in Task 12 (codegen slice)
 """
 
 import argparse
@@ -1005,6 +1006,167 @@ def check_corpus() -> int:
     return 0
 
 
+def codegen_corpus_dir() -> pathlib.Path:
+    # Mirrors corpus_dir() above: relative to this script's own location,
+    # never a hardcoded absolute path.
+    return pathlib.Path(__file__).resolve().parent.parent / "test_files" / "codegen"
+
+
+def parse_stdout_label(lines):
+    """Parses the leading '# stdout:' block of a codegen sample.
+
+    Mirrors codegen_corpus_test.cpp's parse_label exactly: the FIRST line
+    must read exactly '# stdout:', and every following '# '-prefixed line
+    (or a bare '#', for a blank expected output line) is one more expected
+    output line. The block ends at the first line that is neither -- where
+    the real Python source begins. If the two parsers ever disagreed about
+    a sample, this whole arm would prove nothing, so this must track the
+    C++ version's semantics precisely rather than approximate them.
+
+    Returns (expected_lines, header_line_count). Raises ValueError for
+    anything that doesn't match -- a label this cannot parse must fail
+    loudly, not be silently skipped, the same doctrine parse_header (the
+    semantic-corpus parser above) already follows.
+    """
+    if not lines:
+        raise ValueError("file is empty; expected a '# stdout:' header")
+
+    first = lines[0].rstrip("\r\n")
+    if first != "# stdout:":
+        raise ValueError(f"first line must be exactly '# stdout:', got: {first!r}")
+
+    expected = []
+    header_count = 1
+    for line in lines[1:]:
+        stripped = line.rstrip("\r\n")
+        if stripped == "#":
+            expected.append("")
+            header_count += 1
+            continue
+        if stripped.startswith("# "):
+            expected.append(stripped[2:])
+            header_count += 1
+            continue
+        break  # First non-label line: the header is over.
+    return expected, header_count
+
+
+def _check_codegen_label(sample_name: str, tmp_file: pathlib.Path, tmpdir: str, expected_lines):
+    """Runs one codegen sample under CPython and compares stdout to its label.
+
+    Returns (status, detail): status is "OK", "MISMATCH" or "CRASHED", and
+    detail is a human-readable explanation for the two failing ones. Shape
+    mirrors _check_cpython_label above: run one file per invocation, cwd set
+    to the shared throwaway tmpdir so a sample cannot touch the repo or
+    import anything from the working tree, against the header-stripped copy
+    so a traceback's line numbers still match the original file.
+
+    A nonzero exit code, OR any stderr output even alongside exit 0, is
+    reported as CRASHED rather than compared: every codegen sample must be a
+    program CPython runs to completion, and a bad sample's partial stdout
+    proves nothing about its label.
+
+    TRAILING-NEWLINE RULE, chosen to match codegen_corpus_test.cpp's
+    check_sample() byte-for-byte rather than approximate it: the expected
+    string is built by appending '\\n' after EVERY label line, including the
+    last one (exactly what that function's `expected += line; expected +=
+    '\\n';` loop does), and compared against CPython's raw, UNSTRIPPED
+    stdout. No trailing newline is added to or stripped from the actual
+    output on either side. This works because every sample's last statement
+    is a `print(...)` call, which itself ends in '\\n' -- so the byte-exact
+    expectation and "one print per label line" coincide, and stripping
+    either side would make this arm accept a label the C++ harness would
+    reject (or vice versa).
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, str(tmp_file)],
+            cwd=tmpdir,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return "CRASHED", f"{sample_name}: running it under CPython timed out after 60s"
+
+    if result.returncode != 0:
+        return "CRASHED", (
+            f"{sample_name}: CPython exited {result.returncode}, not a program that runs to "
+            f"completion -- a codegen sample must always exit 0:\n{result.stdout}{result.stderr}"
+        )
+    if result.stderr:
+        return "CRASHED", (
+            f"{sample_name}: CPython wrote to stderr even though it exited 0, which a clean "
+            f"codegen sample must never do:\n{result.stderr}"
+        )
+
+    expected = "".join(line + "\n" for line in expected_lines)
+    if result.stdout != expected:
+        return "MISMATCH", (
+            f"{sample_name}: labelled '# stdout:' does not match CPython's real stdout\n"
+            f"  expected: {expected!r}\n"
+            f"  actual:   {result.stdout!r}"
+        )
+    return "OK", ""
+
+
+def check_codegen_labels() -> int:
+    """Runs every test_files/codegen/*.py sample under real CPython and
+    confirms its '# stdout:' label matches.
+
+    This is the other half of the asymmetry codegen_corpus_test.cpp's own
+    header comment names explicitly: ctest's EverySampleMatchesItsLabel
+    proves the emitted C++ program's stdout matches the RECORDED label, on
+    every run, with no Python involved at all. It does NOT prove the
+    recorded label matches CPython -- that rests entirely on a developer
+    having actually run `python <file>` and pasted the real output in by
+    hand. This function is what actually checks that, the same way
+    check_corpus()'s CPython arm (_check_cpython_label) is what actually
+    checks a '# cpython:' label in the semantic corpus.
+
+    Developer-run only -- NEVER invoked by ctest, which must stay hermetic
+    (no Python, no network, no shelling out). Every sample is run with its
+    cwd set to a fresh, shared TemporaryDirectory, never the repository, so
+    a sample cannot accidentally import something from the working tree and
+    so nothing it writes touches the repo.
+    """
+    samples = sorted(codegen_corpus_dir().glob("*.py"))
+    if not samples:
+        print(f"no *.py files found under {codegen_corpus_dir()}", file=sys.stderr)
+        return 1
+
+    failures = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = pathlib.Path(tmpdir)
+        for sample in samples:
+            lines = sample.read_text(encoding="utf-8").splitlines(keepends=True)
+            try:
+                expected_lines, header_count = parse_stdout_label(lines)
+            except ValueError as exc:
+                print(f"MALFORMED  {sample.name}: {exc}")
+                failures.append(f"{sample}: {exc}")
+                continue
+
+            tmp_file = tmpdir_path / sample.name
+            tmp_file.write_text("".join(strip_header(lines, header_count)), encoding="utf-8")
+
+            status, detail = _check_codegen_label(sample.name, tmp_file, tmpdir, expected_lines)
+            if status == "OK":
+                print(f"OK         {sample.name}")
+            else:
+                print(f"{status:<10} {sample.name}")
+                failures.append(f"{sample}: {detail}")
+
+    if failures:
+        print("\nFAILURES:", file=sys.stderr)
+        for failure in failures:
+            print(f"  - {failure}", file=sys.stderr)
+        return 1
+
+    print(f"\nAll {len(samples)} codegen sample(s) match their '# stdout:' label.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     # Mutually exclusive: passing both used to silently run only
@@ -1019,9 +1181,20 @@ def main() -> int:
         "--check-corpus",
         action="store_true",
         help="Run mypy --strict on every test_files/semantic sample and confirm its "
-        "'# mypy:' header matches, and run CPython on every sample carrying a "
-        "'# cpython:' header to confirm that half too. Developer-run only -- never "
-        "part of ctest.",
+        "'# mypy:' header matches, run CPython on every sample carrying a "
+        "'# cpython:' header to confirm that half too, AND run CPython on every "
+        "test_files/codegen sample to confirm its '# stdout:' header (see "
+        "--check-codegen). One command, every label in the repository. "
+        "Developer-run only -- never part of ctest.",
+    )
+    group.add_argument(
+        "--check-codegen",
+        action="store_true",
+        help="Run every test_files/codegen/*.py sample under real CPython and confirm "
+        "its '# stdout:' header matches. This is the other half of the asymmetry "
+        "codegen_corpus_test.cpp's own header comment names: ctest proves the emitted "
+        "C++ program matches the RECORDED label, this proves the recorded label "
+        "matches CPython. Developer-run only -- never part of ctest.",
     )
     args = parser.parse_args()
     if args.generate_class_table:
@@ -1033,8 +1206,16 @@ def main() -> int:
     if args.generate_object_member_table:
         sys.stdout.write(generate_object_member_table())
         return 0
+    if args.check_codegen:
+        return check_codegen_labels()
     if args.check_corpus:
-        return check_corpus()
+        # Both arms run regardless of whether the first fails, so a single
+        # invocation always reports on every label family rather than
+        # stopping at the first broken one.
+        semantic_result = check_corpus()
+        print()
+        codegen_result = check_codegen_labels()
+        return 1 if (semantic_result != 0 or codegen_result != 0) else 0
     parser.print_help()
     return 1
 
