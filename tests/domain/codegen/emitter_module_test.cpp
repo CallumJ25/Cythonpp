@@ -62,8 +62,22 @@ TEST(EmitterModule, OneRefusalYieldsNoModuleText) {
 // A bare declaration binds nothing in Python (no executable statement), but
 // the C++ variable still needs to exist at file scope so a later assignment
 // or a def reading it has something to refer to.
+//
+// POST-WAVE CRITICAL: this test used to omit the `total = 5` line, and that
+// omission made it pin a DEFECT rather than a property. `total: int` alone
+// binds nothing at all (bound_name_of says exactly this), so `print(total)`
+// inside `show()` is `NameError: name 'total' is not defined` under CPython
+// (mypy --strict: Success) while the emitted program printed `0` and exited
+// 0 -- silently wrong output on a program the union rule rejects. The
+// MODULE-level analogue (`total: int` then a top-level `print(total)`) was
+// already refused by the wave's own in-scope check; only the read from
+// inside a function slipped through, which is the hole this round closes.
+// The assignment is added so the test pins the file-scope-declaration
+// property on a program both oracles accept; the refusal it was masking is
+// pinned separately, below.
 TEST(EmitterModule, BareAnnotationStillGetsAFileScopeDeclaration) {
-    Fixture fixture = build("total: int\n\n\ndef show() -> None:\n    print(total)\n\n\nshow()\n");
+    Fixture fixture =
+        build("total: int\ntotal = 5\n\n\ndef show() -> None:\n    print(total)\n\n\nshow()\n");
     const std::string text = emit_module(fixture).value();
 
     EXPECT_NE(text.find("py::int_ cy_total;"), std::string::npos);
@@ -146,6 +160,79 @@ TEST(EmitterModule, AVariableFirstAssignedInsideAModuleLevelLoopIsStillFileScope
 
     EXPECT_NE(text.find("py::int_ cy_z;"), std::string::npos);
     EXPECT_NE(text.find("py::int_ cy_w;"), std::string::npos);
+}
+
+// POST-WAVE CRITICAL: the module-scope definite-assignment refusal above,
+// carried across the FUNCTION boundary. The wave that added that refusal
+// checked reads WITHIN the module body and WITHIN each function body, but
+// never a function's read of a module-level global -- so
+// `if c: s: str = "cfg"` plus a `def` reading `s` emitted, compiled, and
+// printed "!" where CPython raises NameError and exits 1. Silently wrong
+// OUTPUT on a program the union rule rejects.
+//
+// Every source here was measured against CPython 3.14 and mypy 1.18.1: all
+// four are `mypy --strict` Success, and all four raise
+// `NameError: name 's' is not defined` under CPython.
+TEST(EmitterModule, AFunctionReadingAConditionallyAssignedGlobalIsRefused) {
+    for (const std::string source :
+         {std::string("c: bool = False\nif c:\n    s: str = \"cfg\"\n\n\n"
+                      "def label() -> str:\n    return s + \"!\"\n\n\nprint(label())\n"),
+          // The read nested in a call argument rather than a return value.
+          std::string("c: bool = False\nif c:\n    s: str = \"cfg\"\n\n\n"
+                      "def show() -> None:\n    print(s)\n\n\nshow()\n"),
+          // Assigned only in a `while` body, which may run zero times.
+          std::string("c: bool = False\nwhile c:\n    s: str = \"cfg\"\n    c = False\n\n\n"
+                      "def label() -> str:\n    return s + \"!\"\n\n\nprint(label())\n"),
+          // The read in the function's own `if` condition.
+          std::string("c: bool = False\nif c:\n    s: str = \"cfg\"\n\n\n"
+                      "def label() -> str:\n    if s == \"cfg\":\n        return \"y\"\n"
+                      "    return \"n\"\n\n\nprint(label())\n"),
+          // A bare `total: int` binds NOTHING in Python, so a function
+          // reading it is the same hole with no `if` involved at all -- the
+          // shape BareAnnotationStillGetsAFileScopeDeclaration above used to
+          // assert emitted. CPython: NameError, exit 1. mypy: Success.
+          std::string("total: int\n\n\ndef show() -> None:\n    print(total)\n\n\nshow()\n")}) {
+        Fixture fixture = build(source);
+        EXPECT_FALSE(emit_module(fixture).has_value()) << source;
+        EXPECT_FALSE(fixture.emit_sink.empty()) << source;
+    }
+}
+
+// The two shadowing controls, at unit level: a name the function BINDS
+// itself, and a name a PARAMETER carries, are the function's own and never
+// reach the module-level global at all -- so neither may be refused by the
+// check above. Both are CPython exit 0 (measured); the execution test of the
+// same name in codegen_execution_test.cpp runs them for real.
+TEST(EmitterModule, AShadowedGlobalNameIsNotRefusedByTheCrossBoundaryCheck) {
+    for (const std::string source :
+         {// A parameter of the same name.
+          std::string("c: bool = False\nif c:\n    s: str = \"cfg\"\n\n\n"
+                      "def label(s: str) -> str:\n    return s + \"!\"\n\n\n"
+                      "print(label(\"arg\"))\n"),
+          // A local the function assigns before reading.
+          std::string("c: bool = False\nif c:\n    s: str = \"cfg\"\n\n\n"
+                      "def label() -> str:\n    s = \"own\"\n    return s + \"!\"\n\n\n"
+                      "print(label())\n")}) {
+        Fixture fixture = build(source);
+        EXPECT_TRUE(emit_module(fixture).has_value()) << source;
+        EXPECT_TRUE(fixture.emit_sink.empty()) << source;
+    }
+}
+
+// The deliberate BOUNDARY of the check, kept as a pinned control so a future
+// widening is a conscious decision rather than an accident: the set is keyed
+// on "not bound by the END of the module body", which says nothing about
+// CALL ORDER. `t` here IS assigned at module level, just after the call that
+// reads it, so it stays out of module_unbound_ and this program is emitted.
+// CPython rejects it (`NameError: name 't' is not defined`) -- a
+// PRE-EXISTING gap that predates the cross-boundary check and needs
+// call-order reasoning this stage does not have. Not closed here; pinned so
+// its status is visible.
+TEST(EmitterModule, AGlobalAssignedAfterTheCallThatReadsItIsStillEmitted) {
+    Fixture fixture = build("def g() -> int:\n    return t\n\n\nprint(g())\nt: int = 5\n");
+
+    EXPECT_TRUE(emit_module(fixture).has_value());
+    EXPECT_TRUE(fixture.emit_sink.empty());
 }
 
 } // namespace

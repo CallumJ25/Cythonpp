@@ -235,15 +235,37 @@ private:
     // `bound` is in/out (seeded with a function's parameter names, empty for a
     // module). Returns whether the suite always leaves via return/break/
     // continue, which is what lets an `if` arm be excluded from the merge.
+    //
+    // `unbound_phrase` is the clause every refusal this walk produces names
+    // the problem with -- see check_reads. It is a parameter rather than a
+    // fixed string because the SAME walk answers two different questions: a
+    // scope's reads of its own not-yet-assigned locals, and (over a function
+    // body, seeded with module_unbound_) that function's reads of a
+    // module-level global the module body may never assign.
     bool check_definite_assignment(const std::vector<ast::StmtPtr>& body,
                                    const std::set<std::string>& locals,
-                                   std::set<std::string>& bound);
+                                   std::set<std::string>& bound,
+                                   std::string_view unbound_phrase);
+
+    // The two clauses check_reads words a refusal with. Separate strings, not
+    // one generic wording, because the two shapes have different CAUSES and a
+    // user reading the diagnostic needs to know which. The first is a read
+    // within one scope's own body -- a function's, or the module's -- of a
+    // name that scope may not have assigned yet; the second is the
+    // cross-boundary one: a function reading a MODULE-level global whose
+    // assignment sits in a block that may not run, which is a fact about the
+    // module body and nothing the function itself can fix.
+    static constexpr std::string_view kScopeUnboundPhrase =
+        "this scope may not have assigned yet";
+    static constexpr std::string_view kModuleUnboundPhrase =
+        "the module body may never assign, so it may be unbound here";
 
     // Refuses every read, anywhere in `expr`, of a `locals` name not in
-    // `bound`. Walks the whole sub-tree, so a read nested in a call argument
-    // or an operand is seen.
+    // `bound`, wording the refusal as "a read of 'x', which <unbound_phrase>,".
+    // Walks the whole sub-tree, so a read nested in a call argument or an
+    // operand is seen.
     void check_reads(const ast::Expr& expr, const std::set<std::string>& locals,
-                     const std::set<std::string>& bound);
+                     const std::set<std::string>& bound, std::string_view unbound_phrase);
 
     // Names already declared in the CURRENT function body, mapped to the C++
     // type each was declared with. Empty at module level, where declarations
@@ -267,6 +289,26 @@ private:
     // producing e.g. a bare `py::int_(2)` assigned into a `py::float_`
     // global, which does not compile.
     std::map<std::string, semantic::Type> module_declared_;
+
+    // POST-WAVE CRITICAL: every module-level variable NOT definitely bound by
+    // the END of the module body, as the module's own definite-assignment walk
+    // left it. A file-scope C++ declaration DEFAULT-CONSTRUCTS, so reading one
+    // of these names yields 0/""/false where CPython raises NameError -- the
+    // identical silently-wrong-OUTPUT failure check_definite_assignment
+    // already refuses WITHIN a scope, simply not carried across the function
+    // boundary when that check landed. visit(FunctionDef) seeds a second walk
+    // of its own body with this set, so `if c: s: str = "x"` at module level
+    // followed by a `def` that reads `s` is a named refusal rather than a
+    // program that prints the wrong thing.
+    //
+    // Keyed on "not bound by the END of the module body", deliberately, so it
+    // says nothing about CALL ORDER: a global assigned at module level only
+    // AFTER the call that reads it (`def g(): return t` / `print(g())` /
+    // `t: int = 5`) is definitely bound by the end of the body and stays out
+    // of this set. That shape is a separate, pre-existing gap needing
+    // call-order reasoning this stage does not have; it is deliberately left
+    // exactly as it was rather than half-closed here.
+    std::set<std::string> module_unbound_;
 
     // The enclosing function's declared return type, consulted by
     // visit(Return) to widen its value exactly as emit_assignment does for an

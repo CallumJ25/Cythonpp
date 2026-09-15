@@ -5,6 +5,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -272,7 +273,8 @@ bool Emitter::collect_scope_variables(const std::vector<ast::StmtPtr>& body,
 }
 
 void Emitter::check_reads(const ast::Expr& expr, const std::set<std::string>& locals,
-                          const std::set<std::string>& bound) {
+                          const std::set<std::string>& bound,
+                          std::string_view unbound_phrase) {
     NameReadCollector collector;
     expr.accept(collector);
     for (const ast::Name* name : collector.names) {
@@ -280,8 +282,8 @@ void Emitter::check_reads(const ast::Expr& expr, const std::set<std::string>& lo
         if (locals.count(identifier) == 0 || bound.count(identifier) != 0) {
             continue;
         }
-        refuse(*name, "a read of '" + identifier +
-                          "', which this scope may not have assigned yet,");
+        refuse(*name, "a read of '" + identifier + "', which " +
+                          std::string(unbound_phrase) + ",");
         return;
     }
 }
@@ -289,18 +291,19 @@ void Emitter::check_reads(const ast::Expr& expr, const std::set<std::string>& lo
 // FINAL-REVIEW CRITICAL 3, half two. See emitter.h for the full argument.
 bool Emitter::check_definite_assignment(const std::vector<ast::StmtPtr>& body,
                                         const std::set<std::string>& locals,
-                                        std::set<std::string>& bound) {
+                                        std::set<std::string>& bound,
+                                        std::string_view unbound_phrase) {
     for (const ast::StmtPtr& stmt : body) {
         if (failed_) {
             return false;
         }
         if (const auto* expression = dynamic_cast<const ast::ExprStmt*>(stmt.get())) {
-            check_reads(expression->value(), locals, bound);
+            check_reads(expression->value(), locals, bound, unbound_phrase);
             continue;
         }
         if (const auto* returned = dynamic_cast<const ast::Return*>(stmt.get())) {
             if (returned->has_value()) {
-                check_reads(returned->value(), locals, bound);
+                check_reads(returned->value(), locals, bound, unbound_phrase);
             }
             return true;
         }
@@ -309,12 +312,13 @@ bool Emitter::check_definite_assignment(const std::vector<ast::StmtPtr>& body,
             return true;
         }
         if (const auto* branch = dynamic_cast<const ast::If*>(stmt.get())) {
-            check_reads(branch->condition(), locals, bound);
+            check_reads(branch->condition(), locals, bound, unbound_phrase);
             std::set<std::string> then_bound = bound;
-            const bool then_leaves = check_definite_assignment(branch->body(), locals, then_bound);
+            const bool then_leaves =
+                check_definite_assignment(branch->body(), locals, then_bound, unbound_phrase);
             std::set<std::string> else_bound = bound;
             const bool else_leaves =
-                check_definite_assignment(branch->orelse(), locals, else_bound);
+                check_definite_assignment(branch->orelse(), locals, else_bound, unbound_phrase);
             if (then_leaves && else_leaves) {
                 return true;
             }
@@ -338,7 +342,7 @@ bool Emitter::check_definite_assignment(const std::vector<ast::StmtPtr>& body,
             continue;
         }
         if (const auto* loop = dynamic_cast<const ast::While*>(stmt.get())) {
-            check_reads(loop->condition(), locals, bound);
+            check_reads(loop->condition(), locals, bound, unbound_phrase);
             // A loop body may run ZERO times, so nothing it binds is
             // definitely bound afterwards -- and its own reads are checked
             // against the state on the FIRST iteration, which is exactly the
@@ -346,9 +350,9 @@ bool Emitter::check_definite_assignment(const std::vector<ast::StmtPtr>& body,
             // clause is checked the same way and likewise contributes nothing
             // (it does not run when the loop is left by `break`).
             std::set<std::string> body_bound = bound;
-            check_definite_assignment(loop->body(), locals, body_bound);
+            check_definite_assignment(loop->body(), locals, body_bound, unbound_phrase);
             std::set<std::string> else_bound = bound;
-            check_definite_assignment(loop->orelse(), locals, else_bound);
+            check_definite_assignment(loop->orelse(), locals, else_bound, unbound_phrase);
             continue;
         }
         // A nested def or class is a different scope whose body runs later (or
@@ -362,10 +366,10 @@ bool Emitter::check_definite_assignment(const std::vector<ast::StmtPtr>& body,
         // Whatever remains is an assignment form: its VALUE is evaluated
         // before its target binds, so `x = x + 1` reads the OLD x.
         if (const auto* assign = dynamic_cast<const ast::Assign*>(stmt.get())) {
-            check_reads(assign->value(), locals, bound);
+            check_reads(assign->value(), locals, bound, unbound_phrase);
         } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(stmt.get())) {
             if (ann_assign->has_value()) {
-                check_reads(ann_assign->value(), locals, bound);
+                check_reads(ann_assign->value(), locals, bound, unbound_phrase);
             }
         }
         if (const ast::Name* target = bound_name_of(*stmt)) {
@@ -806,11 +810,40 @@ void Emitter::visit(const ast::FunctionDef& node) {
     for (const ScopeVariable& local : locals) {
         local_names.insert(local.identifier);
     }
-    std::set<std::string> bound;
+    std::set<std::string> parameter_names;
     for (const ast::Parameter& parameter : node.params()) {
-        bound.insert(parameter.name);
+        parameter_names.insert(parameter.name);
     }
-    check_definite_assignment(node.body(), local_names, bound);
+    std::set<std::string> bound = parameter_names;
+    check_definite_assignment(node.body(), local_names, bound, kScopeUnboundPhrase);
+
+    // POST-WAVE CRITICAL: the same check carried across the FUNCTION BOUNDARY,
+    // which is what the wave that added check_definite_assignment left out. A
+    // module-level global whose only assignment sits in a block that may not
+    // run is declared at C++ file scope regardless, so it DEFAULT-CONSTRUCTS
+    // and a function reading it silently yields 0/""/false where CPython
+    // raises NameError -- a program both oracles' union rule REJECTS, compiled
+    // into one that runs and prints the wrong thing. Refused instead.
+    //
+    // A second walk rather than folding module_unbound_ into `local_names`
+    // above, for two reasons: the wording differs (a module-level cause is not
+    // something the function itself can fix), and SHADOWING then falls out
+    // exactly right -- a name this function binds itself is already in
+    // local_names, and a parameter of that name is in parameter_names, so
+    // subtracting both leaves only the names whose read really does reach the
+    // module-level global. `bound` for this walk is therefore empty by
+    // construction: nothing left in the set is ever assigned in this body.
+    if (!failed_ && !module_unbound_.empty()) {
+        std::set<std::string> reaches_global;
+        for (const std::string& name : module_unbound_) {
+            if (local_names.count(name) == 0 && parameter_names.count(name) == 0) {
+                reaches_global.insert(name);
+            }
+        }
+        std::set<std::string> nothing_bound;
+        check_definite_assignment(node.body(), reaches_global, nothing_bound,
+                                  kModuleUnboundPhrase);
+    }
     if (failed_) {
         at_module_level_ = outer_module_level;
         in_conditional_block_ = outer_conditional;

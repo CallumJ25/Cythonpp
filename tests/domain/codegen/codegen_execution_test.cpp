@@ -200,6 +200,55 @@ TEST(CodegenExecution, OverflowExitsNonZeroWithNoStdout) {
     EXPECT_EQ(result.stdout_text, "");
 }
 
+// POST-WAVE CRITICAL, the ACCEPTING half. The cross-boundary refusal that
+// closes the "a function reads a global the module may never assign" hole
+// (emitter_module_test.cpp pins the refusals) must not over-refuse the
+// ordinary case, and only actually RUNNING these proves it -- a text
+// assertion would pass for a program that does not compile, which is how
+// five separate defects reached review on this project. Every expected
+// stdout below was produced by RUNNING CPython 3.14.
+TEST(CodegenExecution, AFunctionReadingADefinitelyAssignedGlobalStillRunsCorrectly) {
+    // Unconditional assignment at module level.
+    const RunResult unconditional =
+        compile_and_run("s: str = \"cfg\"\n\n\n"
+                        "def label() -> str:\n    return s + \"!\"\n\n\nprint(label())\n");
+    EXPECT_EQ(unconditional.exit_code, 0);
+    EXPECT_EQ(unconditional.stdout_text, "cfg!\n");
+
+    // Assigned in BOTH arms, so the intersection binds it.
+    const RunResult both_arms =
+        compile_and_run("c: bool = False\nif c:\n    s: str = \"cfg\"\nelse:\n    s = \"alt\"\n\n\n"
+                        "def label() -> str:\n    return s + \"!\"\n\n\nprint(label())\n");
+    EXPECT_EQ(both_arms.exit_code, 0);
+    EXPECT_EQ(both_arms.stdout_text, "alt!\n");
+
+    // Assigned before the `if` and merely reassigned inside it.
+    const RunResult reassigned =
+        compile_and_run("c: bool = True\ns: str = \"base\"\nif c:\n    s = \"cfg\"\n\n\n"
+                        "def label() -> str:\n    return s + \"!\"\n\n\nprint(label())\n");
+    EXPECT_EQ(reassigned.exit_code, 0);
+    EXPECT_EQ(reassigned.stdout_text, "cfg!\n");
+
+    // A PARAMETER shadowing a global the module may never assign: the
+    // parameter wins, and the global is never read at all.
+    const RunResult shadowed =
+        compile_and_run("c: bool = False\nif c:\n    s: str = \"cfg\"\n\n\n"
+                        "def label(s: str) -> str:\n    return s + \"!\"\n\n\n"
+                        "print(label(\"arg\"))\n");
+    EXPECT_EQ(shadowed.exit_code, 0);
+    EXPECT_EQ(shadowed.stdout_text, "arg!\n");
+
+    // A LOCAL of the same name, assigned before its own read: likewise the
+    // function's own, so the cross-boundary check must leave it alone and
+    // the ordinary in-scope check must find it bound.
+    const RunResult own_local =
+        compile_and_run("c: bool = False\nif c:\n    s: str = \"cfg\"\n\n\n"
+                        "def label() -> str:\n    s = \"own\"\n    return s + \"!\"\n\n\n"
+                        "print(label())\n");
+    EXPECT_EQ(own_local.exit_code, 0);
+    EXPECT_EQ(own_local.stdout_text, "own!\n");
+}
+
 // Spec Decision 2: the representation stays swappable only while the emitter
 // names the type and calls its operations. A convention nobody checks is not
 // a guarantee, so this inspects the emitted text directly.

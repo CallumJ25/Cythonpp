@@ -70,6 +70,7 @@ std::optional<std::string> Emitter::emit_module(const ast::Module& module) {
     indent_ = 0;
     function_declared_.clear();
     module_declared_.clear();
+    module_unbound_.clear();
 
     // Step 2: the runtime include.
     write("#include \"cythonpp/cythonpp.h\"\n\n");
@@ -89,9 +90,20 @@ std::optional<std::string> Emitter::emit_module(const ast::Module& module) {
     // entry, so `bound` starts empty.
     {
         std::set<std::string> bound;
-        check_definite_assignment(module.body(), module_names, bound);
+        check_definite_assignment(module.body(), module_names, bound, kScopeUnboundPhrase);
         if (failed_) {
             return std::nullopt;
+        }
+        // POST-WAVE CRITICAL: whatever the walk did NOT bind by the end of the
+        // module body is a file-scope declaration that may never be assigned
+        // at all, so every read of it from inside a function body (Step 5,
+        // below) must be refused rather than silently reading a
+        // default-constructed value. See emitter.h's module_unbound_ comment
+        // for why "by the END of the body" is the deliberate key.
+        for (const std::string& name : module_names) {
+            if (bound.count(name) == 0) {
+                module_unbound_.insert(name);
+            }
         }
     }
     if (!module_declared_.empty()) {
