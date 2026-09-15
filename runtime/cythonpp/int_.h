@@ -6,6 +6,7 @@
 #include "bool_.h"
 #include "fail.h"
 #include "none.h"
+#include "numeric_tag.h"
 
 namespace py {
 
@@ -24,22 +25,45 @@ namespace py {
 // one failure this whole design exists to prevent. Trapping is the runtime
 // analogue of the NotImplementedError the compiler reports statically: a loud
 // capability claim.
+//
+// TASK 10B: int_ may hold a bool or a genuine int -- Python's bool is an int
+// subtype, so a bool-declared value read through an int-declared name (or
+// widened into one, via to_int(bool_) below) must still print and compare as
+// a bool. `tag_` records which; every arithmetic function on this type
+// constructs its result through the single-argument constructor, which
+// defaults to Int, matching Python exactly: `True + True` is `2`, an int,
+// never a bool, so arithmetic always loses the Bool tag and only
+// to_int(bool_)/the two-argument constructor below ever produce one.
 class int_ {
 public:
     constexpr int_() = default;
     constexpr explicit int_(std::int64_t value) : value_(value) {}
+    // For a value that is ACTUALLY a bool or genuinely an int -- never
+    // ambiguous with the single-argument constructor above, since argument
+    // counts differ; there is still exactly one single-argument (converting)
+    // constructor, so the "no implicit converting constructors" rule that
+    // keeps the add/sub/mul overload sets unambiguous (see float_.h) still
+    // holds.
+    constexpr explicit int_(std::int64_t value, NumericTag tag) : value_(value), tag_(tag) {}
 
     constexpr std::int64_t raw() const { return value_; }
+    constexpr NumericTag tag() const { return tag_; }
+    constexpr bool is_bool() const { return tag_ == NumericTag::Bool; }
 
 private:
     std::int64_t value_ = 0;
+    NumericTag tag_ = NumericTag::Int;
 };
 
 inline bool truthy(int_ v) { return v.raw() != 0; }
 
 // Python's bool is an int subtype, so `True + 1` is `2`. The emitter inserts
-// this widening around a Bool-typed operand whose operation produces an Int.
-inline int_ to_int(bool_ v) { return int_(v.raw() ? 1 : 0); }
+// this widening around a Bool-typed operand whose operation produces an Int,
+// and around a Bool-typed VALUE assigned/declared/returned where an Int is
+// expected (emit_value_widened) -- the latter is why the tag must survive:
+// `i: int = some_bool` must still print and compare as the bool it actually
+// holds, not silently become a plain int.
+inline int_ to_int(bool_ v) { return int_(v.raw() ? 1 : 0, NumericTag::Bool); }
 inline int_ to_int(int_ v) { return v; }
 
 inline int_ add(int_ a, int_ b) {

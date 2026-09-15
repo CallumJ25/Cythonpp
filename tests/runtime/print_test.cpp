@@ -34,4 +34,16 @@ TEST(RuntimePrint, StrPrintsItsContentsUnquoted) {
     EXPECT_EQ(captured([] { py::print(py::str("hi")); }), "hi\n");
 }
 
+// TASK 10B, obligation 1: print renders by the RUNTIME tag, not the static
+// C++ type -- `x: float = 1; print(x)` must print `1`, not `1.0`, and
+// `def f(x: bool) -> int: return x` must print `True`/`False`, not `1`/`0`.
+TEST(RuntimePrint, RendersByRuntimeTagNotStaticType) {
+    EXPECT_EQ(captured([] { py::print(py::to_float(py::int_(1))); }), "1\n");
+    EXPECT_EQ(captured([] { py::print(py::to_int(py::bool_(true))); }), "True\n");
+    EXPECT_EQ(captured([] { py::print(py::to_int(py::bool_(false))); }), "False\n");
+    EXPECT_EQ(captured([] { py::print(py::to_float(py::bool_(true))); }), "True\n");
+    // A genuine float still prints via the shortest-round-trip repr.
+    EXPECT_EQ(captured([] { py::print(py::float_(1.0)); }), "1.0\n");
+}
+
 } // namespace

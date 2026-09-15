@@ -50,6 +50,31 @@ TEST(RuntimeInt, BoolWidensToInt) {
     EXPECT_EQ(py::add(py::to_int(py::bool_(true)), py::int_(1)).raw(), 2);
 }
 
+// TASK 10B, obligation 1: to_int(bool_) must still be recognisably the bool
+// it widened -- an annotation constrains, it does not coerce -- so the
+// widened value keeps the Bool tag and prints/repr's as True/False, not 1/0.
+TEST(RuntimeInt, ToIntWidensBoolWithoutCoercingItToANumber) {
+    const py::int_ widened_true = py::to_int(py::bool_(true));
+    EXPECT_TRUE(widened_true.is_bool());
+    EXPECT_EQ(widened_true.raw(), 1);
+
+    const py::int_ widened_false = py::to_int(py::bool_(false));
+    EXPECT_TRUE(widened_false.is_bool());
+    EXPECT_EQ(widened_false.raw(), 0);
+
+    // Ordinary int_ values are never tagged Bool.
+    EXPECT_FALSE(py::int_(1).is_bool());
+}
+
+// TASK 10B, obligation 2: `bool + bool` is an int, `True + True == 2`, and
+// the result must NOT itself be tagged Bool (arithmetic always loses the
+// Bool tag in Python, matching `type(True + True) is int`).
+TEST(RuntimeInt, BoolPlusBoolIsAnUntaggedInt) {
+    const py::int_ sum = py::add(py::to_int(py::bool_(true)), py::to_int(py::bool_(true)));
+    EXPECT_EQ(sum.raw(), 2);
+    EXPECT_FALSE(sum.is_bool());
+}
+
 // Overflow and division by zero exit the process; EXPECT_EXIT is how
 // GoogleTest observes that without the test binary dying.
 TEST(RuntimeIntDeathTest, OverflowExitsNonZero) {

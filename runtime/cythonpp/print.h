@@ -13,7 +13,20 @@ namespace py {
 
 // One overload per printable type. Bool and None need Python's spelling, and
 // float needs repr rather than operator<<'s default, which prints 1.0 as "1".
-inline void print_one(std::ostream& out, int_ v) { out << v.raw(); }
+//
+// TASK 10B: int_ must render by its runtime TAG, not by its static C++ type
+// -- an int_ actually holding a bool (reached via to_int(bool_), or read
+// through an int-declared name after a bool value flowed into it) prints as
+// "True"/"False", matching the object it actually is. print_one(float_)
+// needs no equivalent branch here: repr(float_) (float_.h) already renders
+// by tag on its own.
+inline void print_one(std::ostream& out, int_ v) {
+    if (v.is_bool()) {
+        out << (v.raw() != 0 ? "True" : "False");
+    } else {
+        out << v.raw();
+    }
+}
 inline void print_one(std::ostream& out, bool_ v) { out << (v.raw() ? "True" : "False"); }
 inline void print_one(std::ostream& out, float_ v) { out << repr(v); }
 inline void print_one(std::ostream& out, none_t) { out << "None"; }
