@@ -172,5 +172,68 @@ TEST(CliAdapter, EmitCppFlagWritesNoFileAndExitsNonZeroForAnUnsupportedInput) {
     EXPECT_FALSE(std::filesystem::exists(expected_cpp));
 }
 
+// THE SEAM this round's fix closes. Reproduces the reviewer's exact
+// scenario: emit successfully once, regress the SAME source file into
+// something unsupported, re-run, and confirm the prior run's .cpp does not
+// survive -- a stale file that would otherwise be indistinguishable from
+// current output. Driven through the real CliAdapter path rather than a
+// unit-level stub, since the gap was in the write step, not in the pipeline.
+TEST(CliAdapter, EmitCppFlagRemovesAStaleCppWhenAPreviouslyEmittableFileRegresses) {
+    TempPythonFile file("print(1)\n");
+    const std::filesystem::path expected_cpp =
+        std::filesystem::path(file.path()).replace_extension(".cpp");
+    std::filesystem::remove(expected_cpp);
+    std::string out;
+    std::string err;
+
+    ASSERT_EQ(run_cli({"--emit-cpp", file.path()}, out, err), 0);
+    ASSERT_TRUE(std::filesystem::exists(expected_cpp)) << "precondition: a prior run wrote it";
+
+    // Regress the very same file in place, exactly as the reviewer's
+    // reproduction edits stale.py into an unsupported construct.
+    {
+        std::ofstream regressed(file.path(), std::ios::trunc);
+        regressed << "xs: list[int] = []\n";
+    }
+
+    const int exit_code = run_cli({"--emit-cpp", file.path()}, out, err);
+
+    EXPECT_NE(exit_code, 0);
+    EXPECT_FALSE(std::filesystem::exists(expected_cpp))
+        << "a stale .cpp from the prior successful run must not survive a regression";
+}
+
+// The safety half of the same fix: a file at the target path that this
+// compiler never wrote (no marker) must be left alone even when the source
+// at the same stem fails to emit. Without this, "clean up a stale target"
+// could turn into "delete whatever happens to be at this path", which is a
+// strictly worse defect than the stale-file problem being fixed.
+TEST(CliAdapter, EmitCppFlagLeavesAForeignFileAtTheTargetPathUntouchedOnFailure) {
+    TempPythonFile file("xs: list[int] = []\n");
+    const std::filesystem::path foreign_cpp =
+        std::filesystem::path(file.path()).replace_extension(".cpp");
+    std::filesystem::remove(foreign_cpp);
+    {
+        std::ofstream foreign(foreign_cpp);
+        foreign << "// hand-written, not cythonpp output\nint main() { return 0; }\n";
+    }
+    std::string out;
+    std::string err;
+
+    const int exit_code = run_cli({"--emit-cpp", file.path()}, out, err);
+
+    EXPECT_NE(exit_code, 0);
+    ASSERT_TRUE(std::filesystem::exists(foreign_cpp))
+        << "a file this compiler never wrote must never be deleted";
+    std::ostringstream contents;
+    {
+        std::ifstream reopened(foreign_cpp);
+        contents << reopened.rdbuf();
+    }
+    EXPECT_NE(contents.str().find("hand-written"), std::string::npos);
+
+    std::filesystem::remove(foreign_cpp);
+}
+
 } // namespace
 } // namespace cythonpp::adapters::cli
