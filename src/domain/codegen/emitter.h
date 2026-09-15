@@ -2,6 +2,7 @@
 #define CYTHONPP_DOMAIN_CODEGEN_EMITTER_H
 
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -63,6 +64,12 @@ public:
     // make every expression test assert on boilerplate too.
     std::optional<std::string> emit_expression_for_test(const ast::Expr& expr);
 
+    // Test-only seam: emit one statement in isolation, the statement-side
+    // counterpart of emit_expression_for_test above, for exactly the same
+    // reason -- pinning one statement's emitted text without dragging in a
+    // whole module's boilerplate.
+    std::optional<std::string> emit_statement_for_test(const ast::Stmt& statement);
+
     // Expressions (emitter_expressions.cpp, Tasks 5-6).
     void visit(const ast::Attribute& node) override;
     void visit(const ast::BinOp& node) override;
@@ -122,6 +129,31 @@ private:
     // Task 7-8 helpers.
     void emit_suite(const std::vector<ast::StmtPtr>& body);
     void write_indent();
+    void write_line(std::string_view text);
+    void emit_assignment(const ast::Expr& target, const ast::Expr& value,
+                         const semantic::Type* declared);
+
+    // A function's parameter and return types (and an AnnAssign's declared
+    // type) come from ANNOTATIONS, not from an expression the checker typed
+    // -- TypeMap deliberately holds no annotation-subtree entries (see
+    // type_map.h's own comment). This resolves one through
+    // semantic::AnnotationResolver and feeds the result to cpp_type_name; see
+    // emitter_statements.cpp for the class-lookup stand-in and the sink this
+    // uses, and why both are safe for the scalar slice this stage admits.
+    std::optional<std::string> cpp_type_name_of_annotation(const ast::Expr& annotation) const;
+
+    // Names already declared in the CURRENT function body. Empty at module
+    // level, where declarations live in the file-scope prelude instead.
+    std::set<std::string> function_declared_;
+    bool at_module_level_ = true;
+
+    // Whether the loop currently being emitted declared a `_cy_broke_<depth>`
+    // flag, i.e. whether it has an `else` clause. Saved and restored around a
+    // loop's own body exactly as at_module_level_ is around a function's,
+    // because loops nest: an inner loop with no else, inside an outer one
+    // that has one, must still emit a bare `break;` rather than reference a
+    // flag only the OUTER loop declared.
+    bool loop_has_else_ = false;
 
     const semantic::TypeMap& types_;
     diagnostics::DiagnosticSink& sink_;

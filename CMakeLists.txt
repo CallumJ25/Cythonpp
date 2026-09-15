@@ -126,6 +126,7 @@ if(CYTHONPP_BUILD_TESTS)
         tests/domain/codegen/cpp_type_name_test.cpp
         tests/domain/codegen/name_mangler_test.cpp
         tests/domain/codegen/emitter_expression_test.cpp
+        tests/domain/codegen/emitter_statement_test.cpp
         tests/runtime/int_test.cpp
         tests/runtime/float_test.cpp
         tests/runtime/str_test.cpp
