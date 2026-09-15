@@ -26,6 +26,20 @@ inline bool truthy(float_ v) { return v.raw() != 0.0; }
 inline double as_double(int_ v) { return static_cast<double>(v.raw()); }
 inline double as_double(float_ v) { return v.raw(); }
 
+// Python's numeric tower (bool <: int <: float) is a real subtyping
+// relationship the checker's own is_subtype enforces -- `x: float = 1` and
+// `def f(x: bool) -> float: return x` both type-check clean -- but int_ and
+// bool_ have no implicit conversion to float_ (see int_.h's own comment: the
+// interface is the point, and an implicit converting constructor here would
+// make the add/sub/mul overload sets below ambiguous). The emitter inserts an
+// explicit call to one of these three wherever a value's own type is a
+// proper subtype of the C++ type it is being declared, assigned, or returned
+// as. to_float(float_) is the identity case, included so a caller need not
+// special-case "no widening needed" itself.
+inline float_ to_float(bool_ v) { return float_(v.raw() ? 1.0 : 0.0); }
+inline float_ to_float(int_ v) { return float_(as_double(v)); }
+inline float_ to_float(float_ v) { return v; }
+
 // Python's float repr: the shortest string that round-trips, with a trailing
 // ".0" when the result would otherwise be indistinguishable from an int.
 // std::to_chars' shortest form supplies the round-trip guarantee; the suffix

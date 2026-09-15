@@ -1,6 +1,9 @@
 #include "domain/codegen/emitter.h"
 
+#include <cstddef>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "domain/ast/ann_assign.h"
@@ -23,6 +26,7 @@
 #include "domain/semantic/annotation_resolver.h"
 #include "domain/semantic/class_lookup.h"
 #include "domain/semantic/type.h"
+#include "domain/semantic/type_compatibility.h"
 
 namespace cythonpp::domain::codegen {
 namespace {
@@ -85,6 +89,36 @@ semantic::Type resolve_annotation_type(const ast::Expr& annotation) {
     return resolver.resolve(annotation);
 }
 
+// CRITICAL FIX (post-review round 1): the runtime spelling of the explicit
+// conversion needed to raise a value of kind `from` into a variable/return
+// slot of kind `to`, or nullptr when none is needed. Reuses
+// semantic::numeric_rank -- the numeric tower's single shared authority
+// (type_compatibility.h's own comment: "shared with the operator rules") --
+// rather than hand-rolling a second copy of Bool <: Int <: Float here, which
+// is exactly the kind of duplication that let two copies of this tower
+// drift apart elsewhere in this codebase.
+//
+// Only WIDENING (from_rank < to_rank) ever needs a conversion; equal ranks
+// (including two kinds outside the tower entirely, e.g. Str to Str, where
+// both ranks are 0) emit nothing, matching every existing test's plain
+// `emit_expr` output. A narrowing pair (e.g. to_rank < from_rank) can only
+// reach this function for a program the checker would already have
+// rejected -- is_subtype's numeric-tower rule is a total order in the
+// widening direction only -- so it is treated the same as "no relationship",
+// not as a case to guess a conversion for.
+//
+// The only two reachable `to` kinds are Int and Float: `to_rank` is nonzero
+// (checked below) and STRICTLY GREATER than `from_rank`, and Bool -- rank 1,
+// the tower's own floor -- can never be a strict upper bound on anything.
+const char* numeric_widening_function(semantic::TypeKind from, semantic::TypeKind to) {
+    const int from_rank = semantic::numeric_rank(from);
+    const int to_rank = semantic::numeric_rank(to);
+    if (from_rank == 0 || to_rank == 0 || from_rank >= to_rank) {
+        return nullptr;
+    }
+    return to == semantic::TypeKind::Int ? "py::to_int" : "py::to_float";
+}
+
 } // namespace
 
 void Emitter::write_indent() {
@@ -121,6 +155,20 @@ std::optional<std::string> Emitter::cpp_type_name_of_annotation(const ast::Expr&
     return cpp_type_name(resolve_annotation_type(annotation));
 }
 
+void Emitter::emit_value_widened(const ast::Expr& value, const semantic::Type& target) {
+    const semantic::Type* value_type = type_of(value);
+    const char* widen =
+        value_type != nullptr ? numeric_widening_function(value_type->kind, target.kind) : nullptr;
+    if (widen != nullptr) {
+        write(widen);
+        write("(");
+    }
+    emit_expr(value);
+    if (widen != nullptr) {
+        write(")");
+    }
+}
+
 void Emitter::visit(const ast::ExprStmt& node) {
     write_indent();
     emit_expr(node.value());
@@ -149,7 +197,27 @@ void Emitter::emit_assignment(const ast::Expr& target, const ast::Expr& value,
         return;
     }
     const std::string mangled = mangle(name->identifier());
-    const semantic::Type* type = declared != nullptr ? declared : type_of(target);
+
+    // CRITICAL FIX (post-review round 1): a REASSIGNMENT'S target type is
+    // whatever the local was FIRST declared as, not whatever this
+    // particular value's own type happens to be -- `x: float = 1.0` then a
+    // later plain `x = 2` is mypy-clean (2 widens into the DECLARED float),
+    // and the C++ variable is still `py::float_`, so the second statement
+    // must widen against Float even though `2` on its own types as Int. A
+    // function-local lookup wins over the `declared`/type_of fallback chain
+    // below for exactly this reason; at module level there is no such
+    // record yet (Task 8 owns the prelude), so the lookup is skipped there.
+    const semantic::Type* existing = nullptr;
+    if (!at_module_level_) {
+        const auto it = function_declared_.find(mangled);
+        if (it != function_declared_.end()) {
+            existing = &it->second;
+        }
+    }
+    const semantic::Type* type = existing;
+    if (type == nullptr) {
+        type = declared != nullptr ? declared : type_of(target);
+    }
     if (type == nullptr) {
         type = type_of(value);
     }
@@ -164,14 +232,20 @@ void Emitter::emit_assignment(const ast::Expr& target, const ast::Expr& value,
     }
 
     write_indent();
-    const bool declare = !at_module_level_ && function_declared_.insert(mangled).second;
+    const bool declare = !at_module_level_ && existing == nullptr;
     if (declare) {
         write(*cpp);
         write(" ");
+        function_declared_.emplace(mangled, *type);
     }
     write(mangled);
     write(" = ");
-    emit_expr(value);
+    // CRITICAL FIX (post-review round 1): the initializer must be WIDENED to
+    // `*type` when its own static type is a proper numeric-tower subtype of
+    // it (see emit_value_widened's own comment) -- `emit_expr(value)` alone
+    // reproduced the value's OWN type, e.g. `py::int_(1)` for an `x: float =
+    // 1` declaration whose variable is `py::float_`, which does not compile.
+    emit_value_widened(value, *type);
     write(";\n");
 }
 
@@ -290,11 +364,29 @@ void Emitter::visit(const ast::Return& node) {
     }
     write_indent();
     write("return ");
-    emit_expr(node.value());
+    // CRITICAL FIX (post-review round 1): widen against the enclosing
+    // function's declared return type -- `def f(x: bool) -> int: return x`
+    // is mypy-clean (bool <: int) but `return cy_x;` alone would hand back a
+    // bare py::bool_ from a function declared to return py::int_, which does
+    // not compile.
+    emit_value_widened(node.value(), return_type_);
     write(";\n");
 }
 
 void Emitter::visit(const ast::FunctionDef& node) {
+    // IMPORTANT FIX (post-review round 1): standard C++ has no nested
+    // function definitions at all -- not even as a Clang extension -- while
+    // Python's are fully supported upstream (TypeChecker walks them, and a
+    // nested def can read/write an enclosing local via a closure). A `def`
+    // reached while already inside another function's body must be refused
+    // by name rather than emitting invalid syntax with no diagnostic at all.
+    // Checked first, before any of the checks below: none of them are
+    // meaningful for a construct this slice cannot represent regardless of
+    // how well-formed it is.
+    if (!at_module_level_) {
+        refuse(node, "a nested function definition");
+        return;
+    }
     if (!is_manglable_identifier(node.name())) {
         refuse(node, "a non-ASCII identifier");
         return;
@@ -304,7 +396,11 @@ void Emitter::visit(const ast::FunctionDef& node) {
         return;
     }
 
-    const std::optional<std::string> return_type = cpp_type_name_of_annotation(node.return_annotation());
+    // Resolved once, as a Type (not just its cpp_type_name spelling), because
+    // visit(Return) needs the Type itself to decide whether a value needs
+    // widening -- see return_type_'s own comment.
+    const semantic::Type declared_return_type = resolve_annotation_type(node.return_annotation());
+    const std::optional<std::string> return_type = cpp_type_name(declared_return_type);
     if (!return_type.has_value()) {
         refuse(node, "an unsupported return type");
         return;
@@ -316,6 +412,12 @@ void Emitter::visit(const ast::FunctionDef& node) {
     write(mangle(node.name()));
     write("(");
     bool first = true;
+    // Parameter Types, matched positionally with node.params() below once
+    // every parameter has been validated -- collected before any name enters
+    // function_declared_, so a refusal partway through never leaves a
+    // partially-populated map for the (never-reached, since failed_ is now
+    // set) body walk to see.
+    std::vector<semantic::Type> parameter_types;
     for (const ast::Parameter& parameter : node.params()) {
         if (parameter.annotation == nullptr) {
             refuse(node, "a parameter with no annotation");
@@ -329,8 +431,8 @@ void Emitter::visit(const ast::FunctionDef& node) {
             refuse(node, "a non-ASCII identifier");
             return;
         }
-        const std::optional<std::string> parameter_type =
-            cpp_type_name_of_annotation(*parameter.annotation);
+        semantic::Type parameter_declared_type = resolve_annotation_type(*parameter.annotation);
+        const std::optional<std::string> parameter_type = cpp_type_name(parameter_declared_type);
         if (!parameter_type.has_value()) {
             refuse(node, "an unsupported parameter type");
             return;
@@ -342,21 +444,29 @@ void Emitter::visit(const ast::FunctionDef& node) {
         write(*parameter_type);
         write(" ");
         write(mangle(parameter.name));
+        parameter_types.push_back(std::move(parameter_declared_type));
     }
     write(") {\n");
 
-    // A nested function would need its own declared-name set saved and
-    // restored; this slice has none, so the sets are simply swapped for the
-    // body and restored after.
+    // A nested function would need its own declared-name map, return type,
+    // and module-level flag saved and restored; this slice refuses nested
+    // defs outright (above), so these are simply swapped/replaced for the
+    // body and restored after -- there is never a second frame live at once,
+    // but the save/restore is written as though there could be, matching
+    // at_module_level_'s own convention, so a future relaxation of the
+    // nested-def refusal does not have to rediscover this.
     const bool outer_module_level = at_module_level_;
-    std::set<std::string> outer_declared;
+    std::map<std::string, semantic::Type> outer_declared;
     outer_declared.swap(function_declared_);
+    const semantic::Type outer_return_type = return_type_;
+    return_type_ = declared_return_type;
     at_module_level_ = false;
-    for (const ast::Parameter& parameter : node.params()) {
-        function_declared_.insert(mangle(parameter.name));
+    for (std::size_t i = 0; i < node.params().size(); ++i) {
+        function_declared_.emplace(mangle(node.params()[i].name), parameter_types[i]);
     }
     emit_suite(node.body());
     at_module_level_ = outer_module_level;
+    return_type_ = outer_return_type;
     function_declared_.swap(outer_declared);
 
     write_line("}");

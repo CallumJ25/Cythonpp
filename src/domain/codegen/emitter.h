@@ -1,8 +1,8 @@
 #ifndef CYTHONPP_DOMAIN_CODEGEN_EMITTER_H
 #define CYTHONPP_DOMAIN_CODEGEN_EMITTER_H
 
+#include <map>
 #include <optional>
-#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -133,6 +133,18 @@ private:
     void emit_assignment(const ast::Expr& target, const ast::Expr& value,
                          const semantic::Type* declared);
 
+    // Emits `value`, wrapped in the runtime's explicit py::to_int/py::to_float
+    // conversion when `value`'s own static type is a PROPER subtype of
+    // `target` within Python's numeric tower (bool <: int <: float) -- a real
+    // subtyping relationship is_subtype enforces, so `x: float = 1` and
+    // `def f(x: bool) -> int: return x` both type-check clean under mypy, yet
+    // py::int_/py::bool_ have no implicit conversion to py::float_/py::int_
+    // (see runtime/cythonpp/int_.h's own comment: that is deliberate, so the
+    // add/sub/mul overload sets stay unambiguous). Backs every site that puts
+    // a value where a DECLARED C++ type is expected rather than an inferred
+    // one: emit_assignment's initializer and visit(Return)'s value.
+    void emit_value_widened(const ast::Expr& value, const semantic::Type& target);
+
     // A function's parameter and return types (and an AnnAssign's declared
     // type) come from ANNOTATIONS, not from an expression the checker typed
     // -- TypeMap deliberately holds no annotation-subtree entries (see
@@ -142,10 +154,22 @@ private:
     // uses, and why both are safe for the scalar slice this stage admits.
     std::optional<std::string> cpp_type_name_of_annotation(const ast::Expr& annotation) const;
 
-    // Names already declared in the CURRENT function body. Empty at module
-    // level, where declarations live in the file-scope prelude instead.
-    std::set<std::string> function_declared_;
+    // Names already declared in the CURRENT function body, mapped to the C++
+    // type each was declared with. Empty at module level, where declarations
+    // live in the file-scope prelude instead. A MAP rather than a set of
+    // names: a REASSIGNMENT (`x = 2.5` with no annotation of its own) must
+    // widen against the type the name was first declared with, not against
+    // whatever this particular value's own type happens to be -- the two can
+    // legitimately differ (`x: float = 1.0` then `x = 2`), and a mere set
+    // cannot answer "declared as what".
+    std::map<std::string, semantic::Type> function_declared_;
     bool at_module_level_ = true;
+
+    // The enclosing function's declared return type, consulted by
+    // visit(Return) to widen its value exactly as emit_assignment does for an
+    // initializer. Meaningless at module level (Python itself rejects a
+    // `return` there, so nothing reads this while at_module_level_ is true).
+    semantic::Type return_type_;
 
     // Whether the loop currently being emitted declared a `_cy_broke_<depth>`
     // flag, i.e. whether it has an `else` clause. Saved and restored around a

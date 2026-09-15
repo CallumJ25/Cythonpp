@@ -23,6 +23,17 @@ TEST(RuntimeFloat, TrueDivisionAlwaysProducesFloat) {
     EXPECT_EQ(py::repr(py::truediv(py::int_(1), py::int_(3))), "0.3333333333333333");
 }
 
+// The numeric-tower widening the emitter inserts for a `bool`/`int` value
+// assigned, declared, or returned where a `float` is expected -- see
+// emitter_statements.cpp's emit_value_widened. to_float(float_) is the
+// identity case a caller reaches when no widening was actually necessary.
+TEST(RuntimeFloat, ToFloatWidensBoolAndInt) {
+    EXPECT_EQ(py::to_float(py::bool_(true)).raw(), 1.0);
+    EXPECT_EQ(py::to_float(py::bool_(false)).raw(), 0.0);
+    EXPECT_EQ(py::to_float(py::int_(7)).raw(), 7.0);
+    EXPECT_EQ(py::to_float(py::float_(2.5)).raw(), 2.5);
+}
+
 TEST(RuntimeFloat, MixedIntAndFloatArithmetic) {
     EXPECT_EQ(py::add(py::int_(1), py::float_(0.5)).raw(), 1.5);
     EXPECT_EQ(py::add(py::float_(0.5), py::int_(1)).raw(), 1.5);

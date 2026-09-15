@@ -95,6 +95,38 @@ TEST(EmitterStatement, NestedLoopWithoutElseInsideOneWithElseEmitsBareBreak) {
     EXPECT_NE(text.find("break;"), std::string::npos);
 }
 
+// MINOR, flagged by review round 1: an outer-level `break` that comes AFTER
+// a nested inner loop has already fully closed must still set the OUTER
+// loop's flag -- loop_has_else_ is restored to the outer loop's own value
+// once the inner loop's body finishes emitting, so this break (which is
+// textually inside the outer loop's body but outside the inner loop
+// entirely) sees loop_has_else_ == true again, same as
+// NestedLoopWithoutElseInsideOneWithElseEmitsBareBreak's inner break sees it
+// restored to false once its own inner loop's turn is done. Exact text
+// asserted (rather than substring checks) since the whole shape is small
+// enough to pin precisely.
+TEST(EmitterStatement, OuterBreakAfterAClosedInnerLoopStillSetsTheOuterFlag) {
+    EXPECT_EQ(emitted("while True:\n"
+                       "    while True:\n"
+                       "        break\n"
+                       "    break\n"
+                       "else:\n"
+                       "    print(1)\n")
+                  .value(),
+              "{\n"
+              "  bool _cy_broke_0 = false;\n"
+              "  while (py::truthy(py::bool_(true))) {\n"
+              "    while (py::truthy(py::bool_(true))) {\n"
+              "      break;\n"
+              "    }\n"
+              "    _cy_broke_0 = true; break;\n"
+              "  }\n"
+              "  if (!_cy_broke_0) {\n"
+              "    py::print(py::int_(1));\n"
+              "  }\n"
+              "}\n");
+}
+
 TEST(EmitterStatement, FunctionDefinition) {
     EXPECT_EQ(emitted("def f(a: int) -> int:\n    return a\n").value(),
               "py::int_ cy_f(py::int_ cy_a) {\n"
@@ -123,17 +155,67 @@ TEST(EmitterStatement, BareReturn) {
 // ANNOTATION, not from the value's own inferred type. `x: float = 1` binds a
 // float-declared local from an int LITERAL -- mypy-clean, since int widens to
 // float -- so the declaration must read `py::float_`, not `py::int_` (the
-// literal's own type). Getting this wrong doesn't just mistype the variable:
-// a later `x = 2.5` (also mypy-clean, since 2.5 is compatible with the
-// DECLARED type float) would then try to assign a py::float_ onto a variable
-// declared py::int_, which does not compile at all (int_ has no operator=
-// taking a float_).
+// literal's own type).
+//
+// FIX (post-review round 1): getting the DECLARED type right isn't the whole
+// fix -- the value `1` is still typed Int by the checker, and Int has no
+// implicit conversion to Float (see runtime/cythonpp/int_.h's own comment),
+// so the initializer itself must be explicitly widened: `py::to_float(...)`,
+// not a bare `py::int_(1)` handed to a `py::float_` variable. This test used
+// to assert the latter, which is invalid C++ -- see this file's clang++
+// verification in the round-1 fix report for the compile check that caught
+// it. The second line (`x = 2.5`, a plain reassignment) still needs no
+// widening of its own -- 2.5 is already Float -- but IS the reassignment
+// case that needs the DECLARED type remembered rather than re-derived from
+// this value: see the dedicated reassignment test below for the case where
+// that distinction actually bites.
 TEST(EmitterStatement, AnnotatedLocalDeclaresTheAnnotationsTypeNotTheValues) {
     EXPECT_EQ(emitted("def f() -> None:\n    x: float = 1\n    x = 2.5\n").value(),
               "py::none_t cy_f() {\n"
-              "  py::float_ cy_x = py::int_(1);\n"
+              "  py::float_ cy_x = py::to_float(py::int_(1));\n"
               "  cy_x = py::float_(2.5);\n"
               "}\n");
+}
+
+// CRITICAL FIX (post-review round 1), the reassignment half specifically:
+// `function_declared_` must remember the DECLARED type (Float, from the
+// annotation), not merely THAT the name was declared, so a later plain
+// reassignment of a LOWER-ranked value (`2`, Int) widens against the
+// variable's real C++ type rather than declaring how `2` alone would type.
+// `x = 2` here reuses `cy_x`'s existing `py::float_` slot, so the value must
+// be `py::to_float(py::int_(2))`, not a bare `py::int_(2)` -- which, again,
+// does not compile against a `py::float_` variable.
+TEST(EmitterStatement, ReassigningALowerRankedValueToAnAlreadyDeclaredLocalWidensIt) {
+    EXPECT_EQ(emitted("def f() -> None:\n    x: float = 1.0\n    x = 2\n").value(),
+              "py::none_t cy_f() {\n"
+              "  py::float_ cy_x = py::float_(1.0);\n"
+              "  cy_x = py::to_float(py::int_(2));\n"
+              "}\n");
+}
+
+// CRITICAL FIX (post-review round 1), the return half: a function returning
+// a WIDER type than one of its parameters must widen the returned value the
+// same way an assignment's initializer does. `bool <: int` is a real
+// subtyping relationship is_subtype enforces, so this is mypy-clean, but
+// `return cy_x;` alone would hand back a bare py::bool_ where py::int_ is
+// declared -- which does not compile.
+TEST(EmitterStatement, ReturnWidensABoolParameterToTheDeclaredIntReturnType) {
+    EXPECT_EQ(emitted("def f(x: bool) -> int:\n    return x\n").value(),
+              "py::int_ cy_f(py::bool_ cy_x) {\n"
+              "  return py::to_int(cy_x);\n"
+              "}\n");
+}
+
+// IMPORTANT FIX (post-review round 1): standard C++ has no nested function
+// definitions at all, not even as a Clang extension, while Python's are
+// fully supported upstream -- so a nested `def`, mypy-clean and
+// CPython-clean, must be refused by name rather than silently emitted as
+// invalid syntax (or, worse, silently dropped).
+TEST(EmitterStatement, NestedFunctionDefinitionIsRefused) {
+    Fixture fixture =
+        build("def outer() -> None:\n    def inner() -> None:\n        pass\n");
+    EXPECT_FALSE(emitted(fixture).has_value());
+    EXPECT_FALSE(fixture.emit_sink.empty());
 }
 
 // A bare `x: int` (no value) declares nothing executable here -- Python binds
