@@ -117,6 +117,7 @@ private:
     void emit_binary(const ast::BinOp& node);
     void emit_power(const ast::BinOp& node);
     void emit_call(const ast::Call& node);
+    void emit_operand_widened(const ast::Expr& operand, const semantic::Type& result);
 
     // Task 7-8 helpers.
     void emit_suite(const std::vector<ast::StmtPtr>& body);

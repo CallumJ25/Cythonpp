@@ -98,5 +98,129 @@ TEST(Emitter, ANonAsciiIdentifierIsRefused) {
     EXPECT_FALSE(fixture.emit_sink.empty());
 }
 
+TEST(Emitter, ArithmeticEmitsRuntimeCallsNotOperators) {
+    EXPECT_EQ(emitted("1 + 2\n").value(), "py::add(py::int_(1), py::int_(2))");
+    EXPECT_EQ(emitted("1 - 2\n").value(), "py::sub(py::int_(1), py::int_(2))");
+    EXPECT_EQ(emitted("1 * 2\n").value(), "py::mul(py::int_(1), py::int_(2))");
+    EXPECT_EQ(emitted("1 / 2\n").value(), "py::truediv(py::int_(1), py::int_(2))");
+    EXPECT_EQ(emitted("1 // 2\n").value(), "py::floordiv(py::int_(1), py::int_(2))");
+    EXPECT_EQ(emitted("1 % 2\n").value(), "py::mod(py::int_(1), py::int_(2))");
+}
+
+// Nesting composes with no parenthesisation logic, because every operation is
+// a CALL. This is the property that makes precedence a non-problem.
+TEST(Emitter, NestedArithmeticNeedsNoPrecedenceHandling) {
+    EXPECT_EQ(emitted("1 + 2 * 3\n").value(),
+              "py::add(py::int_(1), py::mul(py::int_(2), py::int_(3)))");
+}
+
+TEST(Emitter, UnaryOperators) {
+    EXPECT_EQ(emitted("-1\n").value(), "py::neg(py::int_(1))");
+    EXPECT_EQ(emitted("+1\n").value(), "py::int_(1)");
+    EXPECT_EQ(emitted("not True\n").value(), "py::not_(py::bool_(true))");
+}
+
+// Python's bool is an int subtype, so True + 1 is 2. The widening is inserted
+// by the emitter because the runtime has no bool arithmetic overloads.
+TEST(Emitter, BoolOperandsAreWidenedToInt) {
+    EXPECT_EQ(emitted("True + 1\n").value(),
+              "py::add(py::to_int(py::bool_(true)), py::int_(1))");
+}
+
+// --- Decision 4a: the power gate -------------------------------------------
+
+TEST(Emitter, PowerWithANonNegativeIntegerLiteralExponentIsEmitted) {
+    EXPECT_EQ(emitted("2 ** 10\n").value(), "py::pow(py::int_(2), py::int_(10))");
+    EXPECT_EQ(emitted("2 ** 0\n").value(), "py::pow(py::int_(2), py::int_(0))");
+    EXPECT_EQ(emitted("2.0 ** 3\n").value(), "py::pow(py::float_(2.0), py::int_(3))");
+}
+
+// THE GATE MUST BE ON AST SHAPE, NOT TYPE. A negative literal parses as
+// UnaryOp(-, Constant), and the TypeMap types this whole expression as `int`
+// -- which is WRONG, the value is 0.5. A gate that consulted the type would
+// happily emit an int-typed expression here and print 0 instead of 0.5.
+TEST(Emitter, PowerWithANegativeLiteralExponentIsRefused) {
+    Fixture fixture = build("2 ** -1\n");
+    EXPECT_FALSE(emit_last_expression(fixture).has_value());
+    ASSERT_FALSE(fixture.emit_sink.empty());
+    EXPECT_EQ(fixture.emit_sink.diagnostics().front().code, "NotImplementedError");
+}
+
+// mypy itself types a non-literal exponent as Any -- it gives up -- so there
+// is no honest C++ type to emit.
+TEST(Emitter, PowerWithANonLiteralExponentIsRefused) {
+    Fixture fixture = build("a: int = 2\nb: int = 3\na ** b\n");
+    EXPECT_FALSE(emit_last_expression(fixture).has_value());
+    EXPECT_FALSE(fixture.emit_sink.empty());
+}
+
+// (-8.0) ** 0.5 is COMPLEX in both CPython and mypy, and float in cythonpp's
+// TypeMap. Refusing every non-integer exponent covers it without needing to
+// know the base's sign, which nothing here does.
+TEST(Emitter, PowerWithAFractionalExponentIsRefused) {
+    Fixture fixture = build("(-8.0) ** 0.5\n");
+    EXPECT_FALSE(emit_last_expression(fixture).has_value());
+    EXPECT_FALSE(fixture.emit_sink.empty());
+}
+
+// --- Comparison and boolean operators ---------------------------------------
+
+TEST(Emitter, SimpleComparison) {
+    EXPECT_EQ(emitted("1 < 2\n").value(),
+              "py::lt(py::int_(1), py::int_(2))");
+}
+
+// The middle term must be evaluated EXACTLY ONCE, which is why a chain emits
+// an immediately-invoked lambda binding each operand to a temporary rather
+// than desugaring to `a < b && b < c`.
+TEST(Emitter, ComparisonChainEvaluatesEachOperandOnce) {
+    const std::string text = emitted("1 < 2 < 3\n").value();
+
+    EXPECT_NE(text.find("[&]() -> py::bool_"), std::string::npos);
+    EXPECT_NE(text.find("auto&& _cy_cmp_1 = (py::int_(2));"), std::string::npos)
+        << "the middle operand must be bound to one temporary";
+    EXPECT_EQ(text.find("py::int_(2)", text.find("py::int_(2)") + 1), std::string::npos)
+        << "the middle operand must appear exactly once in the emitted text";
+}
+
+// and/or return an OPERAND, not a bool, and short-circuit. The right side is
+// passed as a lambda so it is evaluated at most once and only if needed.
+TEST(Emitter, BooleanOperatorsPassTheRightSideLazily) {
+    EXPECT_EQ(emitted("a: int = 1\nb: int = 2\na and b\n").value(),
+              "py::and_(cy_a, [&]{ return cy_b; })");
+    EXPECT_EQ(emitted("a: int = 1\nb: int = 2\na or b\n").value(),
+              "py::or_(cy_a, [&]{ return cy_b; })");
+}
+
+// Differing operand types give the expression a Union type, which
+// cpp_type_name maps to nullopt. The refusal falls out of that with no rule
+// of its own -- see Task 4.
+TEST(Emitter, BooleanOperatorsOverDifferingTypesAreRefused) {
+    Fixture fixture = build("a: int = 1\nb: str = \"x\"\na and b\n");
+    EXPECT_FALSE(emit_last_expression(fixture).has_value());
+    EXPECT_FALSE(fixture.emit_sink.empty());
+}
+
+// --- Calls ------------------------------------------------------------------
+
+TEST(Emitter, PrintAndLen) {
+    EXPECT_EQ(emitted("print(1)\n").value(), "py::print(py::int_(1))");
+    EXPECT_EQ(emitted("print(1, 2)\n").value(), "py::print(py::int_(1), py::int_(2))");
+    EXPECT_EQ(emitted("print()\n").value(), "py::print()");
+    EXPECT_EQ(emitted("len(\"ab\")\n").value(),
+              "py::len(py::str(std::string(\"\\141\\142\", 2)))");
+}
+
+TEST(Emitter, ACallToADefinedFunctionIsMangled) {
+    EXPECT_EQ(emitted("def f(a: int) -> int:\n    return a\n\nf(1)\n").value(),
+              "cy_f(py::int_(1))");
+}
+
+TEST(Emitter, AnUnsupportedBuiltinCallIsRefused) {
+    Fixture fixture = build("abs(-1)\n");
+    EXPECT_FALSE(emit_last_expression(fixture).has_value());
+    EXPECT_FALSE(fixture.emit_sink.empty());
+}
+
 } // namespace
 } // namespace cythonpp::domain::codegen
