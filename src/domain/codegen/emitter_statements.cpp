@@ -30,6 +30,7 @@
 #include "domain/semantic/class_lookup.h"
 #include "domain/semantic/type.h"
 #include "domain/semantic/type_compatibility.h"
+#include "domain/semantic/type_name.h"
 
 namespace cythonpp::domain::codegen {
 namespace {
@@ -413,6 +414,41 @@ void Emitter::emit_value_widened(const ast::Expr& value, const semantic::Type& t
     const semantic::Type* value_type = type_of(value);
     const char* widen =
         value_type != nullptr ? numeric_widening_function(value_type->kind, target.kind) : nullptr;
+    // DECISION 0 BACKSTOP, 2026-09-16. A value only fits a DECLARED C++ slot
+    // when the two spell the same C++ type, or when a py::to_int/py::to_float
+    // widening call raises it into one; anything else emits an expression the
+    // slot has no `operator=`/parameter/return conversion for, which is
+    // `no viable overloaded '='` at clang++ -- a .cpp on disk from a run that
+    // exited 0 and reported nothing. Refusing here makes that third state
+    // unreachable from EVERY one of this function's three callers (an
+    // assignment initializer, a `return` value, and a call argument) at once,
+    // and it stays a backstop rather than the primary defence: a program whose
+    // value genuinely does not fit its declared type is one mypy rejects, so
+    // the semantic layer is what SHOULD report, with a far better message.
+    //
+    // It exists because the semantic layer is measurably not airtight here.
+    // Measured 2026-09-16, both mypy-rejected and both silent at 58b5ef5:
+    // `x = 1` / `x: float = 2.5` is mypy `Name "x" already defined on line 1
+    // [no-redef]`, and `if c: s = "a"` / `s = 5` was the block-first shape the
+    // same day's pre_bind_assignment_targets fix closes. The first is a
+    // pre-existing gap in a DIFFERENT mechanism (Phase 2 binds every
+    // module-level annotation before any assignment is walked, so the
+    // collision is never seen) and is deliberately left open -- it is a
+    // missed error, the safe direction -- but it must not reach disk as
+    // uncompilable C++, and this is what stops it.
+    //
+    // Compared by C++ SPELLING rather than through is_subtype, deliberately:
+    // the question is whether the emitted text compiles, and two types that
+    // share a spelling always do while two that do not never do. nullopt
+    // compares equal to nullopt, which costs nothing -- an unrepresentable
+    // type is already refused at its declaration, before any value reaches
+    // this function.
+    if (widen == nullptr && value_type != nullptr &&
+        cpp_type_name(*value_type) != cpp_type_name(target)) {
+        refuse(value, "a value of type \"" + semantic::type_name(*value_type) +
+                          "\" where \"" + semantic::type_name(target) + "\" is required");
+        return;
+    }
     if (widen != nullptr) {
         write(widen);
         write("(");

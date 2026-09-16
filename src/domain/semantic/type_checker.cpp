@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -908,23 +909,82 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
 }
 
 void TypeChecker::pre_bind_assignment_targets(const ast::Module& module) {
+    // WHICH names get a placeholder is still decided by the TOP-LEVEL walk
+    // below, deliberately unchanged -- see the header for the false NameError
+    // that widening the SET caused. What this map corrects is the LINE each
+    // placeholder carries, which is a different question and was wrong: the
+    // placeholder used to be stamped with the line of the first TOP-LEVEL
+    // assignment, even when an EARLIER statement inside an `if`/`while`/`for`
+    // already bound the same name. is_unfilled_placeholder then refused to
+    // let that earlier, genuinely-first assignment fill it (the lines did not
+    // match), so the LATER top-level one won the declared type, which is not
+    // mypy's rule and not CPython's behaviour.
+    //
+    // Measured 2026-09-16 -- `if c: x = 1` / `x = 2.5` / `print(x)` was mypy
+    // `Incompatible types in assignment` and cythonpp SILENT, and codegen
+    // then hoisted a `py::int_` declaration and assigned a `py::float_` into
+    // it: uncompilable C++ from a run that exited 0, the third state
+    // Decision 0 forbids. The same shape with `while` and with `for`
+    // behaved identically. And the read-ordering half was a FALSE POSITIVE on
+    // a program BOTH oracles accept: `if c: x = 1` / `print(x)` / `x = 2`
+    // reported `name 'x' is used before definition` against the line-5
+    // placeholder, where mypy is `Success` and CPython prints 1 then 2.
+    //
+    // Only the first binding in SOURCE ORDER is kept (emplace, over a walk
+    // that visits in source order), which is exactly the statement whose
+    // assignment mypy takes the declared type from.
+    //
+    // A nested def's or class's own name is excluded: a module-level `def`
+    // (conditional or not) is already bound by collect_signatures' Phase 2,
+    // and a class name is deliberately never bound into ScopeStack at all, so
+    // neither is a name this pass owns -- including them could only move a
+    // placeholder line for a binding decided somewhere else.
+    //
+    // loop_start_line is deliberately NOT carried onto these placeholders the
+    // way pre_bind_function_body carries it: the back-edge exemption it feeds
+    // requires the name to ALSO resolve in an ENCLOSING scope, and module
+    // scope by definition has none, so the tag would be inert. Measured, and
+    // the union rule agrees it must stay inert: the module-level loop-carried
+    // accumulator (`for x in [1, 2, 3]:` with a guarded `print(total)` above
+    // `total = x`) is mypy `Cannot determine type of "total"  [has-type]`, so
+    // mypy REJECTS it where it accepts the function-scope sibling, and this
+    // compiler must keep reporting.
+    std::map<std::string, int> first_binding_line;
+    for_each_own_scope_binding(
+        module.body(), [&first_binding_line](const std::string& name, int line,
+                                             OwnScopeBindingKind kind, int) {
+            if (kind == OwnScopeBindingKind::NestedDef ||
+                kind == OwnScopeBindingKind::NestedClass) {
+                return;
+            }
+            first_binding_line.emplace(name, line);
+        });
     for (const ast::StmtPtr& statement : module.body()) {
         if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
-            pre_bind_target(assign->target(), assign->span().start_line);
+            pre_bind_target(assign->target(), assign->span().start_line, first_binding_line);
         }
     }
 }
 
-void TypeChecker::pre_bind_target(const ast::Expr& target, int line) {
+void TypeChecker::pre_bind_target(const ast::Expr& target, int line,
+                                  const std::map<std::string, int>& first_binding_line) {
     if (const auto* name = dynamic_cast<const ast::Name*>(&target)) {
         if (!scopes_.bound_in_current_scope(name->identifier())) {
-            scopes_.bind(name->identifier(), Binding{Type::unknown(), line, /*annotated=*/false});
+            // Per NAME, not per statement: a tuple target's elements can each
+            // have their own earlier binding elsewhere in the module body.
+            // The fallback is this statement's own line, which is what every
+            // name whose first binding IS this statement resolves to anyway.
+            const auto first = first_binding_line.find(name->identifier());
+            const int declared_line =
+                first != first_binding_line.end() ? first->second : line;
+            scopes_.bind(name->identifier(),
+                         Binding{Type::unknown(), declared_line, /*annotated=*/false});
         }
         return;
     }
     if (const auto* tuple = dynamic_cast<const ast::TupleExpr*>(&target)) {
         for (const ast::ExprPtr& element : tuple->elements()) {
-            pre_bind_target(*element, line);
+            pre_bind_target(*element, line, first_binding_line);
         }
         return;
     }

@@ -263,5 +263,41 @@ TEST(CodegenExecution, EmittedTextNeverSpellsInt64OrBareArithmetic) {
     EXPECT_EQ(text.find("cy_a - "), std::string::npos);
 }
 
+// 2026-09-16, THE ACCEPTING HALF of the block-first-assignment fix. The
+// declared type of a module-level name now comes from its FIRST assignment
+// wherever that sits, in the type checker as well as in codegen's hoisted
+// declaration -- the two disagreeing is what let a `py::float_` be assigned
+// into a `py::int_` slot. These four are programs BOTH oracles accept, so the
+// new refusals must not touch them, and only RUNNING them proves the declared
+// slot, the hoist and the widening all agree. Every expected stdout was
+// produced by RUNNING CPython 3.14.
+TEST(CodegenExecution, ABlockFirstAssignmentReassignedAtTopLevelStillRunsCorrectly) {
+    // The `if` body fixes `int`; a later top-level `int` needs no widening.
+    const RunResult plain = compile_and_run("c: bool = True\nif c:\n    x = 1\nx = 2\nprint(x)\n");
+    EXPECT_EQ(plain.exit_code, 0);
+    EXPECT_EQ(plain.stdout_text, "2\n");
+
+    // The `if` body's ANNOTATION fixes `float`; the later top-level `int`
+    // widens into it -- and prints `2`, not `2.0`, because widening preserves
+    // the value's own Int tag (see numeric_tag.h).
+    const RunResult annotated =
+        compile_and_run("c: bool = True\nif c:\n    x: float = 1.0\nx = 2\nprint(x)\n");
+    EXPECT_EQ(annotated.exit_code, 0);
+    EXPECT_EQ(annotated.stdout_text, "2\n");
+
+    // The `if` body's VALUE fixes `float`, with no annotation anywhere.
+    const RunResult inferred =
+        compile_and_run("c: bool = True\nif c:\n    x = 1.5\nx = 2\nprint(x)\n");
+    EXPECT_EQ(inferred.exit_code, 0);
+    EXPECT_EQ(inferred.stdout_text, "2\n");
+
+    // A `while` body that never runs: the declaration is still hoisted from
+    // it, and the top-level assignment is what the program actually prints.
+    const RunResult loop =
+        compile_and_run("c: bool = False\nwhile c:\n    n = 1\n    c = False\nn = 7\nprint(n)\n");
+    EXPECT_EQ(loop.exit_code, 0);
+    EXPECT_EQ(loop.stdout_text, "7\n");
+}
+
 } // namespace
 } // namespace cythonpp::domain::codegen

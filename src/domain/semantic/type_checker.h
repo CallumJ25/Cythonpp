@@ -826,8 +826,24 @@ private:
     // (`for line in [...]:` above a later `if True: line = "z"`) a false
     // NameError on a program BOTH oracles accept (measured: mypy --strict
     // "Success: no issues found in 1 source file"; CPython prints `2 z`).
+    //
+    // WHICH names get a placeholder is therefore still the top-level walk's
+    // answer, and that hazard is untouched. What DOES consult the recursive
+    // walk (2026-09-16) is the LINE each placeholder carries -- a strictly
+    // separate question, and the old answer was wrong twice over: a name
+    // first bound inside an `if`/`while`/`for` and assigned again at top
+    // level got its placeholder stamped with the LATER top-level line, so
+    // (a) the earlier, genuinely-first assignment could not fill its own
+    // placeholder (is_unfilled_placeholder compares lines) and the later
+    // assignment won the declared type, losing mypy's `Incompatible types in
+    // assignment` entirely, and (b) a read sitting BETWEEN the two reported a
+    // false `used before definition` against that later line. See
+    // pre_bind_assignment_targets' own definition for the measurements, and
+    // for why a nested def/class name is excluded from the map and
+    // loop_start_line deliberately is not carried.
     void pre_bind_assignment_targets(const ast::Module& module);
-    void pre_bind_target(const ast::Expr& target, int line);
+    void pre_bind_target(const ast::Expr& target, int line,
+                         const std::map<std::string, int>& first_binding_line);
 
     // The Function-scope analogue of pre_bind_assignment_targets, run once a
     // FunctionDef's own Function scope is current and its parameters are

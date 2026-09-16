@@ -235,5 +235,33 @@ TEST(EmitterModule, AGlobalAssignedAfterTheCallThatReadsItIsStillEmitted) {
     EXPECT_TRUE(fixture.emit_sink.empty());
 }
 
+// DECISION 0 BACKSTOP, 2026-09-16: emit_value_widened refuses a value whose
+// C++ spelling neither matches the declared slot's nor widens into it, rather
+// than emitting text clang++ rejects. Both shapes below are ones the SEMANTIC
+// layer misses -- mypy reports `Name "x" already defined on line N
+// [no-redef]` for an annotated redefinition of an already-assigned module
+// name, which this compiler does not model (Phase 2 binds every module-level
+// annotation before any assignment is walked, so the collision is never
+// seen). Measured at 58b5ef5: cythonpp exited 0, wrote the file, and
+// clang++ said `no viable overloaded '='`. The missed diagnostic stays open,
+// deliberately -- it is a missed error, the safe direction -- but the third
+// state does not.
+TEST(EmitterModule, AValueThatCannotFitItsDeclaredSlotIsRefusedNotEmitted) {
+    for (const std::string source :
+         {// Flat: the annotated redefinition needs no block at all.
+          std::string("x = 1\nx: float = 2.5\nprint(x)\n"),
+          // The block-nested sibling, where the hoisted declaration's type
+          // comes from the `if` body's assignment.
+          std::string("c: bool = True\nif c:\n    x = 1\nx: float = 2.5\nprint(x)\n")}) {
+        Fixture fixture = build(source);
+        EXPECT_FALSE(emit_module(fixture).has_value()) << source;
+        ASSERT_FALSE(fixture.emit_sink.empty()) << source;
+        EXPECT_NE(fixture.emit_sink.diagnostics().front().message.find(
+                      "a value of type \"float\" where \"int\" is required"),
+                  std::string::npos)
+            << source << " -> " << fixture.emit_sink.diagnostics().front().message;
+    }
+}
+
 } // namespace
 } // namespace cythonpp::domain::codegen

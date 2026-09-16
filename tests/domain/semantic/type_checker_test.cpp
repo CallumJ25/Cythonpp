@@ -7779,5 +7779,94 @@ TEST(TypeChecker, AnUnboundedModelKindConstructorStillDefersRatherThanGoingSilen
     EXPECT_EQ(error.line, 1);
 }
 
+// 2026-09-16, pre_bind_assignment_targets' placeholder LINE. A module-level
+// name whose first binding sits inside an `if`/`while`/`for` body and which is
+// assigned again at top level used to take its DECLARED type from the LATER
+// top-level assignment: the Phase-2.5 placeholder was stamped with that
+// statement's line, so is_unfilled_placeholder refused to let the earlier,
+// genuinely-first assignment fill it. mypy takes the declared type from the
+// FIRST assignment in source order, wherever it sits, so the later
+// incompatible one is an error -- measured, all three shapes
+// `Incompatible types in assignment (expression has type "float", variable
+// has type "int")`, and all three were SILENT here. Worse than a bare missed
+// diagnostic: codegen hoists its declaration from the same first assignment,
+// so it emitted `py::int_ cy_x;` and then assigned a `py::float_` into it --
+// uncompilable C++ written by a run that exited 0.
+TEST(TypeChecker, ABlockNestedFirstAssignmentFixesTheDeclaredType) {
+    for (const std::string source :
+         {// The `if` body.
+          std::string("c: bool = True\nif c:\n    x = 1\nx = 2.5\nprint(x)\n"),
+          // The `while` body.
+          std::string("c: bool = True\nwhile c:\n    x = 1\n    c = False\nx = 2.5\n"
+                      "print(x)\n"),
+          // The `for` body.
+          std::string("for i in [1]:\n    x = 1\nx = 2.5\nprint(x)\n"),
+          // A non-numeric pair, so the rule is not read as numeric-tower
+          // specific: mypy `Incompatible types in assignment (expression has
+          // type "int", variable has type "str")`.
+          std::string("c: bool = True\nif c:\n    s = \"a\"\ns = 5\nprint(s)\n")}) {
+        const Checked checked = check_module(source);
+        const diagnostics::Diagnostic error = only_error(checked);
+        EXPECT_EQ(error.code, "TypeError") << source;
+        EXPECT_NE(error.message.find("incompatible types in assignment"), std::string::npos)
+            << source << " -> " << error.message;
+    }
+}
+
+// THE FALSE POSITIVE the same placeholder line caused, and the reason this fix
+// is not merely a missed-diagnostic cleanup: a read sitting BETWEEN the
+// block-nested first assignment and a later top-level one reported
+// `name 'x' is used before definition` against that later line. Measured
+// 2026-09-16: mypy `Success`, CPython prints 1 then 2 at exit 0 -- BOTH
+// oracles accept and RUN this program.
+TEST(TypeChecker, AReadBetweenABlockFirstAssignmentAndALaterOneStaysClean) {
+    expect_clean("c: bool = True\nif c:\n    x = 1\nprint(x)\nx = 2\nprint(x)\n");
+}
+
+// CONTROL: the compatible sibling of ABlockNestedFirstAssignmentFixesTheDeclared
+// Type above. The declared type still comes from the block-nested assignment,
+// so a later top-level `int` is fine -- mypy `Success`, CPython prints 2.
+// Guards the direction: a fix that reported on ANY block-first/top-level pair
+// rather than on an incompatible one would fail here.
+TEST(TypeChecker, ABlockNestedFirstAssignmentOfACompatibleTypeStaysClean) {
+    expect_clean("c: bool = True\nif c:\n    x = 1\nx = 2\nprint(x)\n");
+}
+
+// CONTROL, THE RECORDED HAZARD: widening WHICH names get a placeholder (rather
+// than only the line an existing one carries) was tried before and reverted,
+// because it made this exact program a false NameError -- see
+// pre_bind_assignment_targets' own header comment. Measured again 2026-09-16
+// at this fix: mypy `Success`, CPython prints a, b, then z at exit 0. The
+// placeholder SET is deliberately unchanged, so `line` -- bound by a `for`
+// target and by a nested `if`, never by a top-level assignment -- still gets
+// no placeholder at all and this stays clean.
+TEST(TypeChecker, AModuleLoopReadAboveALaterConditionalAssignmentStaysClean) {
+    expect_clean("for line in [\"a\", \"b\"]:\n    print(line)\nif True:\n    line = \"z\"\n"
+                 "print(line)\n");
+}
+
+// CONTROL, THE OTHER DIRECTION: the module-level sibling of
+// ALoopCarriedAccumulatorGuardedByAFlagStaysClean must keep REPORTING, and the
+// reason is the union rule rather than a preference. Measured 2026-09-16:
+// mypy `Cannot determine type of "total"  [has-type]` -- mypy REJECTS the
+// module-level shape where it accepts the function-scope one -- while CPython
+// prints 3 at exit 0. So the back-edge exemption that keeps the function-scope
+// version clean must not reach module scope, which is automatic: that
+// exemption requires the name to resolve in an ENCLOSING scope, and module
+// scope has none. This is what makes NOT carrying loop_start_line onto a
+// module-level placeholder correct rather than merely inert.
+TEST(TypeChecker, AModuleLevelLoopCarriedAccumulatorStillReports) {
+    const Checked checked = check_module("started = False\n"
+                                         "for x in [1, 2, 3]:\n"
+                                         "    if started:\n"
+                                         "        print(total)\n"
+                                         "    total = x\n"
+                                         "    started = True\n"
+                                         "print(total)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "NameError");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic
