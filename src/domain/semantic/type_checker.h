@@ -1135,8 +1135,19 @@ private:
     // reachable for a `for` target for the first time) -- the reassignment
     // branch never builds a new Binding, so there is nothing for it to change
     // there.
+    //
+    // `partial_container` is the mypy PARTIAL CONTAINER shape this assignment
+    // seeds, or nullopt (the overwhelmingly common case). Only the two
+    // BINDING branches consume it -- a fresh bind and a placeholder fill,
+    // exactly the pair seeds_partial_none already has to agree across -- and
+    // the caller passes a value only when assign_to has both established this
+    // is the name's FIRST definition and confirmed with the per-scope scan
+    // that the partial is resolved before it is read. See
+    // Binding::partial_container for why this is a separate rule from
+    // partial_none rather than an extension of it.
     void assign_name(const ast::Name& target, const Type& value_type, int line,
-                     bool order_exempt = false);
+                     bool order_exempt = false,
+                     const std::optional<Type>& partial_container = std::nullopt);
 
     // True when `binding` is THIS exact
     // statement's own still-unfilled placeholder (from
@@ -1564,6 +1575,24 @@ private:
     // level, which is exactly why a module-level `L()` after a `def f` that
     // declares `class L` still reports the NameError mypy reports for it.
     std::vector<LocalClassAliasFrame> local_class_alias_frames_;
+
+    // The names in the CURRENT scope's body whose bare-empty-`list`/`dict`
+    // first assignment seeds a mypy PARTIAL CONTAINER type the per-scope scan
+    // has proven is RESOLVED before it is ever read -- so the eager
+    // `need type annotation` report at that assignment must be suppressed and
+    // a Binding::partial_container recorded in its place.
+    //
+    // Computed by the file-local resolvable_container_partials() scan and
+    // installed at FOUR call sites, not three: visit(Module), BOTH
+    // visit(FunctionDef) branches (the ordinary one and the
+    // report-and-return one a method with no parameters takes), and
+    // visit(ClassDef). Wiring only some of them is the single most likely way
+    // to half-land this rule -- the module-scope accepting tests pass with
+    // just the first -- which is why there is a per-scope accepting test for
+    // each. Saved and restored by ResolvablePartialsGuard (in the .cpp)
+    // around every scope push but the module's, which is outermost and has
+    // nothing to restore to.
+    std::set<std::string> resolvable_container_partials_;
 };
 
 } // namespace cythonpp::domain::semantic

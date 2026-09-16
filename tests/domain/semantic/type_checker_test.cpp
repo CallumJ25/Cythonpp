@@ -1,5 +1,6 @@
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -205,6 +206,211 @@ TEST(TypeChecker, ReportsABareEmptyContainerConstructorCall) {
         EXPECT_EQ(error.code, "TypeError") << "constructor: " << ctor;
         EXPECT_EQ(error.message, "need type annotation for \"x\"") << "constructor: " << ctor;
     }
+}
+
+// CONTAINER PARTIAL TYPES (Spec 5d, 2026-09-16). mypy does NOT take a
+// variable's declared type from a first assignment of a bare empty
+// container: it records a PARTIAL type and takes the type from whatever
+// RESOLVES it. Every expected verdict below was produced by RUNNING mypy
+// 1.18.1 and CPython 3.14.2, never by reasoning about the rule.
+//
+// All four accepting shapes are `mypy --strict` Success and CPython exit 0
+// (measured: `[1]`, `{1: 2}`, `[1]`, `{1: 2}` respectively).
+TEST(TypeChecker, AResolvedContainerPartialIsClean) {
+    expect_clean("x = []\nx = [1]\nprint(x)\n");           // F1
+    expect_clean("x = {}\nx = {1: 2}\nprint(x)\n");        // F2
+    expect_clean("x = list()\nx = [1]\nprint(x)\n");       // F4
+    expect_clean("x = dict()\nx = {1: 2}\nprint(x)\n");    // F5
+}
+
+// THE FOUR CALL SITES. The pre-pass has to run wherever a scope's body
+// becomes current, and there are FOUR places that happens -- visit(Module),
+// visit(FunctionDef)'s broken-method early-return branch, visit(FunctionDef)'s
+// ordinary branch, and visit(ClassDef). A missing site shows up here and
+// NOWHERE else: the module-scope test above passes with only the first wired.
+// Measured, every shape below: mypy Success, CPython exit 0.
+TEST(TypeChecker, AResolvedContainerPartialIsCleanAtFunctionScope) {
+    expect_clean("def f() -> None:\n    x = []\n    x = [1]\n    print(x)\nf()\n");
+    expect_clean("def f() -> None:\n    x = {}\n    x = {1: 2}\n    print(x)\nf()\n");
+    expect_clean("def f() -> None:\n    x = list()\n    x = [1]\n    print(x)\nf()\n");
+    expect_clean("def f() -> None:\n    x = dict()\n    x = {1: 2}\n    print(x)\nf()\n");
+}
+
+TEST(TypeChecker, AResolvedContainerPartialIsCleanAtNestedFunctionScope) {
+    expect_clean("def o() -> None:\n    def i() -> None:\n        x = []\n"
+                 "        x = [1]\n        print(x)\n    i()\no()\n");
+    expect_clean("def o() -> None:\n    def i() -> None:\n        x = dict()\n"
+                 "        x = {1: 2}\n        print(x)\n    i()\no()\n");
+}
+
+TEST(TypeChecker, AResolvedContainerPartialIsCleanInAMethodBody) {
+    expect_clean("class C:\n    def m(self) -> None:\n        x = []\n"
+                 "        x = [1]\n        print(x)\nC().m()\n");
+}
+
+TEST(TypeChecker, AResolvedContainerPartialIsCleanInAClassBody) {
+    expect_clean("class C:\n    x = []\n    x = [1]\n");
+    expect_clean("class C:\n    x = {}\n    x = {1: 2}\n");
+}
+
+// visit(FunctionDef)'s OTHER pre_bind_function_body call site: the
+// report-and-return branch a method with no parameters at all takes. mypy
+// reports ONLY `Method must have at least one argument` for this program
+// (measured), so the partial must resolve there too rather than adding a
+// second diagnostic of our own.
+TEST(TypeChecker, AResolvedContainerPartialIsCleanInAZeroArgumentMethodBody) {
+    const Checked checked = check_module(
+        "class C:\n    def m() -> None:\n        x = []\n        x = [1]\n        print(x)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "method must have at least one argument");
+}
+
+// A resolver at any block nesting depth still resolves. Measured, all three:
+// mypy Success, CPython exit 0.
+TEST(TypeChecker, AContainerPartialResolvedInsideABlockIsClean) {
+    expect_clean("c: bool = True\nx = []\nif c:\n    x = [1]\nprint(x)\n");
+    expect_clean("c: bool = False\nx = []\nwhile c:\n    x = [1]\nprint(x)\n");
+    expect_clean("x = {}\nfor i in [1, 2]:\n    x = {i: i}\nprint(x)\n");
+}
+
+// DECISION 0 -- THE CONTROLS, which matter more than the fix. mypy genuinely
+// reports `Need type annotation for "x"  [var-annotated]` for each of these
+// (measured, every one), and this compiler is RIGHT today. A fix that closed
+// the accepting shapes above by SUPPRESSING the diagnostic would silence a
+// real error.
+TEST(TypeChecker, AnUnresolvableContainerPartialStillReports) {
+    // Each entry is a program mypy REJECTS with Need type annotation.
+    const std::vector<std::pair<const char*, const char*>> shapes = {
+        {"C1 no resolver anywhere", "x = []\nprint(x)\n"},
+        {"C2 a read precedes the first resolver", "x = []\nprint(x)\nx = [1]\n"},
+        {"C4 set() has no reachable resolver", "x = set()\nprint(x)\n"},
+        {"C5 frozenset() has no reachable resolver", "x = frozenset()\nprint(x)\n"},
+        // A tuple DISPLAY is a reachable non-empty value, so the kind
+        // restriction -- not the read scan -- is the only thing keeping this
+        // one reporting. Measured: mypy `Need type annotation for "x"`.
+        {"tuple() is not a modelled partial", "x = tuple()\nx = (1,)\nprint(x)\n"},
+        // A second bare empty container is a TOUCH that is not a resolver.
+        {"a second bare display kills", "x = []\nx = []\nx = [1]\nprint(x)\n"},
+        // A read through an assignment's right-hand side kills it too.
+        {"y = x kills", "x = []\ny = x\nx = [1]\nprint(x)\nprint(y)\n"},
+        // len(x) is a read. Measured: mypy `Need type annotation`.
+        {"len(x) kills", "x = []\nprint(len(x))\nx = [1]\n"},
+        // Iterating the partial is a read. Measured: mypy `Need type annotation`.
+        {"for i in x kills", "x = []\nfor i in x:\n    print(i)\nx = [1]\n"},
+        // A `for` TARGET rebinding the name is not a resolver. Measured: mypy
+        // reports Need type annotation AND an incompatible assignment.
+        {"a for target is not a resolver", "x = []\nfor x in [1, 2]:\n    pass\nprint(x)\n"},
+        // A mismatched container kind is not a resolver. Measured: mypy
+        // reports Need type annotation AND an incompatible assignment; this
+        // compiler reports the first of the two.
+        {"a dict display does not resolve a list partial", "x = []\nx = {1: 2}\nprint(x)\n"},
+        // Nor does a value of a wholly unrelated type.
+        {"None does not resolve a list partial", "x = []\nx = None\nprint(x)\n"},
+    };
+    for (const auto& [label, source] : shapes) {
+        const Checked checked = check_module(source);
+
+        const diagnostics::Diagnostic error = only_error(checked);
+        EXPECT_EQ(error.code, "TypeError") << label;
+        EXPECT_EQ(error.message, "need type annotation for \"x\"") << label;
+        EXPECT_EQ(error.line, 1) << label;
+    }
+}
+
+// The empty tuple DISPLAY is not a partial at all -- `tuple[()]` is a
+// complete, non-generic type -- so this keeps its existing exact wording,
+// which is mypy's own (measured verbatim).
+TEST(TypeChecker, AnEmptyTupleDisplayFollowedByANonEmptyOneKeepsItsOwnWording) {
+    const Checked checked = check_module("x = ()\nx = (1,)\nprint(x)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"tuple[int]\", "
+              "variable has type \"tuple[()]\")");
+    EXPECT_EQ(error.line, 2);
+}
+
+// C2's sibling at a NESTED scope: mypy counts a read inside a nested `def`'s
+// body as killing the partial even though that body does not run until later
+// (measured -- `x = []` / `def f(): print(x)` / `x = [1]` / `f()` is
+// `Need type annotation for "x"`, and CPython prints `[1]` at exit 0).
+TEST(TypeChecker, AReadInsideANestedDefAboveTheResolverKillsThePartial) {
+    const Checked checked =
+        check_module("x = []\ndef f() -> None:\n    print(x)\nx = [1]\nf()\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "need type annotation for \"x\"");
+    EXPECT_EQ(error.line, 1);
+}
+
+// The same read BELOW the resolver is harmless. Measured: mypy Success.
+TEST(TypeChecker, AReadInsideANestedDefBelowTheResolverIsClean) {
+    expect_clean("x = []\nx = [1]\ndef f() -> None:\n    print(x)\nf()\n");
+}
+
+// FIRST RESOLVER COMMITS: `x = [1]` makes `x` a `list[int]` for good, so the
+// later `x = ["s"]` is checked against THAT and never draws a second
+// `need type annotation`. The message is asserted verbatim because it turned
+// out to match mypy's own text (measured -- mypy 1.18.1 says `List item 0 has
+// incompatible type "str"; expected "int"  [list-item]` at line 3, and the
+// only difference is this project's universal lower-case initial). The plan
+// brief predicted a wording divergence here and there is none.
+TEST(TypeChecker, TheFirstContainerResolverCommitsTheDeclaredType) {
+    const Checked checked = check_module("x = []\nx = [1]\nx = [\"s\"]\nprint(x)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "list item 0 has incompatible type \"str\"; expected \"int\"");
+    EXPECT_EQ(error.line, 3);
+}
+
+// SPEC DECISION 4, and the test that catches a future round generalising
+// `partial_none`'s union to containers. A CONTAINER partial resolves to the
+// container type EXACTLY -- `list[int]`, never `list[int] | None`. Measured
+// 2026-09-16: mypy reports ONLY `Incompatible types in assignment (expression
+// has type "None", variable has type "list[int]")` here, with NO accompanying
+// `Need type annotation`, because `x = [1]` already resolved the partial. So
+// exactly ONE diagnostic is the sharp assertion, and the message is mypy's
+// verbatim.
+TEST(TypeChecker, AResolvedContainerPartialDoesNotAbsorbNone) {
+    const Checked checked = check_module("x = []\nx = [1]\nx = None\nprint(x)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"None\", "
+              "variable has type \"list[int]\")");
+    EXPECT_EQ(error.line, 3);
+}
+
+// SCOPE-LOCAL STATE MUST NOT LEAK. One function's cleared name must not clear
+// a same-named partial in a sibling function. Measured: mypy reports exactly
+// one error, at line 6 -- b's partial -- and CPython prints `[1]` then `[]`
+// at exit 0.
+TEST(TypeChecker, AClearedContainerPartialDoesNotLeakIntoASiblingScope) {
+    const Checked checked =
+        check_module("def a() -> None:\n    x = []\n    x = [1]\n    print(x)\n"
+                     "def b() -> None:\n    x = []\n    print(x)\na()\nb()\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "need type annotation for \"x\"");
+    EXPECT_EQ(error.line, 6);
+}
+
+// partial_none and partial_container are two DIFFERENT rules with two
+// different resolved types, and they can never both be live on one binding:
+// a `None` value and a bare-empty-container value are mutually exclusive at
+// the one creation site. `x = None` / `x = []` is an existing MISSED error
+// (mypy: `Need type annotation for "x"` at line 2; this compiler: silent),
+// deliberately out of scope per the spec -- pinned so a future round finds it
+// recorded rather than surprising.
+TEST(TypeChecker, AnEmptyContainerResolvingANonePartialIsAKnownMissedError) {
+    expect_clean("x = None\nx = []\nprint(x)\n");
 }
 
 // THE ORDERING RULE, module scope. Verified: used-before-def.

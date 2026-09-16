@@ -151,6 +151,31 @@ private:
     bool previous_;
 };
 
+// RAII guard for the per-scope set of names whose container partial the scan
+// has cleared -- resolvable_container_partials_ -- saved and restored exactly
+// like ReturnContextGuard restores current_return_type_, and for the same
+// reason: the set is a fact about ONE scope's body, so one function's cleared
+// name must never clear a same-named partial in a sibling scope (measured:
+// `def a(): x = []; x = [1]; print(x)` alongside `def b(): x = []; print(x)`
+// is exactly ONE mypy error, b's, and leaking would silence it). Also RAII
+// rather than a plain assignment because visit(FunctionDef) has a
+// report-and-return path between the set and the restore.
+class ResolvablePartialsGuard {
+public:
+    ResolvablePartialsGuard(std::set<std::string>& current, std::set<std::string> fresh)
+        : current_(current), previous_(current) {
+        current_ = std::move(fresh);
+    }
+    ~ResolvablePartialsGuard() { current_ = std::move(previous_); }
+
+    ResolvablePartialsGuard(const ResolvablePartialsGuard&) = delete;
+    ResolvablePartialsGuard& operator=(const ResolvablePartialsGuard&) = delete;
+
+private:
+    std::set<std::string>& current_;
+    std::set<std::string> previous_;
+};
+
 // The `while True` half of always_returns' While arm: true only for a
 // Constant whose token type is BOOL_TRUE, per the brief's own precise
 // definition -- NOT any expression ExpressionTyper would type as `bool`
@@ -349,6 +374,226 @@ bool receiver_rebound_in_own_scope(const std::string& name, const std::vector<as
     return shadowed;
 }
 
+// Every Name an AST sub-tree mentions, in source order -- an
+// ast::RecursiveVisitor, not a plain ast::Visitor, exactly as
+// domain/codegen/emitter_statements.cpp's own NameReadCollector is and for the
+// same reason: the default "recurse into everything else" is what is wanted,
+// since a Name nested in a call argument, an operand or a comparison chain is
+// still an occurrence. Written LOCALLY rather than shared with that one: the
+// two live in different layers, and this one deliberately counts an
+// assignment TARGET's Name as an occurrence too (an over-approximation whose
+// only effect here is to KILL a partial, which is the safe direction).
+class NameOccurrenceCollector : public ast::RecursiveVisitor {
+public:
+    using ast::RecursiveVisitor::visit;
+    void visit(const ast::Name& node) override { names.push_back(node.identifier()); }
+
+    std::vector<std::string> names;
+};
+
+// What one TOUCH of a name in a scope body is, for the container-partial
+// scan. Only the four container-shaped assignment forms are distinguished;
+// everything else -- a read, any other binding form, a value of any other
+// type, and every bare empty set/frozenset/tuple -- collapses into Other,
+// which is what makes an unrecognised shape keep a diagnostic rather than
+// silence one.
+enum class ContainerTouchKind {
+    BareEmptyList,   // `n = []` or `n = list()`  -- seeds a list partial
+    BareEmptyDict,   // `n = {}` or `n = dict()`  -- seeds a dict partial
+    NonEmptyList,    // `n = [a, ...]`            -- resolves a list partial
+    NonEmptyDict,    // `n = {k: v, ...}`         -- resolves a dict partial
+    Other
+};
+
+struct ContainerTouch {
+    std::string name;
+    ContainerTouchKind kind = ContainerTouchKind::Other;
+};
+
+// How an assignment's VALUE reads for the scan. Purely SYNTACTIC, matching
+// is_bare_empty_container's own discipline, and deliberately narrower than
+// "a non-empty value of the right type": the eager `need type annotation`
+// report has to be suppressed or emitted at the FIRST-assignment statement,
+// so the scan is the only thing that can decide, and it has no types. The
+// cost is recorded rather than hidden -- a resolver that is a CALL or a
+// plain NAME (`x = []` / `x = f()`, `x = []` / `x = y` with `y: list[int]`,
+// both mypy Success, measured 2026-09-16) keeps its pre-existing false
+// positive, exactly like the method-call resolvers the spec leaves out of
+// scope. The benefit is that no program which reports today changes its
+// diagnostic, its message or its line: a value this function cannot
+// recognise is Other, and Other always keeps reporting.
+//
+// set/frozenset/tuple are deliberately absent, and their absence is
+// LOAD-BEARING for one of them: a set display and `.add()` are both refused
+// by earlier stages, so no set partial is ever resolvable anyway, but
+// `x = tuple()` / `x = (1,)` HAS a reachable non-empty value and is still a
+// mypy ERROR (`Need type annotation for "x"`, measured). Only the missing
+// tuple arm keeps that one reporting.
+ContainerTouchKind classify_assigned_value(const ast::Expr& value) {
+    if (const auto* list = dynamic_cast<const ast::ListExpr*>(&value)) {
+        return list->elements().empty() ? ContainerTouchKind::BareEmptyList
+                                        : ContainerTouchKind::NonEmptyList;
+    }
+    if (const auto* dict = dynamic_cast<const ast::DictExpr*>(&value)) {
+        return dict->entries().empty() ? ContainerTouchKind::BareEmptyDict
+                                       : ContainerTouchKind::NonEmptyDict;
+    }
+    if (const auto* call = dynamic_cast<const ast::Call*>(&value)) {
+        if (call->args().empty()) {
+            if (const auto* callee = dynamic_cast<const ast::Name*>(&call->callee())) {
+                if (callee->identifier() == "list") {
+                    return ContainerTouchKind::BareEmptyList;
+                }
+                if (callee->identifier() == "dict") {
+                    return ContainerTouchKind::BareEmptyDict;
+                }
+            }
+        }
+    }
+    return ContainerTouchKind::Other;
+}
+
+// The partial SHAPE a bare-empty-container value seeds, or nullopt when the
+// value is not one of the two container kinds this rule models.
+std::optional<Type> bare_empty_container_shape(const ast::Expr& value) {
+    switch (classify_assigned_value(value)) {
+    case ContainerTouchKind::BareEmptyList:
+        return Type::list_of(Type::unknown());
+    case ContainerTouchKind::BareEmptyDict:
+        return Type::dict_of(Type::unknown(), Type::unknown());
+    case ContainerTouchKind::NonEmptyList:
+    case ContainerTouchKind::NonEmptyDict:
+    case ContainerTouchKind::Other:
+        return std::nullopt;
+    }
+    // Unreachable: exhaustive above with no default, so a new kind warns here
+    // rather than silently seeding nothing.
+    return std::nullopt;
+}
+
+void push_occurrences(const ast::Node& node, std::vector<ContainerTouch>& out) {
+    NameOccurrenceCollector collector;
+    node.accept(collector);
+    for (std::string& name : collector.names) {
+        out.push_back(ContainerTouch{std::move(name), ContainerTouchKind::Other});
+    }
+}
+
+// Every touch of every name in one scope's body, in SOURCE ORDER. Recurses
+// into If/While/For bodies and their `else` clauses, which are not new
+// scopes -- a resolver written inside a block still resolves (measured: all
+// three of `if`, `while` and `for` are mypy Success). A nested def's or
+// class's own body IS a different scope and contributes READS ONLY, never a
+// resolver: measured 2026-09-16, `x = []` / `def f(): print(x)` / `x = [1]`
+// is `Need type annotation for "x"` under mypy even though that body does not
+// run until later, while the same read BELOW the resolver is Success.
+void collect_container_touches(const std::vector<ast::StmtPtr>& body,
+                              std::vector<ContainerTouch>& out) {
+    for (const ast::StmtPtr& statement : body) {
+        if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
+            // The VALUE first, matching Python's own evaluation order, so a
+            // read of the partial's own name inside it (`x = [x]`) is the
+            // EARLIER touch and kills the partial rather than resolving it.
+            push_occurrences(assign->value(), out);
+            if (const auto* target = dynamic_cast<const ast::Name*>(&assign->target())) {
+                out.push_back(ContainerTouch{target->identifier(),
+                                             classify_assigned_value(assign->value())});
+            } else {
+                // A tuple/subscript/attribute target: every name in it is a
+                // NON-resolving touch. For a TUPLE target that is a retained
+                // false positive rather than a modelling claim -- measured,
+                // `x = []` / `x, y = [1], [2]` is mypy Success and this
+                // compiler keeps reporting -- left as-is deliberately, since
+                // resolving through an unpack needs assign_tuple to learn the
+                // rule too. A SUBSCRIPT store is Task 2's own surface, and a
+                // LIST subscript store must never resolve at all.
+                push_occurrences(assign->target(), out);
+            }
+        } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
+            if (ann_assign->has_value()) {
+                push_occurrences(ann_assign->value(), out);
+            }
+            push_occurrences(ann_assign->target(), out);
+        } else if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
+            push_occurrences(if_stmt->condition(), out);
+            collect_container_touches(if_stmt->body(), out);
+            collect_container_touches(if_stmt->orelse(), out);
+        } else if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
+            push_occurrences(while_stmt->condition(), out);
+            collect_container_touches(while_stmt->body(), out);
+            collect_container_touches(while_stmt->orelse(), out);
+        } else if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
+            push_occurrences(for_stmt->iterable(), out);
+            // A `for` TARGET is a non-resolving touch, measured: mypy reports
+            // `Need type annotation` AND an incompatible assignment for
+            // `x = []` / `for x in [1, 2]:`.
+            push_occurrences(for_stmt->target(), out);
+            collect_container_touches(for_stmt->body(), out);
+            collect_container_touches(for_stmt->orelse(), out);
+        } else {
+            if (const auto* nested_def = dynamic_cast<const ast::FunctionDef*>(statement.get())) {
+                out.push_back(
+                    ContainerTouch{nested_def->name(), ContainerTouchKind::Other});
+            } else if (const auto* nested_class =
+                           dynamic_cast<const ast::ClassDef*>(statement.get())) {
+                out.push_back(
+                    ContainerTouch{nested_class->name(), ContainerTouchKind::Other});
+            }
+            // EVERY other statement shape -- an ExprStmt, a Return, a nested
+            // def or class (whose whole sub-tree, body included, is walked by
+            // the RecursiveVisitor for reads and never for resolvers), a
+            // Break/Continue/Pass, and any node a future task adds --
+            // contributes each Name it mentions as a non-resolving touch.
+            // DEFAULT-SAFE BY CONSTRUCTION: an unenumerated shape can only
+            // KILL a partial, which keeps a diagnostic this compiler already
+            // reports, never silence one.
+            push_occurrences(*statement, out);
+        }
+    }
+}
+
+// Which names in one scope body hold a container partial this compiler can
+// PROVE is resolved before it is ever read -- i.e. the ones whose eager
+// `need type annotation` report must be suppressed.
+//
+// mypy's rule, measured: the diagnostic is reported at the FIRST-ASSIGNMENT
+// line iff, scanning forward from it, the first thing that touches the name
+// is not a resolver. So the answer is a two-element question about each
+// name's touch sequence: the FIRST touch must seed a modelled partial and the
+// SECOND must resolve it in the matching kind. A name with no second touch
+// (no resolver anywhere) and a name whose second touch is anything else (a
+// read, a rebind, a mismatched kind) are both left out, which is what keeps
+// controls C1/C2/C4/C5 reporting.
+std::set<std::string> resolvable_container_partials(const std::vector<ast::StmtPtr>& body) {
+    std::vector<ContainerTouch> touches;
+    collect_container_touches(body, touches);
+
+    std::map<std::string, ContainerTouchKind> first;
+    std::map<std::string, ContainerTouchKind> second;
+    for (const ContainerTouch& touch : touches) {
+        if (first.find(touch.name) == first.end()) {
+            first.emplace(touch.name, touch.kind);
+        } else if (second.find(touch.name) == second.end()) {
+            second.emplace(touch.name, touch.kind);
+        }
+    }
+
+    std::set<std::string> resolvable;
+    for (const auto& [name, seeding_kind] : first) {
+        const auto resolving = second.find(name);
+        if (resolving == second.end()) {
+            continue;
+        }
+        if ((seeding_kind == ContainerTouchKind::BareEmptyList &&
+             resolving->second == ContainerTouchKind::NonEmptyList) ||
+            (seeding_kind == ContainerTouchKind::BareEmptyDict &&
+             resolving->second == ContainerTouchKind::NonEmptyDict)) {
+            resolvable.insert(name);
+        }
+    }
+    return resolvable;
+}
+
 } // namespace
 
 TypeChecker::TypeChecker(diagnostics::DiagnosticSink& sink)
@@ -379,6 +624,11 @@ void TypeChecker::visit(const ast::Module& node) {
     }
     collect_signatures(node);
     pre_bind_assignment_targets(node);
+    // CALL SITE 1 OF 4 for the container-partial scan (see
+    // resolvable_container_partials_). No guard here: the module scope is
+    // outermost, so there is nothing to restore it to, and every nested
+    // scope installs -- and restores -- its own set.
+    resolvable_container_partials_ = resolvable_container_partials(node.body());
     check_suite(node.body());
 }
 
@@ -1135,11 +1385,27 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
         const bool is_new_definition = !scopes_.bound_in_current_scope(name->identifier()) ||
                                        is_unfilled_placeholder(
                                            *scopes_.resolve(name->identifier()).binding, line);
+        // A bare empty container does NOT declare the variable's type in
+        // mypy: it records a PARTIAL type and takes the declared type from
+        // whatever RESOLVES it (see Binding::partial_container). So the
+        // report fires only when the per-scope scan could NOT prove this
+        // partial is resolved before it is read -- which is still every
+        // shape mypy itself reports `Need type annotation` for, including a
+        // partial with no resolver at all, one whose first touch is a read,
+        // and every set/frozenset/tuple partial (none of whose resolvers is
+        // even reachable in this subset, except the tuple display, which the
+        // scan's own kind restriction keeps reporting).
+        std::optional<Type> partial_container;
         if (is_new_definition && is_bare_empty_container(value)) {
-            report(*name, DiagnosticKind::TypeCheckerTypeError,
-                   "need type annotation for \"" + name->identifier() + "\"");
+            if (resolvable_container_partials_.count(name->identifier()) != 0) {
+                partial_container = bare_empty_container_shape(value);
+            }
+            if (!partial_container.has_value()) {
+                report(*name, DiagnosticKind::TypeCheckerTypeError,
+                       "need type annotation for \"" + name->identifier() + "\"");
+            }
         }
-        assign_name(*name, value_type, line);
+        assign_name(*name, value_type, line, /*order_exempt=*/false, partial_container);
         if (is_new_definition && scopes_.current_kind() == ScopeKind::Class) {
             // A plain class-body Assign (`class D:
             // x = 5`) never declared an instance attribute at all before
@@ -1289,10 +1555,12 @@ bool seeds_partial_none(const Type& value_type, bool order_exempt) {
 } // namespace
 
 void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, int line,
-                              bool order_exempt) {
+                              bool order_exempt,
+                              const std::optional<Type>& partial_container) {
     if (!scopes_.bound_in_current_scope(target.identifier())) {
         Binding fresh{value_type, line, /*annotated=*/false, order_exempt};
         fresh.partial_none = seeds_partial_none(value_type, order_exempt);
+        fresh.partial_container = partial_container;
         scopes_.bind(target.identifier(), fresh);
         return;
     }
@@ -1316,6 +1584,7 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
         // every pre-existing caller.
         Binding filled{value_type, line, /*annotated=*/false, order_exempt};
         filled.partial_none = seeds_partial_none(value_type, order_exempt);
+        filled.partial_container = partial_container;
         scopes_.rebind(target.identifier(), filled);
         return;
     }
@@ -1347,6 +1616,34 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
         // type is the union, while this path's CURRENT type is the resolver's
         // own, which is what keeps an in-scope `return x` straight after
         // `x = 1` clean (mypy agrees -- its binder narrows identically).
+        narrowings_.kill(target.identifier());
+        narrowings_.set(target.identifier(), value_type);
+        return;
+    }
+    // 2026-09-16: RESOLVE a mypy PARTIAL CONTAINER, the sibling rule to the
+    // partial-None branch directly above -- and the place the two DIVERGE.
+    // The resolved declared type is the resolver's own type EXACTLY, with NO
+    // union: `x = []` / `x = [1]` declares `list[int]`, never
+    // `list[int] | None`. See Binding::partial_container for the measurement
+    // and for the program a generalised union would silently accept.
+    //
+    // The KIND test is not redundant with the scan that cleared this name:
+    // the scan proves the second TOUCH is a matching non-empty display, and
+    // the test confirms the type actually inferred from it is the matching
+    // container -- so if ExpressionTyper ever answers something else for a
+    // non-empty display, the partial stays live and this compiler declares
+    // nothing rather than freezing a wrong declared type in place.
+    if (existing.binding->partial_container.has_value() &&
+        value_type.kind == existing.binding->partial_container->kind) {
+        // partial_container defaults to nullopt on the fresh Binding, so
+        // building one here is what CLEARS the partial: the FIRST resolver
+        // commits, and every later assignment goes through the ordinary
+        // compatibility check below (`x = ["s"]` after `x = [1]` reports,
+        // measured -- mypy calls it `List item 0 has incompatible type`, a
+        // sanctioned wording divergence).
+        Binding resolved{value_type, line, /*annotated=*/false};
+        scopes_.rebind(target.identifier(), resolved);
+        // Same kill-then-set as both neighbouring paths.
         narrowings_.kill(target.identifier());
         narrowings_.set(target.identifier(), value_type);
         return;
@@ -2118,6 +2415,14 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         // the "missing an annotation" completeness check just above.
         ReturnContextGuard return_guard(current_return_type_, Type::unknown());
         pre_bind_function_body(node.body());
+        // CALL SITE 2 OF 4. Easy to miss, because this branch is the
+        // report-and-return path a method with NO parameters at all takes --
+        // its body is still walked, so a container partial in it must still
+        // resolve. Measured: mypy reports ONLY `Method must have at least one
+        // argument` for such a program, so a second diagnostic of our own
+        // would be a divergence.
+        ResolvablePartialsGuard partials_guard(resolvable_container_partials_,
+                                               resolvable_container_partials(node.body()));
         FlagGuard function_guard(in_function_body_, true);
         FlagGuard loop_guard(in_loop_body_, false);
         check_suite(node.body());
@@ -2442,6 +2747,10 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // check can tell "used before definition" apart from "not defined"; see
     // pre_bind_function_body's own comment.
     pre_bind_function_body(node.body());
+    // CALL SITE 3 OF 4 -- the ordinary function-body path, shared by a
+    // top-level def, a nested def and a method.
+    ResolvablePartialsGuard partials_guard(resolvable_container_partials_,
+                                           resolvable_container_partials(node.body()));
     // Classify every nested `def` in THIS body as conditional or not, before
     // the body walk reaches any of them -- see conditional_defs_' comment and
     // the redefinition rule at the binding site above.
@@ -2627,6 +2936,13 @@ void TypeChecker::visit(const ast::ClassDef& node) {
     // it), and still the REAL pass for a function-local or collision-losing
     // class, which that module-wide phase never sees.
     pre_collect_class_body(node, qualified_name);
+    // CALL SITE 4 OF 4. Installed HERE, at the call site, and deliberately
+    // not inside pre_collect_class_body -- that function early-returns for
+    // any class the module-wide member-collection phase already covered
+    // (pre_collected_), which is every ordinary class, so a scan placed
+    // inside it would simply never run for one.
+    ResolvablePartialsGuard partials_guard(resolvable_container_partials_,
+                                           resolvable_container_partials(node.body()));
     FlagGuard function_guard(in_function_body_, false);
     FlagGuard loop_guard(in_loop_body_, false);
     check_suite(node.body());

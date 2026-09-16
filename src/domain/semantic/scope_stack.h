@@ -2,6 +2,7 @@
 #define CYTHONPP_DOMAIN_SEMANTIC_SCOPE_STACK_H
 
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -255,6 +256,47 @@ struct Binding {
     // it. See CLAUDE.md for the same-method sibling, which stays a known
     // false positive.
     bool partial_none = false;
+
+    // The CONTAINER SHAPE of a live mypy PARTIAL CONTAINER type --
+    // `list[Unknown]` or `dict[Unknown, Unknown]` -- and nullopt when this
+    // binding is not one. Created by an UNANNOTATED assignment whose value is
+    // a bare empty `list`/`dict` (`[]`, `{}`, `list()`, `dict()`), and only
+    // when TypeChecker's own per-scope scan has already PROVEN the partial is
+    // resolved before it is ever read; cleared the moment a resolver arrives.
+    //
+    // A SEPARATE RULE FROM partial_none, NOT AN EXTENSION OF IT, and the two
+    // must not be merged. Measured 2026-09-16 against mypy 1.18.1 and CPython
+    // 3.14.2, the divergence that makes them different rules:
+    //   - `x = None` / `x = 1` resolves to `int | None` -- a UNION, because
+    //     the declared type absorbs None (a later `x = None` is accepted).
+    //   - `x = []` / `x = [1]` resolves to `list[int]` PLAINLY. There is no
+    //     None in play to absorb, and a later `x = None` is a real error:
+    //     `Incompatible types in assignment (expression has type "None",
+    //     variable has type "list[int]")`, and that is the ONLY error mypy
+    //     reports for the program, because `x = [1]` already resolved the
+    //     partial. A future round reading partial_none's comment and
+    //     generalising "a partial resolves to `T | None`" to containers would
+    //     invent a `list[int] | None` declared type and silently accept that
+    //     program. TypeChecker.AResolvedContainerPartialDoesNotAbsorbNone
+    //     exists to catch exactly that.
+    //
+    // An optional-of-Type rather than a bool because the resolver has to know
+    // WHICH container kind it is resolving: a dict display does not resolve a
+    // list partial (measured -- mypy reports both `Need type annotation` and
+    // an incompatible assignment for `x = []` / `x = {1: 2}`), and whether a
+    // subscript STORE resolves is kind-dependent too (`dict[k] = v` does,
+    // `list[0] = v` does not, measured both ways).
+    //
+    // The two flags can never both be live on one binding: partial_none needs
+    // a value of type None and this one needs a bare empty container, whose
+    // value ExpressionTyper types as Unknown -- mutually exclusive at the one
+    // creation site in TypeChecker::assign_name.
+    //
+    // Declared LAST, after partial_none, per this struct's own convention
+    // about positional brace-initialisation (see param_names' comment):
+    // appending keeps every existing Binding{...} meaning what it says, and
+    // this member is only ever filled by assignment.
+    std::optional<Type> partial_container;
 };
 
 // What a lookup found, and WHERE, because the ordering rule (3b) depends on
