@@ -114,10 +114,28 @@ TEST(Emitter, NestedArithmeticNeedsNoPrecedenceHandling) {
               "py::add(py::int_(1), py::mul(py::int_(2), py::int_(3)))");
 }
 
+// Text assertions here pin the SHAPE of the emitted call, not correctness --
+// see CodegenExecution.UnaryOperatorsOnABoolOperandRunAsPythonDoes, which
+// compiles and runs these operators over every in-slice operand type. THIS
+// TEST IS THE CAUTIONARY ONE: it asserted only INT operands, so it passed
+// while `-True` emitted uncompilable C++ and `+True` printed `True` where
+// CPython prints `1` (2026-09-16). A text test can make a reader believe an
+// OPERATOR is covered when only one of its OPERAND TYPES is.
 TEST(Emitter, UnaryOperators) {
     EXPECT_EQ(emitted("-1\n").value(), "py::neg(py::int_(1))");
-    EXPECT_EQ(emitted("+1\n").value(), "py::int_(1)");
+    // Unary plus emits a real py::pos call rather than nothing. It is the
+    // identity on the VALUE and NOT on the TYPE -- Python's `+True` is the int
+    // 1 -- and shedding that Bool tag needs a runtime call, since py::to_int
+    // deliberately preserves it (numeric_tag.h). Emitted unconditionally
+    // rather than only for a bool operand: one uniform rule, no operand-type
+    // gate to get wrong, and it matches this emitter's own discipline that
+    // every Python operation emits as a runtime function call.
+    EXPECT_EQ(emitted("+1\n").value(), "py::pos(py::int_(1))");
     EXPECT_EQ(emitted("not True\n").value(), "py::not_(py::bool_(true))");
+    // A bool operand is widened INTO the call, which is what keeps py::neg's
+    // and py::pos's (int_, float_) overload sets sufficient.
+    EXPECT_EQ(emitted("-True\n").value(), "py::neg(py::to_int(py::bool_(true)))");
+    EXPECT_EQ(emitted("+True\n").value(), "py::pos(py::to_int(py::bool_(true)))");
 }
 
 // Python's bool is an int subtype, so True + 1 is 2. The widening is inserted

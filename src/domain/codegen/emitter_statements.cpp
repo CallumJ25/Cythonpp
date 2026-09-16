@@ -461,7 +461,14 @@ void Emitter::emit_value_widened(const ast::Expr& value, const semantic::Type& t
 
 void Emitter::visit(const ast::ExprStmt& node) {
     write_indent();
+    // Saved and restored rather than merely set, matching every other
+    // context flag in this class: a statement's own expression is the only
+    // thing authorised to be a bare `print(...)` call, and leaving the
+    // authorisation behind would extend it to whatever is emitted next.
+    const ast::Expr* const enclosing = statement_expression_;
+    statement_expression_ = &node.value();
     emit_expr(node.value());
+    statement_expression_ = enclosing;
     write(";\n");
 }
 

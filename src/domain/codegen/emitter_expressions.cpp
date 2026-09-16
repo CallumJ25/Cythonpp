@@ -252,6 +252,14 @@ const semantic::Type* Emitter::type_of(const ast::Expr& expr) const {
 std::optional<std::string> Emitter::emit_expression_for_test(const ast::Expr& expr) {
     out_.clear();
     failed_ = false;
+    // This seam's documented contract is that `expr` IS a trailing
+    // ExprStmt's own expression (its only caller pulls it off one), so it
+    // must establish the same statement context visit(ExprStmt) does --
+    // otherwise a bare `print(...)` statement, legal in every real program,
+    // is refused here as a print-used-as-a-value. Set rather than
+    // saved/restored, matching out_/failed_ above: each for-test entry point
+    // owns a fresh emitter instance.
+    statement_expression_ = &expr;
     emit_expr(expr);
     if (failed_) {
         return std::nullopt;
@@ -348,15 +356,51 @@ void Emitter::visit(const ast::Call& node) { emit_call(node); }
 void Emitter::visit(const ast::UnaryOp& node) {
     switch (node.op()) {
     case lexer::token_type::OP_MINUS:
-        write("py::neg(");
-        emit_expr(node.operand());
+    case lexer::token_type::OP_PLUS: {
+        // ADVERSARIAL REVIEW, 2026-09-16, TWO CRITICALs in one arm, both on a
+        // BOOL operand and both pre-existing (this function is untouched by
+        // c5c696a; the defects predate the backstop that failed to catch
+        // them). Python's bool is an int subtype, so `-True` is -1 and
+        // `+True` is 1 -- an int in both cases, never a bool.
+        //
+        // OP_MINUS used to call emit_expr directly, with no widening, unlike
+        // emit_binary and emit_power which both route every operand through
+        // emit_operand_widened. py::neg has exactly two overloads (int_,
+        // float_) and py::bool_ is explicit with no conversion operator, so
+        // `x: int = -True` emitted `py::neg(py::bool_(true))` -- measured
+        // 2026-09-16: cythonpp exit 0 with the .cpp WRITTEN, then clang++
+        // `no matching function for call to 'neg'`, on a program mypy calls
+        // Success and CPython prints -1 for. The third state Decision 0
+        // forbids, reachable from all three value positions (initializer,
+        // return, call argument) and through print, which is
+        // widening-exempt.
+        //
+        // OP_PLUS was worse: it emitted NOTHING, on the stated grounds that
+        // unary plus "is the identity". It is the identity on the VALUE and
+        // not on the TYPE -- `+True` is 1 -- so `b: bool = True` /
+        // `print(+b)` compiled cleanly and printed `True` where CPython
+        // prints `1`. SILENTLY WRONG OUTPUT on a program both oracles
+        // accept, which is the worst class of defect this project can ship
+        // and strictly worse than the uncompilable sibling above.
+        //
+        // Widening alone does NOT fix OP_PLUS, and this is the trap worth
+        // knowing: to_int(bool_) deliberately PRESERVES the Bool tag (see
+        // numeric_tag.h -- an annotation constrains, it does not coerce, so
+        // `x: int = True` must still print `True`), so `py::to_int(b)` would
+        // compile and still print `True`. Shedding the tag needs a real
+        // runtime call, which is why py::pos exists at all rather than this
+        // arm reusing to_int. py::neg already shed it, for free, by
+        // rebuilding through the single-argument constructor.
+        const semantic::Type* result = type_of(node);
+        if (result == nullptr || !cpp_type_name(*result).has_value()) {
+            refuse(node, "an operand type");
+            return;
+        }
+        write(node.op() == lexer::token_type::OP_MINUS ? "py::neg(" : "py::pos(");
+        emit_operand_widened(node.operand(), *result);
         write(")");
         return;
-    case lexer::token_type::OP_PLUS:
-        // Python's unary plus on a number is the identity, so it emits
-        // nothing of its own rather than a no-op runtime call.
-        emit_expr(node.operand());
-        return;
+    }
     case lexer::token_type::OP_NOT:
         write("py::not_(");
         emit_expr(node.operand());
@@ -616,6 +660,33 @@ void Emitter::emit_call(const ast::Call& node) {
     // already has an exact match. Only a USER function has a DECLARED
     // parameter type an argument must be raised into.
     const bool builtin = name == "print" || name == "len";
+    // ADVERSARIAL REVIEW, 2026-09-16, CRITICAL, pre-existing. py::print
+    // returns `void` (print.h) -- it is the ONLY void-returning function in
+    // this runtime, since py::len returns an int_. The TypeMap, correctly,
+    // types a `print(...)` CALL as NoneType, whose cpp_type_name is
+    // "py::none_t". So a print call used as a VALUE passes every type check
+    // and every spelling comparison -- including emit_value_widened's own
+    // Decision 0 backstop, which compares the TypeMap spelling against the
+    // slot's and finds them equal -- while the emitted text's real C++ type
+    // is `void`. Measured 2026-09-16, all three mypy `Success` and CPython
+    // exit 0, all three cythonpp exit 0 WITH the .cpp written and clang++
+    // rejecting it: `x: None = print("a")` is `no viable overloaded '='`,
+    // `return print("a")` is `no viable conversion from ... 'void'`, and
+    // `f(print("a"))` is `cannot convert argument of incomplete type
+    // 'void'`.
+    //
+    // Refused rather than emitted, because py::print's void return is
+    // deliberate and giving it a none_t return to make this one shape work
+    // would be a runtime change serving nothing a real program does. The
+    // test is POSITIONAL, not type-based: a print call is legal as a whole
+    // statement and illegal everywhere else, so it is compared against the
+    // expression the enclosing ExprStmt is emitting. That also catches
+    // `print(print("a"))`, where the inner call is an argument to a
+    // widening-EXEMPT builtin and so is reached by no other guard.
+    if (name == "print" && static_cast<const ast::Expr*>(&node) != statement_expression_) {
+        refuse(node, "a call to 'print' used as a value");
+        return;
+    }
     if (builtin) {
         write(name == "print" ? "py::print" : "py::len");
     } else if (is_refused_builtin_call(name)) {

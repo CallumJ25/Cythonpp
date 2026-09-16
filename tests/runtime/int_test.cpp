@@ -4,6 +4,32 @@
 
 namespace {
 
+// py::pos exists ONLY to shed the Bool tag, so that is what this pins. Python
+// `+True` is the int 1, not True -- unary plus is the identity on the VALUE
+// and NOT on the TYPE. py::to_int is not a substitute: it deliberately
+// PRESERVES the tag (numeric_tag.h), which is what makes `x: int = True`
+// print `True`, so a widening-only emitter fix compiled and still printed
+// `True`. Asserted against neg's identical tag behaviour, since pos is a
+// structural copy of it.
+TEST(RuntimeInt, PosShedsTheBoolTagAndKeepsTheValue) {
+    const py::int_ widened_bool = py::to_int(py::bool_(true));
+    EXPECT_TRUE(widened_bool.is_bool()) << "to_int must PRESERVE the tag";
+    EXPECT_EQ(widened_bool.raw(), 1);
+
+    EXPECT_FALSE(py::pos(widened_bool).is_bool());
+    EXPECT_EQ(py::pos(widened_bool).raw(), 1);
+
+    // neg already shed it, for free, by rebuilding through the
+    // single-argument constructor -- pos must match.
+    EXPECT_FALSE(py::neg(widened_bool).is_bool());
+    EXPECT_EQ(py::neg(widened_bool).raw(), -1);
+
+    // An ordinary int is untouched in value and in tag.
+    EXPECT_FALSE(py::pos(py::int_(7)).is_bool());
+    EXPECT_EQ(py::pos(py::int_(7)).raw(), 7);
+    EXPECT_EQ(py::pos(py::int_(-7)).raw(), -7);
+}
+
 TEST(RuntimeInt, AddSubMul) {
     EXPECT_EQ(py::add(py::int_(2), py::int_(3)).raw(), 5);
     EXPECT_EQ(py::sub(py::int_(2), py::int_(3)).raw(), -1);

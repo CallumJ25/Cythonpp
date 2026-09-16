@@ -263,5 +263,58 @@ TEST(EmitterModule, AValueThatCannotFitItsDeclaredSlotIsRefusedNotEmitted) {
     }
 }
 
+// ADVERSARIAL REVIEW, 2026-09-16, CRITICAL, pre-existing. py::print returns
+// `void` -- the only void-returning function in the runtime, since py::len
+// returns an int_ -- while the TypeMap types a `print(...)` CALL as NoneType,
+// spelled "py::none_t". So a print call used as a VALUE matched its slot's C++
+// spelling exactly, which means emit_value_widened's own Decision 0 backstop
+// (added in the very commit this review covers) compared the two, found them
+// equal, and let it through. Measured 2026-09-16: all four shapes were mypy
+// `Success`, CPython exit 0, cythonpp exit 0 WITH the .cpp written, and
+// clang++ rejecting it -- `no viable overloaded '='`, `no viable conversion
+// from ... 'void'`, and `cannot convert argument of incomplete type 'void'`.
+//
+// The refusal is POSITIONAL: a print call is legal as a whole statement and
+// illegal wherever its value is consumed. That is why the last shape matters
+// -- the inner call is an argument to print itself, which is deliberately
+// widening-EXEMPT and so is reached by no type-based guard at all.
+TEST(EmitterModule, APrintCallUsedAsAValueIsRefusedNotEmitted) {
+    for (const std::string source :
+         {// An assignment initializer.
+          std::string("x: None = print(\"a\")\nprint(x)\n"),
+          // A `return` value.
+          std::string("def f() -> None:\n    return print(\"a\")\n\n\nf()\n"),
+          // A user function's call argument.
+          std::string("def f(v: None) -> None:\n    return v\n\n\nf(print(\"a\"))\n"),
+          // Nested inside print itself, the widening-exempt path.
+          std::string("print(print(\"a\"))\n")}) {
+        Fixture fixture = build(source);
+        EXPECT_FALSE(emit_module(fixture).has_value()) << source;
+        ASSERT_FALSE(fixture.emit_sink.empty()) << source;
+        EXPECT_NE(fixture.emit_sink.diagnostics().front().message.find(
+                      "a call to 'print' used as a value"),
+                  std::string::npos)
+            << source << " -> " << fixture.emit_sink.diagnostics().front().message;
+    }
+}
+
+// CONTROL: a print call as a whole STATEMENT is exactly what the refusal above
+// must not touch -- at module level, inside a block (reached through a
+// different suite walk), and inside a function body. Also pins that `len`, the
+// other modelled builtin, is unaffected: it returns an int_, not void, so it
+// stays legal as a value.
+TEST(EmitterModule, APrintStatementAndALenValueStayEmittable) {
+    Fixture fixture = build("c: bool = True\n"
+                            "n: int = len(\"abc\")\n"
+                            "print(n)\n"
+                            "if c:\n"
+                            "    print(\"in a block\")\n"
+                            "def show() -> None:\n"
+                            "    print(\"in a body\")\n"
+                            "\n\nshow()\n");
+    EXPECT_TRUE(emit_module(fixture).has_value());
+    EXPECT_TRUE(fixture.emit_sink.empty());
+}
+
 } // namespace
 } // namespace cythonpp::domain::codegen

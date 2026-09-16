@@ -278,6 +278,22 @@ private:
     std::map<std::string, semantic::Type> function_declared_;
     bool at_module_level_ = true;
 
+    // The expression the enclosing ExprStmt is currently emitting, or nullptr
+    // when no statement-level expression is in flight. Exists for exactly one
+    // question: is this `print(...)` call a whole STATEMENT, or is its value
+    // being consumed? py::print returns `void` while the TypeMap types the
+    // call as NoneType, so a consumed print call type-checks, matches its
+    // slot's C++ spelling, slips past emit_value_widened's Decision 0
+    // backstop, and then fails at clang++ -- see emit_call's own comment for
+    // the three measured shapes.
+    //
+    // A NODE POINTER rather than a bool, deliberately: a bool set for the
+    // duration of the statement would also authorise every print call
+    // NESTED inside that statement (`print(print("a"))`, `f(print("a"))`),
+    // which is exactly the set that must be refused. Only the identical node
+    // is the statement.
+    const ast::Expr* statement_expression_ = nullptr;
+
     // The module-scope counterpart of function_declared_: the declared type
     // of every module-level variable, populated once by emit_module's
     // file-scope prelude before main() is emitted. function_declared_ is

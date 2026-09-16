@@ -299,5 +299,92 @@ TEST(CodegenExecution, ABlockFirstAssignmentReassignedAtTopLevelStillRunsCorrect
     EXPECT_EQ(loop.stdout_text, "7\n");
 }
 
+// ADVERSARIAL REVIEW, 2026-09-16, the two unary-on-bool CRITICALs. Python's
+// bool is an int subtype, so `-True` is -1 and `+True` is 1 -- an INT in both
+// cases. Every shape below is mypy `Success` and CPython exit 0, and every
+// expected string was produced by RUNNING CPython 3.14.
+//
+// These COMPILE AND RUN rather than asserting on text, and that is the whole
+// point: the pre-existing text test (Emitter.UnaryOperators) asserts
+// "py::neg(py::int_(1))" for `-1` and passed throughout, because it uses an
+// int operand only. With a BOOL operand, OP_MINUS emitted
+// py::neg(py::bool_(true)) -- clang++ `no matching function for call to
+// 'neg'` from a cythonpp run that exited 0 with the file WRITTEN -- and
+// OP_PLUS emitted the operand unchanged, compiling cleanly and printing
+// `True` where CPython prints `1`. The eighth instance of the process lesson
+// in CLAUDE.md: a text assertion cannot tell you the text compiles, let
+// alone runs.
+TEST(CodegenExecution, UnaryOperatorsOnABoolOperandRunAsPythonDoes) {
+    // OP_MINUS, the uncompilable one, in each of the three value positions
+    // plus print (which is widening-exempt and so reached by no other guard).
+    const RunResult minus_init = compile_and_run("x: int = -True\nprint(x)\n");
+    EXPECT_EQ(minus_init.exit_code, 0);
+    EXPECT_EQ(minus_init.stdout_text, "-1\n");
+
+    const RunResult minus_print = compile_and_run("b: bool = True\nprint(-b)\n");
+    EXPECT_EQ(minus_print.exit_code, 0);
+    EXPECT_EQ(minus_print.stdout_text, "-1\n");
+
+    const RunResult minus_return =
+        compile_and_run("def f() -> int:\n    return -True\n\n\nprint(f())\n");
+    EXPECT_EQ(minus_return.exit_code, 0);
+    EXPECT_EQ(minus_return.stdout_text, "-1\n");
+
+    const RunResult minus_arg =
+        compile_and_run("def f(v: int) -> int:\n    return v\n\n\nprint(f(-True))\n");
+    EXPECT_EQ(minus_arg.exit_code, 0);
+    EXPECT_EQ(minus_arg.stdout_text, "-1\n");
+
+    // OP_PLUS, the silently-wrong-output one. `1`, not `True` -- and this is
+    // what proves py::pos sheds the Bool tag, since py::to_int deliberately
+    // PRESERVES it (numeric_tag.h), so a widening-only fix would compile and
+    // still print `True` here.
+    const RunResult plus_print = compile_and_run("b: bool = True\nprint(+b)\n");
+    EXPECT_EQ(plus_print.exit_code, 0);
+    EXPECT_EQ(plus_print.stdout_text, "1\n");
+
+    const RunResult plus_init = compile_and_run("x: int = +True\nprint(x)\n");
+    EXPECT_EQ(plus_init.exit_code, 0);
+    EXPECT_EQ(plus_init.stdout_text, "1\n");
+
+    // The bool has to shed its tag before becoming an operand of something
+    // else, too: `+True + 0` is 1. Pins the interaction with emit_binary's
+    // own widening, which reads the UnaryOp node's type (int) and so declines
+    // to widen -- leaving the shedding entirely to this arm.
+    const RunResult plus_operand = compile_and_run("print(+True + 0)\n");
+    EXPECT_EQ(plus_operand.exit_code, 0);
+    EXPECT_EQ(plus_operand.stdout_text, "1\n");
+
+    // A float-declared slot: widening composes with the tag shedding, and the
+    // value still prints as an INT, because to_float preserves whatever tag
+    // reaches it and neg/pos have already made that Int. CPython: -1.
+    const RunResult widened = compile_and_run("x: float = -True\nprint(x)\n");
+    EXPECT_EQ(widened.exit_code, 0);
+    EXPECT_EQ(widened.stdout_text, "-1\n");
+}
+
+// CONTROLS for the arm above: a non-bool operand must be untouched by the
+// widening it added. Every expected string produced by RUNNING CPython 3.14.
+TEST(CodegenExecution, UnaryOperatorsOnNonBoolOperandsAreUnchanged) {
+    const RunResult ints =
+        compile_and_run("a: int = 7\nprint(-a)\nprint(+a)\nprint(-(-a))\n");
+    EXPECT_EQ(ints.exit_code, 0);
+    EXPECT_EQ(ints.stdout_text, "-7\n7\n7\n");
+
+    // repr spells the sign, so a float round-trips visibly -- and an integral
+    // value held in a float slot must stay integral rather than being routed
+    // through double (int_ reaches 2^63, a double is exact only to 2^53).
+    const RunResult floats = compile_and_run(
+        "a: float = 2.5\nb: float = 4.0\nprint(-a)\nprint(+a)\nprint(-b)\n");
+    EXPECT_EQ(floats.exit_code, 0);
+    EXPECT_EQ(floats.stdout_text, "-2.5\n2.5\n-4.0\n");
+
+    // `not` is deliberately NOT routed through the widening: its result IS a
+    // bool, so shedding would be wrong. CPython: False, True.
+    const RunResult logical = compile_and_run("b: bool = True\nprint(not b)\nprint(not 0)\n");
+    EXPECT_EQ(logical.exit_code, 0);
+    EXPECT_EQ(logical.stdout_text, "False\nTrue\n");
+}
+
 } // namespace
 } // namespace cythonpp::domain::codegen

@@ -291,4 +291,26 @@ TEST(RuntimeFloatDeathTest, FloatDivisionByZeroExitsNonZero) {
                 ::testing::ExitedWithCode(1), "ZeroDivisionError");
 }
 
+// The float_ arm of py::pos -- see int_test.cpp for why pos exists at all.
+// The is_integral() branch is the load-bearing part: an integral value held in
+// a float-declared slot must stay in int64_t rather than being routed through
+// double, since a double is exact only to 2^53 while int_ reaches 2^63.
+TEST(RuntimeFloat, PosPreservesIntegralityAndShedsTheBoolTag) {
+    const py::float_ widened_bool = py::to_float(py::bool_(true));
+    EXPECT_TRUE(widened_bool.is_integral());
+    EXPECT_FALSE(py::pos(widened_bool).is_bool());
+    EXPECT_TRUE(py::pos(widened_bool).is_integral());
+    EXPECT_EQ(py::pos(widened_bool).int_raw(), 1);
+
+    // A large integral value: exact here, corrupted if routed through double.
+    const py::float_ large = py::to_float(py::int_(9007199254740993));
+    EXPECT_TRUE(py::pos(large).is_integral());
+    EXPECT_EQ(py::pos(large).int_raw(), 9007199254740993);
+
+    // A genuine float keeps its value and stays non-integral.
+    EXPECT_FALSE(py::pos(py::float_(2.5)).is_integral());
+    EXPECT_EQ(py::pos(py::float_(2.5)).raw(), 2.5);
+    EXPECT_EQ(py::pos(py::float_(-2.5)).raw(), -2.5);
+}
+
 } // namespace

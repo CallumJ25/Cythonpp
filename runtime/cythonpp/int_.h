@@ -98,6 +98,20 @@ inline int_ neg(int_ a) {
     return int_(result);
 }
 
+// Python's unary `+` is the identity on the VALUE and NOT on the TYPE: `+True`
+// is the int `1`, not `True`. So this cannot be "emit nothing", and it cannot
+// be to_int() either -- to_int(bool_) deliberately PRESERVES the Bool tag (an
+// annotation constrains, it does not coerce, so `x: int = True` must still
+// print `True`). Shedding the tag is the whole job, and it happens here the
+// same way every arithmetic result sheds it: by rebuilding through the
+// single-argument constructor, which defaults to NumericTag::Int.
+//
+// Structurally a copy of neg() above minus the negation, deliberately, so the
+// two cannot drift apart on tag handling -- `-True` is -1 and `+True` is 1,
+// and both must be Int-tagged. No overflow check, because unary plus cannot
+// overflow: the result is the operand.
+inline int_ pos(int_ a) { return int_(a.raw()); }
+
 // Python floors toward negative infinity; C++ truncates toward zero. Measured
 // 2026-09-14: -7 // 2 is -4, and a direct transcription gives -3.
 inline int_ floordiv(int_ a, int_ b) {

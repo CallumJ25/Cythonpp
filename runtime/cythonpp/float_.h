@@ -320,6 +320,19 @@ inline float_ neg(float_ a) {
     return float_(-a.raw());
 }
 
+// The float_ arm of unary plus -- see int_.h's pos() for why `+` needs a real
+// function at all rather than emitting nothing. Mirrors neg() above line for
+// line, including the is_integral() branch that keeps an integral value in
+// int64_t rather than routing it through double (a double is exact only to
+// 2^53 while int_ reaches 2^63, so routing an integral value through raw()
+// here would silently corrupt a large one).
+inline float_ pos(float_ a) {
+    if (a.is_integral()) {
+        return to_float(pos(a.as_int()));
+    }
+    return float_(a.raw());
+}
+
 // Python raises for float division by zero too, where C++ yields inf. That
 // makes this a check the runtime ADDS rather than one it inherits.
 //
