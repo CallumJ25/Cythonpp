@@ -7868,5 +7868,104 @@ TEST(TypeChecker, AModuleLevelLoopCarriedAccumulatorStillReports) {
     EXPECT_EQ(error.code, "NameError");
 }
 
+// 2026-09-16, mypy PARTIAL NONE types. `x = None` does NOT declare `x` to be
+// None: mypy records a partial type and takes the declared type from the next
+// assignment that RESOLVES it. Every shape here was a false `TypeError:
+// incompatible types in assignment (expression has type "int", variable has
+// type "None")` on a program mypy calls Success and CPython RUNS -- measured
+// 2026-09-16 against mypy 1.18.1 and CPython 3.14, 13 distinct shapes at
+// module scope plus function, nested-function and class-body scope, where the
+// rule is identical (scope does not change it). See Binding::partial_none.
+TEST(TypeChecker, APartialNoneIsResolvedByTheNextAssignment) {
+    // The headline shape, and the read-between and re-None variants.
+    expect_clean("x = None\nx = 1\nprint(x)\n");
+    expect_clean("x = None\nprint(x)\nx = 1\nprint(x)\n");
+    // A `None` value leaves the binding partial rather than resolving it.
+    expect_clean("x = None\nx = None\nx = 1\nprint(x)\n");
+    // Never resolved at all: the declared type really is None, and this was
+    // already correct before the fix -- kept as a control.
+    expect_clean("x = None\nprint(x)\n");
+    // A str resolver, so the rule is not read as numeric-tower specific.
+    expect_clean("x = None\nx = \"s\"\nprint(x)\n");
+    // Resolvers in every block form, and a `for` TARGET as the resolver.
+    expect_clean("c: bool = True\nx = None\nif c:\n    x = 1\nprint(x)\n");
+    expect_clean("c: bool = True\nif c:\n    x = None\nx = 1\nprint(x)\n");
+    expect_clean("x = None\nfor i in [1]:\n    x = 1\nprint(x)\n");
+    expect_clean("x = None\nfor x in [1, 2]:\n    print(x)\nprint(x)\n");
+    // An already-Optional resolver.
+    expect_clean("x = None\ny: int | None = 3\nx = y\nprint(x)\n");
+    // Function, and class-body, scope.
+    expect_clean("def f() -> None:\n    x = None\n    x = 1\n    print(x)\n\n\nf()\n");
+    expect_clean("class C:\n    x = None\n    x = 1\n\n\nprint(C.x)\n");
+}
+
+// THE RESOLVED TYPE IS `T | None`, NOT `T`, and this test is the one that
+// separates the two readings -- everything in the test above passes under
+// either. reveal_type shows the NARROWED type (`x = None` / `x = 1` /
+// `reveal_type(x)` is `builtins.int`), so an implementation built on it
+// infers `T` and turns each of these from a correct report into a MISSED
+// ERROR. Measured: mypy names the union in its own message text, and accepts
+// a later `x = None`, and is byte-identically equivalent to writing
+// `x: int | None = None`.
+TEST(TypeChecker, APartialNoneResolvesToTheUnionWithNoneNotToTheBareType) {
+    // mypy: Incompatible types in assignment (expression has type "str",
+    // variable has type "int | None")  [assignment]
+    const Checked str_after_int = check_module("x = None\nx = 1\nx = \"s\"\nprint(x)\n");
+    const diagnostics::Diagnostic mismatch = only_error(str_after_int);
+    EXPECT_EQ(mismatch.code, "TypeError");
+    EXPECT_NE(mismatch.message.find("variable has type \"int | None\""), std::string::npos)
+        << mismatch.message;
+
+    // The resolver's type is taken EXACTLY, with no numeric-tower widening:
+    // a `True` resolver gives `bool | None`, so a later `x = 1` is a genuine
+    // error. mypy: variable has type "bool | None".
+    const Checked int_after_bool = check_module("x = None\nx = True\nx = 1\nprint(x)\n");
+    const diagnostics::Diagnostic exact = only_error(int_after_bool);
+    EXPECT_EQ(exact.code, "TypeError");
+    EXPECT_NE(exact.message.find("variable has type \"bool | None\""), std::string::npos)
+        << exact.message;
+
+    // THE SHARPEST PROBE: a module-level partial read from a `def` BELOW its
+    // resolver. Nothing narrows across the scope boundary, so the DECLARED
+    // type is what the return is checked against. mypy: Incompatible return
+    // value type (got "int | None", expected "int"). Under the `T` reading
+    // this program goes silent, because `int` satisfies `-> int`.
+    const Checked returned =
+        check_module("x = None\nx = 1\n\n\ndef f() -> int:\n    return x\n\n\nprint(f())\n");
+    const diagnostics::Diagnostic returns = only_error(returned);
+    EXPECT_EQ(returns.code, "TypeError");
+    EXPECT_NE(returns.message.find("got \"int | None\""), std::string::npos) << returns.message;
+}
+
+// CONTROLS: the shapes that must KEEP reporting, each for its own reason.
+TEST(TypeChecker, APartialNoneDoesNotSwallowGenuineErrors) {
+    // An EXPLICIT `None` annotation defeats the partial entirely -- mypy:
+    // Incompatible types in assignment (expression has type "int", variable
+    // has type "None"). This is the one shape that was already correct.
+    const Checked annotated = check_module("x: None = None\nx = 1\nprint(x)\n");
+    EXPECT_EQ(only_error(annotated).code, "TypeError");
+
+    // Two resolvers of differing type in the two arms of an if/else: the
+    // first commits the declared type, the second is a real error. mypy:
+    // variable has type "int | None".
+    const Checked arms = check_module(
+        "c: bool = True\nx = None\nif c:\n    x = 1\nelse:\n    x = \"s\"\nprint(x)\n");
+    EXPECT_FALSE(arms.diagnostics.empty());
+
+    // A method-frame attribute partial is DELIBERATELY not covered, and this
+    // is a measured boundary, not an oversight: mypy confines a `self.x`
+    // partial to the method frame that created it, so resolving it from
+    // ANOTHER method is a real error -- `Incompatible types in assignment
+    // (expression has type "int", variable has type "None")`, the identical
+    // message and line this compiler already reports. It is also the
+    // IDIOMATIC shape, so breaking it would be far worse than the
+    // same-method sibling it leaves open (see CLAUDE.md).
+    const Checked attribute =
+        check_module("class C:\n    def __init__(self) -> None:\n        self.x = None\n\n"
+                     "    def set(self) -> None:\n        self.x = 1\n\n\n"
+                     "c = C()\nc.set()\nprint(c.x)\n");
+    EXPECT_EQ(only_error(attribute).code, "TypeError");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

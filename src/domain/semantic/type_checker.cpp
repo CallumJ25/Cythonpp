@@ -1271,11 +1271,29 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
     typer_.type_of(value, Type::unknown());
 }
 
+// True when an assignment's own value makes this binding a mypy PARTIAL NONE
+// -- see Binding::partial_none for the measurements, the `T | None` result,
+// and the reveal_type trap. Kept as one named predicate because the three
+// binding sites in assign_name must agree: a fresh bind, a placeholder fill,
+// and (by its absence) an ordinary reassignment.
+//
+// order_exempt excludes a parameter, a `for` target and a comprehension
+// target from CREATING a partial. It does not stop one from RESOLVING a
+// partial, which is a separate question and is deliberately not gated on the
+// binding kind at all -- measured: `x = None` followed by `for x in [1, 2]:`
+// resolves to `int | None` under mypy.
+namespace {
+bool seeds_partial_none(const Type& value_type, bool order_exempt) {
+    return value_type.kind == TypeKind::NoneType && !order_exempt;
+}
+} // namespace
+
 void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, int line,
                               bool order_exempt) {
     if (!scopes_.bound_in_current_scope(target.identifier())) {
-        scopes_.bind(target.identifier(),
-                     Binding{value_type, line, /*annotated=*/false, order_exempt});
+        Binding fresh{value_type, line, /*annotated=*/false, order_exempt};
+        fresh.partial_none = seeds_partial_none(value_type, order_exempt);
+        scopes_.bind(target.identifier(), fresh);
         return;
     }
     const Resolution existing = scopes_.resolve(target.identifier());
@@ -1296,7 +1314,41 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
         // like the bug order_exempt exists to prevent. An ordinary Assign's
         // own placeholder-fill call never passes true, so this is a no-op for
         // every pre-existing caller.
-        scopes_.rebind(target.identifier(), Binding{value_type, line, /*annotated=*/false, order_exempt});
+        Binding filled{value_type, line, /*annotated=*/false, order_exempt};
+        filled.partial_none = seeds_partial_none(value_type, order_exempt);
+        scopes_.rebind(target.identifier(), filled);
+        return;
+    }
+    // 2026-09-16: RESOLVE a mypy PARTIAL NONE rather than reporting against
+    // it. `x = None` does not declare `x` to be None -- see
+    // Binding::partial_none for the four-way measurement, and for why the
+    // resolved type is `T | None` and not `T`. Before this, every one of
+    // these was a false `TypeError: incompatible types in assignment
+    // (expression has type "int", variable has type "None")` on a program
+    // mypy calls Success and CPython runs: measured 13 distinct shapes at
+    // module scope alone, plus function, nested-function and class-body
+    // scope, where the rule is identical (scope does not change it).
+    //
+    // Placed AFTER the placeholder-fill branch and BEFORE the ordinary
+    // compatibility check, because it is neither: the binding is real (not a
+    // placeholder) and this assignment must NOT be compared against it.
+    //
+    // A `None` value leaves the binding partial -- `x = None` twice then
+    // `x = 1` still resolves to `int | None` (measured `Success`) -- and an
+    // Unknown value is left to the ordinary path, where Unknown is absorbing
+    // and reports nothing anyway, so a resolver this compiler cannot type
+    // never freezes a wrong declared type in place.
+    if (existing.binding->partial_none && value_type.kind != TypeKind::NoneType &&
+        value_type.kind != TypeKind::Unknown) {
+        Binding resolved{Type::union_of({value_type, Type::none()}), line,
+                         /*annotated=*/false};
+        scopes_.rebind(target.identifier(), resolved);
+        // Same kill-then-set the compatible path below performs: the DECLARED
+        // type is the union, while this path's CURRENT type is the resolver's
+        // own, which is what keeps an in-scope `return x` straight after
+        // `x = 1` clean (mypy agrees -- its binder narrows identically).
+        narrowings_.kill(target.identifier());
+        narrowings_.set(target.identifier(), value_type);
         return;
     }
     // A genuine reassignment (including a one-line def's parameter, whose

@@ -205,6 +205,56 @@ struct Binding {
     // top-to-bottom pass check_suite performs, so nothing downstream ever
     // needs to consult this field on the filled-in Binding.
     int loop_start_line = 0;
+
+    // True while this binding is a mypy PARTIAL NONE type: created by an
+    // UNANNOTATED assignment whose value is `None`, and not yet resolved.
+    //
+    // mypy does NOT treat `x = None` as declaring `x` to be `None`. It
+    // records a partial type and takes the declared type from the next
+    // assignment that RESOLVES it -- and the resolved type is `T | None`,
+    // NOT `T`. Measured 2026-09-16 against mypy 1.18.1 and CPython 3.14, in
+    // four independent forms, because getting this wrong is the difference
+    // between closing a false positive and creating a missed error:
+    //   - mypy's own error text names it: `x = None` / `x = 1` / `x = "s"`
+    //     is `Incompatible types in assignment (expression has type "str",
+    //     variable has type "int | None")`.
+    //   - A later `x = None` is ACCEPTED (`x = None` / `x = 1` / `x = None`
+    //     is `Success`), so the declared type genuinely absorbed None.
+    //   - A cross-scope read, where mypy's binder cannot narrow, reveals
+    //     `builtins.int | None`.
+    //   - It is byte-identically equivalent to writing
+    //     `x: int | None = None`, diffed over a whole probe file.
+    //
+    // THE TRAP: `reveal_type` shows the NARROWED type, not the declared one.
+    // `x = None` / `x = 1` / `reveal_type(x)` is `builtins.int`, because the
+    // binder knows the last write was an int. An implementation built on
+    // that reads the rule as resolving to `T`, and then `def f() -> int:
+    // return x` (a module-level partial read from a def BELOW the resolver)
+    // flips from mypy's `got "int | None", expected "int"` to SILENTLY
+    // CLEAN -- a missed error manufactured by the fix. The narrowing map is
+    // what makes an in-scope `return x` right after `x = 1` still clean, so
+    // both readings look identical until that cross-scope probe separates
+    // them.
+    //
+    // NOT set for an order_exempt binding (a parameter, a `for` target, a
+    // comprehension target): mypy's partial types come from ASSIGNMENTS, and
+    // a parameter is annotated in this compiler's subset anyway. A `for`
+    // target may still RESOLVE a partial (measured: `x = None` /
+    // `for x in [1, 2]:` resolves to `int | None`), which is why resolution
+    // below is not gated on the assignment's own kind.
+    //
+    // DELIBERATELY NOT extended to an ATTRIBUTE path (`self.x = None`), and
+    // that is a measured boundary rather than a shortcut: mypy's partial for
+    // `self.x` is confined to the METHOD FRAME that created it, so
+    // `self.x = None` in `__init__` resolved by `self.x = 1` in ANOTHER
+    // method is a real mypy error -- `Incompatible types in assignment
+    // (expression has type "int", variable has type "None")`, which is the
+    // identical message and line this compiler already reports. That is the
+    // idiomatic shape, and it already AGREES; widening this flag to
+    // attribute paths without modelling the frame rule would silently accept
+    // it. See CLAUDE.md for the same-method sibling, which stays a known
+    // false positive.
+    bool partial_none = false;
 };
 
 // What a lookup found, and WHERE, because the ordering rule (3b) depends on
