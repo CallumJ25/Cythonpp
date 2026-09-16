@@ -995,6 +995,16 @@ private:
     void assign_tuple(const ast::TupleExpr& target, const ast::Expr& value, int line);
     void assign_subscript(const ast::Subscript& target, const ast::Expr& value);
 
+    // A dict SUBSCRIPT STORE is the second mypy PARTIAL CONTAINER resolver
+    // form, alongside assign_name's matching non-empty display: `x = {}` /
+    // `x["a"] = 1` declares `dict[str, int]`. Called from assign_subscript
+    // BEFORE it reads the target's element type, which for a live partial
+    // answers Unknown and so checks nothing. A LIST subscript store
+    // deliberately resolves NOTHING (control C3) -- see the function's own
+    // comment and the kind matrix in resolvable_container_partials.
+    bool resolve_dict_partial_from_store(const ast::Subscript& target,
+                                        const Type& value_type);
+
     // Task 19: `self.x = ...` inside a method DECLARES a new instance
     // attribute the first time TypeChecker's own single-pass visitation
     // encounters it for a given name -- checked FIRST, syntactically plus one

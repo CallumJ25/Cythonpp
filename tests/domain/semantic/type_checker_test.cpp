@@ -413,6 +413,173 @@ TEST(TypeChecker, AnEmptyContainerResolvingANonePartialIsAKnownMissedError) {
     expect_clean("x = None\nx = []\nprint(x)\n");
 }
 
+// THE SECOND RESOLVER FORM (Spec 5d §4 item 2): a DICT SUBSCRIPT STORE,
+// `x[k] = v`, resolves a live dict partial to `dict[K, V]` taken from the key
+// and value expression types. Measured 2026-09-16: mypy 1.18.1 Success and
+// CPython 3.14.2 exit 0 printing `{'a': 1}`, `{'a': 1, 'b': 2}` and
+// `{'z': 9}` respectively, where this compiler reported a false
+// `TypeError: need type annotation for "x"` at 1:1 for all three.
+TEST(TypeChecker, ADictSubscriptStoreResolvesAContainerPartial) {
+    expect_clean("x = {}\nx[\"a\"] = 1\nprint(x)\n");                      // F3
+    // The FIRST store commits; a second, compatible store is checked
+    // against it and never draws a second diagnostic.
+    expect_clean("x = {}\nx[\"a\"] = 1\nx[\"b\"] = 2\nprint(x)\n");
+    // The STORE committed the type, so the later whole-dict assignment is
+    // checked against `dict[str, int]` and fits.
+    expect_clean("x = {}\nx[\"a\"] = 1\nx = {\"z\": 9}\nprint(x)\n");
+}
+
+// THE FOUR CALL SITES AGAIN, for the new resolver form specifically. A
+// resolver form wired only at module scope would be a half-landing of exactly
+// the kind the plan names, and the module-scope test above cannot see it.
+// Measured, every shape: mypy Success, CPython exit 0 printing `{'a': 1}`.
+TEST(TypeChecker, ADictSubscriptStoreResolvesAtEveryScope) {
+    expect_clean("def f() -> None:\n    x = {}\n    x[\"a\"] = 1\n    print(x)\nf()\n");
+    expect_clean("def o() -> None:\n    def i() -> None:\n        x = {}\n"
+                 "        x[\"a\"] = 1\n        print(x)\n    i()\no()\n");
+    expect_clean("class C:\n    def m(self) -> None:\n        x = {}\n"
+                 "        x[\"a\"] = 1\n        print(x)\nC().m()\n");
+    expect_clean("class C:\n    x = {}\n    x[\"a\"] = 1\nprint(C.x)\n");
+    // A resolver at block nesting depth still resolves, exactly as the
+    // display form does.
+    expect_clean("c: bool = True\nx = {}\nif c:\n    x[\"a\"] = 1\nprint(x)\n");
+}
+
+// CONTROL C3, THE ASYMMETRY, and the single most important control of this
+// task: a LIST subscript store is NOT a resolver, where a dict one is.
+// Measured both ways against mypy 1.18.1 -- `x = []` / `x[0] = 1` is
+// `Need type annotation for "x" (hint: "x: list[<type>] = ...")` while
+// `x = {}` / `x["a"] = 1` is Success. This is mypy's rule, not a modelling
+// convenience, and this test FAILS the moment a list store is made to
+// resolve.
+TEST(TypeChecker, AListSubscriptStoreIsNotAResolver) {
+    for (const char* source : {"x = []\nx[0] = 1\n", "x = []\nx[0] = 1\nprint(x)\n",
+                               "def f() -> None:\n    x = []\n    x[0] = 1\nf()\n"}) {
+        const Checked checked = check_module(source);
+
+        const diagnostics::Diagnostic error = only_error(checked);
+        EXPECT_EQ(error.code, "TypeError") << source;
+        EXPECT_EQ(error.message, "need type annotation for \"x\"") << source;
+    }
+    // THE ASYMMETRY IN ONE PAIR: the same store, the same index, the same
+    // stored value, differing ONLY in which container the partial is.
+    // Measured: `x = {}` / `x[0] = 1` is mypy Success and CPython prints
+    // `{0: 1}`, while the `x = []` spelling on the first line of the loop
+    // above is `Need type annotation`.
+    expect_clean("x = {}\nx[0] = 1\nprint(x)\n");
+}
+
+// FIRST-STORE-COMMITS, the conflicting halves. Both programs are rejected by
+// mypy and run under CPython, so a VERDICT is what matters -- but the
+// messages are asserted verbatim anyway, because both turned out to match
+// mypy 1.18.1's own text modulo this project's lower-case initial (measured:
+// `Incompatible types in assignment (expression has type "str", target has
+// type "int")` and `Invalid index type "str" for "dict[int, int]"; expected
+// type "int"`, both at line 3 -- the second differs only in dropping mypy's
+// `; expected type "int"` suffix). Spec §7 predicted a wording divergence
+// here and, as with the display resolver, there is almost none.
+TEST(TypeChecker, AConflictingLaterDictStoreReportsAgainstTheCommittedType) {
+    const Checked value_conflict =
+        check_module("x = {}\nx[\"a\"] = 1\nx[\"b\"] = \"s\"\nprint(x)\n");
+    const diagnostics::Diagnostic value_error = only_error(value_conflict);
+    EXPECT_EQ(value_error.code, "TypeError");
+    EXPECT_EQ(value_error.message,
+              "incompatible types in assignment (expression has type \"str\", "
+              "target has type \"int\")");
+    // Never a second `need type annotation` at line 1: the store committed
+    // the type, so the conflict is reported against THAT.
+    EXPECT_EQ(value_error.line, 3);
+
+    const Checked key_conflict = check_module("x = {}\nx[1] = 1\nx[\"a\"] = 2\nprint(x)\n");
+    const diagnostics::Diagnostic key_error = only_error(key_conflict);
+    EXPECT_EQ(key_error.code, "TypeError");
+    EXPECT_EQ(key_error.message, "invalid index type \"str\" for \"dict[int, int]\"");
+    EXPECT_EQ(key_error.line, 3);
+}
+
+// A later WHOLE-container assignment is checked against the type the STORE
+// committed, in both the mismatched-kind and the None direction -- the
+// subscript-store sibling of AResolvedContainerPartialDoesNotAbsorbNone, and
+// the test that would catch a store resolving to `dict[str, int] | None`.
+// Measured, both messages verbatim from mypy 1.18.1 at line 3, both CPython
+// exit 0.
+TEST(TypeChecker, AStoreResolvedPartialIsACeilingForLaterAssignments) {
+    const Checked to_list = check_module("x = {}\nx[\"a\"] = 1\nx = [1]\nprint(x)\n");
+    const diagnostics::Diagnostic list_error = only_error(to_list);
+    EXPECT_EQ(list_error.code, "TypeError");
+    EXPECT_EQ(list_error.message,
+              "incompatible types in assignment (expression has type \"list[int]\", "
+              "variable has type \"dict[str, int]\")");
+    EXPECT_EQ(list_error.line, 3);
+
+    const Checked to_none = check_module("x = {}\nx[\"a\"] = 1\nx = None\nprint(x)\n");
+    const diagnostics::Diagnostic none_error = only_error(to_none);
+    EXPECT_EQ(none_error.code, "TypeError");
+    EXPECT_EQ(none_error.message,
+              "incompatible types in assignment (expression has type \"None\", "
+              "variable has type \"dict[str, int]\")");
+    EXPECT_EQ(none_error.line, 3);
+}
+
+// KNOWN MISSED ERRORS the subscript-store resolver adds, pinned so a future
+// round finds them recorded rather than surprising. In each, mypy reports
+// `Need type annotation for "x"` (or an incompatible assignment) and this
+// compiler is now SILENT; CPython runs all four at exit 0, so these are the
+// mypy-only half of the union rule -- the sanctioned direction, but real.
+//
+// EVERY ONE IS A NEW INSTANCE OF AN EXISTING CLASS, not a new class: the
+// display resolver landed in f2e62cf has the identical silence for each,
+// verified by measuring its own spelling of the same shape (`x = []` /
+// `if False: x = [1]`, `x = []` / `return` / `x = [1]`, and `x = []` /
+// `x = [len]` / `x = [1]`, all mypy-reject and all already silent before this
+// change). The cause is the pre-pass mechanism itself: the scan is purely
+// SYNTACTIC, so it models neither mypy's `{False, 0, None}` constant folding
+// nor reachability, and it has no TYPES, so it cannot see that a resolver
+// leaves an Unknown element behind. Closing them needs a
+// reachability/constant-folding model this codebase does not have -- and
+// CLAUDE.md's own `{False, 0, None}` entry records why a half-measured one is
+// worse than none (`if "":` must NOT be pruned).
+TEST(TypeChecker, ADictStoreInAnUnreachableOrUntypedPositionIsAKnownMissedError) {
+    // mypy: `Need type annotation for "x"` at line 1 -- the `if False:` body
+    // is pruned, so mypy never sees the resolver. CPython prints `{}`.
+    expect_clean("x = {}\nif False:\n    x[\"a\"] = 1\nprint(x)\n");
+    // mypy: same, at line 2 -- the store is unreachable after the `return`.
+    expect_clean("def f() -> None:\n    x = {}\n    return\n    x[\"a\"] = 1\nf()\n");
+    // An Unknown KEY or VALUE (a bare builtin function resolves to Unknown,
+    // which is absorbing) freezes `dict[Unknown, int]` / `dict[str, Unknown]`
+    // in place, so the later whole-dict assignment is unchecked. mypy reports
+    // a `[dict-item]` error at line 3 for both.
+    expect_clean("x = {}\nx[len] = 1\nx = {\"z\": 9}\nprint(x)\n");
+    expect_clean("x = {}\nx[\"a\"] = len\nx = {\"z\": 9}\nprint(x)\n");
+}
+
+// A store into a subscript of a subscript is not a resolver either -- the
+// receiver is not a plain Name, so the scan reads it as an ordinary touch.
+// Measured: mypy reports `Need type annotation for "x"` at line 1 and CPython
+// raises `KeyError: 'a'` at exit 1, so BOTH oracles reject this program.
+TEST(TypeChecker, AStoreIntoASubscriptOfASubscriptIsNotAResolver) {
+    const Checked checked = check_module("x = {}\nx[\"a\"][\"b\"] = 1\nprint(x)\n");
+
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message, "need type annotation for \"x\"");
+    EXPECT_EQ(error.line, 1);
+}
+
+// CONTROL: the ANNOTATED path is untouched. `x: dict[str, int] = {}` is not a
+// partial at all (the annotation supplies the declared type), so the store
+// goes through the ordinary subscript-store check. Measured: mypy Success,
+// CPython prints `{'a': 1}`; and the incompatible sibling still reports.
+TEST(TypeChecker, AStoreIntoAnAnnotatedDictIsUnaffected) {
+    expect_clean("x: dict[str, int] = {}\nx[\"a\"] = 1\nprint(x)\n");
+
+    const Checked checked =
+        check_module("x: dict[str, int] = {}\nx[\"a\"] = \"s\"\nprint(x)\n");
+    const diagnostics::Diagnostic error = only_error(checked);
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.line, 2);
+}
+
 // THE ORDERING RULE, module scope. Verified: used-before-def.
 TEST(TypeChecker, ReportsAModuleLevelUseBeforeDefinition) {
     const Checked checked = check_module("y = x\nx = 5\n");
@@ -8171,6 +8338,73 @@ TEST(TypeChecker, APartialNoneDoesNotSwallowGenuineErrors) {
                      "    def set(self) -> None:\n        self.x = 1\n\n\n"
                      "c = C()\nc.set()\nprint(c.x)\n");
     EXPECT_EQ(only_error(attribute).code, "TypeError");
+}
+
+// ADVERSARIAL REVIEW of the dict-store resolver, 2026-09-16. mypy's rule is
+// "A PARTIAL CANNOT BE RESOLVED FROM A PARTIAL": a store whose KEY or VALUE is
+// itself a partial-producing expression does not resolve, and mypy keeps
+// reporting `Need type annotation for "x"` with reveal_type showing the
+// UNRESOLVED `dict[Any, Any]`. Without the guard this compiler committed a
+// concrete `dict[str, None]` mypy explicitly declines to infer, and went
+// SILENT on all five shapes below.
+//
+// Two of them are also CPython `TypeError: unhashable type`, so the guard
+// restores verdict agreement on programs BOTH oracles reject, not merely
+// mypy's diagnostic.
+TEST(TypeChecker, ADictStoreFromAPartialProducingExpressionIsNotAResolver) {
+    for (const std::string source : {// A None VALUE, and a None KEY.
+                                     std::string("x = {}\nx[\"a\"] = None\nprint(x)\n"),
+                                     std::string("x = {}\nx[None] = 1\nprint(x)\n"),
+                                     // A bare empty container in either position.
+                                     std::string("x = {}\nx[\"a\"] = []\nprint(x)\n"),
+                                     std::string("x = {}\nx[\"a\"] = {}\nprint(x)\n"),
+                                     std::string("x = {}\nx[\"a\"] = set()\nprint(x)\n"),
+                                     // CPython also rejects this one:
+                                     // TypeError: unhashable type: 'list'.
+                                     std::string("x = {}\nx[[]] = 1\nprint(x)\n")}) {
+        const Checked checked = check_module(source);
+        const diagnostics::Diagnostic error = only_error(checked);
+        EXPECT_EQ(error.code, "TypeError") << source;
+        EXPECT_NE(error.message.find("need type annotation"), std::string::npos)
+            << source << " -> " << error.message;
+    }
+}
+
+// CONTROLS for the guard above, and the reason it is consulted by the STORE
+// branch ALONE. The asymmetry is mypy's: a DISPLAY wrapping a
+// partial-producing expression is a COMPLETE type, so `x = []` / `x = [None]`
+// is mypy Success -- only a BARE one standing alone blocks. A guard applied to
+// the display resolver too would turn each of these into a false positive.
+TEST(TypeChecker, ADisplayWrappingAPartialProducingExpressionStillResolves) {
+    // The display sibling of the store shapes above: all mypy Success.
+    expect_clean("x = []\nx = [None]\nprint(x)\n");
+    expect_clean("x = {}\nx = {\"a\": None}\nprint(x)\n");
+    // A store whose key/value are NON-bare containers still resolves.
+    expect_clean("x = {}\nx[\"a\"] = [1]\nprint(x)\n");
+    expect_clean("x = {}\nx[(1,)] = 1\nprint(x)\n");
+}
+
+// ADVERSARIAL REVIEW, 2026-09-16: the resolve typed the store's INDEX and then
+// assign_subscript's own `type_of(target)` re-typed it, so every diagnostic the
+// index raised was reported TWICE. Only reachable through the new store path --
+// an annotated, a non-partial, and a LIST-partial receiver each reported once,
+// which is what isolated the cause. assign_subscript now returns early on a
+// successful resolve, which also makes the element-type check vacuous by
+// construction (the resolve just committed V from this very value).
+TEST(TypeChecker, ADictStoreIndexIsTypedExactlyOnce) {
+    // only_error() fails outright if a second diagnostic is present, so this
+    // asserts the count as much as the content.
+    const Checked undefined = check_module("x = {}\nx[nope] = 1\nprint(x)\n");
+    EXPECT_EQ(only_error(undefined).code, "NameError");
+
+    // The three receivers that never reach the resolve path, each still
+    // reporting exactly once.
+    const Checked annotated =
+        check_module("x: dict[str, int] = {}\nx[nope] = 1\nprint(x)\n");
+    EXPECT_EQ(only_error(annotated).code, "NameError");
+
+    const Checked non_partial = check_module("x = {\"k\": 1}\nx[nope] = 1\nprint(x)\n");
+    EXPECT_EQ(only_error(non_partial).code, "NameError");
 }
 
 } // namespace

@@ -402,6 +402,7 @@ enum class ContainerTouchKind {
     BareEmptyDict,   // `n = {}` or `n = dict()`  -- seeds a dict partial
     NonEmptyList,    // `n = [a, ...]`            -- resolves a list partial
     NonEmptyDict,    // `n = {k: v, ...}`         -- resolves a dict partial
+    SubscriptStore,  // `n[k] = v`                -- resolves a DICT partial ONLY
     Other
 };
 
@@ -455,6 +456,59 @@ ContainerTouchKind classify_assigned_value(const ast::Expr& value) {
 
 // The partial SHAPE a bare-empty-container value seeds, or nullopt when the
 // value is not one of the two container kinds this rule models.
+// True when `expr` is an expression mypy treats as producing its OWN partial
+// type, and which it therefore refuses to resolve another partial FROM.
+//
+// ADVERSARIAL REVIEW, 2026-09-16: mypy's rule is "A PARTIAL CANNOT BE RESOLVED
+// FROM A PARTIAL", and without this the store resolver invented a concrete
+// declared type mypy explicitly declines to infer. Measured, ten shapes, all
+// mypy `Need type annotation for "x"` with `reveal_type` showing the
+// UNRESOLVED `dict[Any, Any]`: a `None` key or value, and a bare `[]`, `{}`,
+// `set()`, `frozenset()`, `tuple()`, `list()` or `dict()` in either position.
+// `x = {}` / `x["a"] = None` committed `dict[str, None]` and went silent; it
+// now reports, agreeing with mypy. Two of the ten -- `x[[]] = 1` and
+// `x[set()] = 1` -- are also CPython `TypeError: unhashable type`, so closing
+// them restores verdict agreement on programs BOTH oracles reject.
+//
+// The DISPLAY resolver needs no such guard, and the asymmetry is mypy's, not
+// a shortcut: `x = []` / `x = [None]` is mypy Success, because `list[None]`
+// is a COMPLETE type. Only a bare partial-producing expression standing alone
+// blocks; a display wrapping one does not. Measured both ways, which is why
+// this predicate is consulted by the SubscriptStore branch alone.
+//
+// SYNTACTIC, deliberately, because the scan that consumes it runs before any
+// typing and has no types to ask. The residual that costs, measured and
+// recorded in CLAUDE.md: a partial reached through a NAME
+// (`y = None` / `x = {}` / `x["a"] = y`, mypy `Need type annotation`) is
+// invisible here and stays silent -- a missed error, the sanctioned
+// direction. Note `y: int | None = None` / `x["a"] = y` is mypy SUCCESS, so
+// the rule really is about an unresolved PARTIAL and not about None-ability.
+bool produces_its_own_partial(const ast::Expr& expr) {
+    if (const auto* constant = dynamic_cast<const ast::Constant*>(&expr)) {
+        return constant->type() == lexer::token_type::KEYWORD_NONE;
+    }
+    if (const auto* list = dynamic_cast<const ast::ListExpr*>(&expr)) {
+        return list->elements().empty();
+    }
+    if (const auto* dict = dynamic_cast<const ast::DictExpr*>(&expr)) {
+        return dict->entries().empty();
+    }
+    if (const auto* call = dynamic_cast<const ast::Call*>(&expr)) {
+        if (!call->args().empty()) {
+            return false;
+        }
+        if (const auto* callee = dynamic_cast<const ast::Name*>(&call->callee())) {
+            // All five names, not just list/dict: `set()`/`frozenset()`/
+            // `tuple()` block a store resolve too (measured), even though
+            // classify_assigned_value deliberately does not model them as
+            // SEEDS. Reuses the exported table rather than a sixth hardcoded
+            // copy of the five-name list.
+            return is_empty_display_builtin(callee->identifier());
+        }
+    }
+    return false;
+}
+
 std::optional<Type> bare_empty_container_shape(const ast::Expr& value) {
     switch (classify_assigned_value(value)) {
     case ContainerTouchKind::BareEmptyList:
@@ -463,12 +517,30 @@ std::optional<Type> bare_empty_container_shape(const ast::Expr& value) {
         return Type::dict_of(Type::unknown(), Type::unknown());
     case ContainerTouchKind::NonEmptyList:
     case ContainerTouchKind::NonEmptyDict:
+    case ContainerTouchKind::SubscriptStore:
     case ContainerTouchKind::Other:
         return std::nullopt;
     }
     // Unreachable: exhaustive above with no default, so a new kind warns here
     // rather than silently seeding nothing.
     return std::nullopt;
+}
+
+// The `n[k] = v` store shape the container scan recognises as a possible
+// resolver: a Subscript target whose RECEIVER is a plain Name. nullptr for
+// every other target, `x["a"]["b"] = 1` included -- measured, mypy reports
+// `Need type annotation for "x"` there and CPython raises `KeyError: 'a'`, so
+// both oracles reject it and it must keep reporting.
+//
+// TypeChecker::resolve_dict_partial_from_store applies the identical rule
+// with the identical reason; it already holds the Subscript, so it makes the
+// one receiver cast directly rather than calling this.
+const ast::Subscript* name_receiver_subscript_store(const ast::Expr& target) {
+    const auto* store = dynamic_cast<const ast::Subscript*>(&target);
+    if (store == nullptr || dynamic_cast<const ast::Name*>(&store->value()) == nullptr) {
+        return nullptr;
+    }
+    return store;
 }
 
 void push_occurrences(const ast::Node& node, std::vector<ContainerTouch>& out) {
@@ -498,15 +570,49 @@ void collect_container_touches(const std::vector<ast::StmtPtr>& body,
             if (const auto* target = dynamic_cast<const ast::Name*>(&assign->target())) {
                 out.push_back(ContainerTouch{target->identifier(),
                                              classify_assigned_value(assign->value())});
+            } else if (const ast::Subscript* store =
+                           name_receiver_subscript_store(assign->target())) {
+                // A SUBSCRIPT STORE through a plain name, `n[k] = v`. The
+                // INDEX is walked for reads first -- `x[x] = 1` must kill the
+                // partial, not resolve it -- and the receiver then becomes a
+                // SubscriptStore touch. Whether that RESOLVES is decided by
+                // the partial's kind, in resolvable_container_partials: a
+                // dict store does, a list store does not.
+                push_occurrences(store->index(), out);
+                // Non-null by name_receiver_subscript_store's own contract:
+                // it returns nullptr unless this exact cast succeeds.
+                const auto* receiver = dynamic_cast<const ast::Name*>(&store->value());
+                if (produces_its_own_partial(store->index()) ||
+                    produces_its_own_partial(assign->value())) {
+                    // A partial cannot be resolved from a partial -- see
+                    // produces_its_own_partial. This store is therefore NOT a
+                    // resolver, and the receiver becomes an ordinary
+                    // non-resolving touch, so the name is never cleared and
+                    // the `need type annotation` report stands. That is
+                    // mypy's own answer for all ten measured shapes.
+                    //
+                    // Gated HERE, in the scan, and NOT at the resolve site,
+                    // which is the whole reason this guard is syntactic:
+                    // suppression is decided by the scan at the SEED line, so
+                    // refusing later would leave the report already
+                    // suppressed and the binding merely Unknown -- silent
+                    // either way, and checking strictly less.
+                    out.push_back(ContainerTouch{receiver->identifier(),
+                                                 ContainerTouchKind::Other});
+                } else {
+                    out.push_back(ContainerTouch{receiver->identifier(),
+                                                 ContainerTouchKind::SubscriptStore});
+                }
             } else {
-                // A tuple/subscript/attribute target: every name in it is a
-                // NON-resolving touch. For a TUPLE target that is a retained
-                // false positive rather than a modelling claim -- measured,
-                // `x = []` / `x, y = [1], [2]` is mypy Success and this
-                // compiler keeps reporting -- left as-is deliberately, since
-                // resolving through an unpack needs assign_tuple to learn the
-                // rule too. A SUBSCRIPT store is Task 2's own surface, and a
-                // LIST subscript store must never resolve at all.
+                // A tuple/attribute target, or a subscript store whose
+                // receiver is not a plain name (`x["a"]["b"] = 1`, measured:
+                // mypy `Need type annotation`, CPython `KeyError`, so both
+                // oracles reject it): every name in it is a NON-resolving
+                // touch. For a TUPLE target that is a retained false positive
+                // rather than a modelling claim -- measured, `x = []` /
+                // `x, y = [1], [2]` is mypy Success and this compiler keeps
+                // reporting -- left as-is deliberately, since resolving
+                // through an unpack needs assign_tuple to learn the rule too.
                 push_occurrences(assign->target(), out);
             }
         } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
@@ -584,10 +690,18 @@ std::set<std::string> resolvable_container_partials(const std::vector<ast::StmtP
         if (resolving == second.end()) {
             continue;
         }
+        // THE KIND MATRIX, and the asymmetry in it is mypy's, measured both
+        // ways: a dict SUBSCRIPT STORE resolves a dict partial
+        // (`x = {}` / `x["a"] = 1` is mypy Success) while a LIST subscript
+        // store resolves nothing (`x = []` / `x[0] = 1` is
+        // `Need type annotation for "x" (hint: "x: list[<type>] = ...")`).
+        // So SubscriptStore appears against BareEmptyDict and deliberately
+        // NOT against BareEmptyList -- that missing arm IS control C3.
         if ((seeding_kind == ContainerTouchKind::BareEmptyList &&
              resolving->second == ContainerTouchKind::NonEmptyList) ||
             (seeding_kind == ContainerTouchKind::BareEmptyDict &&
-             resolving->second == ContainerTouchKind::NonEmptyDict)) {
+             (resolving->second == ContainerTouchKind::NonEmptyDict ||
+              resolving->second == ContainerTouchKind::SubscriptStore))) {
             resolvable.insert(name);
         }
     }
@@ -1694,8 +1808,97 @@ void TypeChecker::assign_tuple(const ast::TupleExpr& target, const ast::Expr& va
     }
 }
 
+// 2026-09-16: RESOLVE a mypy PARTIAL DICT from a SUBSCRIPT STORE -- the
+// second of the two resolver forms, alongside assign_name's matching-display
+// one. `x = {}` / `x["a"] = 1` declares `dict[str, int]` taken from the key
+// and value expression types (measured: mypy 1.18.1 Success, CPython prints
+// `{'a': 1}`, where this compiler reported a false
+// `TypeError: need type annotation for "x"`).
+//
+// Runs BEFORE assign_subscript's own element-type read, deliberately: for a
+// live partial that read is meaningless. The binding's own `type` is Unknown
+// (ExpressionTyper types a bare `{}` as Unknown -- the container SHAPE lives
+// in partial_container, which is why that field is separate from the type),
+// so subscripting it answers Unknown and the ordinary comparison below checks
+// nothing at all. Rebinding first makes the read see the RESOLVED dict, which
+// is what keeps the TypeMap and the declared type derived from one source and
+// makes every later store go through the ordinary check.
+//
+// A LIST partial is deliberately not resolved here, and the omission is
+// control C3 -- see the kind matrix in resolvable_container_partials. The
+// scan has already applied that rule (a list partial with a store as its
+// second touch is never cleared, so it still reports and never reaches this
+// function with a live partial), and the explicit Dict test is the second,
+// independent half of it.
+bool TypeChecker::resolve_dict_partial_from_store(const ast::Subscript& target,
+                                                  const Type& value_type) {
+    // The receiver must be a plain Name -- the same candidacy rule the scan
+    // applies through name_receiver_subscript_store, for the same reason:
+    // `x["a"]["b"] = 1` resolves nothing (measured, both oracles reject it).
+    const auto* receiver = dynamic_cast<const ast::Name*>(&target.value());
+    if (receiver == nullptr) {
+        return false;
+    }
+    // bound_in_current_scope, not a bare resolve: rebind() writes into the
+    // CURRENT scope, so resolving an ENCLOSING scope's partial from here
+    // would invent a shadowing local instead. The scan never clears a name
+    // whose resolver lives in another scope anyway (a nested def's body
+    // contributes reads only), so this is a second, independent guard.
+    if (!scopes_.bound_in_current_scope(receiver->identifier())) {
+        return false;
+    }
+    const Resolution existing = scopes_.resolve(receiver->identifier());
+    if (!existing.binding->partial_container.has_value() ||
+        existing.binding->partial_container->kind != TypeKind::Dict) {
+        return false;
+    }
+    // The key and value types EXACTLY, with no union and no widening -- the
+    // same Decision 4 divergence from partial_none the display resolver
+    // records. An Unknown key or value is kept rather than refused: Unknown
+    // is absorbing, so it can only make a later check pass, never invent a
+    // false one, and the alternative (leaving the partial live) leaves the
+    // binding at Unknown, which checks strictly less.
+    const Type resolved =
+        Type::dict_of(typer_.type_of(target.index(), Type::unknown()), value_type);
+    // The binding keeps its ORIGINAL declared_line -- the bare `x = {}` line
+    // -- and does NOT take the resolver's, unlike assign_name's two resolver
+    // paths. Not a stylistic difference: this resolver statement READS the
+    // name it resolves (the store's receiver), and the ordering rule fires on
+    // `declared_line >= statement_line`, so stamping the store's own line
+    // makes the receiver read a false
+    // `NameError: name 'x' is used before definition` at that very line
+    // (observed, before this was fixed). assign_name's display resolver never
+    // hits it because `x = [1]` mentions `x` only as a target. The original
+    // line is also the honest answer: it is where the name was defined, and
+    // it is mypy's own anchor for the diagnostic this resolve suppresses.
+    scopes_.rebind(receiver->identifier(),
+                   Binding{resolved, existing.binding->declared_line, /*annotated=*/false});
+    // Same kill-then-set as both resolver paths in assign_name.
+    narrowings_.kill(receiver->identifier());
+    narrowings_.set(receiver->identifier(), resolved);
+    return true;
+}
+
 void TypeChecker::assign_subscript(const ast::Subscript& target, const ast::Expr& value) {
     const Type value_type = typer_.type_of(value, Type::unknown());
+    if (resolve_dict_partial_from_store(target, value_type)) {
+        // RESOLVED, so return without the read below. Two reasons, and the
+        // first is a real defect this closes:
+        //
+        // (1) ADVERSARIAL REVIEW, 2026-09-16: the resolve types the INDEX,
+        //     and `type_of(target)` re-types it, so every diagnostic the
+        //     index raises was reported TWICE -- measured,
+        //     `x = {}` / `x[nope] = 1` emitted its NameError twice, and an
+        //     over-64-bit literal index its OverflowError twice. Only
+        //     reachable with a live dict partial, i.e. only through this new
+        //     path; the annotated, non-partial and list-partial receivers
+        //     each reported once.
+        // (2) The check would be vacuous anyway: the resolve just committed
+        //     `dict[K, V]` with V taken from this very value, so
+        //     `is_subtype(value_type, element_type)` is true by
+        //     construction.
+        return;
+    }
     // Reuses the read-path rule table entirely: every interesting row (a
     // non-subscriptable receiver, a bad index) already lives there, and
     // reports through the exact same mechanism a `container[index]` READ
