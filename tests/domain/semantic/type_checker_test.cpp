@@ -8826,6 +8826,44 @@ TEST(TypeChecker, ALeadingZeroIntLexemeIsNotFolded) {
     }
 }
 
+// A MALFORMED UNDERSCORE PLACEMENT is the same defect class as the leading
+// zero above, and skipping every `_` unconditionally got it wrong in the
+// NEVER-ACCEPTABLE direction -- a regression found by adversarial review of
+// the commit that introduced the fold. Python puts a single underscore
+// strictly BETWEEN digits, so each spelling below is a SyntaxError under
+// CPython (exit 1) and a blocking `[syntax]` error under mypy, yet the lexer
+// hands every one of them over as LITERAL_INT. Folding them removed the only
+// diagnostic cythonpp had, so it went SILENT on a program BOTH oracles reject
+// -- and it reached codegen as a third state, since the emitter strips the
+// underscore and `1_` emitted as a valid C++ `py::int_(1)` that compiled and
+// ran. See decimal_int_guard_verdict's own comment for the measurements.
+TEST(TypeChecker, AMalformedUnderscoreIntLexemeIsNotFolded) {
+    // TRUE polarity: folding these silenced the missing-return entirely.
+    for (const char* const literal : {"1_", "1__0", "1_2_", "12__3"}) {
+        const Checked checked = check_module(std::string("def f() -> int:\n    if ") + literal +
+                                             ":\n        return 1\n");
+        EXPECT_EQ(only_error(checked).code, "TypeError") << literal;
+    }
+    // FALSE polarity, which silences through a DIFFERENT site -- a folded-false
+    // guard kills the break, so the `while True:` reads as never-exiting.
+    for (const char* const literal : {"0_", "0__0"}) {
+        const Checked checked =
+            check_module(std::string("def f() -> int:\n    while True:\n        if ") + literal +
+                         ":\n            break\n        return 1\n");
+        EXPECT_EQ(only_error(checked).code, "TypeError") << literal;
+    }
+    // The CONTROLS that make this a placement rule and not a blanket refusal
+    // of underscores: a single interior one is legal Python and must still
+    // fold, so each of these is clean rather than reporting.
+    for (const char* const literal : {"1_0", "1_000", "12_345"}) {
+        const Checked checked = check_module(std::string("def f() -> int:\n    if ") + literal +
+                                             ":\n        return 1\n");
+        EXPECT_TRUE(checked.diagnostics.empty())
+            << literal << ": "
+            << (checked.diagnostics.empty() ? "" : checked.diagnostics.front().message);
+    }
+}
+
 // Forms mypy does NOT fold at all, so including any of them would make
 // cythonpp accept a program mypy rejects. Measured 2026-09-17 in three
 // independent templates. Note `0.0` is here and NOT in the falsy fold set --

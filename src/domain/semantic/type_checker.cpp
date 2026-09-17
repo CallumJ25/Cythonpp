@@ -3891,19 +3891,49 @@ GuardVerdict narrowing_guard_verdict(const ast::Expr& guard, const std::string& 
 GuardVerdict decimal_int_guard_verdict(const std::string& lexeme) {
     char first_digit = '\0';
     bool all_zero = true;
+    bool previous_was_underscore = false;
     for (const char character : lexeme) {
         if (character == '_') {
+            // UNDERSCORE PLACEMENT IS VALIDATED, NOT SKIPPED, and this is the
+            // same class of defect as the leading-zero clause below rather
+            // than a tidiness rule. Python's grammar puts a single underscore
+            // strictly BETWEEN digits, so a LEADING one, a TRAILING one, or a
+            // DOUBLED run is not an integer literal at all -- but the lexer
+            // still hands it over as LITERAL_INT (verified via --tokens:
+            // `1_`, `1__0` and `0_` all arrive here). Measured 2026-09-17,
+            // `if 1_:` is a mypy blocking `Invalid decimal literal  [syntax]`
+            // AND a CPython `SyntaxError: invalid decimal literal` at exit 1,
+            // so BOTH oracles reject the program. Skipping every `_`
+            // unconditionally folded `1_`/`1__0`/`1_2_`/`12__3` TRUE and
+            // `0_`/`0__0` FALSE, which REMOVED the missing-return that was
+            // cythonpp's only diagnostic on those programs -- silent
+            // acceptance of a doubly-rejected program, at all five wired
+            // sites including check_suite's suppression, and it reached
+            // codegen as a third state (the emitter strips the underscore, so
+            // `1_` emitted as C++ `py::int_(1)`, compiled at exit 0 and
+            // printed `1` where CPython prints nothing and exits 1). Found by
+            // adversarial review of the commit that introduced it.
+            if (first_digit == '\0' || previous_was_underscore) {
+                return GuardVerdict::Unknown;
+            }
+            previous_was_underscore = true;
             continue;
         }
         if (character < '0' || character > '9') {
             return GuardVerdict::Unknown;
         }
+        previous_was_underscore = false;
         if (first_digit == '\0') {
             first_digit = character;
         }
         if (character != '0') {
             all_zero = false;
         }
+    }
+    if (previous_was_underscore) {
+        // A trailing underscore -- the other half of the placement rule
+        // above, and not reachable from the in-loop check.
+        return GuardVerdict::Unknown;
     }
     if (first_digit == '\0') {
         // No digits at all -- not a spelling this function can read.
