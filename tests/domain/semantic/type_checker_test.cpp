@@ -8407,5 +8407,151 @@ TEST(TypeChecker, ADictStoreIndexIsTypedExactlyOnce) {
     EXPECT_EQ(only_error(non_partial).code, "NameError");
 }
 
+// 2026-09-16, THE `while c:` BINDER-NARROWING GAP -- the last HIGH-and-open
+// entry in CLAUDE.md, open since 2026-09-12. `while c:` narrows `c` to
+// `Literal[True]` for the loop body, so a guard on that same name is
+// statically decided and a `break` in the branch the guard EXCLUDES is
+// unreachable -- which makes the loop's `else` guaranteed to run, so the
+// function always returns. Every shape here was `TypeError: missing return
+// statement` from this compiler while `mypy --strict` said Success and
+// CPython printed 1 then 3 at exit 0: both oracles accept AND RUN them.
+//
+// Measured 2026-09-16 across three parallel oracle sweeps. The recorded
+// "five variants" figure was wrong in both directions -- SIX distinct
+// break-reachability arrangements reproduce, and they fall out of one 2x2
+// over {guard polarity} x {which arm holds the break}.
+TEST(TypeChecker, AGuardNarrowedByItsOwnWhileConditionMakesABreakUnreachable) {
+    // A1: guard true, break AFTER the if -- the if always leaves, so the
+    // break is dead. The headline shape.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if c:\n            return 1\n"
+                 "        break\n    else:\n        return 3\n\n\nprint(f(True))\n"
+                 "print(f(False))\n");
+    // A2: guard false, break INSIDE it -- the break's own arm is dead.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if not c:\n            break\n"
+                 "        return 1\n    else:\n        return 3\n\n\nprint(f(True))\n"
+                 "print(f(False))\n");
+    // A3: guard true, break in the ELSE arm.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if c:\n            return 1\n"
+                 "        else:\n            break\n    else:\n        return 3\n\n\n"
+                 "print(f(True))\nprint(f(False))\n");
+    // A4: guard false, break in the body, return in the else arm.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if not c:\n            break\n"
+                 "        else:\n            return 1\n    else:\n        return 3\n\n\n"
+                 "print(f(True))\nprint(f(False))\n");
+    // A5: guard true with a `pass` body, break in the else arm, return after.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if c:\n            pass\n"
+                 "        else:\n            break\n        return 1\n    else:\n"
+                 "        return 3\n\n\nprint(f(True))\nprint(f(False))\n");
+    // A6: an elif chain -- the dead first arm holds the break.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if not c:\n            break\n"
+                 "        elif c:\n            return 1\n        else:\n            return 2\n"
+                 "    else:\n        return 3\n\n\nprint(f(True))\nprint(f(False))\n");
+    // The guard may sit deeper than the loop body's top level.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if c:\n            if c:\n"
+                 "                return 1\n        break\n    else:\n        return 3\n\n\n"
+                 "print(f(True))\nprint(f(False))\n");
+}
+
+// THE CONTROLS, and they matter more than the arm above: an implementation
+// MORE aggressive than mypy's narrowing SILENCES a real `missing return
+// statement`, while one LESS aggressive merely keeps a false positive. Every
+// shape here is one mypy REPORTS, so this compiler must keep reporting it.
+// Each was measured 2026-09-16; several RUN cleanly under CPython, so
+// "CPython printed the expected output" is not evidence the narrowing held.
+TEST(TypeChecker, WhileNarrowingDoesNotSilenceAReachableBreak) {
+    // THE SINGLE MOST DANGEROUS SHAPE. The guard is statically TRUE, so its
+    // own BODY stays live -- the break is REACHABLE and mypy reports. A fix
+    // keyed on "a guard naming the loop condition kills the break" without
+    // tracking POLARITY silences this. CPython genuinely returns None here.
+    const Checked guard_true_break_inside =
+        check_module("def f(c: bool) -> int:\n    while c:\n        if c:\n            break\n"
+                     "    else:\n        return 3\n\n\nprint(f(True))\nprint(f(False))\n");
+    EXPECT_EQ(only_error(guard_true_break_inside).code, "TypeError");
+
+    // The mirror: guard statically FALSE kills the RETURN, and the break
+    // after it survives.
+    const Checked guard_false_kills_return =
+        check_module("def f(c: bool) -> int:\n    while c:\n        if not c:\n"
+                     "            return 1\n        break\n    else:\n        return 3\n\n\n"
+                     "print(f(True))\nprint(f(False))\n");
+    EXPECT_EQ(only_error(guard_false_kills_return).code, "TypeError");
+
+    // The guard must name the LOOP CONDITION's own name. A guard on an
+    // unrelated parameter decides nothing.
+    const Checked unrelated_guard = check_module(
+        "def f(c: bool, d: bool) -> int:\n    while c:\n        if d:\n            return 1\n"
+        "        break\n    else:\n        return 3\n\n\nprint(f(True, True))\n"
+        "print(f(True, False))\n");
+    EXPECT_EQ(only_error(unrelated_guard).code, "TypeError");
+
+    // AN UNGUARDED break is reachable. Pins that narrowing never makes the
+    // whole body dead.
+    const Checked unguarded =
+        check_module("def f(c: bool) -> int:\n    while c:\n        break\n    else:\n"
+                     "        return 3\n\n\nprint(f(True))\nprint(f(False))\n");
+    EXPECT_EQ(only_error(unguarded).code, "TypeError");
+}
+
+// REBINDING KILLS THE NARROWING, whatever value is assigned -- and this is
+// where a careless fix is most likely to silence a real error. Measured:
+// `c = True` immediately before the guard makes mypy REPORT, because
+// assigning a bare literal to a `bool`-declared name widens back to `bool`
+// rather than re-narrowing. That shape PRINTS THE EXPECTED OUTPUT under
+// CPython, so it looks correct and is not.
+TEST(TypeChecker, ARebindingInTheLoopBodyKillsTheWhileNarrowing) {
+    for (const std::string source :
+         {// Rebound to True -- still a kill.
+          std::string("def f(c: bool) -> int:\n    while c:\n        c = True\n        if c:\n"
+                      "            return 1\n        break\n    else:\n        return 3\n\n\n"
+                      "print(f(True))\nprint(f(False))\n"),
+          // Rebound to False.
+          std::string("def f(c: bool) -> int:\n    while c:\n        c = False\n        if c:\n"
+                      "            return 1\n        break\n    else:\n        return 3\n\n\n"
+                      "print(f(True))\nprint(f(False))\n"),
+          // Rebound inside a nested `if` -- the reason this check must
+          // RECURSE, and why it routes through for_each_own_scope_binding.
+          std::string("def f(c: bool, d: bool) -> int:\n    while c:\n        if d:\n"
+                      "            c = False\n        if c:\n            return 1\n"
+                      "        break\n    else:\n        return 3\n\n\n"
+                      "print(f(True, False))\nprint(f(False, False))\n"),
+          // A TUPLE-UNPACK target. A scan that only matched a plain Name
+          // target would miss it; this compiler has been bitten by exactly
+          // that gap before.
+          std::string("def f(c: bool) -> int:\n    while c:\n        c, x = False, 1\n"
+                      "        if c:\n            return 1\n        break\n    else:\n"
+                      "        return 3\n\n\nprint(f(True))\nprint(f(False))\n"),
+          // Rebound inside an INNER loop before the guard.
+          std::string("def f(c: bool, d: bool) -> int:\n    while c:\n        while d:\n"
+                      "            c = False\n            d = False\n        if c:\n"
+                      "            return 1\n        break\n    else:\n        return 3\n\n\n"
+                      "print(f(True, True))\nprint(f(False, False))\n")}) {
+        const Checked checked = check_module(source);
+        const diagnostics::Diagnostic error = only_error(checked);
+        EXPECT_EQ(error.code, "TypeError") << source;
+        EXPECT_NE(error.message.find("missing return statement"), std::string::npos)
+            << source << " -> " << error.message;
+    }
+}
+
+// THE DECLARED TYPE IS SAFETY-CRITICAL, not fussiness. Truthiness narrowing
+// yields a statically DECIDABLE literal only for `bool` (and `bool | None`,
+// omitted for scope). Measured 2026-09-16: mypy REPORTS for every type below,
+// because `while c:` narrows `c: int` to `int` and `c: object` to `object` --
+// neither of which decides the guard. Narrowing without this check would
+// silence all four.
+TEST(TypeChecker, WhileNarrowingAppliesOnlyToABoolCondition) {
+    for (const std::string annotation : {std::string("int"), std::string("str"),
+                                         std::string("float"), std::string("object")}) {
+        const Checked checked =
+            check_module("def f(c: " + annotation +
+                         ") -> int:\n    while c:\n        if c:\n            return 1\n"
+                         "        break\n    else:\n        return 3\n");
+        const diagnostics::Diagnostic error = only_error(checked);
+        EXPECT_EQ(error.code, "TypeError") << annotation;
+        EXPECT_NE(error.message.find("missing return statement"), std::string::npos)
+            << annotation << " -> " << error.message;
+    }
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

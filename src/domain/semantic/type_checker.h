@@ -1189,8 +1189,9 @@ private:
     // The loop-`else` half of always_returns, factored out because BOTH the
     // For arm and the While arm need it and a second copy could drift. See
     // the definition for the measurement. static, matching its two callers.
-    static bool loop_else_always_returns(const std::vector<ast::StmtPtr>& body,
-                                         const std::vector<ast::StmtPtr>& orelse);
+    bool loop_else_always_returns(const std::vector<ast::StmtPtr>& body,
+                                  const std::vector<ast::StmtPtr>& orelse,
+                                  const std::string* narrowed_true_name = nullptr);
 
     // Task 20's return-path check. Purely syntactic -- it touches no member,
     // no scope, no ClassTable, nothing but the AST shape -- so it can be (and
@@ -1201,7 +1202,42 @@ private:
     // always returns if ANY of its statements does" is the fold this
     // recursion performs at every level, mirroring collect_classes' own
     // recursive-then-fold shape.
-    static bool always_returns(const std::vector<ast::StmtPtr>& body);
+    bool always_returns(const std::vector<ast::StmtPtr>& body);
+
+    // The name a `while` header narrows TRUTHY for the whole loop body, or
+    // nullopt when this loop narrows nothing this checker can rely on.
+    //
+    // Measured 2026-09-16 against mypy 1.18.1 (three parallel sweeps; see
+    // CLAUDE.md). `while c:` narrows `c` to `Literal[True]` for the body, so
+    // a guard `if c:` inside it is statically true and a `break` in the
+    // branch that guard excludes is UNREACHABLE -- which is why mypy accepts
+    // the shapes this compiler used to call `missing return statement`.
+    //
+    // DELIBERATELY NARROW, and every omission below only RETAINS a false
+    // positive this compiler already emits, never silences an error. The
+    // asymmetry is the whole design constraint: an evaluator MORE aggressive
+    // than mypy's narrowing silences real errors, one LESS aggressive merely
+    // keeps false positives.
+    //   - The condition must be a BARE NAME. Measured NOT narrowing, so each
+    //     must stay excluded: `while c or d:`, `while c == True:`,
+    //     `while c != False:`, `while bool(c):`, `while len(s) > 0:`,
+    //     `while c > 0:`, `while True:`, `while 1:`. (`while c and d:`,
+    //     `while c is True:` and `while not c:` DO narrow and are omitted
+    //     only for scope.)
+    //   - The name's DECLARED TYPE must be exactly `bool`, and this is
+    //     SAFETY-CRITICAL rather than fussy: truthiness narrowing yields a
+    //     statically decidable literal for `bool` alone (and `bool | None`,
+    //     omitted for scope). Measured, mypy REPORTS for every one of
+    //     `c: int`, `c: str`, `c: float`, `c: list[int]`, `c: object`,
+    //     `c: int | None` and `c: str | bool`, so narrowing without this
+    //     check would silence seven measured errors.
+    //   - The body must not REBIND the name anywhere. Any binding kills
+    //     mypy's narrowing regardless of the value assigned -- measured,
+    //     `c = True` immediately before the guard makes mypy REPORT, because
+    //     assigning a bare literal to a `bool`-declared name widens back to
+    //     `bool` rather than re-narrowing. That shape prints the "expected"
+    //     output under CPython, so it looks fine and is not.
+    std::optional<std::string> loop_narrows_truthy(const ast::While& loop);
 
     // The `while True` arm's "no reachable break" half: true when `body`
     // contains a `break` at any depth EXCEPT inside a nested For/While's own
@@ -1237,7 +1273,12 @@ private:
     // orelse, never the same list twice), so the recursion is bounded by the
     // AST's finite depth, the same way any tree-shaped mutual recursion
     // terminates.
-    static bool contains_reachable_break(const std::vector<ast::StmtPtr>& body, bool in_function);
+    // `narrowed_true_name`, when non-null, is the name a `while <name>:`
+    // header has narrowed TRUTHY for this body -- see
+    // narrowing_guard_verdict for the measured rule and for why the
+    // declared type has to be `bool` for it to be set at all.
+    bool contains_reachable_break(const std::vector<ast::StmtPtr>& body, bool in_function,
+                                  const std::string* narrowed_true_name = nullptr);
 
     // "Does control ALWAYS leave this branch rather than falling through to
     // the statement after the enclosing `if`?" -- used ONLY by visit(If)'s
@@ -1275,8 +1316,9 @@ private:
     // predicate had before they existed, so visit(If)'s join (its only
     // caller besides check_suite) is unchanged. check_suite passes the real
     // context instead; see statement_always_leaves for why.
-    static bool always_leaves_branch(const std::vector<ast::StmtPtr>& body,
-                                     bool in_function = true, bool in_loop = true);
+    bool always_leaves_branch(const std::vector<ast::StmtPtr>& body,
+                              bool in_function = true, bool in_loop = true,
+                              const std::string* narrowed_true_name = nullptr);
 
     // The per-statement half of always_leaves_branch, extracted so the
     // reachability walk below can ask the question of ONE statement -- "is
@@ -1333,8 +1375,9 @@ private:
     // arms call contains_reachable_break on that loop's own body, and
     // contains_reachable_break's trailing "does this statement always leave"
     // check calls back into this function.
-    static bool statement_always_leaves(const ast::Stmt& statement, bool in_function = true,
-                                        bool in_loop = true);
+    bool statement_always_leaves(const ast::Stmt& statement, bool in_function = true,
+                                 bool in_loop = true,
+                                 const std::string* narrowed_true_name = nullptr);
 
     // THE ONE CHOKE POINT every suite walk goes through, and the whole of
     // this checker's reachability model. It walks each statement exactly as

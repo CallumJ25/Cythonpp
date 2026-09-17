@@ -3822,8 +3822,92 @@ void TypeChecker::visit(const ast::Return& node) {
     }
 }
 
+namespace {
+
+// The bare `ast::Name` an expression is, or nullptr. Deliberately does NOT
+// look through parentheses, `not`, `and`/`or`, `is` or `==`: see
+// TypeChecker::loop_narrows_truthy for which of those mypy narrows on and why
+// every omission here is safe.
+const ast::Name* bare_name_of(const ast::Expr& expr) {
+    return dynamic_cast<const ast::Name*>(&expr);
+}
+
+// What a guard evaluates to, given that `narrowed` is known truthy.
+enum class GuardVerdict {
+    Unknown,      // not decidable -- BOTH arms live, the pre-existing behaviour
+    AlwaysTrue,   // `if <narrowed>:`     -- the ELSE arm is dead
+    AlwaysFalse,  // `if not <narrowed>:` -- the BODY is dead
+};
+
+// Measured 2026-09-16: given `c: Literal[True]`, mypy treats `if c:` as
+// statically true and `if not c:` as statically false, and the `break` in the
+// branch each excludes is unreachable. Only these two forms are modelled.
+// `if c == True:`, `if c is True:`, `if c and True:`, `if not not c:` and
+// `if c or d:` are ALSO statically true under mypy and are omitted purely for
+// scope -- omitting them retains a false positive, which is the safe
+// direction. `if bool(c):` is measured NOT decidable (narrowing does not
+// survive a call), so it must stay Unknown.
+GuardVerdict narrowing_guard_verdict(const ast::Expr& guard, const std::string& narrowed) {
+    if (const ast::Name* name = bare_name_of(guard)) {
+        return name->identifier() == narrowed ? GuardVerdict::AlwaysTrue : GuardVerdict::Unknown;
+    }
+    if (const auto* unary = dynamic_cast<const ast::UnaryOp*>(&guard)) {
+        if (unary->op() == lexer::token_type::OP_NOT) {
+            if (const ast::Name* name = bare_name_of(unary->operand())) {
+                return name->identifier() == narrowed ? GuardVerdict::AlwaysFalse
+                                                      : GuardVerdict::Unknown;
+            }
+        }
+    }
+    return GuardVerdict::Unknown;
+}
+
+} // namespace
+
+std::optional<std::string> TypeChecker::loop_narrows_truthy(const ast::While& loop) {
+    const ast::Name* condition = bare_name_of(loop.condition());
+    if (condition == nullptr) {
+        return std::nullopt;
+    }
+    const std::string& name = condition->identifier();
+    // The DECLARED type must be exactly `bool` -- see the header for the
+    // seven measured types where mypy reports and this check is what stops
+    // us silencing them.
+    const Resolution resolved = scopes_.resolve(name);
+    if (resolved.binding == nullptr || resolved.binding->type.kind != TypeKind::Bool) {
+        return std::nullopt;
+    }
+    // ANY rebinding anywhere in the body kills it. Routed through the shared
+    // for_each_own_scope_binding walker deliberately: it already enumerates
+    // every binding form the measurement sweep ranked as dangerous -- a
+    // tuple-unpack target, a `for` target, a nested def's or class's own
+    // name -- and already recurses into if/while/for bodies and their else
+    // clauses, which is exactly where the sweep found rebindings that kill
+    // the narrowing (a rebinding nested in `if d:` or in an inner loop
+    // before the guard both make mypy REPORT). A hand-rolled scan here would
+    // reproduce precisely the gaps that walker exists to close.
+    //
+    // More conservative than mypy on purpose: mypy only cares about a
+    // rebinding REACHABLE FROM THE HEADER BEFORE THE GUARD, so a rebinding
+    // after the guard, in the guard's own else arm, or in the loop's else
+    // clause leaves its narrowing intact. Treating those as kills keeps a
+    // false positive and silences nothing.
+    bool rebound = false;
+    for_each_own_scope_binding(loop.body(),
+                               [&](const std::string& bound, int, OwnScopeBindingKind, int) {
+                                   if (bound == name) {
+                                       rebound = true;
+                                   }
+                               });
+    if (rebound) {
+        return std::nullopt;
+    }
+    return name;
+}
+
 bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body,
-                                           bool in_function) {
+                                           bool in_function,
+                                           const std::string* narrowed_true_name) {
     for (const ast::StmtPtr& statement : body) {
         if (dynamic_cast<const ast::Break*>(statement.get()) != nullptr) {
             return true;
@@ -3831,9 +3915,52 @@ bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body
         if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
             // An `if` is not a loop, so a break inside one still belongs to
             // THIS enclosing loop -- look through it.
-            if (contains_reachable_break(if_stmt->body(), in_function) ||
-                contains_reachable_break(if_stmt->orelse(), in_function)) {
+            //
+            // BINDER NARROWING, 2026-09-16: when the enclosing `while <name>:`
+            // has narrowed `name` truthy, a guard on that same name is
+            // statically decided and only ONE arm is live. Searching the dead
+            // arm for a `break` is what made mypy-clean programs draw a false
+            // `missing return statement`.
+            //
+            // THE CONTROL THAT KEEPS THIS HONEST, and the shape a careless
+            // version of this gets wrong: an always-TRUE guard leaves its own
+            // BODY live, so `if c: break` still finds that break and still
+            // reports -- measured, mypy reports it too, and CPython genuinely
+            // returns None on one path. The verdict decides WHICH arm dies,
+            // never that the whole statement is dead.
+            const GuardVerdict verdict =
+                narrowed_true_name == nullptr
+                    ? GuardVerdict::Unknown
+                    : narrowing_guard_verdict(if_stmt->condition(), *narrowed_true_name);
+            const bool body_live = verdict != GuardVerdict::AlwaysFalse;
+            const bool orelse_live = verdict != GuardVerdict::AlwaysTrue;
+            if ((body_live && contains_reachable_break(if_stmt->body(), in_function,
+                                                       narrowed_true_name)) ||
+                (orelse_live && contains_reachable_break(if_stmt->orelse(), in_function,
+                                                         narrowed_true_name))) {
                 return true;
+            }
+            // The always-leaves stop, for a DECIDED guard only. An `if` with
+            // no `else` normally never "always leaves" (it can fall through),
+            // but a statically-true one leaves exactly when its body does --
+            // which is what makes `if c: return 1` followed by `break` a
+            // program whose break is dead. Handled here rather than inside
+            // statement_always_leaves so that function stays narrowing-free
+            // and its many other callers are untouched.
+            if (verdict != GuardVerdict::Unknown) {
+                const std::vector<ast::StmtPtr>& live =
+                    verdict == GuardVerdict::AlwaysTrue ? if_stmt->body() : if_stmt->orelse();
+                if (always_leaves_branch(live, in_function, /*in_loop=*/true,
+                                         narrowed_true_name)) {
+                    return false;
+                }
+                // Decided guards skip the generic stop below, which would ask
+                // whether BOTH arms leave -- a question that is meaningless
+                // once one of them is dead. An UNDECIDED guard deliberately
+                // falls through to it instead, preserving the pre-existing
+                // behaviour this function was restructured for (see the stop
+                // check's own comment: every statement kind must reach it).
+                continue;
             }
         } else if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
             // A nested For/While's own BODY is
@@ -3912,7 +4039,8 @@ bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body
         // out of at all (and could not legally appear there either), so
         // they are skipped here too -- statement_always_leaves already
         // answers false for both.
-        if (statement_always_leaves(*statement, in_function, /*in_loop=*/true)) {
+        if (statement_always_leaves(*statement, in_function, /*in_loop=*/true,
+                                    narrowed_true_name)) {
             return false;
         }
     }
@@ -3941,8 +4069,10 @@ bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body
 // value here, unlike at contains_reachable_break's OTHER call sites inside
 // statement_always_leaves, which is reached from module/class scope too.
 bool TypeChecker::loop_else_always_returns(const std::vector<ast::StmtPtr>& body,
-                                           const std::vector<ast::StmtPtr>& orelse) {
-    return !orelse.empty() && !contains_reachable_break(body, /*in_function=*/true) &&
+                                           const std::vector<ast::StmtPtr>& orelse,
+                                           const std::string* narrowed_true_name) {
+    return !orelse.empty() &&
+           !contains_reachable_break(body, /*in_function=*/true, narrowed_true_name) &&
            always_returns(orelse);
 }
 
@@ -3965,7 +4095,9 @@ bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
                 !contains_reachable_break(while_stmt->body(), /*in_function=*/true)) {
                 return true;
             }
-            if (loop_else_always_returns(while_stmt->body(), while_stmt->orelse())) {
+            const std::optional<std::string> narrowed = loop_narrows_truthy(*while_stmt);
+            if (loop_else_always_returns(while_stmt->body(), while_stmt->orelse(),
+                                         narrowed.has_value() ? &*narrowed : nullptr)) {
                 return true;
             }
             continue;
@@ -3992,12 +4124,13 @@ bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
 }
 
 bool TypeChecker::always_leaves_branch(const std::vector<ast::StmtPtr>& body, bool in_function,
-                                       bool in_loop) {
+                                       bool in_loop,
+                                       const std::string* narrowed_true_name) {
     // An any-of fold over the per-statement rule below. A hit ANYWHERE in the
     // list counts, not just at the end: whatever follows a `break` in the
     // same suite is dead code, so the branch still never falls through.
     for (const ast::StmtPtr& statement : body) {
-        if (statement_always_leaves(*statement, in_function, in_loop)) {
+        if (statement_always_leaves(*statement, in_function, in_loop, narrowed_true_name)) {
             return true;
         }
     }
@@ -4005,7 +4138,8 @@ bool TypeChecker::always_leaves_branch(const std::vector<ast::StmtPtr>& body, bo
 }
 
 bool TypeChecker::statement_always_leaves(const ast::Stmt& statement, bool in_function,
-                                          bool in_loop) {
+                                          bool in_loop,
+                                          const std::string* narrowed_true_name) {
     // All three terminators the parser admits count, each only where Python
     // permits it to appear at all -- see the header for the four measured
     // rows that make the context checks load-bearing rather than pedantic.
@@ -4020,6 +4154,29 @@ bool TypeChecker::statement_always_leaves(const ast::Stmt& statement, bool in_fu
         return in_loop;
     }
     if (const auto* if_stmt = dynamic_cast<const ast::If*>(&statement)) {
+        // BINDER NARROWING, 2026-09-16. When an enclosing `while <name>:` has
+        // narrowed `name` truthy and THIS `if` guards on that same name, the
+        // guard is statically decided and only one arm is live -- so the
+        // statement always leaves exactly when that LIVE arm does, even
+        // though it may have no `else` at all. Without this, a guard NESTED
+        // inside another decided guard still fell through: `while c:` /
+        // `if c:` / `if c: return 1` / `break` stayed a false
+        // `missing return statement`, because the outer arm's
+        // always-leaves fold asked the narrowing-free question about the
+        // inner `if` and got "can fall through".
+        //
+        // `narrowed_true_name` is nullptr for every pre-existing caller
+        // (check_suite's own walk, and the unreachable-code scan), so their
+        // behaviour is untouched by construction.
+        if (narrowed_true_name != nullptr) {
+            const GuardVerdict verdict =
+                narrowing_guard_verdict(if_stmt->condition(), *narrowed_true_name);
+            if (verdict != GuardVerdict::Unknown) {
+                const std::vector<ast::StmtPtr>& live =
+                    verdict == GuardVerdict::AlwaysTrue ? if_stmt->body() : if_stmt->orelse();
+                return always_leaves_branch(live, in_function, in_loop, narrowed_true_name);
+            }
+        }
         // An `if` with no `else` can always fall through, so it never
         // counts -- that is what makes a `break` guarded by a nested `if`
         // CONDITIONAL, and a conditional terminator must still contribute
