@@ -87,29 +87,44 @@ namespace cythonpp::domain::semantic {
 // RETURN-PATH CHECKING, the sole flow-sensitive check (mypy runs it despite
 // declining definite-assignment analysis generally): `always_returns` is a
 // purely syntactic, non-recursive-into-nested-scopes walk over a statement
-// list -- a Return is a hit; an If counts only when orelse() is NON-EMPTY and
-// BOTH branches always return; a While counts only when its condition is the
-// literal `True` (a Constant whose token type is BOOL_TRUE) AND its body has
-// no reachable break (see contains_reachable_break -- a break belonging to a
-// nested For/While's own BODY does not count, since it can never escape THIS
-// loop, but one in that nested loop's ORELSE does, since a loop's else runs
-// outside its own break scope); a For, or a While with any other condition,
-// is always assumed skippable (false).
+// list -- a Return is a hit; an If counts when orelse() is NON-EMPTY and BOTH
+// branches always return, OR when its condition FOLDS (see
+// literal_guard_verdict) and the arm the fold leaves LIVE always returns, so a
+// folded-true `if` with an empty else still counts; a While counts only when
+// its condition FOLDS TRUE AND its body has no reachable break (see
+// contains_reachable_break -- a break belonging to a nested For/While's own
+// BODY does not count, since it can never escape THIS loop, but one in that
+// nested loop's ORELSE does, since a loop's else runs outside its own break
+// scope); a For, or a While whose condition does not fold true, is always
+// assumed skippable (false). NOTE the While condition was for a long time
+// "the literal `True`, a Constant whose token type is BOOL_TRUE" -- that was
+// narrower than mypy, which folds `while 1:` identically; see the second
+// bullet below.
 //
 // This is a syntactic approximation of mypy's real reachability analysis, and
 // it does NOT err in only one direction. FIVE failure modes have been
-// measured against mypy 1.18.1 so far. THREE are FIXED: the first (already
-// fixed before this task touched this file), the third and the fourth (both
-// fixed by this task, the fourth being a defect in the very fix for the
-// third, caught by adversarial review of that same commit the same day).
-// TWO remain OPEN, and they are DISTINCT gaps needing DIFFERENT machinery to
-// close -- see the second and fifth bullets below for what each needs. A
-// PRIOR version of this intro said "the third and fourth are now fixed, the
-// first two remain", which was wrong the moment it was written: the first
-// was never open in the first place (it is a historical entry, not a live
-// gap), so lumping it in with the still-open second overcounted the open set
-// by one. State the fixed/open split the measurements actually show, not a
-// single "N remain" tally that the next round has to re-derive from scratch:
+// measured against mypy 1.18.1 so far, and as of 2026-09-17 ALL FIVE ARE
+// FIXED -- the first before this file's return-path work began, the third and
+// fourth by that work (the fourth being a defect in the very fix for the
+// third, caught by adversarial review of that same commit the same day), the
+// FIFTH by `a8cae40` (binder narrowing decides break reachability), and the
+// SECOND by the literal-folding change that followed it. Do NOT read "all
+// five fixed" as "this approximation is now complete": it means only that the
+// five measured failure modes are closed. Two SUCCESSORS to the second
+// bullet's gap are open and recorded on its own bullet below, and CLAUDE.md
+// carries the live list.
+//
+// A WORD ON THIS TALLY, because it has now been wrong twice. A PRIOR version
+// said "the third and fourth are now fixed, the first two remain", which was
+// wrong the moment it was written: the first was never open (it is a
+// historical entry, not a live gap), so lumping it with the still-open second
+// overcounted by one. A LATER version said "exactly two failure modes remain
+// open: the second bullet's constant-folding gap, and the fifth bullet's
+// narrowing gap" and went STALE when `a8cae40` closed the fifth -- that
+// commit touched this very file (+59 lines) but only added new per-function
+// comments, leaving this block asserting an open gap it had itself just
+// closed. State the fixed/open split the measurements actually show, and when
+// you close one of these, update THIS paragraph in the same commit:
 //   - FIXED (already, before this task -- a historical entry kept for the
 //     record, not a live gap): mypy reports "missing return statement"; we
 //     did not: `while True: / for x in xs: pass / else: break` with no
@@ -120,32 +135,48 @@ namespace cythonpp::domain::semantic {
 //     current binary: cythonpp and mypy now AGREE (both report "missing
 //     return statement" on this exact shape), confirming the fix already
 //     held and was not itself touched by this task.
-//   - STILL OPEN: we report "missing return statement"; mypy does not:
-//     `while True: / if False: / break` with no return after the loop. mypy
-//     prunes the `if False:` block as unreachable and never counts that
-//     break, so it judges the loop non-terminating and accepts the function.
-//     This checker has no reachability analysis -- contains_reachable_break
-//     finds the `break` textually regardless of the `if False:` guard around
-//     it -- so it judges the `while True` skippable and reports a spurious
-//     "missing return statement" mypy would not. Needs a CONSTANT-FOLDING
-//     evaluator matched to mypy's actual prune set (see below); the fifth
-//     bullet's gap needs different machinery entirely and the two must not
-//     be folded together. Re-measured 2026-09-12 with no
-//     trailing statement after the loop (the discriminating shape -- a
-//     trailing `return 1` after the loop would be clean either way,
-//     regardless of whether the break folds, so it proves nothing): mypy's
-//     prune set for THIS reachability judgement is `{False, 0, None}` --
-//     `if False:`, `if 0:` and `if None:` guarding the `break` are all
-//     `Success`, matching the redefinition-allowance prune set documented
-//     elsewhere in this codebase (see CLAUDE.md's conditional-def entry) --
-//     and it EXCLUDES `""`: `if "":` guarding the same `break` still reports
-//     `Missing return statement`. So mirroring the existing
-//     `is_literal_true` helper into an `is_literal_false` one -- which is
-//     what the obvious fix looks like -- would SILENCE A REAL ERROR for the
-//     `""` case exactly as it would for the redefinition check. Closing this
-//     needs a constant-folding evaluator matched to mypy's actual prune set,
-//     not a blanket falsy check, and building one is out of scope for this
-//     task.
+//   - A SECOND failure mode, previously open since 2026-09-12 and NOW FIXED
+//     (literal_guard_verdict, 2026-09-17): we reported "missing return
+//     statement"; mypy did not, for `while True: / if False: / break` with no
+//     return after the loop. mypy prunes the `if False:` block as unreachable
+//     and never counts that break, so it judges the loop non-terminating and
+//     accepts the function, while contains_reachable_break found the `break`
+//     textually regardless of the guard around it. The discriminating shape
+//     is the one with NO trailing statement after the loop -- a trailing
+//     `return 1` would be clean either way, regardless of whether the break
+//     folds, so it proves nothing.
+//
+//     THE PRUNE SET RECORDED HERE WAS INCOMPLETE, and the correction is the
+//     part worth carrying forward. This bullet used to state it as
+//     `{False, 0, None}` excluding `""`. Re-measured 2026-09-17 across three
+//     independent templates: those four claims all hold, but the set also
+//     contains the EMPTY TUPLE `()`, and it does NOT contain `0.0` -- so it is
+//     neither "numeric zero" nor "any empty container". An int literal folds
+//     by VALUE in ANY BASE (`0x0`/`0b0`/`0o0`/`0_0`/`00` all fold false,
+//     `0x1`/`1_0` fold true), which is mypy's own `is_true_literal` /
+//     `is_false_literal` at `checker.py:8255`. The warning this bullet gave
+//     -- that mirroring `is_literal_true` into an `is_literal_false` would
+//     SILENCE A REAL ERROR for the `""` case -- was correct and is respected:
+//     `""` is not folded. See literal_guard_verdict's own comment in the .cpp
+//     for the full measured set and for the two mypy-UNSOUND forms
+//     (`NotImplemented`, `not TYPE_CHECKING`) a future widening must refuse.
+//
+//     `is_literal_true`, which this bullet used to name, NO LONGER EXISTS --
+//     it was deleted rather than extended, because it had already DRIFTED:
+//     it answered false for `while 1:`, which mypy treats as non-terminating
+//     exactly as it does `while True:`. Two rival notions of "literally true"
+//     is the condition that produced that drift.
+//
+//     TWO SUCCESSORS ARE OPEN, and neither is this bullet's gap re-opened.
+//     (a) `not`/`and`/`or` over a folded operand are NOT folded, so
+//     `while not False:` and `if not True: break` remain false positives --
+//     deliberately, because mypy's behaviour there is inconsistent with its
+//     own atom rules (`"" or 1` folds TRUE though `""` alone does not fold)
+//     and `and` is one-sided where `or` is two-sided. (b) A statically-dead
+//     BRANCH's own contents are still type-checked, so `if False: x: int =
+//     "s"` is a false "incompatible types in assignment"; that needs a
+//     dead-BLOCK model (skip walking the branch), which is strictly more than
+//     a folded always-leaves answer.
 //   - A THIRD failure mode, previously open and NOW FIXED (loop_else_always_
 //     returns, added 2026-09-12): `for i in range(3): / total = total + i /
 //     else: / return total` as the whole body of a `-> int` function used to
@@ -194,7 +225,9 @@ namespace cythonpp::domain::semantic {
 //     suppressed a real diagnostic after `while True: return / break` at
 //     module scope -- see contains_reachable_break's own comment for both
 //     measurements.
-//   - A FIFTH failure mode, found by later adversarial review, STILL OPEN,
+//   - A FIFTH failure mode, found by later adversarial review, previously
+//     open since 2026-09-12 and NOW FIXED by `a8cae40` (loop_narrows_truthy
+//     plus narrowing_guard_verdict, 2026-09-16) --
 //     and a DISTINCT gap from the second bullet's constant-folding one --
 //     do not fold the two together or describe this as an instance of that
 //     one. Measured 2026-09-12: `def f(c: bool) -> int: / while c: / if c: /
@@ -212,17 +245,28 @@ namespace cythonpp::domain::semantic {
 //     write-up (a second, independently re-measured variant beyond the one
 //     above; a reported count of five was NOT independently confirmed at
 //     that count, see CLAUDE.md for the honest tally) and why it is
-//     deliberately parked rather than fixed: closing it needs narrowing-
-//     aware break reachability, and the same over-/under-aggressive hazard
-//     applies as for constant folding above.
-// This ships anyway because building real reachability analysis (constant
-// folding, binder-narrowing-aware reachability) is out of scope for this
-// task -- the syntactic rule catches the overwhelmingly common shapes
-// correctly, and exactly two failure modes remain open: the second bullet's
-// constant-folding gap, and the fifth bullet's narrowing gap. Each needs
-// different machinery to close; neither needs an artificial exercise in
-// dead code -- the fifth needs none at all, and the second only because
-// `if False:`/`if 0:`/`if None:` ARE themselves the dead code in question.
+//     parked for four days behind an explicit precondition -- measure mypy's
+//     narrowing per condition shape FIRST -- and that precondition is what
+//     made the closure safe: the sweeps found that the DECLARED TYPE decides
+//     whether narrowing is usable at all (seven measured non-bool types where
+//     mypy REPORTS) and that guard POLARITY decides which arm dies. Both
+//     hazards are the same over-/under-aggressive one the second bullet
+//     records for constant folding.
+//
+//     WORTH KNOWING, because the two fixes look alike and are gated on
+//     OPPOSITE conditions: narrowing requires the loop condition's declared
+//     type to be exactly `bool`, while literal folding is INDEPENDENT of it
+//     (measured 2026-09-17: the folded shape is mypy-clean with the condition
+//     declared `bool`, `int`, `str`, `float`, `list[int]` and `object`). So
+//     folding must NOT be routed through loop_narrows_truthy's bool gate, and
+//     must still answer when no narrowed name exists -- that null case is
+//     exactly why the `for` sibling of the fifth bullet's shape stayed broken
+//     after `a8cae40` fixed the `while` one. See guard_verdict in the .cpp.
+// Building real reachability analysis was out of scope for the task that
+// wrote this comment, and the syntactic rule catches the overwhelmingly
+// common shapes correctly. All five measured failure modes are now closed;
+// the second bullet lists the two successors that remain, and CLAUDE.md
+// carries the live open-defect list.
 //
 // Checked once per FunctionDef, at the very end of its body walk, ONLY when
 // the function has a return annotation that is neither None nor Unknown --

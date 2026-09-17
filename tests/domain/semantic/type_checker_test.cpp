@@ -8553,5 +8553,349 @@ TEST(TypeChecker, WhileNarrowingAppliesOnlyToABoolCondition) {
     }
 }
 
+// 2026-09-17, LITERAL CONDITION FOLDING. mypy prunes a statically-decided
+// branch before asking any reachability question; these helpers had no
+// constant folding at all, which produced false positives in FOUR separate
+// places on programs both oracles accept and run. mypy's own authority is
+// `is_true_literal`/`is_false_literal` at the top of
+// `find_isinstance_check_helper`, mypy 1.18.1 `checker.py:8255`.
+//
+// F1 -- a folded guard did not decide always_returns, because that arm
+// requires a NON-EMPTY `orelse`. This is the most ordinary shape in the whole
+// family: no loop, no `break`, no dead code. Every case below was
+// `TypeError: missing return statement` here while `mypy --strict` said
+// Success and CPython printed the value at exit 0.
+TEST(TypeChecker, ALiteralTrueGuardDecidesTheReturnPath) {
+    // P1: the entire function body.
+    expect_clean("def f() -> int:\n    if True:\n        return 1\n\n\nprint(f())\n");
+    // P2: with a trailing statement after the decided `if`.
+    expect_clean("def f() -> int:\n    if True:\n        return 1\n    print(\"after\")\n\n\n"
+                 "print(f())\n");
+    // P3: an explicit, non-returning `else` -- the pre-existing both-arms rule
+    // answers false for this one, so the fold is the sole cause.
+    expect_clean("def f() -> int:\n    if True:\n        return 1\n    else:\n        pass\n\n\n"
+                 "print(f())\n");
+    // P4: the decided guard is an `elif`, i.e. nested in the outer `orelse`.
+    expect_clean("def f(c: bool) -> int:\n    if c:\n        return 1\n    elif True:\n"
+                 "        return 2\n\n\nprint(f(True))\nprint(f(False))\n");
+    // P5: a bare nonzero int, which mypy folds by VALUE exactly as it folds
+    // `True` -- `is_true_literal` is `refers_to_fullname(..., "builtins.True")
+    // or isinstance(n, IntExpr) and n.value != 0`.
+    expect_clean("def f() -> int:\n    if 1:\n        return 1\n\n\nprint(f())\n");
+}
+
+// F2 -- a folded-true `return` did not start an unreachable REGION, so the
+// statement after it was still type-checked. A DIFFERENT DIAGNOSTIC CLASS from
+// the rest of this family: a false `incompatible types in assignment`, not a
+// missing-return. It needed no change to check_suite, which already consumes
+// statement_always_leaves -- putting the fold inside that predicate (rather
+// than threading it as a parameter the way binder narrowing is threaded) is
+// what makes this family fall out for free.
+TEST(TypeChecker, ALiteralTrueGuardStartsAnUnreachableRegion) {
+    // P6. mypy Success (confirmed under --warn-unreachable as
+    // `Statement is unreachable`), CPython prints 1 at exit 0.
+    expect_clean("def f() -> int:\n    if True:\n        return 1\n    x: int = \"s\"\n"
+                 "    return 2\n\n\nprint(f())\n");
+    // P7: the same shape one suite deeper, inside a `while` body.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if True:\n            return 1\n"
+                 "        x: int = \"s\"\n    else:\n        return 3\n\n\nprint(f(True))\n"
+                 "print(f(False))\n");
+}
+
+// F3 -- an always-true loop condition that is not spelled `True`. The deleted
+// `is_literal_true` matched a BOOL_TRUE Constant alone, so `while 1:` and
+// `while 2:` were false `missing return statement`s even though mypy treats
+// them as never-exiting exactly as it treats `while True:`. That helper was a
+// second, independent notion of "literally true" and is gone; both call sites
+// now ask literal_guard_verdict.
+TEST(TypeChecker, AnAlwaysTrueLoopConditionIsNotOnlyTheWordTrue) {
+    // P8/P9: type-only -- these hang by design under CPython, so no driver.
+    expect_clean("def f() -> int:\n    while 1:\n        pass\n");
+    expect_clean("def f() -> int:\n    while 2:\n        pass\n");
+    // P10: the gap type_checker.h's own second bullet recorded as open since
+    // 2026-09-12 -- `while True:` whose only `break` sits under a folded-FALSE
+    // guard, so the loop never exits. CPython prints 1 at exit 0.
+    expect_clean("def f() -> int:\n    while True:\n        if False:\n            break\n"
+                 "        return 1\n\n\nprint(f())\n");
+}
+
+// F4 -- a folded guard did not kill a `break`. This is the family a8cae40's
+// binder narrowing already handled for a NAMED condition; folding reaches the
+// same decided-guard path through guard_verdict. The `for` sibling is the
+// sharpest case: a `for` loop never produces a narrowed name, so
+// `narrowed_true_name == nullptr` forced Unknown and a8cae40's entire
+// decided-guard path -- its always_leaves_branch stop included -- was DEAD
+// CODE for every `for` loop.
+TEST(TypeChecker, ALiteralGuardDecidesBreakReachability) {
+    // P12, the headline `while` shape. CPython prints 1 then 3.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if True:\n            return 1\n"
+                 "        break\n    else:\n        return 3\n\n\nprint(f(True))\n"
+                 "print(f(False))\n");
+    // P14, the `for` sibling. CPython prints 7 then 3.
+    expect_clean("def f(xs: list[int]) -> int:\n    for x in xs:\n        if True:\n"
+                 "            return x\n        break\n    else:\n        return 3\n\n\n"
+                 "print(f([7, 8]))\nprint(f([]))\n");
+    // P16, the guard nested two and three decided guards deep -- the shape
+    // a8cae40's own first implementation missed for narrowing, reached here
+    // through the same recursive thread.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if True:\n            if True:\n"
+                 "                return 1\n        break\n    else:\n        return 3\n\n\n"
+                 "print(f(True))\nprint(f(False))\n");
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if True:\n            if True:\n"
+                 "                if True:\n                    return 1\n        break\n"
+                 "    else:\n        return 3\n\n\nprint(f(True))\nprint(f(False))\n");
+    // P17: an `elif` chain whose dead arm holds the break.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if True:\n            return 1\n"
+                 "        elif c:\n            break\n    else:\n        return 3\n\n\n"
+                 "print(f(True))\nprint(f(False))\n");
+}
+
+// P13, AND THE DIVERGENCE FROM a8cae40 THAT IS EASIEST TO GET WRONG BY
+// ANALOGY. loop_narrows_truthy requires the condition's declared type to be
+// exactly `bool`, because narrowing a non-bool decides nothing and seven
+// measured types make mypy REPORT. Literal folding is the exact INVERSE:
+// measured 2026-09-17, the P12 shape is mypy-Success and CPython-clean with
+// `c` declared `bool`, `int`, `str`, `float`, `list[int]` AND `object`, all
+// six -- the guard is decided by its own literal, so the condition's type is
+// irrelevant. Routing folding through that bool gate would retain five of
+// these six false positives.
+TEST(TypeChecker, LiteralFoldingIgnoresTheLoopConditionsDeclaredType) {
+    for (const char* const head :
+         {"def f(c: int) -> int:\n", "def f(c: str) -> int:\n", "def f(c: float) -> int:\n",
+          "def f(c: list[int]) -> int:\n", "def f(c: object) -> int:\n"}) {
+        expect_clean(std::string(head) +
+                     "    while c:\n        if True:\n            return 1\n        break\n"
+                     "    else:\n        return 3\n");
+    }
+}
+
+// THE SAFETY CONTROLS, and they matter more than every accepting test above:
+// a fold MORE aggressive than mypy's SILENCES a real `missing return
+// statement`, while one LESS aggressive merely keeps a false positive. Every
+// shape here is one mypy REPORTS, so this compiler must keep reporting it.
+//
+// All are mypy-ONLY rejections -- CPython exits 0 for each, because Python
+// performs no return-type check at runtime. The observable harm is a None
+// leaking out of an `-> int` function, and after codegen a C++ slot default.
+// That does not weaken them: the union rule says a program either oracle
+// rejects must not be silently accepted.
+//
+// POLARITY DECIDES WHICH ARM DIES, never that the whole `if` is dead. An
+// always-TRUE guard leaves its own BODY live.
+TEST(TypeChecker, AFoldedTrueGuardLeavesItsOwnBodyLive) {
+    // C1. THE SINGLE MOST DANGEROUS SHAPE, and the sharpest pair in this work
+    // when set against `if not True: break` -- same literal, same `break`,
+    // opposite verdicts from mypy. A fix keyed on "a literal guard kills the
+    // break it contains" flips this to silent.
+    const Checked while_break =
+        check_module("def f(c: bool) -> int:\n    while c:\n        if True:\n            break\n"
+                     "    else:\n        return 3\n");
+    EXPECT_EQ(only_error(while_break).code, "TypeError");
+
+    // C2, the `for` sibling of C1 -- and the one the fold newly EXPOSES,
+    // since this decided-guard path was unreachable for `for` loops before.
+    const Checked for_break =
+        check_module("def f(xs: list[int]) -> int:\n    for x in xs:\n        if True:\n"
+                     "            break\n    else:\n        return 3\n");
+    EXPECT_EQ(only_error(for_break).code, "TypeError");
+
+    // C4: the live arm leaves via `break`, but the loop has no `else`, so the
+    // function can still fall off its end.
+    const Checked no_loop_else = check_module(
+        "def f(c: bool) -> int:\n    while c:\n        if True:\n            return 1\n"
+        "        else:\n            break\n");
+    EXPECT_EQ(only_error(no_loop_else).code, "TypeError");
+
+    // C6: a folded-TRUE guard whose body does NOT return decides nothing --
+    // the fold answers WHICH arm is live, never that the `if` leaves.
+    const Checked true_pass = check_module("def f() -> int:\n    if True:\n        pass\n");
+    EXPECT_EQ(only_error(true_pass).code, "TypeError");
+
+    // C11: `while True:` with a genuinely LIVE guarded break.
+    const Checked live_break =
+        check_module("def f(c: bool) -> int:\n    while True:\n        if c:\n            break\n");
+    EXPECT_EQ(only_error(live_break).code, "TypeError");
+
+    // C12: the decided guard sits in an INNER loop, so it cannot kill the
+    // OUTER loop's own break.
+    const Checked outer_break =
+        check_module("def f(c: bool, xs: list[int]) -> int:\n    while c:\n        for x in xs:\n"
+                     "            if True:\n                return x\n        break\n"
+                     "    else:\n        return 3\n");
+    EXPECT_EQ(only_error(outer_break).code, "TypeError");
+}
+
+// THE POLARITY CONTROL PROPER: a folded-FALSE guard's own BODY is DEAD, so
+// whatever leaves in there must NOT count. Treating AlwaysFalse as AlwaysTrue
+// silences every shape below -- that is the signature of a change which
+// silences a real error while looking like it closed a false positive.
+TEST(TypeChecker, AFoldedFalseGuardsDeadBodyDoesNotDecideAnything) {
+    // C7/C8: `if False:` / `if 0:` guarding the only return. mypy reports.
+    const Checked false_return = check_module("def f() -> int:\n    if False:\n        return 1\n");
+    EXPECT_EQ(only_error(false_return).code, "TypeError");
+    const Checked zero_return = check_module("def f() -> int:\n    if 0:\n        return 1\n");
+    EXPECT_EQ(only_error(zero_return).code, "TypeError");
+    // `None` folds FALSE too, and is the third member of the falsy set this
+    // project records (re-measured 2026-09-17: `()` is ALSO pruned by mypy and
+    // `0.0` is NOT, so the recorded `{False, 0, None}` set is incomplete
+    // rather than wrong).
+    const Checked none_return = check_module("def f() -> int:\n    if None:\n        return 1\n");
+    EXPECT_EQ(only_error(none_return).code, "TypeError");
+
+    // The dead body holds the return, so the `break` after it stays LIVE and
+    // the loop's `else` is not guaranteed. This is the polarity mirror of C1
+    // and the shape a folded-FALSE-as-TRUE bug makes silent.
+    const Checked dead_return_live_break = check_module(
+        "def f(c: bool) -> int:\n    while c:\n        if False:\n            return 1\n"
+        "        break\n    else:\n        return 3\n");
+    EXPECT_EQ(only_error(dead_return_live_break).code, "TypeError");
+
+    // A folded-FALSE LOOP condition means the loop never RUNS, which is the
+    // opposite of never exiting -- so the While arms test `== AlwaysTrue` and
+    // not `!= Unknown`.
+    const Checked while_zero = check_module("def f() -> int:\n    while 0:\n        pass\n");
+    EXPECT_EQ(only_error(while_zero).code, "TypeError");
+    const Checked while_none = check_module("def f() -> int:\n    while None:\n        pass\n");
+    EXPECT_EQ(only_error(while_none).code, "TypeError");
+}
+
+// THE GATE IS THE AST SHAPE, NEVER THE TYPE -- a bare `ast::Constant` and
+// nothing else, the same discipline emit_power uses for `**`. A signed literal
+// parses as `UnaryOp(-, Constant)`, so the sign lives in a node the TYPE
+// cannot see and `-1` types as `int` exactly as `1` does. This is mypy's own
+// exclusion, structurally: `-1` is a `UnaryExpr` and never an `IntExpr`, so it
+// never reaches `is_true_literal` -- which is why mypy folds `(1)` but not
+// `(-1)`. Measured 2026-09-17: mypy reports for all three below.
+TEST(TypeChecker, ASignedLiteralGuardIsNotFolded) {
+    for (const char* const literal : {"-1", "+1", "-0"}) {
+        const Checked checked =
+            check_module(std::string("def f() -> int:\n    if ") + literal +
+                         ":\n        return 1\n");
+        EXPECT_EQ(only_error(checked).code, "TypeError") << literal;
+    }
+}
+
+// INT LEXEMES ARE WHITELISTED AS DECIMAL, NEVER BLACKLISTED, and this is the
+// one place where the cheap implementation is wrong in the UNACCEPTABLE
+// direction. `0x0` arrives here as a LITERAL_INT whose lexeme is "0x0"
+// (verified via --tokens), so the obvious "is the lexeme all zeros" test
+// answers false and would fold it TRUE -- killing the break below, guaranteeing
+// the `else`, and making cythonpp SILENT on a program mypy REJECTS.
+//
+// The test is per-CHARACTER and not a check for the prefix `0x`: the
+// UPPER-CASE spellings are as much non-decimal as the lower-case ones, and all
+// six of 0x0/0X0/0o0/0O0/0b0/0B0 were measured to fold FALSE under mypy.
+TEST(TypeChecker, ANonDecimalIntLexemeIsNotFolded) {
+    // The safety-critical half: every one of these folds FALSE under mypy, so
+    // the break stays live and this compiler must keep reporting.
+    for (const char* const literal : {"0x0", "0X0", "0o0", "0O0", "0b0", "0B0"}) {
+        const Checked checked = check_module(
+            std::string("def f(c: bool) -> int:\n    while c:\n        if ") + literal +
+            ":\n            return 1\n        break\n    else:\n        return 3\n");
+        EXPECT_EQ(only_error(checked).code, "TypeError") << literal;
+    }
+    // The cost, pinned deliberately: a non-decimal NONZERO literal folds TRUE
+    // under mypy (`0x1`/`0X1`/`0b1`/`0o1` all measured Success) and this
+    // compiler retains the false positive rather than reading the value.
+    // Omitting a form only ever RETAINS a false positive, the safe direction,
+    // and handling every base is a purely additive widening later.
+    const Checked hex_one = check_module("def f() -> int:\n    if 0x1:\n        return 1\n");
+    EXPECT_EQ(only_error(hex_one).code, "TypeError");
+}
+
+// A LEADING ZERO followed by a nonzero digit is not a legal Python decimal
+// literal at all, and the whitelist must not fold it TRUE. Measured
+// 2026-09-17: `if 0_1:` is a mypy BLOCKING `Leading zeros in decimal integer
+// literals are not permitted [syntax]` and a CPython `SyntaxError`, so BOTH
+// oracles reject the program. This compiler has no diagnostic of its own for
+// the literal (a separate, pre-existing parser gap) and today exits non-zero
+// only because of the very missing-return this work removes -- so folding it
+// TRUE would turn a right-verdict/wrong-message rejection into SILENT
+// acceptance of a program both oracles reject.
+TEST(TypeChecker, ALeadingZeroIntLexemeIsNotFolded) {
+    const Checked checked = check_module("def f() -> int:\n    if 0_1:\n        return 1\n");
+    EXPECT_EQ(only_error(checked).code, "TypeError");
+
+    // The all-zero leading-zero spellings ARE legal Python and DO fold false,
+    // so they must keep reporting for the ordinary reason rather than being
+    // excluded by the clause above.
+    for (const char* const literal : {"00", "000", "0_0"}) {
+        const Checked zero = check_module(std::string("def f() -> int:\n    if ") + literal +
+                                          ":\n        return 1\n");
+        EXPECT_EQ(only_error(zero).code, "TypeError") << literal;
+    }
+}
+
+// Forms mypy does NOT fold at all, so including any of them would make
+// cythonpp accept a program mypy rejects. Measured 2026-09-17 in three
+// independent templates. Note `0.0` is here and NOT in the falsy fold set --
+// the set is not "numeric zero".
+TEST(TypeChecker, AnUnfoldableGuardOrLoopConditionStillReports) {
+    // C5: nothing foldable at all -- the pre-existing behaviour.
+    const Checked plain = check_module("def f(c: bool) -> int:\n    if c:\n        return 1\n");
+    EXPECT_EQ(only_error(plain).code, "TypeError");
+    // C10, plus the float and empty-string forms.
+    for (const char* const literal : {"\"x\"", "\"\"", "0.0", "1.0"}) {
+        const Checked checked =
+            check_module(std::string("def f() -> int:\n    if ") + literal +
+                         ":\n        return 1\n");
+        EXPECT_EQ(only_error(checked).code, "TypeError") << literal;
+    }
+    // C13: an unfoldable LOOP condition must not be read as never-exiting.
+    for (const char* const condition : {"\"x\"", "[1]", "1.0"}) {
+        const Checked checked = check_module(std::string("def f() -> int:\n    while ") +
+                                             condition + ":\n        pass\n");
+        EXPECT_EQ(only_error(checked).code, "TypeError") << condition;
+    }
+}
+
+// TWO mypy-UNSOUND FORMS, EXCLUDED BY CONSTRUCTION rather than by a check, and
+// pinned so a future widening cannot quietly admit them. Measured 2026-09-17:
+// mypy prunes `NotImplemented` as always-true while CPython raises
+// `TypeError: NotImplemented should not be used in a boolean context` at exit
+// 1, and mypy prunes `not TYPE_CHECKING` while the pruned branch actually
+// RUNS, returning None from an `-> int` function. Following mypy on either
+// would compile a program CPython refuses to run.
+//
+// Both are bare `ast::Name`s, never an `ast::Constant`, so
+// literal_guard_verdict cannot reach either -- which is ALSO why the
+// diagnostic below is a NameError rather than a missing-return: these names
+// are in no builtin table this compiler models (a separate, recorded false
+// positive of its own, unrelated to folding). The assertion that matters is
+// that neither is silently accepted.
+TEST(TypeChecker, AMypyUnsoundNameGuardIsNeverFolded) {
+    const Checked not_implemented =
+        check_module("def f() -> int:\n    if NotImplemented:\n        return 1\n");
+    EXPECT_FALSE(not_implemented.diagnostics.empty());
+    const Checked type_checking =
+        check_module("def f() -> int:\n    if not TYPE_CHECKING:\n        pass\n"
+                     "    else:\n        return 1\n");
+    EXPECT_FALSE(type_checking.diagnostics.empty());
+}
+
+// RETAINED FALSE POSITIVES, pinned because the spec's own measurement table
+// lists them as shapes to close and the IMPLEMENTED fold set cannot: every one
+// is a `not` over a folded literal, and `not`/`and`/`or` are deliberately
+// excluded. mypy's behaviour there is inconsistent with its own atom rules
+// (`not True` folds false, and `"" or 1` folds TRUE even though `""` alone
+// does not fold at all), and `and` is ONE-sided where `or` is TWO-sided, so
+// modelling them needs its own sweep. All three below are mypy-Success and
+// CPython-clean, and this compiler still reports -- a retained false positive,
+// which is the safe direction, not a violation.
+TEST(TypeChecker, ANotOverAFoldedLiteralIsDeliberatelyNotFolded) {
+    const Checked while_not_false =
+        check_module("def f() -> int:\n    while not False:\n        pass\n");
+    EXPECT_EQ(only_error(while_not_false).code, "TypeError");
+    const Checked break_under_not_true =
+        check_module("def f() -> int:\n    while True:\n        if not True:\n            break\n"
+                     "        return 1\n");
+    EXPECT_EQ(only_error(break_under_not_true).code, "TypeError");
+    const Checked guard_else_under_not_true =
+        check_module("def f(c: bool) -> int:\n    while c:\n        if not True:\n"
+                     "            break\n        else:\n            return 1\n    else:\n"
+                     "        return 3\n");
+    EXPECT_EQ(only_error(guard_else_under_not_true).code, "TypeError");
+}
+
 } // namespace
 } // namespace cythonpp::domain::semantic

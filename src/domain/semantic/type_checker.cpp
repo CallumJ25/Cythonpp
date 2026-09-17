@@ -176,16 +176,15 @@ private:
     std::set<std::string> previous_;
 };
 
-// The `while True` half of always_returns' While arm: true only for a
-// Constant whose token type is BOOL_TRUE, per the brief's own precise
-// definition -- NOT any expression ExpressionTyper would type as `bool`
-// (e.g. a bare `1` is truthy but not this), because always_returns is a
-// SYNTACTIC approximation with no typing pass of its own.
-bool is_literal_true(const ast::Expr& condition) {
-    const auto* constant = dynamic_cast<const ast::Constant*>(&condition);
-    return constant != nullptr && constant->type() == lexer::token_type::BOOL_TRUE;
-}
-
+// `is_literal_true` USED TO LIVE HERE, and was DELETED 2026-09-17 rather than
+// kept as a forwarder. It answered "is this a Constant of BOOL_TRUE" for
+// always_returns' and statement_always_leaves' While arms -- a second,
+// independent notion of "literally true" alongside literal_guard_verdict's,
+// free to drift from it. It had already drifted: it answered false for
+// `while 1:` and `while 2:`, which mypy treats as always-true loop conditions
+// exactly as it treats `while True:`. Both call sites now ask
+// `literal_guard_verdict(...) == GuardVerdict::AlwaysTrue`.
+//
 // Structural type identity with Union members matched as an unordered SET at
 // every depth -- i.e. exactly what `Type::operator==` computes, minus its
 // union-order sensitivity, and nothing else relaxed. The sole caller is
@@ -3862,6 +3861,174 @@ GuardVerdict narrowing_guard_verdict(const ast::Expr& guard, const std::string& 
     return GuardVerdict::Unknown;
 }
 
+// The LITERAL_INT half of literal_guard_verdict, split out because the lexeme
+// test is the one place in this file where the cheap implementation is wrong in
+// the UNACCEPTABLE direction and so deserves to be read on its own.
+//
+// A WHITELIST, never a blacklist: fold only when every character is a decimal
+// digit or `_`. The obvious alternative -- "is the lexeme all zeros" -- folds
+// `0x0` TRUE, because `0x0` is not all zeros. mypy folds it FALSE (measured
+// 2026-09-17: `while c:` / `if 0x0: return 1` / `break` / `else: return 3` is
+// `Missing return statement [return]`, because the dead body leaves the `break`
+// live), so folding it TRUE would kill that break, guarantee the `else`, and
+// make cythonpp SILENT on a program mypy rejects. Verified via `--tokens` that
+// `0x0` really does arrive here as a LITERAL_INT whose lexeme is "0x0", and
+// that `0X0` arrives as "0X0" -- which is why this is a per-CHARACTER test and
+// not a check for the prefix `0x`: the upper-case spellings `0X`/`0O`/`0B` are
+// as much non-decimal as the lower-case ones (all six measured to fold FALSE),
+// and a prefix check written for one case admits the other.
+//
+// A LEADING ZERO followed by any nonzero digit is NOT a legal Python decimal
+// literal at all (`0_1`, `01`), and this returns Unknown for it rather than
+// folding it TRUE. Measured 2026-09-17: `if 0_1:` is a mypy BLOCKING
+// `Leading zeros in decimal integer literals are not permitted [syntax]` and a
+// CPython `SyntaxError`, so BOTH oracles reject the program; cythonpp has no
+// diagnostic of its own for it (a separate, pre-existing parser gap) and today
+// only exits non-zero because of the very `missing return statement` this fix
+// removes. Folding it TRUE would therefore turn a right-verdict/wrong-message
+// rejection into silent acceptance. `00`/`000`/`0_0` are legal and all-zero, so
+// they fold FALSE and are unaffected by this clause.
+GuardVerdict decimal_int_guard_verdict(const std::string& lexeme) {
+    char first_digit = '\0';
+    bool all_zero = true;
+    for (const char character : lexeme) {
+        if (character == '_') {
+            continue;
+        }
+        if (character < '0' || character > '9') {
+            return GuardVerdict::Unknown;
+        }
+        if (first_digit == '\0') {
+            first_digit = character;
+        }
+        if (character != '0') {
+            all_zero = false;
+        }
+    }
+    if (first_digit == '\0') {
+        // No digits at all -- not a spelling this function can read.
+        return GuardVerdict::Unknown;
+    }
+    if (all_zero) {
+        return GuardVerdict::AlwaysFalse;
+    }
+    if (first_digit == '0') {
+        return GuardVerdict::Unknown;
+    }
+    return GuardVerdict::AlwaysTrue;
+}
+
+// LITERAL CONDITION FOLDING, 2026-09-17. mypy prunes a statically-decided
+// branch before asking any reachability question; this compiler's reachability
+// helpers had no constant folding at all, which produced false positives in
+// four separate places on programs both oracles accept and run -- the most
+// ordinary of them needing no loop, no `break` and no dead code:
+// `def f() -> int:` / `if True: return 1` was a false
+// `missing return statement`.
+//
+// THE AUTHORITY IS MYPY'S OWN SOURCE, not a guess at its intent: the two
+// helpers at the top of `find_isinstance_check_helper`, mypy 1.18.1
+// `checker.py:8255`, are
+//
+//     def is_true_literal(n):  refers_to_fullname(n, "builtins.True")
+//                              or isinstance(n, IntExpr) and n.value != 0
+//     def is_false_literal(n): refers_to_fullname(n, "builtins.False")
+//                              or isinstance(n, IntExpr) and n.value == 0
+//
+// so an int literal folds BY VALUE (re-measured directly: `0x1`, `0b1`, `0o1`,
+// `1_0` and `(1)` all fold TRUE), and mypy's own prune set is wider than what
+// is implemented below.
+//
+// THE GATE IS THE AST SHAPE, NEVER THE TYPE -- a bare `ast::Constant` and
+// nothing else. This is the same discipline `emit_power` uses for `**`, adopted
+// for the same recorded reason: a NEGATIVE literal parses as
+// `UnaryOp(-, Constant)`, so the sign lives in a node the TYPE cannot see, and
+// `-1` types as `int` exactly as `1` does. Requiring a bare `Constant` excludes
+// `-1`, `+1` and `-0` for free, with no unary logic to get wrong -- and it is
+// mypy's own exclusion, structurally: `-1` is a `UnaryExpr`, never an
+// `IntExpr`, so it never reaches the test above, which is exactly why mypy
+// folds `(1)` but not `(-1)`. A type-based gate would be wrong in the
+// DANGEROUS direction. All three measured 2026-09-17: `if -1:`, `if +1:` and
+// `if -0:` guarding a return leave mypy reporting `Missing return statement`.
+//
+// TWO mypy-UNSOUND FORMS ARE EXCLUDED BY CONSTRUCTION, and a future widening
+// must not admit them. Measured 2026-09-17: mypy prunes `NotImplemented` as
+// always-true while CPython raises
+// `TypeError: NotImplemented should not be used in a boolean context` (exit 1),
+// and mypy prunes `not TYPE_CHECKING` while the pruned branch actually RUNS,
+// returning None from an `-> int` function. Following mypy on either would
+// compile a program CPython refuses to run. Both are bare `ast::Name`s, never
+// an `ast::Constant`, so neither can reach this function at all.
+//
+// DELIBERATE OMISSIONS, each measured-foldable under mypy and each left out:
+// `...` (ELLIPSIS), tuple displays (which fold by LENGTH -- `(0,)` folds TRUE),
+// `not`/`and`/`or`, and non-decimal int literals. Omitting a form only ever
+// RETAINS a false positive, which is the safe direction, and each is a purely
+// additive widening later. `not`/`and`/`or` are held back because mypy's
+// behaviour there is inconsistent with its own atom rules (`not True` folds
+// false, and `"" or 1` folds TRUE even though `""` alone does not fold at all),
+// and `and` is ONE-sided while `or` is TWO-sided -- getting `or` wrong in the
+// permissive direction silences a real error on `False or ""`.
+//
+// EXCLUDED BECAUSE MYPY DOES NOT FOLD THEM, and including any would make
+// cythonpp accept a program mypy rejects: every signed number, float, complex,
+// str, bytes, list, dict and set. Note in particular that the falsy prune set
+// recorded elsewhere in this project as `{False, 0, None}` is INCOMPLETE rather
+// than wrong -- re-measured 2026-09-17, `()` is also pruned and `0.0` is NOT,
+// so the set is neither "numeric zero" nor "any empty container".
+GuardVerdict literal_guard_verdict(const ast::Expr& condition) {
+    const auto* constant = dynamic_cast<const ast::Constant*>(&condition);
+    if (constant == nullptr) {
+        return GuardVerdict::Unknown;
+    }
+    switch (constant->type()) {
+    case lexer::token_type::BOOL_TRUE:
+        return GuardVerdict::AlwaysTrue;
+    case lexer::token_type::BOOL_FALSE:
+    case lexer::token_type::KEYWORD_NONE:
+        return GuardVerdict::AlwaysFalse;
+    case lexer::token_type::LITERAL_INT:
+        return decimal_int_guard_verdict(constant->lexeme());
+    default:
+        // A default is right here, the same judgement literal_type() makes for
+        // its own switch over the same enum: token_type has well over a
+        // hundred enumerators and all but these four are either not literals
+        // at all or measured NOT to fold. It is NOT the exhaustive-switch
+        // idiom `-Werror=switch` guards elsewhere in this codebase (TypeKind,
+        // DiagnosticKind, RuleResult::Status), where a missing case must be a
+        // compile error.
+        return GuardVerdict::Unknown;
+    }
+}
+
+// The two verdict sources are DISJOINT BY CONSTRUCTION -- literal folding
+// matches only an `ast::Constant`, binder narrowing only an `ast::Name` (or a
+// `not` over one), and no expression is both -- so the order below is
+// irrelevant to the answer and is chosen purely because folding is cheaper
+// (one dynamic_cast and a lexeme scan, versus a scope resolution).
+//
+// They differ in what they NEED, which is why folding is not simply routed
+// through the narrowing path: narrowing needs `scopes_`, needs the loop
+// condition's declared type to be exactly `bool`, and needs a narrowed name to
+// exist at all. Folding needs none of the three. Measured 2026-09-17, the
+// declared type is the exact INVERSE of narrowing's requirement: the folded
+// `while c:` / `if True: return 1` / `break` / `else: return 3` shape is
+// mypy-`Success` with `c` declared `bool`, `int`, `str`, `float`, `list[int]`
+// AND `object`, all six. And a `for` loop never produces a narrowed name at
+// all, so passing a null pointer here must still fold -- that null case is
+// precisely why the `for` sibling of that shape was broken while the `while`
+// one was not.
+GuardVerdict guard_verdict(const ast::Expr& condition, const std::string* narrowed_true_name) {
+    const GuardVerdict folded = literal_guard_verdict(condition);
+    if (folded != GuardVerdict::Unknown) {
+        return folded;
+    }
+    if (narrowed_true_name != nullptr) {
+        return narrowing_guard_verdict(condition, *narrowed_true_name);
+    }
+    return GuardVerdict::Unknown;
+}
+
 } // namespace
 
 std::optional<std::string> TypeChecker::loop_narrows_truthy(const ast::While& loop) {
@@ -3916,22 +4083,34 @@ bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body
             // An `if` is not a loop, so a break inside one still belongs to
             // THIS enclosing loop -- look through it.
             //
-            // BINDER NARROWING, 2026-09-16: when the enclosing `while <name>:`
-            // has narrowed `name` truthy, a guard on that same name is
-            // statically decided and only ONE arm is live. Searching the dead
-            // arm for a `break` is what made mypy-clean programs draw a false
-            // `missing return statement`.
+            // A STATICALLY DECIDED GUARD has only ONE live arm, and searching
+            // the dead arm for a `break` is what made mypy-clean programs draw
+            // a false `missing return statement`.
             //
-            // THE CONTROL THAT KEEPS THIS HONEST, and the shape a careless
-            // version of this gets wrong: an always-TRUE guard leaves its own
-            // BODY live, so `if c: break` still finds that break and still
-            // reports -- measured, mypy reports it too, and CPython genuinely
-            // returns None on one path. The verdict decides WHICH arm dies,
-            // never that the whole statement is dead.
-            const GuardVerdict verdict =
-                narrowed_true_name == nullptr
-                    ? GuardVerdict::Unknown
-                    : narrowing_guard_verdict(if_stmt->condition(), *narrowed_true_name);
+            // The verdict has TWO INDEPENDENT SOURCES, and this comment used to
+            // attribute the whole mechanism to the first of them:
+            //   - BINDER NARROWING, 2026-09-16: the enclosing `while <name>:`
+            //     narrowed `name` truthy, so a guard on that same name is
+            //     decided. Needs a narrowed name, and so never fires for a
+            //     `for` loop.
+            //   - LITERAL FOLDING, 2026-09-17: the guard is a literal mypy
+            //     itself prunes on. Needs no name, no scope and no type.
+            // Before folding existed, `narrowed_true_name == nullptr` forced
+            // Unknown here, which made this whole decided-guard path -- the
+            // always-leaves stop below included -- DEAD CODE for every `for`
+            // loop. Routing both sources through guard_verdict is the single
+            // substitution that makes the `for` sibling work.
+            //
+            // THE CONTROL THAT KEEPS THIS HONEST APPLIES TO BOTH SOURCES, and
+            // is the shape a careless version of this gets wrong: an
+            // always-TRUE guard leaves its own BODY live, so `if c: break` AND
+            // `if True: break` both still find that break and still report --
+            // measured, mypy reports both too, and CPython genuinely returns
+            // None on one path. The verdict decides WHICH arm dies, never that
+            // the whole statement is dead. `if True: break` against
+            // `if not True: break` is the sharpest pair here: same literal,
+            // same break, opposite verdicts from mypy.
+            const GuardVerdict verdict = guard_verdict(if_stmt->condition(), narrowed_true_name);
             const bool body_live = verdict != GuardVerdict::AlwaysFalse;
             const bool orelse_live = verdict != GuardVerdict::AlwaysTrue;
             if ((body_live && contains_reachable_break(if_stmt->body(), in_function,
@@ -3944,9 +4123,12 @@ bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body
             // no `else` normally never "always leaves" (it can fall through),
             // but a statically-true one leaves exactly when its body does --
             // which is what makes `if c: return 1` followed by `break` a
-            // program whose break is dead. Handled here rather than inside
-            // statement_always_leaves so that function stays narrowing-free
-            // and its many other callers are untouched.
+            // program whose break is dead. Kept here even though
+            // statement_always_leaves now folds literals in its own `If` arm:
+            // that arm only sees the NARROWED name when a caller threads one,
+            // so the narrowing half of this stop still has to live here, and
+            // splitting the two sources across two functions would be worse
+            // than one stop that handles both.
             if (verdict != GuardVerdict::Unknown) {
                 const std::vector<ast::StmtPtr>& live =
                     verdict == GuardVerdict::AlwaysTrue ? if_stmt->body() : if_stmt->orelse();
@@ -4082,8 +4264,34 @@ bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
             return true;
         }
         if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
-            if (!if_stmt->orelse().empty() && always_returns(if_stmt->body()) &&
-                always_returns(if_stmt->orelse())) {
+            // LITERAL FOLDING, 2026-09-17. This arm's own rule requires a
+            // NON-EMPTY `orelse`, which is right for an undecided guard (an
+            // `if` with no `else` can fall through) and wrong for a decided
+            // one: `def f() -> int:` / `if True: return 1` is the single most
+            // ordinary shape in the whole folding family and was a false
+            // `missing return statement` purely because of it. A folded-TRUE
+            // guard returns exactly when its BODY does; a folded-FALSE one
+            // exactly when its ORELSE does, and an empty orelse yields false
+            // naturally from the fold over zero statements -- deliberately NOT
+            // special-cased.
+            //
+            // literal_guard_verdict, not guard_verdict: always_returns takes no
+            // narrowed name, needs none, and folding needs no scope.
+            //
+            // A decided guard SKIPS the both-arms rule below rather than
+            // falling through to it, the same choice contains_reachable_break
+            // documents: asking whether BOTH arms return is meaningless once
+            // one of them is dead. The two answers provably cannot differ here
+            // (the live arm is one of the two the conjunction tests), so this
+            // is a statement of intent rather than a behaviour change.
+            const GuardVerdict verdict = literal_guard_verdict(if_stmt->condition());
+            if (verdict != GuardVerdict::Unknown) {
+                if (always_returns(verdict == GuardVerdict::AlwaysTrue ? if_stmt->body()
+                                                                       : if_stmt->orelse())) {
+                    return true;
+                }
+            } else if (!if_stmt->orelse().empty() && always_returns(if_stmt->body()) &&
+                       always_returns(if_stmt->orelse())) {
                 return true;
             }
             continue;
@@ -4091,7 +4299,16 @@ bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
         if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
             // always_returns only ever runs on a FunctionDef's own body (see
             // its own declaration comment), so in_function=true here too.
-            if (is_literal_true(while_stmt->condition()) &&
+            //
+            // Was `is_literal_true(condition)`, a second, independent notion of
+            // "literally true" that matched a BOOL_TRUE Constant alone. Folded
+            // into literal_guard_verdict so the two cannot drift: `while 1:`
+            // and `while 2:` are always-true loop conditions under mypy exactly
+            // as `while True:` is, and were false `missing return statement`s.
+            // Note the check is `== AlwaysTrue` and not `!= Unknown`: a
+            // folded-FALSE condition (`while 0:`) means the loop never runs,
+            // which is the opposite of never exiting.
+            if (literal_guard_verdict(while_stmt->condition()) == GuardVerdict::AlwaysTrue &&
                 !contains_reachable_break(while_stmt->body(), /*in_function=*/true)) {
                 return true;
             }
@@ -4154,28 +4371,45 @@ bool TypeChecker::statement_always_leaves(const ast::Stmt& statement, bool in_fu
         return in_loop;
     }
     if (const auto* if_stmt = dynamic_cast<const ast::If*>(&statement)) {
-        // BINDER NARROWING, 2026-09-16. When an enclosing `while <name>:` has
-        // narrowed `name` truthy and THIS `if` guards on that same name, the
-        // guard is statically decided and only one arm is live -- so the
-        // statement always leaves exactly when that LIVE arm does, even
-        // though it may have no `else` at all. Without this, a guard NESTED
-        // inside another decided guard still fell through: `while c:` /
-        // `if c:` / `if c: return 1` / `break` stayed a false
-        // `missing return statement`, because the outer arm's
-        // always-leaves fold asked the narrowing-free question about the
-        // inner `if` and got "can fall through".
+        // A STATICALLY DECIDED GUARD has only one live arm, so the statement
+        // always leaves exactly when that LIVE arm does, even though it may
+        // have no `else` at all. Two independent sources decide it:
         //
-        // `narrowed_true_name` is nullptr for every pre-existing caller
-        // (check_suite's own walk, and the unreachable-code scan), so their
-        // behaviour is untouched by construction.
-        if (narrowed_true_name != nullptr) {
-            const GuardVerdict verdict =
-                narrowing_guard_verdict(if_stmt->condition(), *narrowed_true_name);
-            if (verdict != GuardVerdict::Unknown) {
-                const std::vector<ast::StmtPtr>& live =
-                    verdict == GuardVerdict::AlwaysTrue ? if_stmt->body() : if_stmt->orelse();
-                return always_leaves_branch(live, in_function, in_loop, narrowed_true_name);
-            }
+        // BINDER NARROWING, 2026-09-16. An enclosing `while <name>:` narrowed
+        // `name` truthy and THIS `if` guards on that same name. Without it, a
+        // guard NESTED inside another decided guard still fell through:
+        // `while c:` / `if c:` / `if c: return 1` / `break` stayed a false
+        // `missing return statement`, because the outer arm's always-leaves
+        // fold asked the narrowing-free question about the inner `if` and got
+        // "can fall through". That source is threaded in as a parameter and is
+        // nullptr for every caller that has no loop condition to narrow.
+        //
+        // LITERAL FOLDING, 2026-09-17. The guard is a literal mypy prunes on.
+        // This one takes NO parameter, deliberately -- folding is context-free,
+        // needing no scope, no type and no narrowed name -- and it is exactly
+        // that which makes the unreachable-REGION family fall out for free:
+        // check_suite already consumes this predicate, so `if True: return 1`
+        // followed by `x: int = "s"` now starts an unreachable region and the
+        // false `incompatible types in assignment` goes away, with no change to
+        // check_suite at all. That is a DIFFERENT diagnostic class from the
+        // missing-return family, not a variant of it.
+        //
+        // The folded verdict deliberately reaches this arm even when
+        // `narrowed_true_name` is nullptr, which is every pre-existing caller
+        // (check_suite's own walk, and the unreachable-code scan) -- so unlike
+        // the narrowing half, this one IS a behaviour change for them, by
+        // design. `visit(If)`'s narrowing JOIN reaches it transitively too; the
+        // direction is more correct (an always-returning branch should not
+        // contribute narrowing to the join) and the suite confirms nothing else
+        // moves.
+        const GuardVerdict verdict = guard_verdict(if_stmt->condition(), narrowed_true_name);
+        if (verdict != GuardVerdict::Unknown) {
+            const std::vector<ast::StmtPtr>& live =
+                verdict == GuardVerdict::AlwaysTrue ? if_stmt->body() : if_stmt->orelse();
+            // An empty `orelse` makes this fold over zero statements and answer
+            // false on its own, which is the right answer for a folded-FALSE
+            // guard with no `else`: nothing is live, so nothing leaves.
+            return always_leaves_branch(live, in_function, in_loop, narrowed_true_name);
         }
         // An `if` with no `else` can always fall through, so it never
         // counts -- that is what makes a `break` guarded by a nested `if`
@@ -4203,7 +4437,9 @@ bool TypeChecker::statement_always_leaves(const ast::Stmt& statement, bool in_fu
                always_leaves_branch(if_stmt->orelse(), in_function, in_loop);
     }
     if (const auto* while_stmt = dynamic_cast<const ast::While*>(&statement)) {
-        if (is_literal_true(while_stmt->condition()) &&
+        // See always_returns' own While arm for why this was `is_literal_true`
+        // and why the test is `== AlwaysTrue` rather than `!= Unknown`.
+        if (literal_guard_verdict(while_stmt->condition()) == GuardVerdict::AlwaysTrue &&
             !contains_reachable_break(while_stmt->body(), in_function)) {
             // Never exits, so it never falls through to the merge either.
             // No terminator is involved, so this arm needs no context check:
