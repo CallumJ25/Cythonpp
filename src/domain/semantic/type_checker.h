@@ -167,16 +167,26 @@ namespace cythonpp::domain::semantic {
 //     exactly as it does `while True:`. Two rival notions of "literally true"
 //     is the condition that produced that drift.
 //
-//     TWO SUCCESSORS ARE OPEN, and neither is this bullet's gap re-opened.
-//     (a) `not`/`and`/`or` over a folded operand are NOT folded, so
-//     `while not False:` and `if not True: break` remain false positives --
-//     deliberately, because mypy's behaviour there is inconsistent with its
-//     own atom rules (`"" or 1` folds TRUE though `""` alone does not fold)
-//     and `and` is one-sided where `or` is two-sided. (b) A statically-dead
-//     BRANCH's own contents are still type-checked, so `if False: x: int =
-//     "s"` is a false "incompatible types in assignment"; that needs a
-//     dead-BLOCK model (skip walking the branch), which is strictly more than
-//     a folded always-leaves answer.
+//     SUCCESSORS, and none of them is this bullet's gap re-opened.
+//     (a) CLOSED 2026-09-18 for `not`, which now INVERTS a decided operand
+//     and leaves an undecided one undecided -- so `while not False:` and
+//     `if not True: break` fold, nesting works, and every exclusion composes
+//     for free (`not ""`/`not 0.0`/`not -1`/`not 0x1` still fold NEITHER way,
+//     because Unknown inverts to Unknown). `and`/`or` REMAIN excluded, and
+//     not for symmetry: measured, mypy's `and` is ONE-sided (`"x" and False`
+//     folds FALSE from the right operand alone) while its `or` is TWO-sided,
+//     and `"" or 1` folds TRUE though `""` alone does not fold at all -- so
+//     neither is expressible as a fold over operand verdicts the way `not`
+//     is, and getting `or` wrong in the permissive direction silences a real
+//     error on `False or ""`.
+//     (b) STILL OPEN: a statically-dead BRANCH's own contents are still
+//     type-checked, so `if False: x: int = "s"` is a false "incompatible
+//     types in assignment"; that needs a dead-BLOCK model (skip walking the
+//     branch), which is strictly more than a folded always-leaves answer.
+//     (c) STILL OPEN: a folded-false loop header prunes the body for
+//     RETURN-PATH purposes (loop_else_always_returns' body_never_runs, added
+//     2026-09-18) but the body's CONTENTS are still type-checked, which is
+//     the same dead-BLOCK gap as (b) wearing a loop.
 //   - A THIRD failure mode, previously open and NOW FIXED (loop_else_always_
 //     returns, added 2026-09-12): `for i in range(3): / total = total + i /
 //     else: / return total` as the whole body of a `-> int` function used to
