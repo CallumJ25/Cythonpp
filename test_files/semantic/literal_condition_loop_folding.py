@@ -16,6 +16,13 @@
 # deliberately NOT in this sample (a `# mypy: clean` sample drawing a TypeError
 # fails the harness by construction).
 #
+# The `not_*` functions were added 2026-09-18, when the fold learned to look
+# through `not`: it INVERTS a decided operand and leaves an undecided one
+# undecided, so nesting works and every existing exclusion composes for free
+# (`not ""`, `not 0.0`, `not -1` and `not 0x1` all still fold NEITHER way).
+# Before that, `not_kills_a_guarded_break` had to be written with a bare
+# `False` because `not True` was a retained false positive.
+#
 # Every function is driven below so CPython actually executes both paths.
 
 
@@ -62,6 +69,30 @@ def nested_folded_guards(c: bool) -> int:
         return 3
 
 
+def not_over_a_false_literal() -> int:
+    while not False:
+        return 8
+
+
+def not_kills_a_guarded_break(c: bool) -> int:
+    while c:
+        if not True:
+            break
+        else:
+            return 9
+    else:
+        return 10
+
+
+def nested_not_inverts_twice(c: bool) -> int:
+    while c:
+        if not not True:
+            return 11
+        break
+    else:
+        return 12
+
+
 print(always_true_loop_header(5))
 print(folded_guard_kills_the_break(True))
 print(folded_guard_kills_the_break(False))
@@ -71,3 +102,8 @@ print(the_for_sibling([7]))
 print(the_for_sibling([]))
 print(nested_folded_guards(True))
 print(nested_folded_guards(False))
+print(not_over_a_false_literal())
+print(not_kills_a_guarded_break(True))
+print(not_kills_a_guarded_break(False))
+print(nested_not_inverts_twice(True))
+print(nested_not_inverts_twice(False))

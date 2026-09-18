@@ -4007,6 +4007,41 @@ GuardVerdict decimal_int_guard_verdict(const std::string& lexeme) {
 // than wrong -- re-measured 2026-09-17, `()` is also pruned and `0.0` is NOT,
 // so the set is neither "numeric zero" nor "any empty container".
 GuardVerdict literal_guard_verdict(const ast::Expr& condition) {
+    // `not` INVERTS a decided operand and leaves an undecided one undecided,
+    // which is exactly mypy's behaviour and -- because it RECURSES -- gets the
+    // nesting and the exclusions for free rather than by enumeration.
+    // Measured 2026-09-17/18 in both directions: `not False`, `not 0`,
+    // `not None` and `not not True` fold TRUE; `not True`, `not 1` and
+    // `not not False` fold FALSE; and `not ""`, `not 0.0`, `not []`, `not -1`
+    // and `not 0x1` fold NEITHER -- the last five fall out with no special
+    // case at all, since their operands are Unknown and Unknown inverts to
+    // Unknown. Seven false positives closed, every one mypy-Success and
+    // CPython-clean.
+    //
+    // `and`/`or` are still excluded, and that is not symmetry for its own
+    // sake: mypy's `and` is ONE-sided (`"x" and False` folds FALSE from the
+    // right operand alone) while its `or` is TWO-sided, and `"" or 1` folds
+    // TRUE even though `""` alone does not fold -- so they cannot be written
+    // as a fold over operand verdicts the way `not` can, and getting `or`
+    // wrong in the permissive direction silences a real error on `False or ""`.
+    if (const auto* unary = dynamic_cast<const ast::UnaryOp*>(&condition)) {
+        if (unary->op() == lexer::token_type::OP_NOT) {
+            switch (literal_guard_verdict(unary->operand())) {
+            case GuardVerdict::AlwaysTrue:
+                return GuardVerdict::AlwaysFalse;
+            case GuardVerdict::AlwaysFalse:
+                return GuardVerdict::AlwaysTrue;
+            case GuardVerdict::Unknown:
+                return GuardVerdict::Unknown;
+            }
+        }
+        // Any OTHER unary operator -- `-`, `+`, `~` -- is deliberately NOT
+        // looked through: measured, mypy folds neither `-1` nor `+1` nor `-0`,
+        // because the sign makes it a UnaryExpr and never an IntExpr. Falling
+        // through to the Constant cast below returns Unknown for them, which
+        // is the whole reason the gate is the AST SHAPE rather than the type.
+        return GuardVerdict::Unknown;
+    }
     const auto* constant = dynamic_cast<const ast::Constant*>(&condition);
     if (constant == nullptr) {
         return GuardVerdict::Unknown;
@@ -4031,11 +4066,22 @@ GuardVerdict literal_guard_verdict(const ast::Expr& condition) {
     }
 }
 
-// The two verdict sources are DISJOINT BY CONSTRUCTION -- literal folding
+// The two verdict sources are DISJOINT IN THEIR ANSWERS, which since
+// 2026-09-18 is a weaker and more precise claim than the one this comment used
+// to make. It said they were disjoint "by construction -- literal folding
 // matches only an `ast::Constant`, binder narrowing only an `ast::Name` (or a
-// `not` over one), and no expression is both -- so the order below is
-// irrelevant to the answer and is chosen purely because folding is cheaper
-// (one dynamic_cast and a lexeme scan, versus a scope resolution).
+// `not` over one), and no expression is both". That stopped being true at the
+// NODE level when literal folding learned to look through `not`: both now
+// match `UnaryOp(OP_NOT, ...)`. They still cannot both ANSWER, because each
+// returns Unknown exactly where the other can decide -- `not <Constant>` makes
+// narrowing's `bare_name_of(operand)` null, and `not <Name>` recurses into
+// literal folding, which has no Constant to read and yields Unknown, which
+// inverts to Unknown. So the order below remains irrelevant to the answer and
+// is still chosen purely because folding is cheaper (a dynamic_cast and a
+// lexeme scan, versus a scope resolution). If a future widening gives BOTH
+// sources an answer for one expression, this ordering silently becomes a
+// precedence rule -- state which wins and why, rather than leaving it to fall
+// out of the order.
 //
 // They differ in what they NEED, which is why folding is not simply routed
 // through the narrowing path: narrowing needs `scopes_`, needs the loop

@@ -8997,28 +8997,89 @@ TEST(TypeChecker, AMypyUnsoundNameGuardIsNeverFolded) {
     EXPECT_FALSE(type_checking.diagnostics.empty());
 }
 
-// RETAINED FALSE POSITIVES, pinned because the spec's own measurement table
-// lists them as shapes to close and the IMPLEMENTED fold set cannot: every one
-// is a `not` over a folded literal, and `not`/`and`/`or` are deliberately
-// excluded. mypy's behaviour there is inconsistent with its own atom rules
-// (`not True` folds false, and `"" or 1` folds TRUE even though `""` alone
-// does not fold at all), and `and` is ONE-sided where `or` is TWO-sided, so
-// modelling them needs its own sweep. All three below are mypy-Success and
-// CPython-clean, and this compiler still reports -- a retained false positive,
-// which is the safe direction, not a violation.
-TEST(TypeChecker, ANotOverAFoldedLiteralIsDeliberatelyNotFolded) {
-    const Checked while_not_false =
-        check_module("def f() -> int:\n    while not False:\n        pass\n");
-    EXPECT_EQ(only_error(while_not_false).code, "TypeError");
-    const Checked break_under_not_true =
-        check_module("def f() -> int:\n    while True:\n        if not True:\n            break\n"
-                     "        return 1\n");
-    EXPECT_EQ(only_error(break_under_not_true).code, "TypeError");
-    const Checked guard_else_under_not_true =
-        check_module("def f(c: bool) -> int:\n    while c:\n        if not True:\n"
-                     "            break\n        else:\n            return 1\n    else:\n"
-                     "        return 3\n");
-    EXPECT_EQ(only_error(guard_else_under_not_true).code, "TypeError");
+// `not` INVERTS a decided operand, 2026-09-18. This test REPLACES
+// `ANotOverAFoldedLiteralIsDeliberatelyNotFolded`, which pinned these same
+// three shapes as retained false positives -- it failed the moment the fold
+// learned `not`, which is the correct signal for a test whose whole job was to
+// record a deliberate omission. The three shapes were the ones Spec 6's own
+// measurement table listed as targets while its implemented fold set could not
+// reach them; the third is also the shape Spec 6 named as half of its
+// "sharpest pair" and could not demonstrate.
+TEST(TypeChecker, ANotOverAFoldedLiteralIsInverted) {
+    // A loop header: `not False` is a non-terminating condition.
+    expect_clean("def f() -> int:\n    while not False:\n        pass\n");
+    // A guard whose `not True` is statically FALSE, so the break it holds is
+    // dead and the `while True:` never exits.
+    expect_clean("def f() -> int:\n    while True:\n        if not True:\n            break\n"
+                 "        return 1\n");
+    // The same with a loop `else` -- the break is dead, so the else runs.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if not True:\n"
+                 "            break\n        else:\n            return 1\n    else:\n"
+                 "        return 3\n\n\nprint(f(True))\nprint(f(False))\n");
+    // Nesting comes free from the recursion, in both polarities.
+    expect_clean("def f(c: bool) -> int:\n    while c:\n        if not not True:\n"
+                 "            return 1\n        break\n    else:\n        return 3\n");
+}
+
+// POLARITY. `not` must INVERT its operand's verdict, not pass it through, and
+// this test exists because the neutering proof exposed that nothing caught the
+// difference: with pass-through, both accepting shapes above still came out
+// clean by a different route, so removing the inversion looked harmless.
+//
+// These two are where it is not. Measured 2026-09-18, both mypy-REPORT with
+// CPython printing None: `if not True: return 1` followed by a `break` would,
+// under pass-through, read as an always-TRUE guard whose body always leaves --
+// killing the break, guaranteeing the else, and SILENCING a real error. The
+// `not False` sibling is the mirror.
+//
+// Third time in this family that a polarity control was missing until a
+// neutering ran; the accepting tests never catch it, because a polarity flip
+// tends to reach the same verdict by a different path.
+TEST(TypeChecker, ANotInvertsRatherThanPassingThroughItsOperandsVerdict) {
+    EXPECT_EQ(only_error(check_module(
+                  "def f(c: bool) -> int:\n    while c:\n        if not True:\n"
+                  "            return 1\n        break\n    else:\n        return 3\n\n\n"
+                  "print(f(True))\nprint(f(False))\n"))
+                  .code,
+              "TypeError");
+    EXPECT_EQ(only_error(check_module(
+                  "def f(c: bool) -> int:\n    while c:\n        if not False:\n"
+                  "            break\n        return 1\n    else:\n        return 3\n\n\n"
+                  "print(f(True))\nprint(f(False))\n"))
+                  .code,
+              "TypeError");
+}
+
+// THE EXCLUSIONS, which the recursion gets right with NO special case: a `not`
+// over an operand that does not fold must not fold either, and its verdict is
+// Unknown rather than an inverted guess. Every one below is a program mypy
+// REJECTS, so each must keep reporting -- measured 2026-09-18 in both the
+// truthy and falsy templates.
+TEST(TypeChecker, ANotOverAnUnfoldableOperandStaysUnknown) {
+    // `""`, a float, and a list are outside the fold set, so `not` over them
+    // decides nothing -- mypy agrees, and this is the `""` exclusion the
+    // project's prune-set record has warned about since 2026-09-11.
+    for (const char* const guard : {"not \"\"", "not 0.0", "not []"}) {
+        const Checked checked =
+            check_module(std::string("def f(c: bool) -> int:\n    while c:\n        if ") + guard +
+                         ":\n            return 1\n        break\n    else:\n        return 3\n");
+        EXPECT_EQ(only_error(checked).code, "TypeError") << guard;
+    }
+    // A SIGNED literal and a NON-DECIMAL one are excluded by the shape gate
+    // and the decimal whitelist respectively, so `not` over them is Unknown
+    // too -- the exclusions compose rather than needing to be restated.
+    for (const char* const guard : {"not -1", "not 0x1"}) {
+        const Checked checked =
+            check_module(std::string("def f(c: bool) -> int:\n    while c:\n        if ") + guard +
+                         ":\n            return 1\n        break\n    else:\n        return 3\n");
+        EXPECT_EQ(only_error(checked).code, "TypeError") << guard;
+    }
+    // `and`/`or` remain excluded: mypy's `and` is ONE-sided and its `or` is
+    // TWO-sided, so neither is a fold over operand verdicts the way `not` is.
+    const Checked conjunction =
+        check_module("def f(c: bool) -> int:\n    while c:\n        if True and True:\n"
+                     "            return 1\n        break\n    else:\n        return 3\n");
+    EXPECT_EQ(only_error(conjunction).code, "TypeError");
 }
 
 } // namespace
