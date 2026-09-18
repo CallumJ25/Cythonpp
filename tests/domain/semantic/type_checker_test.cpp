@@ -8420,6 +8420,92 @@ TEST(TypeChecker, ADictStoreIndexIsTypedExactlyOnce) {
 // "five variants" figure was wrong in both directions -- SIX distinct
 // break-reachability arrangements reproduce, and they fall out of one 2x2
 // over {guard polarity} x {which arm holds the break}.
+// A FOLDED-FALSE LOOP HEADER means the body never executes, so a `break`
+// written in it cannot run and the `else` is guaranteed. Measured 2026-09-17:
+// `while False: break` / `else: return 1` is `mypy --strict` Success and
+// CPython prints `1`, while this checker reported `missing return statement`
+// because contains_reachable_break found the break textually.
+//
+// Split from its sibling below by DIAGNOSTIC CLASS, not by taste: this one is
+// always_returns/loop_else_always_returns, the sibling is
+// statement_always_leaves feeding check_suite's suppression.
+//
+// MEASURED, rather than asserted, because the first version of this comment
+// claimed "neutering either half fails only its own test" and that was false:
+// the sibling's program can draw EITHER diagnostic, so with the
+// always_returns half neutered it failed on the missing-return instead of on
+// the assignment it exists to pin. The sibling now carries a trailing `return`
+// so it always-returns independently, which is what actually isolates the two.
+TEST(TypeChecker, AFoldedFalseLoopHeaderGuaranteesItsElse) {
+    // The headline shape, and its `while 0:` sibling -- both fold false.
+    expect_clean("def f() -> int:\n    while False:\n        break\n    else:\n"
+                 "        return 1\n\n\nprint(f())\n");
+    expect_clean("def f() -> int:\n    while 0:\n        break\n    else:\n"
+                 "        return 1\n\n\nprint(f())\n");
+}
+
+// The check_suite half: a folded-false loop whose `else` returns starts an
+// unreachable region, so what follows is not type-checked. Measured: mypy is
+// Success on this program (the region is pruned) and this checker drew a false
+// `incompatible types in assignment` -- a DIFFERENT diagnostic class from the
+// missing-return above, which is why it needs its own arm and its own test.
+//
+// The trailing `return 2` is what makes this test ISOLATE the suppression
+// half. It is unreachable (the `else` already returned) and mypy is still
+// Success, but it makes always_returns answer true through the ordinary path,
+// so neutering the always_returns half can no longer fail this test via a
+// missing-return. Without it the two halves were indistinguishable -- measured,
+// not assumed.
+TEST(TypeChecker, AFoldedFalseLoopWithAReturningElseStartsAnUnreachableRegion) {
+    expect_clean("def f() -> int:\n    while False:\n        break\n    else:\n"
+                 "        return 1\n    x: int = \"s\"\n    print(x)\n    return 2\n\n\n"
+                 "print(f())\n");
+}
+
+// THE CONTROLS. Every one is a program mypy REJECTS, so each must keep
+// reporting; a fix that folded too eagerly silences a real error.
+TEST(TypeChecker, AFoldedFalseLoopHeaderDoesNotSilenceARealError) {
+    // C-E: a break with NO else and no trailing return -- nothing guarantees a
+    // return, folded header or not.
+    EXPECT_EQ(only_error(check_module(
+                  "def f() -> int:\n    while False:\n        break\n\n\nprint(f())\n"))
+                  .code,
+              "TypeError");
+    // C-G: THE SHARP ONE. A `break` in the folded-false loop's ELSE arm
+    // targets the ENCLOSING loop and genuinely DOES run, escaping it and
+    // skipping its else -- so the outer function really can return None.
+    // The fix searches the orelse normally, which is what keeps this reporting.
+    EXPECT_EQ(only_error(check_module(
+                  "def f(c: bool) -> int:\n    while c:\n        while False:\n"
+                  "            pass\n        else:\n            break\n    else:\n"
+                  "        return 1\n\n\nprint(f(True))\nprint(f(False))\n"))
+                  .code,
+              "TypeError");
+    // C-POL: POLARITY. A folded-TRUE header must NOT get the folded-FALSE
+    // treatment: `while True:`'s body DOES run, so its `break` is real, it
+    // skips the `else`, and the function genuinely returns None on that path.
+    // Measured 2026-09-17 -- mypy REPORTS and CPython prints None. Flipping
+    // either new site to key on AlwaysTrue silences this, and before this
+    // control was added nothing in the suite caught that in the
+    // always_returns arm. The `while 1:` sibling folds the same way.
+    EXPECT_EQ(only_error(check_module("def f() -> int:\n    while True:\n        break\n"
+                                      "    else:\n        return 1\n\n\nprint(f())\n"))
+                  .code,
+              "TypeError");
+    EXPECT_EQ(only_error(check_module("def f() -> int:\n    while 1:\n        break\n"
+                                      "    else:\n        return 1\n\n\nprint(f())\n"))
+                  .code,
+              "TypeError");
+    // C-K: a REAL condition, so the break can run and the else is not
+    // guaranteed -- the trailing statement IS reachable and must be checked.
+    EXPECT_EQ(only_error(check_module(
+                  "def f(c: bool) -> int:\n    while c:\n        break\n    else:\n"
+                  "        return 1\n    x: int = \"s\"\n    print(x)\n    return 2\n\n\n"
+                  "print(f(True))\n"))
+                  .code,
+              "TypeError");
+}
+
 TEST(TypeChecker, AGuardNarrowedByItsOwnWhileConditionMakesABreakUnreachable) {
     // A1: guard true, break AFTER the if -- the if always leaves, so the
     // break is dead. The headline shape.

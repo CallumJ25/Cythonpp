@@ -1233,9 +1233,17 @@ private:
     // The loop-`else` half of always_returns, factored out because BOTH the
     // For arm and the While arm need it and a second copy could drift. See
     // the definition for the measurement. static, matching its two callers.
+    // `body_never_runs` is for a loop whose condition FOLDS FALSE: the body
+    // cannot execute, so no `break` written in it can run and the `else` is
+    // guaranteed. Defaulted, so the For arm (which has no condition to fold)
+    // and every other caller are untouched. It is deliberately a fact about
+    // the LOOP HEADER passed in, not something this function derives -- it
+    // receives suites, not the While node, and giving it the node would make
+    // the For caller pass something it does not have.
     bool loop_else_always_returns(const std::vector<ast::StmtPtr>& body,
                                   const std::vector<ast::StmtPtr>& orelse,
-                                  const std::string* narrowed_true_name = nullptr);
+                                  const std::string* narrowed_true_name = nullptr,
+                                  bool body_never_runs = false);
 
     // Task 20's return-path check. Purely syntactic -- it touches no member,
     // no scope, no ClassTable, nothing but the AST shape -- so it can be (and

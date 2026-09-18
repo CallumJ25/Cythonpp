@@ -4282,10 +4282,26 @@ bool TypeChecker::contains_reachable_break(const std::vector<ast::StmtPtr>& body
 // statement_always_leaves, which is reached from module/class scope too.
 bool TypeChecker::loop_else_always_returns(const std::vector<ast::StmtPtr>& body,
                                            const std::vector<ast::StmtPtr>& orelse,
-                                           const std::string* narrowed_true_name) {
-    return !orelse.empty() &&
-           !contains_reachable_break(body, /*in_function=*/true, narrowed_true_name) &&
-           always_returns(orelse);
+                                           const std::string* narrowed_true_name,
+                                           bool body_never_runs) {
+    // A FOLDED-FALSE loop header (`while False:`, `while 0:`) means the body
+    // never executes, so searching it for a `break` asks the wrong question --
+    // measured 2026-09-17, `while False: break` / `else: return 1` is
+    // `mypy --strict` Success and CPython prints `1`, while this checker
+    // reported `missing return statement` because the break was found
+    // textually. The `else` of a loop that never iterates always runs.
+    //
+    // The ORELSE is still searched normally, and that is what keeps the sharp
+    // control honest: a `break` in the else arm targets the ENCLOSING loop and
+    // genuinely DOES run here (`while c:` / `while False: pass` / `else: break`
+    // / `else: return 1` is a mypy ERROR, since the inner else's break escapes
+    // the outer loop and skips its else). always_returns treats a `break` as
+    // "not a return" anyway, so that shape answers false through the ordinary
+    // path rather than needing a carve-out.
+    const bool body_can_break =
+        !body_never_runs &&
+        contains_reachable_break(body, /*in_function=*/true, narrowed_true_name);
+    return !orelse.empty() && !body_can_break && always_returns(orelse);
 }
 
 bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
@@ -4338,13 +4354,15 @@ bool TypeChecker::always_returns(const std::vector<ast::StmtPtr>& body) {
             // Note the check is `== AlwaysTrue` and not `!= Unknown`: a
             // folded-FALSE condition (`while 0:`) means the loop never runs,
             // which is the opposite of never exiting.
-            if (literal_guard_verdict(while_stmt->condition()) == GuardVerdict::AlwaysTrue &&
+            const GuardVerdict header = literal_guard_verdict(while_stmt->condition());
+            if (header == GuardVerdict::AlwaysTrue &&
                 !contains_reachable_break(while_stmt->body(), /*in_function=*/true)) {
                 return true;
             }
             const std::optional<std::string> narrowed = loop_narrows_truthy(*while_stmt);
             if (loop_else_always_returns(while_stmt->body(), while_stmt->orelse(),
-                                         narrowed.has_value() ? &*narrowed : nullptr)) {
+                                         narrowed.has_value() ? &*narrowed : nullptr,
+                                         header == GuardVerdict::AlwaysFalse)) {
                 return true;
             }
             continue;
@@ -4469,7 +4487,8 @@ bool TypeChecker::statement_always_leaves(const ast::Stmt& statement, bool in_fu
     if (const auto* while_stmt = dynamic_cast<const ast::While*>(&statement)) {
         // See always_returns' own While arm for why this was `is_literal_true`
         // and why the test is `== AlwaysTrue` rather than `!= Unknown`.
-        if (literal_guard_verdict(while_stmt->condition()) == GuardVerdict::AlwaysTrue &&
+        const GuardVerdict header = literal_guard_verdict(while_stmt->condition());
+        if (header == GuardVerdict::AlwaysTrue &&
             !contains_reachable_break(while_stmt->body(), in_function)) {
             // Never exits, so it never falls through to the merge either.
             // No terminator is involved, so this arm needs no context check:
@@ -4487,7 +4506,20 @@ bool TypeChecker::statement_always_leaves(const ast::Stmt& statement, bool in_fu
         // inside `while_stmt->body()` is not actually "always leaving" --
         // measured 2026-09-12, second round; see contains_reachable_break's
         // own comment for the reproduction.
-        return !contains_reachable_break(while_stmt->body(), in_function) &&
+        //
+        // A FOLDED-FALSE header means the body never executes, so its
+        // `break`s cannot run and the `else` is guaranteed -- the same
+        // correction loop_else_always_returns carries, needed here too because
+        // this arm feeds check_suite's unreachable-region suppression.
+        // Measured 2026-09-17: `while False: break` / `else: return 1`
+        // followed by `x: int = "s"` is mypy Success (the region is pruned)
+        // and drew a false `incompatible types in assignment` here -- a
+        // DIFFERENT diagnostic class from the missing-return the sibling fix
+        // closes. The control that keeps it honest is the same shape with a
+        // REAL condition (`while c: break` / `else: return 1`), where the
+        // break can run, the else is not guaranteed, and mypy REPORTS.
+        return (header == GuardVerdict::AlwaysFalse ||
+                !contains_reachable_break(while_stmt->body(), in_function)) &&
                always_leaves_branch(while_stmt->orelse(), in_function, in_loop);
     }
     if (const auto* for_stmt = dynamic_cast<const ast::For*>(&statement)) {
