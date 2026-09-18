@@ -386,5 +386,30 @@ TEST(CodegenExecution, UnaryOperatorsOnNonBoolOperandsAreUnchanged) {
     EXPECT_EQ(logical.stdout_text, "False\nTrue\n");
 }
 
+// Every legal numeric spelling the emitter admits, COMPILED AND RUN rather
+// than text-asserted -- because the defect this brackets was precisely a text
+// test's blind spot: `0123` emitted `py::int_(0123)`, which is valid C++ that
+// a text assertion would happily match, and which C++ reads as OCTAL 83.
+//
+// The all-zero forms are the sharp ones: they carry a leading zero, they are
+// legal Python, and C++ `00` is 0, so they must translate rather than being
+// swept up by the leading-zero refusal. Every expected string below was
+// produced by RUNNING CPython 3.14.
+TEST(CodegenExecution, LegalUnderscoreAndZeroLiteralSpellingsMatchPython) {
+    const RunResult ints = compile_and_run(
+        "print(0)\nprint(00)\nprint(000)\nprint(0_0)\nprint(1_0)\nprint(1_000)\n"
+        "print(12_345)\n");
+    EXPECT_EQ(ints.exit_code, 0);
+    EXPECT_EQ(ints.stdout_text, "0\n0\n0\n0\n10\n1000\n12345\n");
+
+    const RunResult floats = compile_and_run(
+        "print(1.)\nprint(1.0)\nprint(1e5)\nprint(.5)\nprint(1_0.0_0)\nprint(1_0.5)\n"
+        "print(1.5_0)\nprint(0.0_1)\nprint(1_000.000_1)\nprint(1.e5)\nprint(1_0e1_0)\n");
+    EXPECT_EQ(floats.exit_code, 0);
+    EXPECT_EQ(floats.stdout_text,
+              "1.0\n1.0\n100000.0\n0.5\n10.0\n10.5\n1.5\n0.01\n1000.0001\n100000.0\n"
+              "100000000000.0\n");
+}
+
 } // namespace
 } // namespace cythonpp::domain::codegen

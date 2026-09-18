@@ -51,6 +51,65 @@ bool is_decimal_digits(const std::string& text) {
     return true;
 }
 
+// TRANSLATION FIDELITY for a numeric lexeme, and deliberately NOT a check that
+// the lexeme is valid Python. CPython does the syntax checking; this compiler's
+// job is to translate, so the only question asked here is "can I map this
+// lexeme to C++ EXACTLY?" -- which needs no grammar and cannot drift from
+// CPython's, because a refusal is always sanctioned while a wrong answer is
+// not.
+//
+// It matters because the arms below used to ask a weaker question and got a
+// WRONG NUMBER. Two independent faults, both measured 2026-09-17:
+//
+//   1. `without_underscores` ran BEFORE the check, so placement was invisible:
+//      `1_` became `1`, passed is_decimal_digits, and emitted py::int_(1).
+//      `1_` is a CPython `SyntaxError` and a mypy blocking `[syntax]` error.
+//   2. A LEADING ZERO was written straight through, and C++ reads that as
+//      OCTAL. `a: int = 0123` emitted `py::int_(0123)`, compiled at clang
+//      exit 0, and the binary printed **83** -- while CPython refuses the
+//      program outright. A Decision 0 third state produced by this function's
+//      own predecessor, not by any missing diagnostic elsewhere.
+//
+// The rule: digits and underscores only, every underscore SINGLE and strictly
+// INTERIOR, and no leading `0` unless every digit is `0` (`00`/`0_0` are legal
+// Python and C++ `00` is 0, so those still translate exactly). Non-decimal
+// spellings never reach here -- the caller refuses them first, which is also
+// why the "an underscore may lead a BASED literal's digits" rule (`0x_1` is
+// legal Python) is irrelevant to this function.
+// Every `_` must sit strictly BETWEEN two digits. One rule covers ints and
+// floats alike: for an integer that is exactly "single and interior", and for
+// a float it also rejects an underscore adjacent to `.`, `e`, a sign, or the
+// end -- so `1_0.0_0`, `1_000.000_1` and `1_0e1_0` translate while `1_.0`,
+// `1._0`, `1.0_`, `1__.0`, `1_e5`, `1e5_`, `1e-5_`, `.5_` and `1_.` do not.
+bool underscores_are_interior(const std::string& lexeme) {
+    const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    for (std::size_t i = 0; i < lexeme.size(); ++i) {
+        if (lexeme[i] != '_') {
+            continue;
+        }
+        if (i == 0 || i + 1 == lexeme.size()) {
+            return false;
+        }
+        if (!is_digit(lexeme[i - 1]) || !is_digit(lexeme[i + 1])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A LEADING ZERO is an INT-ONLY hazard, and the reason is C++ rather than
+// Python: `py::int_(0123)` reads as OCTAL 83. A float is immune -- the `.`
+// makes it a floating literal, so C++ `0123.0` really is 123.0 -- which is why
+// this is separate from the underscore rule above rather than folded into it.
+// `00`/`000`/`0_0` are legal Python AND map exactly (C++ `00` is 0), so the
+// all-zero form stays translatable.
+bool leading_zero_is_translatable(const std::string& digits) {
+    if (digits.empty() || digits[0] != '0') {
+        return true;
+    }
+    return digits.find_first_not_of('0') == std::string::npos;
+}
+
 // Decodes a Python string literal's lexeme -- quotes and escapes included --
 // into the bytes it denotes. Returns nullopt for any prefix or escape this
 // slice does not model, so an unsupported escape is a refusal rather than a
@@ -274,8 +333,16 @@ void Emitter::visit(const ast::Constant& node) {
         if (!is_decimal_digits(digits)) {
             // Hex, octal and binary literals spell differently in C++ (0o has
             // no C++ equivalent at all), so they are refused rather than
-            // passed through and hoped for.
+            // passed through and hoped for. Checked FIRST so these keep this
+            // message rather than the translation-fidelity one below.
             refuse(node, "a non-decimal integer literal");
+            return;
+        }
+        // Asked of the ORIGINAL lexeme, not of `digits`: stripping the
+        // underscores first is what made placement invisible and let `1_`
+        // through as `1`. See the two helpers for the measurements.
+        if (!underscores_are_interior(node.lexeme()) || !leading_zero_is_translatable(digits)) {
+            refuse(node, "an integer literal this compiler cannot translate exactly");
             return;
         }
         write("py::int_(");
@@ -284,6 +351,10 @@ void Emitter::visit(const ast::Constant& node) {
         return;
     }
     case lexer::token_type::LITERAL_FLOAT:
+        if (!underscores_are_interior(node.lexeme())) {
+            refuse(node, "a float literal this compiler cannot translate exactly");
+            return;
+        }
         write("py::float_(");
         write(without_underscores(node.lexeme()));
         write(")");

@@ -92,6 +92,71 @@ TEST(Emitter, ANonDecimalIntegerLiteralIsRefused) {
     EXPECT_FALSE(fixture.emit_sink.empty());
 }
 
+// TRANSLATION FIDELITY, not syntax checking -- CPython does the latter. These
+// lexemes reach the emitter because `scan_number` accepts spellings Python's
+// grammar forbids, and the emitter used to translate them anyway, producing a
+// WRONG NUMBER: `0123` was written straight into C++, which reads a leading
+// zero as OCTAL, so the compiled binary printed 83 while CPython refuses the
+// program outright. `1_` was worse-hidden: underscores were stripped BEFORE
+// the check, so it passed as `1`.
+//
+// All 20 spellings below are CPython `SyntaxError` exit 1 AND mypy blocking
+// `[syntax]` exit 2, measured 2026-09-17. A refusal is always sanctioned, so
+// the emitter never has to be right about Python's grammar -- only about its
+// own capability.
+// Split into one test PER GUARD, deliberately. A single test covering all
+// three families passed/failed as a unit, so neutering either guard failed the
+// same one test and the two could not be told apart -- a neutering that cannot
+// discriminate is not pinning anything. Measured: with these split, disabling
+// the leading-zero clause fails only the first, and disabling the
+// underscore-placement clause fails only the second and third.
+TEST(Emitter, ALeadingZeroIntegerLiteralIsRefusedNotEmittedAsOctal) {
+    for (const char* const literal : {"01", "0_1", "00_1", "0123", "007", "0_0_1"}) {
+        Fixture fixture = build(std::string(literal) + "\n");
+        EXPECT_FALSE(emit_last_expression(fixture).has_value()) << literal;
+        EXPECT_FALSE(fixture.emit_sink.empty()) << literal;
+    }
+}
+
+TEST(Emitter, AMalformedUnderscoreIntegerLiteralIsRefused) {
+    for (const char* const literal : {"1_", "1__0", "1_2_", "12__3"}) {
+        Fixture fixture = build(std::string(literal) + "\n");
+        EXPECT_FALSE(emit_last_expression(fixture).has_value()) << literal;
+        EXPECT_FALSE(fixture.emit_sink.empty()) << literal;
+    }
+}
+
+// Adjacent to `.`, to `e`, to a sign, or at either end -- the float digit-run
+// rule, which has no leading-zero clause because a `.` makes C++ read the
+// literal as floating rather than octal.
+TEST(Emitter, AMalformedUnderscoreFloatLiteralIsRefused) {
+    for (const char* const literal :
+         {"1_.0", "1._0", "1.0_", "1__.0", "1.__0", "1_e5", "1e5_", "1e-5_", ".5_", "1_."}) {
+        Fixture fixture = build(std::string(literal) + "\n");
+        EXPECT_FALSE(emit_last_expression(fixture).has_value()) << literal;
+        EXPECT_FALSE(fixture.emit_sink.empty()) << literal;
+    }
+}
+
+// THE CONTROLS, and the direction that would be a real regression: refusing a
+// legal spelling removes a working translation. Every one of these is CPython
+// exit 0 and mypy exit 0. The all-zero forms are the sharp ones -- they have a
+// leading zero and are still legal Python, and C++ `00` really is 0, so they
+// must keep translating.
+TEST(Emitter, LegalNumericLiteralSpellingsStillTranslate) {
+    EXPECT_EQ(emitted("0\n").value(), "py::int_(0)");
+    EXPECT_EQ(emitted("00\n").value(), "py::int_(00)");
+    EXPECT_EQ(emitted("000\n").value(), "py::int_(000)");
+    EXPECT_EQ(emitted("0_0\n").value(), "py::int_(00)");
+    EXPECT_EQ(emitted("1_0\n").value(), "py::int_(10)");
+    EXPECT_EQ(emitted("12_345\n").value(), "py::int_(12345)");
+    EXPECT_EQ(emitted("1_0.0_0\n").value(), "py::float_(10.00)");
+    EXPECT_EQ(emitted("1_000.000_1\n").value(), "py::float_(1000.0001)");
+    EXPECT_EQ(emitted("1_0e1_0\n").value(), "py::float_(10e10)");
+    EXPECT_EQ(emitted("1.e5\n").value(), "py::float_(1.e5)");
+    EXPECT_EQ(emitted(".5\n").value(), "py::float_(.5)");
+}
+
 TEST(Emitter, ANonAsciiIdentifierIsRefused) {
     Fixture fixture = build("caf\xc3\xa9: int = 1\ncaf\xc3\xa9\n");
     EXPECT_FALSE(emit_last_expression(fixture).has_value());
