@@ -185,6 +185,24 @@ private:
 // exactly as it treats `while True:`. Both call sites now ask
 // `literal_guard_verdict(...) == GuardVerdict::AlwaysTrue`.
 //
+// FORWARD DECLARATIONS, so visit(If)/visit(While) -- which sit ABOVE the
+// definitions -- can fold their own headers to prune a dead arm. Declared
+// rather than moved: the definitions carry ~90 lines of measurement that
+// belong next to the reachability helpers they were written for, and a
+// scoped enum may be declared opaquely because its underlying type is fixed.
+// These are the ONE fold set; adding a second would reproduce exactly the
+// drift that got `is_literal_true` deleted.
+// What a guard evaluates to. `Unknown` means BOTH arms stay live, which is
+// the pre-existing behaviour and the safe default -- a verdict is only ever
+// an invitation to prune, never a requirement.
+enum class GuardVerdict {
+    Unknown,      // not decidable -- BOTH arms live, the pre-existing behaviour
+    AlwaysTrue,   // `if True:` / `if <narrowed>:`     -- the ELSE arm is dead
+    AlwaysFalse,  // `if False:` / `if not <narrowed>:` -- the BODY is dead
+};
+
+GuardVerdict literal_guard_verdict(const ast::Expr& condition);
+//
 // Structural type identity with Union members matched as an unordered SET at
 // every depth -- i.e. exactly what `Type::operator==` computes, minus its
 // union-order sensitivity, and nothing else relaxed. The sole caller is
@@ -3456,12 +3474,22 @@ void TypeChecker::visit(const ast::If& node) {
     // Verified against mypy 1.18.1: `builtins.int | builtins.str` for a
     // genuine two-branch split, `builtins.int` when both branches agree, and
     // `builtins.object` for the else-less case.
+    // A FOLDED condition proves one arm dead, and mypy does not type-check it
+    // (measured 2026-09-20 across both arms, both loop kinds, module and
+    // function scope, and nested/elif shapes -- eight false positives).
+    // Polarity decides WHICH arm: a folded-FALSE header kills the BODY, a
+    // folded-TRUE one kills the ORELSE. Never both -- the statement itself is
+    // reachable either way, which is why this prunes an ARM rather than the
+    // `if`. `literal_guard_verdict` is the same fold set used everywhere else
+    // in this file, so `""` and `0.0` decide nothing here either.
+    const GuardVerdict header = literal_guard_verdict(node.condition());
+
     const NarrowingState before = narrowings_.snapshot();
-    check_suite(node.body());
+    check_possibly_dead_suite(node.body(), header == GuardVerdict::AlwaysFalse);
     const NarrowingState after_body = narrowings_.snapshot();
 
     narrowings_.restore(before);
-    check_suite(node.orelse());
+    check_possibly_dead_suite(node.orelse(), header == GuardVerdict::AlwaysTrue);
     const NarrowingState after_orelse = narrowings_.snapshot();
 
     // A BRANCH CONTROL ALWAYS LEAVES CONTRIBUTES NO EDGE. Its end-of-branch
@@ -3591,6 +3619,16 @@ void TypeChecker::visit(const ast::While& node) {
     typer_.set_statement_line(node.span().start_line);
     typer_.type_of(node.condition(), Type::unknown());
 
+    // A FOLDED header proves one arm dead here too, with the polarity
+    // INVERTED relative to If and for a reason specific to loops: a
+    // folded-FALSE header means the BODY never runs (and the `else` always
+    // does, which is the rule `loop_else_always_returns` already encodes),
+    // while a folded-TRUE one means the loop never completes normally, so the
+    // ELSE never runs. Measured 2026-09-20: `while True: break` / `else:` is
+    // `--warn-unreachable` `Statement is unreachable` and mypy `--strict`
+    // prunes it, exactly as `while False:`'s body is pruned.
+    const GuardVerdict header = literal_guard_verdict(node.condition());
+
     // NARROWING JOIN, ONE FORWARD PASS. The body starts from the pre-loop
     // state, which is what lets a narrowing established before the loop reach
     // into it (measured: mypy does too). Afterwards the state is the union of
@@ -3613,7 +3651,7 @@ void TypeChecker::visit(const ast::While& node) {
     const NarrowingState before = narrowings_.snapshot();
     {
         FlagGuard loop_guard(in_loop_body_, true);
-        check_suite(node.body());
+        check_possibly_dead_suite(node.body(), header == GuardVerdict::AlwaysFalse);
     }
     const NarrowingState after_body = narrowings_.snapshot();
     narrowings_.restore(join_narrowings(
@@ -3646,7 +3684,7 @@ void TypeChecker::visit(const ast::While& node) {
     // `while/else` or a `for/else` suite instead of a mid-body jump draws a
     // diagnostic on mypy's line (a NotImplementedError for the joined
     // `int | str` operand, which is the sanctioned "cannot model" code).
-    check_suite(node.orelse());
+    check_possibly_dead_suite(node.orelse(), header == GuardVerdict::AlwaysTrue);
 }
 
 void TypeChecker::visit(const ast::For& node) {
@@ -3831,12 +3869,11 @@ const ast::Name* bare_name_of(const ast::Expr& expr) {
     return dynamic_cast<const ast::Name*>(&expr);
 }
 
-// What a guard evaluates to, given that `narrowed` is known truthy.
-enum class GuardVerdict {
-    Unknown,      // not decidable -- BOTH arms live, the pre-existing behaviour
-    AlwaysTrue,   // `if <narrowed>:`     -- the ELSE arm is dead
-    AlwaysFalse,  // `if not <narrowed>:` -- the BODY is dead
-};
+// GuardVerdict is DEFINED near the top of this file, beside the note on the
+// deleted `is_literal_true`, because visit(If)/visit(While) sit above this
+// point and need its ENUMERATORS (an opaque declaration is not enough) to
+// prune a statically-dead arm. Its two producers stay here, with the
+// measurements they were written for.
 
 // Measured 2026-09-16: given `c: Literal[True]`, mypy treats `if c:` as
 // statically true and `if not c:` as statically false, and the `break` in the
@@ -4577,6 +4614,46 @@ bool TypeChecker::statement_always_leaves(const ast::Stmt& statement, bool in_fu
     // this branch. FunctionDef/ClassDef bodies are new scopes no
     // terminator can reach out of.
     return false;
+}
+
+void TypeChecker::check_possibly_dead_suite(const std::vector<ast::StmtPtr>& body, bool dead) {
+    // A STATICALLY-DEAD ARM is TYPE-UNCHECKED, not UNVISITED -- the same line
+    // check_suite already draws for an unreachable REGION, and drawn here for
+    // the same reason: mypy's semantic analyzer runs over dead code while its
+    // type checker does not, so binding, class declaration and name
+    // resolution must all still happen.
+    //
+    // THE SPLIT IS MEASURED, not assumed, and it matches the EXISTING
+    // Suppressibility division exactly -- which is why this reuses
+    // DiagnosticSuppression rather than inventing a second mechanism.
+    // Measured 2026-09-20 with the arm holding each error in turn, mypy
+    // `--strict`:
+    //
+    //   PRUNED (mypy clean)     an incompatible assignment, a missing
+    //                           attribute, a wrong argument type, a wrong
+    //                           arity, an unsupported operand -- every one a
+    //                           TypeCheckerTypeError, which is Suppressible
+    //   STILL REPORTED          an unbound name and a call to an undefined
+    //                           function (NameError), and a redefinition
+    //                           (SemanticAnalyzerTypeError) -- all
+    //                           NotSuppressible
+    //
+    // So the guard below yields mypy's answer on all nine measured shapes
+    // with no per-code logic of its own. OverflowError also survives, which
+    // is deliberate and consistent with the unreachable-region model: it is
+    // this compiler's own CAPABILITY claim rather than a type judgement, and
+    // such a claim is sanctioned regardless of reachability.
+    //
+    // `dead` is decided by the CALLER from literal_guard_verdict, so this
+    // function needs no notion of folding and the fold set stays in one
+    // place. std::optional mirrors check_suite's own idiom; the suppression
+    // is a DEPTH counter, so a dead arm containing its own unreachable region
+    // nests correctly rather than un-suppressing at the inner scope's end.
+    std::optional<diagnostics::DiagnosticSuppression> pruned;
+    if (dead) {
+        pruned.emplace(sink_);
+    }
+    check_suite(body);
 }
 
 void TypeChecker::check_suite(const std::vector<ast::StmtPtr>& body) {

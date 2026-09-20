@@ -8420,6 +8420,90 @@ TEST(TypeChecker, ADictStoreIndexIsTypedExactlyOnce) {
 // "five variants" figure was wrong in both directions -- SIX distinct
 // break-reachability arrangements reproduce, and they fall out of one 2x2
 // over {guard polarity} x {which arm holds the break}.
+// A STATICALLY-DEAD ARM IS NOT TYPE-CHECKED. mypy prunes the arm a folded
+// condition excludes, so a type error written there is not reported -- the
+// same line check_suite already draws for an unreachable REGION, now drawn
+// for a dead ARM. Measured 2026-09-20 across both `if` arms, both `while`
+// arms, module and function scope, and nested/`elif` shapes.
+//
+// Split per ARM so a neutering can discriminate: pruning the wrong arm is the
+// dangerous direction, and one combined test cannot tell the four apart.
+TEST(TypeChecker, AFoldedFalseIfBodyIsNotTypeChecked) {
+    expect_clean("def f() -> None:\n    if False:\n        x: int = \"s\"\n        print(x)\n"
+                 "\n\nf()\n");
+    // Every folded-false spelling, including the `not` form.
+    for (const char* const guard : {"0", "None", "not True"}) {
+        expect_clean(std::string("def f() -> None:\n    if ") + guard +
+                     ":\n        x: int = \"s\"\n        print(x)\n\n\nf()\n");
+    }
+}
+
+TEST(TypeChecker, AFoldedTrueIfElseArmIsNotTypeChecked) {
+    expect_clean("def f() -> None:\n    if True:\n        print(\"live\")\n    else:\n"
+                 "        x: int = \"s\"\n        print(x)\n\n\nf()\n");
+}
+
+TEST(TypeChecker, AFoldedFalseWhileBodyIsNotTypeChecked) {
+    expect_clean("def f() -> None:\n    while False:\n        x: int = \"s\"\n        print(x)\n"
+                 "\n\nf()\n");
+}
+
+// The polarity INVERTS for a loop: a folded-TRUE header never completes
+// normally, so its `else` never runs. Confirmed with mypy --warn-unreachable,
+// which names that clause `Statement is unreachable`.
+TEST(TypeChecker, AFoldedTrueWhileElseClauseIsNotTypeChecked) {
+    expect_clean("def f() -> None:\n    while True:\n        break\n    else:\n"
+                 "        x: int = \"s\"\n        print(x)\n\n\nf()\n");
+}
+
+// THE SPLIT, and the reason this reuses DiagnosticSuppression rather than
+// inventing a mechanism: mypy's semantic analyzer runs over dead code while
+// its type checker does not, which is EXACTLY the existing Suppressibility
+// division. Each of these is a program mypy REJECTS even with the arm dead,
+// so each must keep reporting.
+TEST(TypeChecker, ADeadArmStillReportsWhatMypyStillReports) {
+    const std::string pre = "def f(a: int) -> int:\n    return a\n\n\ng: str = \"x\"\n\n\n";
+    // NameError -- mypy reports [name-defined] in dead code.
+    EXPECT_EQ(only_error(check_module(pre + "if False:\n    print(nope)\nprint(\"end\")\n")).code,
+              "NameError");
+    EXPECT_EQ(
+        only_error(check_module(pre + "if False:\n    undefined_fn()\nprint(\"end\")\n")).code,
+        "NameError");
+    // Redefinition -- a SemanticAnalyzerTypeError, NotSuppressible, and mypy
+    // reports [no-redef] in a dead branch too.
+    EXPECT_EQ(
+        only_error(check_module(pre + "if False:\n    g: int = 1\nprint(\"end\")\n")).code,
+        "TypeError");
+}
+
+// THE FOLD-SET CONTROLS. `""` and `0.0` are NOT in mypy's prune set, and an
+// unfoldable condition decides nothing -- so the arm stays live and a type
+// error in it must still report. `if True:`'s own BODY is live, which is the
+// polarity control: pruning it instead of the `else` silences a real error.
+TEST(TypeChecker, AnUnfoldableOrLiveArmIsStillTypeChecked) {
+    for (const char* const guard : {"\"\"", "0.0", "[]", "f(1) > 0"}) {
+        const Checked checked =
+            check_module(std::string("def f(a: int) -> int:\n    return a\n\n\nif ") + guard +
+                         ":\n    x: int = \"s\"\n    print(x)\nprint(\"end\")\n");
+        EXPECT_EQ(only_error(checked).code, "TypeError") << guard;
+    }
+    // POLARITY: the body of a folded-TRUE `if` is LIVE.
+    EXPECT_EQ(only_error(check_module(
+                  "if True:\n    x: int = \"s\"\n    print(x)\nprint(\"end\")\n"))
+                  .code,
+              "TypeError");
+    // POLARITY, loop: the `else` of a folded-FALSE `while` RUNS.
+    EXPECT_EQ(only_error(check_module(
+                  "while False:\n    pass\nelse:\n    x: int = \"s\"\n    print(x)\n"))
+                  .code,
+              "TypeError");
+    // POLARITY, loop: the BODY of a folded-TRUE `while` is LIVE.
+    EXPECT_EQ(only_error(check_module(
+                  "while True:\n    x: int = \"s\"\n    print(x)\n    break\n"))
+                  .code,
+              "TypeError");
+}
+
 // A FOLDED-FALSE LOOP HEADER means the body never executes, so a `break`
 // written in it cannot run and the `else` is guaranteed. Measured 2026-09-17:
 // `while False: break` / `else: return 1` is `mypy --strict` Success and

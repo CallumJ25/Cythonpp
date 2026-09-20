@@ -179,14 +179,21 @@ namespace cythonpp::domain::semantic {
 //     neither is expressible as a fold over operand verdicts the way `not`
 //     is, and getting `or` wrong in the permissive direction silences a real
 //     error on `False or ""`.
-//     (b) STILL OPEN: a statically-dead BRANCH's own contents are still
-//     type-checked, so `if False: x: int = "s"` is a false "incompatible
-//     types in assignment"; that needs a dead-BLOCK model (skip walking the
-//     branch), which is strictly more than a folded always-leaves answer.
-//     (c) STILL OPEN: a folded-false loop header prunes the body for
-//     RETURN-PATH purposes (loop_else_always_returns' body_never_runs, added
-//     2026-09-18) but the body's CONTENTS are still type-checked, which is
-//     the same dead-BLOCK gap as (b) wearing a loop.
+//     (b) and (c) CLOSED 2026-09-20 by check_possibly_dead_suite, and they
+//     were ONE gap wearing two shapes: a statically-dead ARM's contents were
+//     type-checked, so `if False: x: int = "s"` and `while False: x: int =
+//     "s"` were both false "incompatible types in assignment". Eight shapes,
+//     across both `if` arms, both `while` arms, module and function scope.
+//     The prediction recorded here -- that closing it needed a dead-BLOCK
+//     model that SKIPS walking the branch -- was wrong in the useful
+//     direction: mypy's semantic analyzer runs over dead code while its type
+//     checker does not, so the arm must still be WALKED (binding, class
+//     declaration, name resolution all still happen) with only Suppressible
+//     diagnostics dropped. That is the existing Suppressibility split
+//     exactly, measured per diagnostic, so the fix reuses
+//     DiagnosticSuppression rather than adding a mechanism. Note the polarity
+//     INVERTS between `if` and `while`: see check_possibly_dead_suite and
+//     visit(While) for which arm each header kills and why.
 //   - A THIRD failure mode, previously open and NOW FIXED (loop_else_always_
 //     returns, added 2026-09-12): `for i in range(3): / total = total + i /
 //     else: / return total` as the whole body of a `-> int` function used to
@@ -1510,6 +1517,14 @@ private:
     // on the reachable `k: int = n` while mypy --strict said `Success` and
     // CPython printed `7` twice.
     void check_suite(const std::vector<ast::StmtPtr>& body);
+
+    // check_suite for an arm a FOLDED condition has proven dead: identical,
+    // but with every Suppressible diagnostic dropped for the duration. The
+    // caller decides `dead` from literal_guard_verdict, so the fold set lives
+    // in exactly one place and this function knows nothing about folding.
+    // See the definition for the measured split that makes reusing
+    // DiagnosticSuppression correct here rather than merely convenient.
+    void check_possibly_dead_suite(const std::vector<ast::StmtPtr>& body, bool dead);
 
     void report(const ast::Node& at, DiagnosticKind kind, std::string message);
     void report_incompatible_assignment(const ast::Node& at, const Type& value_type,
