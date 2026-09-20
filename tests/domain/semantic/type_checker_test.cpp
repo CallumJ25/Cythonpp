@@ -9136,9 +9136,10 @@ TEST(TypeChecker, ANotInvertsRatherThanPassingThroughItsOperandsVerdict) {
 
 // THE EXCLUSIONS, which the recursion gets right with NO special case: a `not`
 // over an operand that does not fold must not fold either, and its verdict is
-// Unknown rather than an inverted guess. Every one below is a program mypy
-// REJECTS, so each must keep reporting -- measured 2026-09-18 in both the
-// truthy and falsy templates.
+// Unknown rather than an inverted guess. Every `not` case below is a program
+// mypy REJECTS, so each must keep reporting -- measured 2026-09-18 in both the
+// truthy and falsy templates. The LAST case is an `and`, and it is NOT one of
+// those: mypy accepts it, and the comment beside it says so.
 TEST(TypeChecker, ANotOverAnUnfoldableOperandStaysUnknown) {
     // `""`, a float, and a list are outside the fold set, so `not` over them
     // decides nothing -- mypy agrees, and this is the `""` exclusion the
@@ -9158,8 +9159,24 @@ TEST(TypeChecker, ANotOverAnUnfoldableOperandStaysUnknown) {
                          ":\n            return 1\n        break\n    else:\n        return 3\n");
         EXPECT_EQ(only_error(checked).code, "TypeError") << guard;
     }
-    // `and`/`or` remain excluded: mypy's `and` is ONE-sided and its `or` is
-    // TWO-sided, so neither is a fold over operand verdicts the way `not` is.
+    // `and`/`or` remain excluded, so a conjunction of two folded literals
+    // decides nothing here.
+    //
+    // NOTE THIS ONE IS NOT A CONTROL, unlike every `not` case above it --
+    // the header comment now says so, and until 2026-09-20 it did not, which
+    // is why this note is here rather than only there. Measured 2026-09-20,
+    // `mypy --strict` ACCEPTS this program (`True and True` folds TRUE, so
+    // the guarded `return 1` kills the break and the loop `else` guarantees
+    // a return) and CPython runs it. So the assertion pins a DELIBERATELY
+    // RETAINED false positive, which is the safe direction, not a real error
+    // that must keep being reported.
+    //
+    // The justification this comment used to carry -- that mypy's `and` is
+    // ONE-sided and its `or` TWO-sided, "so neither is a fold over operand
+    // verdicts the way `not` is" -- was refuted by measurement the same day:
+    // both are exactly Kleene three-valued logic. `and`/`or` were scoped and
+    // declined for reasons of value, not expressibility; see
+    // literal_guard_verdict's own comment.
     const Checked conjunction =
         check_module("def f(c: bool) -> int:\n    while c:\n        if True and True:\n"
                      "            return 1\n        break\n    else:\n        return 3\n");

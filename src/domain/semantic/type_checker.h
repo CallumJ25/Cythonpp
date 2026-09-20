@@ -172,13 +172,35 @@ namespace cythonpp::domain::semantic {
 //     and leaves an undecided one undecided -- so `while not False:` and
 //     `if not True: break` fold, nesting works, and every exclusion composes
 //     for free (`not ""`/`not 0.0`/`not -1`/`not 0x1` still fold NEITHER way,
-//     because Unknown inverts to Unknown). `and`/`or` REMAIN excluded, and
-//     not for symmetry: measured, mypy's `and` is ONE-sided (`"x" and False`
-//     folds FALSE from the right operand alone) while its `or` is TWO-sided,
-//     and `"" or 1` folds TRUE though `""` alone does not fold at all -- so
-//     neither is expressible as a fold over operand verdicts the way `not`
-//     is, and getting `or` wrong in the permissive direction silences a real
-//     error on `False or ""`.
+//     because Unknown inverts to Unknown). `and`/`or` REMAIN excluded --
+//     SCOPED AND DECLINED 2026-09-20, on measured grounds that are NOT the
+//     ones this bullet used to give.
+//
+//     THE OLD REASON WAS WRONG; do not restore it. It said mypy's `and` is
+//     ONE-sided while its `or` is TWO-sided, "so neither is expressible as a
+//     fold over operand verdicts the way `not` is". The premises are right
+//     and the conclusion is not: a fold over operand verdicts DOES express
+//     mypy's behaviour, and that asymmetry is the ordinary duality of
+//     three-valued logic -- `and` short-circuits on FALSE so one FALSE
+//     operand decides it, `or` short-circuits on TRUE so one TRUE operand
+//     decides IT. 52 verdict cells, zero mismatches, including n-ary chains,
+//     mixed precedence, and every existing exclusion composing for free.
+//     NOT an equivalence, though: mypy's reachability is TYPE-based, so it
+//     can be MORE decided (`if -1 and 1:` is undecided while
+//     `if (-1 and 1) or (-1 and 1):` folds TRUE). Always in the safe
+//     direction; see literal_guard_verdict's comment.
+//
+//     THE REAL REASONS, both about value rather than expressibility:
+//     (i) the motivating idiom does not fold -- a named `bool` debug flag is
+//     mypy-Unknown (`DEBUG = True` / `if c or DEBUG:` is `Missing return
+//     statement`, as is the `Final` spelling; only `Literal[True]` folds, and
+//     that needs an import the parser refuses), so only an inline bare
+//     literal folds and for those `if True:` / `if False:` already does; and
+//     (ii) a Kleene fold reverses the semantic half of `4c62de1` by a side
+//     route, since `if 1_ or True:` folds TRUE from the sibling and the
+//     malformed lexeme never needs the verdict that commit withheld.
+//     Full measurements in
+//     `.claude/specs/2026-09-20-boolop-condition-folding-design.md`.
 //     (b) and (c) CLOSED 2026-09-20 by check_possibly_dead_suite, and they
 //     were ONE gap wearing two shapes: a statically-dead ARM's contents were
 //     type-checked, so `if False: x: int = "s"` and `while False: x: int =

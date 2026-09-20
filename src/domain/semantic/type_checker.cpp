@@ -4027,15 +4027,81 @@ GuardVerdict decimal_int_guard_verdict(const std::string& lexeme) {
 // compile a program CPython refuses to run. Both are bare `ast::Name`s, never
 // an `ast::Constant`, so neither can reach this function at all.
 //
+// THAT LAST SENTENCE IS ONLY TRUE WHILE `and`/`or` STAY OUT, and a future
+// widening must not read it as unconditional. Measured 2026-09-20: under the
+// Kleene rule below, `NotImplemented and False` folds FALSE from the DECIDING
+// SIBLING alone -- the bare Name never needs a verdict of its own, so
+// "excluded by construction" stops holding. It is harmless today only by
+// accident, because a bare `NotImplemented` draws a (NotSuppressible, and
+// itself wrong) `NameError` here, so the program still exits 1; close that
+// gap and the fold goes silent on a CPython-rejected program. Note this is
+// NOT the same as the `ZeroDivisionError` family, where cythonpp's own
+// runtime reproduces the failure faithfully -- there is no `NotImplemented`
+// in `runtime/` to reproduce anything with.
+//
+// AND THE CODEGEN HALF WOULD CLOSE AT THE SAME MOMENT, which is why this is
+// a warning and not a curiosity. Measured 2026-09-20: `--emit-cpp` on
+// `if NotImplemented and False:` refuses with no file written -- but the
+// refusal IS that same `NameError`, not a guard of the emitter's own. So the
+// reassuring-sounding claim "the emitter would refuse it anyway" is NOT
+// established; closing the `NameError` gap removes both defences together.
+// Whether anything downstream would then refuse it is UNDETERMINED and must
+// be measured, not assumed, by whoever closes that gap.
+//
 // DELIBERATE OMISSIONS, each measured-foldable under mypy and each left out:
 // `...` (ELLIPSIS), tuple displays (which fold by LENGTH -- `(0,)` folds TRUE),
-// `not`/`and`/`or`, and non-decimal int literals. Omitting a form only ever
-// RETAINS a false positive, which is the safe direction, and each is a purely
-// additive widening later. `not`/`and`/`or` are held back because mypy's
-// behaviour there is inconsistent with its own atom rules (`not True` folds
-// false, and `"" or 1` folds TRUE even though `""` alone does not fold at all),
-// and `and` is ONE-sided while `or` is TWO-sided -- getting `or` wrong in the
-// permissive direction silences a real error on `False or ""`.
+// `and`/`or`, and non-decimal int literals. For every one EXCEPT `and`/`or`,
+// omitting the form only ever RETAINS a false positive -- the safe direction
+// -- and adding it later is purely additive.
+//
+// `and`/`or` IS THE EXCEPTION, which is why it needs the paragraph below
+// rather than a line in this list: adding it is NOT purely additive, because
+// a deciding sibling can decide a condition whose other operand is a lexeme
+// BOTH ORACLES REJECT, removing a diagnostic rather than adding one. See
+// reason (2).
+//
+// `and`/`or` ARE EXCLUDED BY DECISION, NOT BY DIFFICULTY -- and the reason
+// recorded here until 2026-09-20 was WRONG, so do not restore it. It said
+// mypy's `and` is ONE-sided while its `or` is TWO-sided, so neither "is
+// expressible as a fold over operand verdicts the way `not` is". Every
+// premise is true and the conclusion is false: a fold over operand verdicts
+// expresses mypy's behaviour everywhere it was measured, and that asymmetry
+// IS the ordinary duality of three-valued logic (`and` short-circuits on
+// FALSE so one FALSE operand decides it; `or` short-circuits on TRUE so one
+// TRUE operand decides IT). Measured 2026-09-20: 52 verdict cells -- the 3x3
+// matrix for each operator, composition with every existing exclusion, n-ary
+// chains, mixed precedence, and name/call operands -- all Kleene, ZERO
+// mismatches. Every existing exclusion composes for free, `-1 and False`
+// folding FALSE because `False` decides what the signed literal cannot.
+//
+// BUT IT IS NOT AN EQUIVALENCE, and do not write that it is. Found by
+// adversarial review, re-derived here: mypy's `and`/`or` reachability is
+// TYPE-based (`can_be_false` over the narrowed type), not a fold over
+// operand verdicts, so it can be MORE decided than Kleene. Measured,
+// `if -1 and 1:` is `Missing return statement` -- UNDECIDED, both operands
+// being Unknown to mypy itself -- while `if (-1 and 1) or (-1 and 1):` is
+// `Success`, i.e. TRUE, where Kleene gives `Unknown or Unknown = Unknown`.
+// It needs int LITERAL types: the `0.0` and `""` spellings of the same shape
+// stay undecided. The divergence is always in the SAFE direction (a targeted
+// 196-case sweep found no case where Kleene decides and mypy does not), so a
+// Kleene fold would still be a strict subset -- but the subset property is
+// an EMPIRICAL result, not the equivalence it was first written as. The real reasons to decline are in
+// `.claude/specs/2026-09-20-boolop-condition-folding-design.md` and are about
+// VALUE, not expressibility:
+//   (1) the motivating idiom does not fold. A named `bool` debug flag is
+//       mypy-Unknown -- `DEBUG = True` / `if c or DEBUG:` is `Missing return
+//       statement`, and so is the `Final` spelling; only `Literal[True]`
+//       folds, and that needs an import the parser refuses. So only an inline
+//       bare literal folds, and for those the plain `if True:` / `if False:`
+//       spelling already folds today.
+//   (2) a Kleene fold would reverse the semantic half of `4c62de1` by a side
+//       route: `if 1_ or True: return 1` folds TRUE from the sibling, so the
+//       malformed lexeme never needs the verdict that commit deliberately
+//       withheld, and cythonpp's only diagnostic on a program BOTH oracles
+//       reject as a SyntaxError disappears. Five measured shapes. Guarding it
+//       needs poison-propagation through `not` and nested `BoolOp`s, which
+//       re-litigates `3d672c2`'s decision not to model Python's numeric
+//       grammar.
 //
 // EXCLUDED BECAUSE MYPY DOES NOT FOLD THEM, and including any would make
 // cythonpp accept a program mypy rejects: every signed number, float, complex,
@@ -4055,12 +4121,24 @@ GuardVerdict literal_guard_verdict(const ast::Expr& condition) {
     // Unknown. Seven false positives closed, every one mypy-Success and
     // CPython-clean.
     //
-    // `and`/`or` are still excluded, and that is not symmetry for its own
-    // sake: mypy's `and` is ONE-sided (`"x" and False` folds FALSE from the
-    // right operand alone) while its `or` is TWO-sided, and `"" or 1` folds
-    // TRUE even though `""` alone does not fold -- so they cannot be written
-    // as a fold over operand verdicts the way `not` can, and getting `or`
-    // wrong in the permissive direction silences a real error on `False or ""`.
+    // `and`/`or` are still excluded, but NOT because they cannot be written
+    // this way -- they can, and the claim that they cannot was refuted by
+    // measurement on 2026-09-20. A Kleene fold over operand verdicts matches
+    // mypy everywhere it was measured, so the arm would be a sibling of this
+    // one: `and` yields AlwaysFalse if ANY operand is AlwaysFalse and
+    // AlwaysTrue if ALL are AlwaysTrue; `or` is the dual. (It is a SUBSET of
+    // mypy, not an equivalence -- see the header block, which records the
+    // measured case where mypy is more decided than Kleene.) See that block
+    // for the two measured reasons it was declined anyway, both about VALUE
+    // rather than expressibility.
+    //
+    // A reader who implements it should know two shapes that are easy to get
+    // wrong. The loop must NOT early-exit on the first undecided operand --
+    // `"" and False` folds FALSE from the SECOND one. And `ast::BoolOp` is
+    // n-ary for an unparenthesised run (`a and b and c` is ONE node with
+    // three values) while a parenthesised same-operator run STAYS NESTED
+    // (`a and (b and c)` is a BoolOp inside a BoolOp), so a recursion written
+    // for only one of the two mis-folds the other.
     if (const auto* unary = dynamic_cast<const ast::UnaryOp*>(&condition)) {
         if (unary->op() == lexer::token_type::OP_NOT) {
             switch (literal_guard_verdict(unary->operand())) {
@@ -4119,6 +4197,21 @@ GuardVerdict literal_guard_verdict(const ast::Expr& condition) {
 // sources an answer for one expression, this ordering silently becomes a
 // precedence rule -- state which wins and why, rather than leaving it to fall
 // out of the order.
+//
+// RE-DERIVED 2026-09-20 against the `and`/`or` widening that was scoped and
+// declined: the claim would have SURVIVED it. `narrowing_guard_verdict`
+// matches a bare `ast::Name` or a `not` over one and nothing else, so it
+// answers Unknown for every `ast::BoolOp`, which is the only node class such
+// a widening adds. Recorded because the supporting argument is an
+// enumeration of node classes and went stale once already; `BoolOp` is the
+// class to check first if this is revisited.
+//
+// THE INTERACTION TO WATCH IS THE OTHER SIDE, though: narrowing's own
+// comment below lists `if c and True:` and `if c or d:` as decidable under
+// mypy and "omitted purely for scope". Widening NARROWING onto `BoolOp` --
+// not folding -- is what would finally give both sources an answer for one
+// expression, and it is the likelier of the two widenings to be attempted,
+// since `and`/`or` folding has now been measured and declined.
 //
 // They differ in what they NEED, which is why folding is not simply routed
 // through the narrowing path: narrowing needs `scopes_`, needs the loop
