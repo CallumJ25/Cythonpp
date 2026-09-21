@@ -194,6 +194,13 @@ private:
         std::string identifier; // as written in the Python source
         std::string mangled;    // as written in the emitted C++
         semantic::Type type;    // the type its C++ declaration carries
+
+        // Was `type` taken from an UNANNOTATED assignment inside a
+        // statically-dead arm, and is therefore still open to replacement by
+        // the first LIVE assignment of the same name? See
+        // collect_scope_variables' own comment for why that replacement
+        // exists and why it happens at most once.
+        bool from_dead_arm = false;
     };
 
     // FINAL-REVIEW CRITICAL 3, half one: every name a scope assigns ANYWHERE
@@ -213,9 +220,48 @@ private:
     //
     // Returns false (having already refused) if a collected name has no
     // representable C++ type.
+    //
+    // `prefer_live_arm` (2026-09-21) is the codegen half of the dead-arm
+    // binding fix, and it is a PARAMETER rather than unconditional behaviour
+    // because the SCOPE BOUNDARY is load-bearing. Measured against mypy
+    // 1.18.1, `if False: x = 1` / `else: x = 2.5` / `print(x)` infers the
+    // LIVE arm's type inside a `def` (mypy Success) and the DEAD arm's at
+    // MODULE and class scope (mypy reports). The semantic layer therefore
+    // prefers the live arm at function scope ONLY
+    // (TypeChecker::pre_bind_function_body), and CLAUDE.md requires that
+    // "codegen's slot and TypeMap's read type for a name must stay derived
+    // from ONE source" -- so visit(FunctionDef) passes true here and
+    // emit_module_variable_declarations passes false.
+    //
+    // WHAT PREFERRING THE LIVE ARM AT MODULE SCOPE ACTUALLY COSTS, measured
+    // 2026-09-21 rather than argued: a LOST CAPABILITY, never a desync
+    // reaching disk. An earlier version of this comment said it "would
+    // desynchronise the two in exactly the direction that warning names",
+    // which overstates -- whenever the two types genuinely differ AND the
+    // dead arm's value cannot widen into the live slot, emit_value_widened's
+    // Decision 0 backstop refuses by name with no file written, and whenever
+    // the semantic layer disagrees at all it reports first and codegen never
+    // produces a binary. Flipping this to true was measured to turn
+    // `if False: x = 2.5` / `x = 1` / `print(x)` and `if False: x = 1` /
+    // `x = True` / `print(x)` -- both mypy Success, both currently emitting
+    // and matching CPython -- into named refusals. Same class of correction
+    // as this project's recorded `find_builtin_arity` "defensive, not
+    // load-bearing" note: the parameter is still the right formulation, and
+    // the scope boundary it encodes is still the measured rule, but the
+    // consequence of getting it wrong is a refusal rather than a wrong
+    // binary. Pinned by
+    // CodegenExecution.AModuleScopeDeadArmStillDecidesTheSlotType, which
+    // COMPILES AND RUNS both shapes; before that test existed the flip left
+    // the entire suite green.
+    //
+    // `in_dead_arm` is the recursion parameter only: it is STICKY
+    // (`in_dead_arm ||` at each descent, never a plain reassignment) because
+    // dead regions NEST -- a "live" arm written inside a dead one is still
+    // dead. No caller outside this function passes it.
     bool collect_scope_variables(const std::vector<ast::StmtPtr>& body,
                                  const std::map<std::string, semantic::Type>& already_declared,
-                                 std::vector<ScopeVariable>& variables);
+                                 std::vector<ScopeVariable>& variables, bool prefer_live_arm,
+                                 bool in_dead_arm = false);
 
     // FINAL-REVIEW CRITICAL 3, half two: a hoisted C++ declaration
     // DEFAULT-CONSTRUCTS, so a name whose only assignment sits in a branch

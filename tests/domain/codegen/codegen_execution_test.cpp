@@ -411,5 +411,145 @@ TEST(CodegenExecution, LegalUnderscoreAndZeroLiteralSpellingsMatchPython) {
               "100000000000.0\n");
 }
 
+// A STATICALLY-DEAD ARM MUST NOT DECIDE A NAME'S C++ SLOT TYPE at function
+// scope. Both shapes below are `mypy --strict` Success and CPython exit 0
+// (measured 2026-09-21; every expected string here was produced by RUNNING
+// CPython 3.14), and both were a NAMED CODEGEN REFUSAL with no file written
+// before this fix -- the Decision 0 backstop correctly rejecting a live
+// `py::float_` being assigned into a slot the DEAD arm had typed. The
+// semantic layer already infers the live arm's type here, so the slot and
+// the TypeMap were derived from two different sources, which is precisely
+// what CLAUDE.md says must not happen.
+//
+// COMPILED AND RUN, never text-asserted: the whole point is that the emitted
+// text now compiles, which no assertion on its spelling can establish.
+//
+// The dead arm is still EMITTED -- `cy_x = py::to_float(py::int_(1));` for
+// the first shape -- and that is safe only because py::to_float WIDENS and
+// NumericTag preserves the value's own rank. It is also why this is one test
+// per guard: neutering the live-arm preference fails exactly this test.
+TEST(CodegenExecution, ADeadArmDoesNotDecideTheSlotTypeOfALiveAssignment) {
+    // G4: dead arm binds int, live arm binds float.
+    const RunResult int_then_float = compile_and_run(
+        "def f() -> None:\n"
+        "    if False:\n"
+        "        x = 1\n"
+        "    else:\n"
+        "        x = 2.5\n"
+        "    print(x)\n"
+        "\n"
+        "\n"
+        "f()\n");
+    EXPECT_EQ(int_then_float.exit_code, 0);
+    EXPECT_EQ(int_then_float.stdout_text, "2.5\n");
+
+    // G5: dead arm binds bool, live arm binds float.
+    const RunResult bool_then_float = compile_and_run(
+        "def f() -> None:\n"
+        "    if False:\n"
+        "        x = True\n"
+        "    else:\n"
+        "        x = 2.5\n"
+        "    print(x)\n"
+        "\n"
+        "\n"
+        "f()\n");
+    EXPECT_EQ(bool_then_float.exit_code, 0);
+    EXPECT_EQ(bool_then_float.stdout_text, "2.5\n");
+}
+
+// CONTROL for the fold POLARITY, and it discriminates: a folded-TRUE header
+// kills its ELSE, never its own BODY. So the live arm here is the `if` body
+// and the slot must be `py::float_`, into which the dead `else`'s int widens.
+// Inverting the polarity in the emitter makes the body the "dead" arm, the
+// `else` replace the slot with `py::int_`, and the body's own emitted
+// `py::float_(2.5)` then fail the Decision 0 backstop -- a refusal where this
+// program must run. It is NOT a new capability (this shape emitted and ran
+// before the fix too, since the body is also the FIRST assignment), which is
+// exactly what makes it a control rather than an accepting test: it is
+// unaffected by neutering the live-arm preference and fails only on polarity.
+//
+// mypy --strict: Success. CPython 3.14: prints 2.5, exit 0.
+TEST(CodegenExecution, AFoldedTrueHeaderLeavesItsOwnBodyLiveForSlotSelection) {
+    const RunResult result = compile_and_run(
+        "def f() -> None:\n"
+        "    if True:\n"
+        "        x = 2.5\n"
+        "    else:\n"
+        "        x = 1\n"
+        "    print(x)\n"
+        "\n"
+        "\n"
+        "f()\n");
+
+    EXPECT_EQ(result.exit_code, 0);
+    EXPECT_EQ(result.stdout_text, "2.5\n");
+}
+
+// THE SCOPE GATE, CODEGEN HALF, and until this test existed it was pinned by
+// NOTHING: flipping emit_module_variable_declarations to
+// `prefer_live_arm=true` left the whole suite green (measured 2026-09-21,
+// 1739/1739 passing), while silently turning two programs both oracles accept
+// and run into named refusals.
+//
+// At MODULE scope the semantic layer keeps taking the declared type from the
+// dead arm -- pre_bind_assignment_targets ignores `in_dead_arm`, because mypy
+// genuinely reports there. So the slot must come from the dead arm too, or
+// the slot and the TypeMap stop being derived from one source. Both shapes
+// below are `mypy --strict` Success and CPython exit 0 (every expected string
+// produced by RUNNING CPython 3.14), and both currently EMIT with the DEAD
+// arm's slot, into which the live value widens.
+//
+// Preferring the live arm here reverses the widening direction -- a dead
+// `py::float_(2.5)` into a `py::int_` slot, a dead `py::int_(1)` into a
+// `py::bool_` one -- and neither widens, so the Decision 0 backstop refuses
+// with no file written. COMPILED AND RUN, so the failure mode this pins is a
+// real refusal rather than a spelling.
+TEST(CodegenExecution, AModuleScopeDeadArmStillDecidesTheSlotType) {
+    // Dead arm binds float, live arm binds int: the int widens into the
+    // float slot and NumericTag keeps it printing as `1`.
+    const RunResult float_then_int = compile_and_run(
+        "if False:\n"
+        "    x = 2.5\n"
+        "x = 1\n"
+        "print(x)\n");
+    EXPECT_EQ(float_then_int.exit_code, 0);
+    EXPECT_EQ(float_then_int.stdout_text, "1\n");
+
+    // Dead arm binds int, live arm binds bool: the bool widens into the int
+    // slot and still prints `True`, because an annotation constrains rather
+    // than coerces.
+    const RunResult int_then_bool = compile_and_run(
+        "if False:\n"
+        "    x = 1\n"
+        "x = True\n"
+        "print(x)\n");
+    EXPECT_EQ(int_then_bool.exit_code, 0);
+    EXPECT_EQ(int_then_bool.stdout_text, "True\n");
+}
+
+// A NAME BOUND ONLY IN A DEAD ARM MUST STILL BE DECLARED. The dead arm's
+// assignment is still emitted, so dropping the name from the collection
+// entirely -- an obvious-looking way to "skip dead arms" -- produces
+// `use of undeclared identifier 'cy_x'` at clang, which this test catches by
+// COMPILING. There is deliberately no read of `x`: a read would be refused
+// first by check_definite_assignment, which this fix does not touch, and the
+// test would then pass for the wrong reason.
+//
+// mypy --strict: Success. CPython 3.14: prints `done`, exit 0.
+TEST(CodegenExecution, ANameBoundOnlyInADeadArmIsStillDeclared) {
+    const RunResult result = compile_and_run(
+        "def f() -> None:\n"
+        "    if False:\n"
+        "        x = 1\n"
+        "    print(\"done\")\n"
+        "\n"
+        "\n"
+        "f()\n");
+
+    EXPECT_EQ(result.exit_code, 0);
+    EXPECT_EQ(result.stdout_text, "done\n");
+}
+
 } // namespace
 } // namespace cythonpp::domain::codegen

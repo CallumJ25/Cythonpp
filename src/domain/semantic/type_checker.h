@@ -157,9 +157,13 @@ namespace cythonpp::domain::semantic {
 //     `is_false_literal` at `checker.py:8255`. The warning this bullet gave
 //     -- that mirroring `is_literal_true` into an `is_literal_false` would
 //     SILENCE A REAL ERROR for the `""` case -- was correct and is respected:
-//     `""` is not folded. See literal_guard_verdict's own comment in the .cpp
-//     for the full measured set and for the two mypy-UNSOUND forms
-//     (`NotImplemented`, `not TYPE_CHECKING`) a future widening must refuse.
+//     `""` is not folded. See literal_guard_verdict's own comment -- which
+//     lives in `domain/semantic/literal_guard.cpp` as of 2026-09-21, MOVED
+//     out of `type_checker.cpp` so codegen's collect_scope_variables could
+//     share the one fold set; this pointer said "in the .cpp" and was stale
+//     the moment that move landed -- for the full measured set and for the
+//     two mypy-UNSOUND forms (`NotImplemented`, `not TYPE_CHECKING`) a
+//     future widening must refuse.
 //
 //     `is_literal_true`, which this bullet used to name, NO LONGER EXISTS --
 //     it was deleted rather than extended, because it had already DRIFTED:
@@ -216,6 +220,22 @@ namespace cythonpp::domain::semantic {
 //     DiagnosticSuppression rather than adding a mechanism. Note the polarity
 //     INVERTS between `if` and `while`: see check_possibly_dead_suite and
 //     visit(While) for which arm each header kills and why.
+//     THE SIBLING DEFECT that fix left open is CLOSED 2026-09-21, and the
+//     distinction is the first thing to get right: the suppression above
+//     covers diagnostics raised INSIDE a dead arm, while a dead arm's own
+//     BINDING committed the declared type and the LIVE arm's assignment was
+//     then checked against it -- a report on a REACHABLE line, which no
+//     suppression can reach. `if False: x = "s"` / `else: x = 1` /
+//     `print(x)` inside a `def` was a false "incompatible types in
+//     assignment"; mypy is Success and CPython prints 1. Fixed in
+//     pre_bind_function_body (the placeholder LINE skips a dead arm's
+//     UNANNOTATED binding) plus visit(If)'s join (a dead arm contributes no
+//     narrowing edge). AND THE SCOPE BOUNDARY IS THE OPPOSITE OF THIS
+//     BULLET'S: the contents fix above applies "at module and function scope
+//     alike", the binding fix is FUNCTION SCOPE ONLY -- measured,
+//     `reveal_type` after the join is the LIVE arm's type inside a `def` and
+//     the DEAD arm's at module and class scope, where mypy REPORTS. Do not
+//     generalise the binding fix by analogy with this one.
 //   - A THIRD failure mode, previously open and NOW FIXED (loop_else_always_
 //     returns, added 2026-09-12): `for i in range(3): / total = total + i /
 //     else: / return total` as the whole body of a `-> int` function used to

@@ -36,7 +36,13 @@ namespace cythonpp::domain::codegen {
 void Emitter::emit_module_variable_declarations(const ast::Module& module,
                                                 std::set<std::string>& identifiers) {
     std::vector<ScopeVariable> variables;
-    if (!collect_scope_variables(module.body(), module_declared_, variables)) {
+    // `prefer_live_arm=false`: at MODULE scope mypy genuinely does let a
+    // statically-dead arm decide the inferred declared type (measured --
+    // `reveal_type` after the join is the DEAD arm's there, and mypy
+    // reports), so preferring the live arm here would desynchronise this
+    // slot from the TypeMap. See emitter.h.
+    if (!collect_scope_variables(module.body(), module_declared_, variables,
+                                 /*prefer_live_arm=*/false)) {
         return;
     }
     for (const ScopeVariable& variable : variables) {

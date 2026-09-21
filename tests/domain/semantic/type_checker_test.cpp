@@ -8504,6 +8504,373 @@ TEST(TypeChecker, AnUnfoldableOrLiveArmIsStillTypeChecked) {
               "TypeError");
 }
 
+// ===========================================================================
+// A STATICALLY-DEAD ARM'S *INFERRED* BINDING (2026-09-21) -- the sibling
+// defect `d2de3a5` left open. That commit suppresses diagnostics raised
+// INSIDE a dead arm; this one is a diagnostic raised on the LIVE line, which
+// no suppression can reach:
+//
+//     def f() -> None:
+//         if False:
+//             x = "s"        <-- filled the placeholder, committing `str`
+//         else:
+//             x = 1          <-- checked against it, and REPORTED
+//         print(x)
+//
+// mypy `--strict` Success, CPython prints `1`. Fixed by moving the
+// placeholder LINE past a dead arm's unannotated binding in
+// pre_bind_function_body, so the LIVE assignment is the one that fills it.
+// ===========================================================================
+
+// GUARD 1: the dead-arm line skip itself. Every shape below is mypy Success
+// and CPython exit 0, and every one reported before this fix.
+TEST(TypeChecker, ADeadArmsInferredBindingDoesNotFixTheDeclaredType) {
+    // The headline `if`/`else`, and its flat sibling.
+    expect_clean("def f() -> None:\n    if False:\n        x = \"s\"\n    else:\n"
+                 "        x = 1\n    print(x)\n\n\nf()\n");
+    expect_clean("def f() -> None:\n    if False:\n        x = \"s\"\n    x = 1\n"
+                 "    print(x)\n\n\nf()\n");
+    // Every folded-false spelling produces the same dead arm.
+    for (const char* const guard : {"0", "None", "not True"}) {
+        expect_clean(std::string("def f() -> None:\n    if ") + guard +
+                     ":\n        x = \"s\"\n    x = 1\n    print(x)\n\n\nf()\n");
+    }
+    // The `else` of a folded-TRUE guard, and a dead `elif` arm.
+    expect_clean("def f() -> None:\n    if True:\n        x = 1\n    else:\n"
+                 "        x = \"s\"\n    print(x)\n\n\nf()\n");
+    expect_clean("def f(c: bool) -> None:\n    if c:\n        x = 1\n    elif False:\n"
+                 "        x = \"s\"\n    else:\n        x = 2\n    print(x)\n\n\n"
+                 "f(True)\nf(False)\n");
+    // Both loop arms, with the polarity visit(While) already uses.
+    expect_clean("def f() -> None:\n    while False:\n        x = \"s\"\n    x = 1\n"
+                 "    print(x)\n\n\nf()\n");
+    expect_clean("def f() -> None:\n    while True:\n        x = 1\n        break\n"
+                 "    else:\n        x = \"s\"\n    print(x)\n\n\nf()\n");
+    // A dead arm nested inside a LIVE one, and one inside a loop body.
+    expect_clean("def f(c: bool) -> None:\n    if c:\n        if False:\n"
+                 "            x = \"s\"\n        x = 1\n    else:\n        x = 2\n"
+                 "    print(x)\n\n\nf(True)\nf(False)\n");
+    expect_clean("def f() -> None:\n    for i in [1, 2]:\n        if False:\n"
+                 "            x = \"s\"\n        x = i\n    print(x)\n\n\nf()\n");
+    // A `for` TARGET and a TUPLE UNPACK in a dead arm bind exactly as an
+    // ordinary assignment does, and mypy takes a declared type from neither.
+    expect_clean("def f() -> None:\n    if False:\n        for x in [\"s\"]:\n"
+                 "            pass\n    x = 1\n    print(x)\n\n\nf()\n");
+    expect_clean("def f() -> None:\n    if False:\n        x, y = \"s\", \"t\"\n"
+                 "    x = 1\n    print(x)\n\n\nf()\n");
+    // A method and a nested def -- the two other FUNCTION scopes this pass
+    // runs for.
+    expect_clean("class C:\n    def m(self) -> None:\n        if False:\n"
+                 "            x = \"s\"\n        x = 1\n        print(x)\n\n\nC().m()\n");
+    expect_clean("def outer() -> None:\n    def inner() -> None:\n        if False:\n"
+                 "            x = \"s\"\n        x = 1\n        print(x)\n    inner()\n\n\n"
+                 "outer()\n");
+    // Numeric-tower pairs: the dead arm's type is NOT merely a subtype
+    // problem, it must not be consulted in either direction.
+    expect_clean("def f() -> None:\n    if False:\n        x = 1\n    x = 2.5\n"
+                 "    print(x)\n\n\nf()\n");
+    expect_clean("def f() -> None:\n    if False:\n        x = True\n    x = 2\n"
+                 "    print(x)\n\n\nf()\n");
+}
+
+// GUARD 2: the NARROWING EDGE (visit(If)). Needed, and measured rather than
+// assumed -- with the declared type now taken from the live arm, the dead
+// arm's assignment still SET a narrowing, so the two-armed join produced
+// `str | int` and `print(x + 1)` drew a false `NotImplementedError:
+// operations on a union-typed value require narrowing`. Three downstream
+// diagnostic classes share that one root, which is why all three are here:
+// an operand, a return value and a call argument.
+//
+// Deliberately all in the `if`/`else` (two-arm) form: the FLAT form is clean
+// WITHOUT this guard, because a loop -- and an `if` with an empty `else` --
+// joins against a pre-statement edge that has no entry for the name at all.
+// Using the flat form here would pin nothing.
+TEST(TypeChecker, ADeadArmContributesNoNarrowingEdgeAtTheJoin) {
+    expect_clean("def f() -> None:\n    if False:\n        x = \"s\"\n    else:\n"
+                 "        x = 1\n    print(x + 1)\n\n\nf()\n");
+    expect_clean("def f() -> int:\n    if False:\n        x = \"s\"\n    else:\n"
+                 "        x = 1\n    return x\n\n\nprint(f())\n");
+    expect_clean("def g(n: int) -> int:\n    return n\n\n\ndef f() -> None:\n"
+                 "    if False:\n        x = \"s\"\n    else:\n        x = 1\n"
+                 "    print(g(x))\n\n\nf()\n");
+}
+
+// GUARD 3: THE ANNOTATED EXCEPTION. mypy's rule is about INFERRED types only
+// -- an ANNOTATED binding in a dead arm, and a definition-shaped one (a
+// nested `def`'s own name), DO commit, at every scope. Measured 2026-09-21,
+// all four report `Incompatible types in assignment`; dropping this exclusion
+// silences all of them.
+// THE MESSAGE IS ASSERTED, NOT JUST THE CODE, and that is load-bearing: the
+// first version of this test checked `.code == "TypeError"` only, and the
+// neutering that drops the exclusion was then a SILENT NO-OP -- it made the
+// whole suite pass. With the exclusion dropped the dead AnnAssign no longer
+// owns the placeholder, so it reports a `name "x" already defined`
+// redefinition (a SemanticAnalyzerTypeError) instead, which spells
+// "TypeError" too. Two different rules, one code string; only the wording
+// tells them apart.
+TEST(TypeChecker, AnAnnotatedOrDefinitionShapedDeadArmBindingStillCommits) {
+    const std::string int_over_str =
+        "incompatible types in assignment (expression has type \"int\", variable has type "
+        "\"str\")";
+    // Function, nested function, method.
+    for (const std::string source :
+         {std::string("def f() -> None:\n    if False:\n        x: str = \"s\"\n"
+                      "    else:\n        x = 1\n    print(x)\n\n\nf()\n"),
+          std::string("def outer() -> None:\n    def inner() -> None:\n        if False:\n"
+                      "            x: str = \"s\"\n        x = 1\n        print(x)\n"
+                      "    inner()\n\n\nouter()\n"),
+          std::string("class C:\n    def m(self) -> None:\n        if False:\n"
+                      "            x: str = \"s\"\n        x = 1\n        print(x)\n\n\n"
+                      "C().m()\n"),
+          // A BARE annotation binds no value at all and still commits.
+          std::string("def f() -> None:\n    if False:\n        x: str\n    x = 1\n"
+                      "    print(x)\n\n\nf()\n")}) {
+        const diagnostics::Diagnostic error = only_error(check_module(source));
+        EXPECT_EQ(error.code, "TypeError") << source;
+        EXPECT_EQ(error.message, int_over_str) << source;
+    }
+    // A nested `def`'s own name is a definition, not an inference.
+    const diagnostics::Diagnostic nested_def =
+        only_error(check_module("def f() -> None:\n    if False:\n"
+                                "        def x() -> None:\n            print(\"hi\")\n"
+                                "    x = 1\n    print(x)\n\n\nf()\n"));
+    EXPECT_EQ(nested_def.code, "TypeError");
+    EXPECT_EQ(nested_def.message,
+              "incompatible types in assignment (expression has type \"int\", variable has "
+              "type \"Callable[[], None]\")");
+}
+
+// GUARD 4: THE SCOPE GATE, and it is STRUCTURAL -- pre_bind_function_body
+// runs for function bodies only. mypy genuinely REPORTS at module and class
+// scope (measured 2026-09-21: `reveal_type(x)` after the join is
+// `builtins.int` inside a `def` and `builtins.str` at module and class scope),
+// so a fix that leaked past the function boundary would silence a diagnostic
+// mypy itself emits. CLAUDE.md's `d2de3a5` entry says that wave applied "at
+// module and function scope alike", which primes a fixer to generalise by
+// analogy; the CONTENTS fix generalises, this one must not.
+TEST(TypeChecker, ADeadArmBindingStillCommitsAtModuleAndClassScope) {
+    const std::string int_over_str =
+        "incompatible types in assignment (expression has type \"int\", variable has type "
+        "\"str\")";
+    for (const std::string source :
+         {std::string("if False:\n    x = \"s\"\nelse:\n    x = 1\nprint(x)\n"),
+          std::string("class C:\n    if False:\n        x = \"s\"\n    else:\n        x = 1\n"
+                      "\n\nprint(C.x)\n")}) {
+        const diagnostics::Diagnostic error = only_error(check_module(source));
+        EXPECT_EQ(error.code, "TypeError") << source;
+        EXPECT_EQ(error.message, int_over_str) << source;
+    }
+}
+
+// GUARD 4b: THE SCOPE GATE, MEASURED AT THE SHAPE THAT ACTUALLY REACHES THE
+// MACHINERY -- and until this test existed the gate was pinned by NOTHING.
+// Leaking the dead-arm skip into pre_bind_assignment_targets left the whole
+// suite green (measured 2026-09-21, 1739/1739 passing) while silencing the
+// two programs below, both `mypy --strict` exit 1.
+//
+// GUARD 4 above cannot catch that leak, and the reason is structural rather
+// than incidental: at module scope pre_bind_target runs ONLY for TOP-LEVEL
+// `Assign` statements, so in the two-arm `if`/`else` form neither arm's
+// assignment ever creates a placeholder, and the line map the leak would
+// corrupt is never consulted. The FLAT form is the discriminating one --
+// there the live `x = 1` IS a top-level Assign, so it takes its declared
+// line from the map, and the map is exactly what a leaked skip changes.
+TEST(TypeChecker, ADeadArmStillDecidesTheModuleScopePlaceholderLine) {
+    const std::string int_over_str =
+        "incompatible types in assignment (expression has type \"int\", variable has type "
+        "\"str\")";
+    for (const std::string source :
+         {// The FLAT module shape: a dead `if` arm, then a TOP-LEVEL live
+          // assignment. mypy: `Incompatible types in assignment`, exit 1.
+          std::string("if False:\n    x = \"s\"\nx = 1\nprint(x)\n"),
+          // Its folded-false LOOP sibling, which reaches the same map by the
+          // other polarity arm.
+          std::string("while False:\n    x = \"s\"\nx = 1\nprint(x)\n")}) {
+        const diagnostics::Diagnostic error = only_error(check_module(source));
+        EXPECT_EQ(error.code, "TypeError") << source;
+        EXPECT_EQ(error.message, int_over_str) << source;
+    }
+}
+
+// GUARD 5: THE FOLD SET AND THE POLARITY. `""` and `0.0` are outside mypy's
+// prune set (recorded here since 2026-09-11) and a real `bool` condition
+// decides nothing, so all three arms stay LIVE and their bindings commit.
+// The two polarity cases are the sharp ones: an inverted fold would treat a
+// folded-TRUE guard's own BODY as dead and silence a real error.
+TEST(TypeChecker, ADeadArmLineSkipRespectsTheFoldSetAndThePolarity) {
+    const std::string int_over_str =
+        "incompatible types in assignment (expression has type \"int\", variable has type "
+        "\"str\")";
+    for (const std::string source :
+         {// OUTSIDE THE FOLD SET: `""` and `0.0` decide nothing, so the arm
+          // is LIVE and its binding commits.
+          std::string("def f() -> None:\n    if \"\":\n        x = \"s\"\n    x = 1\n"
+                      "    print(x)\n\n\nf()\n"),
+          std::string("def f() -> None:\n    if 0.0:\n        x = \"s\"\n    x = 1\n"
+                      "    print(x)\n\n\nf()\n"),
+          // A real `bool` condition decides nothing either.
+          std::string("def f(c: bool) -> None:\n    if c:\n        x = \"s\"\n    else:\n"
+                      "        x = 1\n    print(x)\n\n\nf(True)\n"),
+          // POLARITY: the BODY of a folded-TRUE `if` is LIVE.
+          std::string("def f() -> None:\n    if True:\n        x = \"s\"\n    x = 1\n"
+                      "    print(x)\n\n\nf()\n"),
+          // POLARITY, loop: the BODY of a folded-TRUE `while` is LIVE too.
+          std::string("def f() -> None:\n    while True:\n        x = \"s\"\n        break\n"
+                      "    x = 1\n    print(x)\n\n\nf()\n")}) {
+        const diagnostics::Diagnostic error = only_error(check_module(source));
+        EXPECT_EQ(error.code, "TypeError") << source;
+        EXPECT_EQ(error.message, int_over_str) << source;
+    }
+}
+
+// GUARD 6: DEADNESS IS STICKY. A "live" arm written INSIDE a dead one is
+// still dead, which is why the recursion ORs rather than reassigns -- the
+// same reason DiagnosticSuppression counts depth. A non-sticky bool would let
+// the inner arm look live and re-commit the declared type.
+TEST(TypeChecker, DeadnessIsStickyThroughNestedArms) {
+    // A folded-TRUE `if` nested inside a folded-FALSE one.
+    expect_clean("def f() -> None:\n    if False:\n        if True:\n            x = \"s\"\n"
+                 "        else:\n            pass\n    x = 1\n    print(x)\n\n\nf()\n");
+    // A folded-TRUE `while` BODY (live in its own right) inside a dead `if`.
+    expect_clean("def f() -> None:\n    if False:\n        while True:\n            x = \"s\"\n"
+                 "            break\n    x = 1\n    print(x)\n\n\nf()\n");
+}
+
+// GUARD 7: THE CHOSEN BINDING'S LOOP SPAN. A placeholder carries the
+// back-edge span of the loop the binding it represents sits inside; pairing
+// the LIVE binding's line with the DEAD binding's span breaks that. Here the
+// dead binding sits inside a `for` and the live one does not, so carrying the
+// dead one's span would wrongly enable the loop back-edge exemption and go
+// SILENT on a program BOTH oracles reject -- mypy `Cannot determine type of
+// "total"  [has-type]`, CPython `UnboundLocalError`, exit 1.
+TEST(TypeChecker, ThePlaceholdersLoopSpanComesFromTheChosenBinding) {
+    const diagnostics::Diagnostic error =
+        only_error(check_module("total = 0\n\n\ndef run() -> None:\n    for y in [1, 2]:\n"
+                                "        if False:\n            total = \"s\"\n"
+                                "    print(total)\n    total = 1\n\n\nrun()\n"));
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'total' is used before definition");
+}
+
+// GUARD 8: THE READ SIDE, and the sharpest control in this family. Moving the
+// placeholder line onto the LIVE binding means a read ABOVE it is now
+// order-checked against that line -- which is exactly right, because a name
+// bound ONLY in a dead arm really is unbound when read. Measured: mypy
+// `Cannot determine type of "x"  [has-type]`, CPython `UnboundLocalError`
+// exit 1. BOTH oracles reject, so this must NOT go silent; a fix that made
+// the moved placeholder `order_exempt` would.
+TEST(TypeChecker, AReadAboveTheLiveBindingOfADeadArmNameIsUsedBeforeDefinition) {
+    const diagnostics::Diagnostic error =
+        only_error(check_module("def f() -> None:\n    if False:\n        x = \"s\"\n"
+                                "    print(x)\n    x = 1\n    print(x)\n\n\nf()\n"));
+    EXPECT_EQ(error.code, "NameError");
+    EXPECT_EQ(error.message, "name 'x' is used before definition");
+}
+
+// GUARD 9: LIVE-AGAINST-LIVE is still checked. The dead arm drops out of the
+// declared-type decision; the live arm's own type is still a permanent
+// ceiling for everything after it.
+TEST(TypeChecker, ALaterLiveAssignmentIsStillCheckedAgainstTheLiveDeclaredType) {
+    const diagnostics::Diagnostic error =
+        only_error(check_module("def f() -> None:\n    if False:\n        x = \"s\"\n"
+                                "    else:\n        x = 1\n    x = 2.5\n    print(x)\n\n\nf()\n"));
+    EXPECT_EQ(error.code, "TypeError");
+    EXPECT_EQ(error.message,
+              "incompatible types in assignment (expression has type \"float\", variable has "
+              "type \"int\")");
+}
+
+// GUARD 10: ONLY A BENIGNLY-FILLING KIND MAY TAKE THE MOVED LINE, and this is
+// a UNION-RULE GUARD rather than a refinement -- found by adversarial review
+// of the fix above, which had introduced the defect it closes.
+//
+// The placeholder line decides which statement `is_unfilled_placeholder` lets
+// fill its own placeholder instead of reporting a redefinition. For an
+// `Assign` that is harmless: rebinding a name is legal Python and mypy says
+// nothing. But bind_resolved_annotation (an AnnAssign) and visit(FunctionDef)
+// (a nested def) route through the SAME predicate, and for those two the
+// report they would otherwise make is mypy's `[no-redef]`. Moving the line
+// onto one of them therefore SILENCED it -- eleven measured shapes went from
+// a correct `name "x" already defined on line N` at exit 1 to exit 0, on
+// programs mypy rejects.
+//
+// THE MESSAGE IS ASSERTED, NOT JUST THE CODE, for the same reason GUARD 3
+// says so: `TypeCheckerTypeError` and `SemanticAnalyzerTypeError` both spell
+// "TypeError", and a `.code`-only assertion already produced one silent
+// no-op neutering in this wave. The LINE inside the message is asserted too,
+// because it is what discriminates this fix from the near-miss version that
+// skips ahead to the next benign binding instead of falling back -- see the
+// last case below.
+TEST(TypeChecker, ALiveAnnotatedOrNestedDefBindingDoesNotTakeTheMovedLine) {
+    // Every source here is `mypy --strict` exit 1 (`[no-redef]`) and CPython
+    // exit 0, so the union rule requires a report. Each was SILENT with the
+    // line-move applied unconditionally.
+    for (const auto& [source, expected] :
+         std::vector<std::pair<std::string, std::string>>{
+             // A live ANNOTATED binding: the `if`/`else` headline and its
+             // flat, `while False:`, dead-`elif` and `else`-of-`if True:`
+             // siblings.
+             {"def f() -> None:\n    if False:\n        x = \"s\"\n    else:\n"
+              "        x: int = 1\n    print(x)\n\n\nf()\n",
+              "name \"x\" already defined on line 3"},
+             {"def f() -> None:\n    if False:\n        x = \"s\"\n    x: int = 1\n"
+              "    print(x)\n\n\nf()\n",
+              "name \"x\" already defined on line 3"},
+             {"def f() -> None:\n    while False:\n        x = \"s\"\n    x: int = 1\n"
+              "    print(x)\n\n\nf()\n",
+              "name \"x\" already defined on line 3"},
+             {"def f(c: bool) -> None:\n    if c:\n        print(\"live\")\n    elif False:\n"
+              "        x = \"s\"\n    x: int = 1\n    print(x)\n\n\nf(False)\n",
+              "name \"x\" already defined on line 5"},
+             {"def f() -> None:\n    if True:\n        print(\"live\")\n    else:\n"
+              "        x = \"s\"\n    x: int = 1\n    print(x)\n\n\nf()\n",
+              "name \"x\" already defined on line 5"},
+             // The two other FUNCTION scopes this pass runs for.
+             {"def outer() -> None:\n    def inner() -> None:\n        if False:\n"
+              "            x = \"s\"\n        else:\n            x: int = 1\n"
+              "        print(x)\n    inner()\n\n\nouter()\n",
+              "name \"x\" already defined on line 4"},
+             {"class C:\n    def m(self) -> None:\n        if False:\n            x = \"s\"\n"
+              "        else:\n            x: int = 1\n        print(x)\n\n\nC().m()\n",
+              "name \"x\" already defined on line 4"},
+             // A BARE annotation is a redefinition too, with no value of its
+             // own to check.
+             {"def f() -> None:\n    if False:\n        x = \"s\"\n    x: int\n    x = 1\n"
+              "    print(x)\n\n\nf()\n",
+              "name \"x\" already defined on line 3"},
+             // The dead binding is a `for` TARGET rather than an Assign --
+             // the other kind the skip covers.
+             {"def f() -> None:\n    if False:\n        for x in [\"s\"]:\n"
+              "            print(x)\n    x: int = 1\n    print(x)\n\n\nf()\n",
+              "name \"x\" already defined on line 3"},
+             // A live NESTED DEF, flat and in the `else` arm. mypy loses TWO
+             // diagnostics here without the guard, not one.
+             {"def f() -> None:\n    if False:\n        x = \"s\"\n\n"
+              "    def x() -> None:\n        pass\n    x()\n\n\nf()\n",
+              "name \"x\" already defined on line 3"},
+             {"def f() -> None:\n    if False:\n        x = \"s\"\n    else:\n"
+              "        def x() -> None:\n            pass\n    x()\n\n\nf()\n",
+              "name \"x\" already defined on line 3"},
+             // THE FALL-BACK CASE, and the one that discriminates this fix
+             // from the near-miss that skips ahead to the next BENIGN
+             // binding. Here the first non-dead binding is the AnnAssign on
+             // line 4 and a benign `x = 2` follows it on line 5. Skipping
+             // ahead would put the placeholder on line 5, making the
+             // annotation report `already defined on line 5` -- a FORWARD
+             // line reference. Measured, mypy says line 3, the DEAD arm's own
+             // line, which is what falling back all the way reproduces.
+             {"def f() -> None:\n    if False:\n        x = \"s\"\n    x: int = 1\n"
+              "    x = 2\n    print(x)\n\n\nf()\n",
+              "name \"x\" already defined on line 3"}}) {
+        const Checked checked = check_module(source);
+        ASSERT_FALSE(checked.diagnostics.empty())
+            << "SILENT on a program mypy rejects:\n"
+            << source;
+        EXPECT_EQ(checked.diagnostics.front().code, "TypeError") << source;
+        EXPECT_EQ(checked.diagnostics.front().message, expected) << source;
+    }
+}
+
 // A FOLDED-FALSE LOOP HEADER means the body never executes, so a `break`
 // written in it cannot run and the `else` is guaranteed. Measured 2026-09-17:
 // `while False: break` / `else: return 1` is `mypy --strict` Success and

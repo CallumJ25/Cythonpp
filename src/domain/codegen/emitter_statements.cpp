@@ -28,6 +28,7 @@
 #include "domain/diagnostics/diagnostic_sink.h"
 #include "domain/semantic/annotation_resolver.h"
 #include "domain/semantic/class_lookup.h"
+#include "domain/semantic/literal_guard.h"
 #include "domain/semantic/type.h"
 #include "domain/semantic/type_compatibility.h"
 #include "domain/semantic/type_name.h"
@@ -189,24 +190,66 @@ const semantic::Type* Emitter::declared_type_for_assignment(const ast::Expr& tar
 }
 
 // FINAL-REVIEW CRITICAL 3, half one. See emitter.h for why this recurses.
+//
+// A STATICALLY-DEAD ARM DOES NOT GET TO DECIDE A NAME'S C++ SLOT TYPE at
+// function scope (2026-09-21). `if False: x = 1` / `else: x = 2.5` /
+// `print(x)` is mypy Success and CPython prints `2.5`, and the semantic layer
+// now infers `x` as the LIVE arm's `float` -- but this collector took the
+// FIRST assignment anywhere, which is the dead arm's `int`, so the live
+// `x = 2.5` hit emit_value_widened's Decision 0 backstop and the whole
+// emission was refused by name. A sanctioned outcome, but a LOST CAPABILITY
+// on a program both oracles accept and run, and a desynchronisation between
+// this stage's slot and the TypeMap's read type -- the exact coupling
+// CLAUDE.md warns must stay derived from one source.
+//
+// WHAT CHANGED IS THE SLOT ONLY. Nothing here prunes EMISSION: the dead arm's
+// own assignment is still walked and still emitted, which is why
+// EmitterStatement.ConditionalFunctionDefinitionIsRefused is unaffected --
+// pruning a dead arm from emission would turn that refusal into silence.
+// Emitting the dead arm into a live-arm slot is safe across the numeric tower
+// because py::to_int/py::to_float WIDEN and NumericTag preserves the value's
+// own rank, so `cy_x = py::to_float(py::int_(1));` into a `py::float_` slot
+// compiles and still prints `1` if it ever ran. Where no widening exists --
+// a dead `str` against a live `int` -- the backstop still refuses, which is
+// correct and unchanged.
+//
+// The deadness verdict comes from semantic::literal_guard_verdict, the SAME
+// fold the type checker uses; it was moved into its own header for this
+// caller rather than copied, because CLAUDE.md records that two rival notions
+// of "literally true" is exactly what got `is_literal_true` deleted. Polarity
+// is copied from TypeChecker::visit(If)/visit(While) rather than re-derived:
+// for BOTH, AlwaysFalse kills the body and AlwaysTrue kills the orelse.
 bool Emitter::collect_scope_variables(const std::vector<ast::StmtPtr>& body,
                                       const std::map<std::string, semantic::Type>& already_declared,
-                                      std::vector<ScopeVariable>& variables) {
+                                      std::vector<ScopeVariable>& variables, bool prefer_live_arm,
+                                      bool in_dead_arm) {
     for (const ast::StmtPtr& stmt : body) {
         // An `if`/`while` body is the SAME Python scope as the statement list
         // containing it, so its assignments belong to this collection. A
         // nested def or class is a different scope and is deliberately not
         // descended into (both are refused by this stage regardless).
         if (const auto* branch = dynamic_cast<const ast::If*>(stmt.get())) {
-            if (!collect_scope_variables(branch->body(), already_declared, variables) ||
-                !collect_scope_variables(branch->orelse(), already_declared, variables)) {
+            const semantic::GuardVerdict header =
+                semantic::literal_guard_verdict(branch->condition());
+            if (!collect_scope_variables(
+                    branch->body(), already_declared, variables, prefer_live_arm,
+                    in_dead_arm || header == semantic::GuardVerdict::AlwaysFalse) ||
+                !collect_scope_variables(
+                    branch->orelse(), already_declared, variables, prefer_live_arm,
+                    in_dead_arm || header == semantic::GuardVerdict::AlwaysTrue)) {
                 return false;
             }
             continue;
         }
         if (const auto* loop = dynamic_cast<const ast::While*>(stmt.get())) {
-            if (!collect_scope_variables(loop->body(), already_declared, variables) ||
-                !collect_scope_variables(loop->orelse(), already_declared, variables)) {
+            const semantic::GuardVerdict header =
+                semantic::literal_guard_verdict(loop->condition());
+            if (!collect_scope_variables(
+                    loop->body(), already_declared, variables, prefer_live_arm,
+                    in_dead_arm || header == semantic::GuardVerdict::AlwaysFalse) ||
+                !collect_scope_variables(
+                    loop->orelse(), already_declared, variables, prefer_live_arm,
+                    in_dead_arm || header == semantic::GuardVerdict::AlwaysTrue)) {
                 return false;
             }
             continue;
@@ -244,7 +287,15 @@ bool Emitter::collect_scope_variables(const std::vector<ast::StmtPtr>& body,
                                        [&mangled](const ScopeVariable& variable) {
                                            return variable.mangled == mangled;
                                        });
-        if (seen != variables.end()) {
+        // A name already collected from a DEAD arm's unannotated assignment
+        // gets its type REPLACED by the first LIVE assignment, and then never
+        // again -- clearing the flag below is what makes it once, so that
+        // first-live-assignment-wins keeps holding among live assignments
+        // exactly as first-assignment-wins did before. A name collected from
+        // a LIVE arm, or from an ANNOTATED dead one, is untouched.
+        const bool replaces_dead_arm_type =
+            seen != variables.end() && seen->from_dead_arm && !in_dead_arm;
+        if (seen != variables.end() && !replaces_dead_arm_type) {
             continue; // Not the first assignment; already collected.
         }
 
@@ -268,7 +319,23 @@ bool Emitter::collect_scope_variables(const std::vector<ast::StmtPtr>& body,
             refuse(*target, "an assignment of an unsupported type");
             return false;
         }
-        variables.push_back(ScopeVariable{name->identifier(), mangled, *type});
+        if (replaces_dead_arm_type) {
+            seen->type = *type;
+            seen->from_dead_arm = false;
+            continue;
+        }
+        // An ANNOTATED binding in a dead arm DOES commit its declared type,
+        // at every scope -- measured: `if False: x: str = "s"` / `x = 1` is
+        // `Incompatible types in assignment` under mypy at function, nested-
+        // function and method scope alike. The rule is about INFERRED types
+        // only, which is exactly the distinction
+        // TypeChecker::pre_bind_function_body draws, so the two agree by
+        // construction rather than by coincidence. `declared_ptr` is non-null
+        // for an AnnAssign and null for a plain Assign, which IS that test.
+        const bool open_to_replacement =
+            prefer_live_arm && in_dead_arm && declared_ptr == nullptr;
+        variables.push_back(
+            ScopeVariable{name->identifier(), mangled, *type, open_to_replacement});
     }
     return true;
 }
@@ -839,7 +906,10 @@ void Emitter::visit(const ast::FunctionDef& node) {
     // Python itself gives it. Parameters are excluded: the signature already
     // declared them.
     std::vector<ScopeVariable> locals;
-    if (!collect_scope_variables(node.body(), function_declared_, locals)) {
+    // `prefer_live_arm` is TRUE here and FALSE at module scope: see
+    // emitter.h for the measured scope boundary that forces the split.
+    if (!collect_scope_variables(node.body(), function_declared_, locals,
+                                 /*prefer_live_arm=*/true)) {
         at_module_level_ = outer_module_level;
         in_conditional_block_ = outer_conditional;
         return_type_ = outer_return_type;

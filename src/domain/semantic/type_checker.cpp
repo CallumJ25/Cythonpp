@@ -22,6 +22,7 @@
 #include "domain/ast/parameter.h"
 #include "domain/ast/source_span.h"
 #include "domain/lexer/token_type.h"
+#include "literal_guard.h"
 #include "type_compatibility.h"
 #include "type_name.h"
 
@@ -176,33 +177,6 @@ private:
     std::set<std::string> previous_;
 };
 
-// `is_literal_true` USED TO LIVE HERE, and was DELETED 2026-09-17 rather than
-// kept as a forwarder. It answered "is this a Constant of BOOL_TRUE" for
-// always_returns' and statement_always_leaves' While arms -- a second,
-// independent notion of "literally true" alongside literal_guard_verdict's,
-// free to drift from it. It had already drifted: it answered false for
-// `while 1:` and `while 2:`, which mypy treats as always-true loop conditions
-// exactly as it treats `while True:`. Both call sites now ask
-// `literal_guard_verdict(...) == GuardVerdict::AlwaysTrue`.
-//
-// FORWARD DECLARATIONS, so visit(If)/visit(While) -- which sit ABOVE the
-// definitions -- can fold their own headers to prune a dead arm. Declared
-// rather than moved: the definitions carry ~90 lines of measurement that
-// belong next to the reachability helpers they were written for, and a
-// scoped enum may be declared opaquely because its underlying type is fixed.
-// These are the ONE fold set; adding a second would reproduce exactly the
-// drift that got `is_literal_true` deleted.
-// What a guard evaluates to. `Unknown` means BOTH arms stay live, which is
-// the pre-existing behaviour and the safe default -- a verdict is only ever
-// an invitation to prune, never a requirement.
-enum class GuardVerdict {
-    Unknown,      // not decidable -- BOTH arms live, the pre-existing behaviour
-    AlwaysTrue,   // `if True:` / `if <narrowed>:`     -- the ELSE arm is dead
-    AlwaysFalse,  // `if False:` / `if not <narrowed>:` -- the BODY is dead
-};
-
-GuardVerdict literal_guard_verdict(const ast::Expr& condition);
-//
 // Structural type identity with Union members matched as an unordered SET at
 // every depth -- i.e. exactly what `Type::operator==` computes, minus its
 // union-order sensitivity, and nothing else relaxed. The sole caller is
@@ -325,47 +299,79 @@ enum class OwnScopeBindingKind { Assign, AnnAssign, ForTarget, NestedDef, Nested
 // Augmented assignment to a target (`self += 1`) needs no arm here: the
 // parser rejects it outright with its own SyntaxError before this scan ever
 // runs, so there is no silent case to cover.
+//
+// `in_dead_arm` (the visit callback's last parameter, and the recursion
+// parameter of the same name) reports whether the binding sits inside a
+// STATICALLY-DEAD arm -- the same arms visit(If)/visit(While) hand to
+// check_possibly_dead_suite, decided by the SAME literal_guard_verdict fold
+// set, deliberately: CLAUDE.md records that two rival notions of "literally
+// true" is exactly what got `is_literal_true` deleted, so there must not be
+// a second one here. Polarity is copied from those two visit methods rather
+// than re-derived -- for BOTH If and While, AlwaysFalse kills the body and
+// AlwaysTrue kills the orelse (the REASONS differ between the two, and
+// visit(While)'s own comment spells that out, but the MAPPING is identical).
+//
+// It is STICKY: `in_dead_arm ||` at each recursion, never a plain
+// reassignment, because dead regions NEST -- a "live" arm written inside a
+// dead one is still dead, exactly as DiagnosticSuppression's depth counter
+// encodes for the diagnostic side. A `for` target is reported with its
+// enclosing arm's deadness, and a For introduces no deadness of its own
+// (there is no condition to fold).
+//
+// Computing it for every caller costs a pure literal_guard_verdict call and
+// changes nothing for the two callers that ignore the parameter --
+// receiver_rebound_in_own_scope asks only "is this name bound anywhere" and
+// pre_bind_assignment_targets is module scope, where mypy genuinely DOES let
+// a dead arm commit the declared type (measured; see
+// pre_bind_function_body's own comment for the scope boundary).
 void for_each_own_scope_binding(
     const std::vector<ast::StmtPtr>& body,
-    const std::function<void(const std::string&, int, OwnScopeBindingKind, int)>& visit,
-    int enclosing_loop_start_line = 0) {
+    const std::function<void(const std::string&, int, OwnScopeBindingKind, int, bool)>& visit,
+    int enclosing_loop_start_line = 0, bool in_dead_arm = false) {
     for (const ast::StmtPtr& statement : body) {
         if (const auto* assign = dynamic_cast<const ast::Assign*>(statement.get())) {
             const int line = assign->span().start_line;
             for_each_bound_name(assign->target(), [&](const std::string& name) {
-                visit(name, line, OwnScopeBindingKind::Assign, enclosing_loop_start_line);
+                visit(name, line, OwnScopeBindingKind::Assign, enclosing_loop_start_line,
+                      in_dead_arm);
             });
         } else if (const auto* ann_assign = dynamic_cast<const ast::AnnAssign*>(statement.get())) {
             if (const auto* target_name = dynamic_cast<const ast::Name*>(&ann_assign->target())) {
                 visit(target_name->identifier(), ann_assign->span().start_line,
-                      OwnScopeBindingKind::AnnAssign, enclosing_loop_start_line);
+                      OwnScopeBindingKind::AnnAssign, enclosing_loop_start_line, in_dead_arm);
             }
         } else if (const auto* for_stmt = dynamic_cast<const ast::For*>(statement.get())) {
             const int loop_start =
                 enclosing_loop_start_line != 0 ? enclosing_loop_start_line : for_stmt->span().start_line;
             for_each_bound_name(for_stmt->target(), [&](const std::string& name) {
                 visit(name, for_stmt->span().start_line, OwnScopeBindingKind::ForTarget,
-                      enclosing_loop_start_line);
+                      enclosing_loop_start_line, in_dead_arm);
             });
-            for_each_own_scope_binding(for_stmt->body(), visit, loop_start);
-            for_each_own_scope_binding(for_stmt->orelse(), visit, loop_start);
+            for_each_own_scope_binding(for_stmt->body(), visit, loop_start, in_dead_arm);
+            for_each_own_scope_binding(for_stmt->orelse(), visit, loop_start, in_dead_arm);
         } else if (const auto* if_stmt = dynamic_cast<const ast::If*>(statement.get())) {
-            for_each_own_scope_binding(if_stmt->body(), visit, enclosing_loop_start_line);
-            for_each_own_scope_binding(if_stmt->orelse(), visit, enclosing_loop_start_line);
+            const GuardVerdict header = literal_guard_verdict(if_stmt->condition());
+            for_each_own_scope_binding(if_stmt->body(), visit, enclosing_loop_start_line,
+                                       in_dead_arm || header == GuardVerdict::AlwaysFalse);
+            for_each_own_scope_binding(if_stmt->orelse(), visit, enclosing_loop_start_line,
+                                       in_dead_arm || header == GuardVerdict::AlwaysTrue);
         } else if (const auto* while_stmt = dynamic_cast<const ast::While*>(statement.get())) {
             const int loop_start = enclosing_loop_start_line != 0 ? enclosing_loop_start_line
                                                                  : while_stmt->span().start_line;
-            for_each_own_scope_binding(while_stmt->body(), visit, loop_start);
-            for_each_own_scope_binding(while_stmt->orelse(), visit, loop_start);
+            const GuardVerdict header = literal_guard_verdict(while_stmt->condition());
+            for_each_own_scope_binding(while_stmt->body(), visit, loop_start,
+                                       in_dead_arm || header == GuardVerdict::AlwaysFalse);
+            for_each_own_scope_binding(while_stmt->orelse(), visit, loop_start,
+                                       in_dead_arm || header == GuardVerdict::AlwaysTrue);
         } else if (const auto* nested_def = dynamic_cast<const ast::FunctionDef*>(statement.get())) {
             visit(nested_def->name(), nested_def->span().start_line, OwnScopeBindingKind::NestedDef,
-                  enclosing_loop_start_line);
+                  enclosing_loop_start_line, in_dead_arm);
             // Its BODY is a different scope -- deliberately not descended
             // into, matching every other reason this file stops at that
             // boundary.
         } else if (const auto* nested_class = dynamic_cast<const ast::ClassDef*>(statement.get())) {
             visit(nested_class->name(), nested_class->span().start_line,
-                  OwnScopeBindingKind::NestedClass, enclosing_loop_start_line);
+                  OwnScopeBindingKind::NestedClass, enclosing_loop_start_line, in_dead_arm);
             // Its BODY is a different scope, for the same reason.
         }
     }
@@ -383,7 +389,11 @@ void for_each_own_scope_binding(
 bool receiver_rebound_in_own_scope(const std::string& name, const std::vector<ast::StmtPtr>& body) {
     bool shadowed = false;
     for_each_own_scope_binding(
-        body, [&](const std::string& bound_name, int, OwnScopeBindingKind, int) {
+        body, [&](const std::string& bound_name, int, OwnScopeBindingKind, int, bool) {
+        // `in_dead_arm` is deliberately IGNORED: this asks only whether the
+        // name is rebound anywhere in the scope, and a rebinding written in
+        // a statically-dead arm still creates the local (mypy's semantic
+        // analyzer runs there), so it shadows exactly as a live one does.
         if (bound_name == name) {
             shadowed = true;
         }
@@ -1333,7 +1343,15 @@ void TypeChecker::pre_bind_assignment_targets(const ast::Module& module) {
     std::map<std::string, int> first_binding_line;
     for_each_own_scope_binding(
         module.body(), [&first_binding_line](const std::string& name, int line,
-                                             OwnScopeBindingKind kind, int) {
+                                             OwnScopeBindingKind kind, int, bool) {
+            // `in_dead_arm` is deliberately IGNORED here, and that is the
+            // SCOPE BOUNDARY the function-scope fix must not cross. Measured
+            // 2026-09-21 against mypy 1.18.1: `if False: x = "s"` /
+            // `else: x = 1` / `print(x)` reveals `builtins.int` and is
+            // Success INSIDE a `def`, but reveals `builtins.str` and reports
+            // `Incompatible types in assignment` at MODULE scope (and in a
+            // class body). Skipping a dead arm here would therefore SILENCE
+            // a diagnostic mypy itself emits.
             if (kind == OwnScopeBindingKind::NestedDef ||
                 kind == OwnScopeBindingKind::NestedClass) {
                 return;
@@ -1391,8 +1409,72 @@ void TypeChecker::pre_bind_function_body(const std::vector<ast::StmtPtr>& body) 
     // mypy reports `Name "self" is used before definition  [used-before-def]`
     // at the store, and CPython raises the matching UnboundLocalError -- both
     // oracles reject a program this compiler accepted.
-    for_each_own_scope_binding(body, [this](const std::string& name, int line,
-                                           OwnScopeBindingKind kind, int loop_start_line) {
+    //
+    // A STATICALLY-DEAD ARM'S INFERRED BINDING DOES NOT DECIDE THE LINE
+    // (2026-09-21). `if False: x = "s"` / `else: x = 1` / `print(x)` inside a
+    // `def` is `mypy --strict` Success and CPython prints `1`, and this
+    // compiler reported a false `incompatible types in assignment` on the
+    // LIVE line: the dead arm filled the placeholder, committing `str` as the
+    // declared type, and the live assignment was then checked against it. The
+    // report lands on a LIVE statement, so `check_possibly_dead_suite`'s
+    // suppression -- which covers only diagnostics raised INSIDE the arm --
+    // could never reach it. Moving the placeholder LINE past the dead arm is
+    // what fixes it: the dead arm's assign then finds a placeholder whose
+    // line does not match, so it compares against `Unknown` (absorbing, no
+    // report) and leaves the placeholder for the LIVE assignment to fill.
+    //
+    // WHICH BINDING FORMS ARE SKIPPED, and every clause is measured:
+    //  - Assign (including a tuple unpack, which is an Assign with a
+    //    TupleExpr target) and ForTarget, in a dead arm -- mypy infers the
+    //    declared type from the LIVE arm only for these.
+    //  - AnnAssign is NOT skipped. An ANNOTATED dead binding DOES commit, at
+    //    every scope: `if False: x: str = "s"` / `else: x = 1` is
+    //    `Incompatible types in assignment` under mypy at function, nested-
+    //    function and method scope alike, and so is a bare `x: str`. The rule
+    //    is about INFERRED types only.
+    //  - NestedDef is NOT skipped either: a `def x()` in a dead arm followed
+    //    by `x = 1` is a mypy error, measured.
+    //
+    // When EVERY binding of a name is a skippable dead one, the first is
+    // used anyway (the `fallback` below) -- the name must still get a
+    // placeholder at some line, and no live binding exists to prefer.
+    //
+    // loop_start_line is carried from the CHOSEN binding, not from the
+    // first-visited one: it is the back-edge span of the loop the binding
+    // this placeholder actually represents sits inside, and pairing a live
+    // binding's line with a dead binding's loop span would break exactly the
+    // loop-carried-accumulator exemption Binding::loop_start_line exists for.
+    //
+    // THE SCOPE GATE IS STRUCTURAL, not a condition in this function: this
+    // pass runs for FUNCTION bodies only. Module scope goes through
+    // pre_bind_assignment_targets and a class body through
+    // pre_collect_class_body, and mypy genuinely reports at both -- see
+    // pre_bind_assignment_targets' own callback for that measurement.
+    struct ChosenBinding {
+        int line = 0;
+        int loop_start_line = 0;
+        OwnScopeBindingKind kind = OwnScopeBindingKind::Assign;
+    };
+    std::map<std::string, ChosenBinding> fallback;
+    std::map<std::string, ChosenBinding> chosen;
+    for_each_own_scope_binding(
+        body, [&fallback, &chosen](const std::string& name, int line, OwnScopeBindingKind kind,
+                                   int loop_start_line, bool in_dead_arm) {
+            if (kind == OwnScopeBindingKind::NestedClass) {
+                return;
+            }
+            fallback.emplace(name, ChosenBinding{line, loop_start_line, kind});
+            const bool dead_inferred =
+                in_dead_arm && (kind == OwnScopeBindingKind::Assign ||
+                                kind == OwnScopeBindingKind::ForTarget);
+            if (!dead_inferred) {
+                chosen.emplace(name, ChosenBinding{line, loop_start_line, kind});
+            }
+        });
+
+    for_each_own_scope_binding(body, [this, &fallback, &chosen](const std::string& name, int,
+                                                                OwnScopeBindingKind kind, int,
+                                                                bool) {
         if (kind == OwnScopeBindingKind::NestedClass) {
             // Deliberately UNBOUND, not merely unhandled. A nested class's
             // own name is a genuine same-scope binding form too (measured:
@@ -1421,8 +1503,40 @@ void TypeChecker::pre_bind_function_body(const std::vector<ast::StmtPtr>& body) 
             // can still execute AFTER this binding, on a later iteration, and
             // the ordering check must not mistake that back-edge for a
             // straight-line use-before-definition.
-            Binding placeholder{Type::unknown(), line, /*annotated=*/false};
-            placeholder.loop_start_line = loop_start_line;
+            // ONLY A BENIGNLY-FILLING KIND MAY MOVE THE LINE, and this
+            // clause is a UNION-RULE GUARD, not a refinement (2026-09-21,
+            // found by adversarial review of the fix above). The placeholder
+            // line decides which statement `is_unfilled_placeholder` lets
+            // "fill its own placeholder" instead of reporting a
+            // redefinition. For an Assign that is harmless -- rebinding a
+            // name is legal Python and mypy says nothing -- but
+            // bind_resolved_annotation (an AnnAssign) and visit(FunctionDef)
+            // (a nested def) route through the SAME predicate, and for those
+            // two the redefinition report is mypy's `[no-redef]`, which the
+            // move SILENCED. Measured 2026-09-21, eleven shapes went from a
+            // correct `name "x" already defined on line N` to exit 0:
+            // `if False: x = "s"` / `else: x: int = 1`, its flat,
+            // `while False:`, dead-`elif` and `else`-of-`if True:` siblings,
+            // the nested-function and method spellings, a bare `x: int`, and
+            // the three nested-`def` arrangements -- every one a mypy
+            // `[no-redef]` at exit 1, i.e. silent acceptance of a program an
+            // oracle rejects.
+            //
+            // FALL BACK ENTIRELY rather than skipping to the next benign
+            // binding, and that is measured too: with `if False: x = "s"` /
+            // `x: int = 1` / `x = 2`, skipping ahead to the `x = 2` on line 5
+            // would make the annotation on line 4 report `already defined on
+            // line 5` -- a FORWARD line reference -- where mypy says
+            // `already defined on line 3`, the dead arm's own line. Falling
+            // back reproduces mypy's line exactly.
+            const auto live = chosen.find(name);
+            const bool line_may_move =
+                live != chosen.end() && (live->second.kind == OwnScopeBindingKind::Assign ||
+                                         live->second.kind == OwnScopeBindingKind::ForTarget);
+            const ChosenBinding& picked =
+                line_may_move ? live->second : fallback.find(name)->second;
+            Binding placeholder{Type::unknown(), picked.line, /*annotated=*/false};
+            placeholder.loop_start_line = picked.loop_start_line;
             scopes_.bind(name, placeholder);
         }
     });
@@ -3598,11 +3712,45 @@ void TypeChecker::visit(const ast::If& node) {
     // is kept as a stored Union -- and a Union operand defers every operator
     // applied to it, turning otherwise-clean code into a false
     // NotImplementedError.
+    // A STATICALLY-DEAD ARM CONTRIBUTES NO EDGE EITHER, for exactly the
+    // reason above: its end-of-arm state is unreachable at the merge. This
+    // is the narrowing half of the 2026-09-21 dead-arm-binding fix, and it
+    // is NEEDED, measured rather than assumed -- with the declared type now
+    // taken from the LIVE arm (see pre_bind_function_body), the dead arm's
+    // own assignment still set a narrowing, so
+    //
+    //   def f() -> None:
+    //       if False:
+    //           x = "s"
+    //       else:
+    //           x = 1
+    //       print(x + 1)
+    //
+    // joined to `str | int` and drew `NotImplementedError: operations on a
+    // union-typed value require narrowing` -- mypy `Success`, CPython prints
+    // `2`. The same downstream union reaches `incompatible return value
+    // type` and `argument N has incompatible type` from the same root.
+    //
+    // NOT MIRRORED INTO visit(While)/visit(For), deliberately and on
+    // measurement, not by analogy: `while False: x = "s"` / `x = 1` /
+    // `print(x + 1)` and the `while True:`/`else:` sibling both already read
+    // `x` as `int` (verified with `--types`), because a loop joins the
+    // PRE-LOOP state against the end-of-body state rather than two sibling
+    // arms, and the pre-loop edge has no entry for a name the loop
+    // introduces. Adding an arm there would be untestable dead code.
+    //
+    // The both-dead case cannot arise (AlwaysTrue and AlwaysFalse are
+    // mutually exclusive for one header), and the existing "when dropping
+    // would leave no edges, keep both" fallback below is left in charge of
+    // a dead arm paired with an always-leaving live one.
+    const bool body_dead = header == GuardVerdict::AlwaysFalse;
+    const bool orelse_dead = header == GuardVerdict::AlwaysTrue;
+
     std::vector<NarrowingState> edges;
-    if (!always_leaves_branch(node.body())) {
+    if (!body_dead && !always_leaves_branch(node.body())) {
         edges.push_back(after_body);
     }
-    if (!always_leaves_branch(node.orelse())) {
+    if (!orelse_dead && !always_leaves_branch(node.orelse())) {
         edges.push_back(after_orelse);
     }
     if (edges.empty()) {
@@ -3869,11 +4017,14 @@ const ast::Name* bare_name_of(const ast::Expr& expr) {
     return dynamic_cast<const ast::Name*>(&expr);
 }
 
-// GuardVerdict is DEFINED near the top of this file, beside the note on the
-// deleted `is_literal_true`, because visit(If)/visit(While) sit above this
-// point and need its ENUMERATORS (an opaque declaration is not enough) to
-// prune a statically-dead arm. Its two producers stay here, with the
-// measurements they were written for.
+// GuardVerdict and the LITERAL fold that produces it MOVED OUT of this file
+// on 2026-09-21, into semantic/literal_guard.h/.cpp, because codegen's
+// Emitter::collect_scope_variables needs the same verdict and a second copy
+// of the fold would have recreated exactly the drift that got
+// `is_literal_true` deleted. Moved unchanged, measurements and all -- read
+// that file before widening the set. What stays here is the half that is
+// genuinely the type checker's own: narrowing_guard_verdict, which needs
+// `scopes_`, and guard_verdict, which combines the two sources.
 
 // Measured 2026-09-16: given `c: Literal[True]`, mypy treats `if c:` as
 // statically true and `if not c:` as statically false, and the `break` in the
@@ -3896,289 +4047,6 @@ GuardVerdict narrowing_guard_verdict(const ast::Expr& guard, const std::string& 
         }
     }
     return GuardVerdict::Unknown;
-}
-
-// The LITERAL_INT half of literal_guard_verdict, split out because the lexeme
-// test is the one place in this file where the cheap implementation is wrong in
-// the UNACCEPTABLE direction and so deserves to be read on its own.
-//
-// A WHITELIST, never a blacklist: fold only when every character is a decimal
-// digit or `_`. The obvious alternative -- "is the lexeme all zeros" -- folds
-// `0x0` TRUE, because `0x0` is not all zeros. mypy folds it FALSE (measured
-// 2026-09-17: `while c:` / `if 0x0: return 1` / `break` / `else: return 3` is
-// `Missing return statement [return]`, because the dead body leaves the `break`
-// live), so folding it TRUE would kill that break, guarantee the `else`, and
-// make cythonpp SILENT on a program mypy rejects. Verified via `--tokens` that
-// `0x0` really does arrive here as a LITERAL_INT whose lexeme is "0x0", and
-// that `0X0` arrives as "0X0" -- which is why this is a per-CHARACTER test and
-// not a check for the prefix `0x`: the upper-case spellings `0X`/`0O`/`0B` are
-// as much non-decimal as the lower-case ones (all six measured to fold FALSE),
-// and a prefix check written for one case admits the other.
-//
-// A LEADING ZERO followed by any nonzero digit is NOT a legal Python decimal
-// literal at all (`0_1`, `01`), and this returns Unknown for it rather than
-// folding it TRUE. Measured 2026-09-17: `if 0_1:` is a mypy BLOCKING
-// `Leading zeros in decimal integer literals are not permitted [syntax]` and a
-// CPython `SyntaxError`, so BOTH oracles reject the program; cythonpp has no
-// diagnostic of its own for it (a separate, pre-existing parser gap) and today
-// only exits non-zero because of the very `missing return statement` this fix
-// removes. Folding it TRUE would therefore turn a right-verdict/wrong-message
-// rejection into silent acceptance. `00`/`000`/`0_0` are legal and all-zero, so
-// they fold FALSE and are unaffected by this clause.
-GuardVerdict decimal_int_guard_verdict(const std::string& lexeme) {
-    char first_digit = '\0';
-    bool all_zero = true;
-    bool previous_was_underscore = false;
-    for (const char character : lexeme) {
-        if (character == '_') {
-            // UNDERSCORE PLACEMENT IS VALIDATED, NOT SKIPPED, and this is the
-            // same class of defect as the leading-zero clause below rather
-            // than a tidiness rule. Python's grammar puts a single underscore
-            // strictly BETWEEN digits, so a LEADING one, a TRAILING one, or a
-            // DOUBLED run is not an integer literal at all -- but the lexer
-            // still hands it over as LITERAL_INT (verified via --tokens:
-            // `1_`, `1__0` and `0_` all arrive here). Measured 2026-09-17,
-            // `if 1_:` is a mypy blocking `Invalid decimal literal  [syntax]`
-            // AND a CPython `SyntaxError: invalid decimal literal` at exit 1,
-            // so BOTH oracles reject the program. Skipping every `_`
-            // unconditionally folded `1_`/`1__0`/`1_2_`/`12__3` TRUE and
-            // `0_`/`0__0` FALSE, which REMOVED the missing-return that was
-            // cythonpp's only diagnostic on those programs -- silent
-            // acceptance of a doubly-rejected program, at all five wired
-            // sites including check_suite's suppression, and it reached
-            // codegen as a third state (the emitter strips the underscore, so
-            // `1_` emitted as C++ `py::int_(1)`, compiled at exit 0 and
-            // printed `1` where CPython prints nothing and exits 1). Found by
-            // adversarial review of the commit that introduced it.
-            if (first_digit == '\0' || previous_was_underscore) {
-                return GuardVerdict::Unknown;
-            }
-            previous_was_underscore = true;
-            continue;
-        }
-        if (character < '0' || character > '9') {
-            return GuardVerdict::Unknown;
-        }
-        previous_was_underscore = false;
-        if (first_digit == '\0') {
-            first_digit = character;
-        }
-        if (character != '0') {
-            all_zero = false;
-        }
-    }
-    if (previous_was_underscore) {
-        // A trailing underscore -- the other half of the placement rule
-        // above, and not reachable from the in-loop check.
-        return GuardVerdict::Unknown;
-    }
-    if (first_digit == '\0') {
-        // No digits at all -- not a spelling this function can read.
-        return GuardVerdict::Unknown;
-    }
-    if (all_zero) {
-        return GuardVerdict::AlwaysFalse;
-    }
-    if (first_digit == '0') {
-        return GuardVerdict::Unknown;
-    }
-    return GuardVerdict::AlwaysTrue;
-}
-
-// LITERAL CONDITION FOLDING, 2026-09-17. mypy prunes a statically-decided
-// branch before asking any reachability question; this compiler's reachability
-// helpers had no constant folding at all, which produced false positives in
-// four separate places on programs both oracles accept and run -- the most
-// ordinary of them needing no loop, no `break` and no dead code:
-// `def f() -> int:` / `if True: return 1` was a false
-// `missing return statement`.
-//
-// THE AUTHORITY IS MYPY'S OWN SOURCE, not a guess at its intent: the two
-// helpers at the top of `find_isinstance_check_helper`, mypy 1.18.1
-// `checker.py:8255`, are
-//
-//     def is_true_literal(n):  refers_to_fullname(n, "builtins.True")
-//                              or isinstance(n, IntExpr) and n.value != 0
-//     def is_false_literal(n): refers_to_fullname(n, "builtins.False")
-//                              or isinstance(n, IntExpr) and n.value == 0
-//
-// so an int literal folds BY VALUE (re-measured directly: `0x1`, `0b1`, `0o1`,
-// `1_0` and `(1)` all fold TRUE), and mypy's own prune set is wider than what
-// is implemented below.
-//
-// THE GATE IS THE AST SHAPE, NEVER THE TYPE -- a bare `ast::Constant` and
-// nothing else. This is the same discipline `emit_power` uses for `**`, adopted
-// for the same recorded reason: a NEGATIVE literal parses as
-// `UnaryOp(-, Constant)`, so the sign lives in a node the TYPE cannot see, and
-// `-1` types as `int` exactly as `1` does. Requiring a bare `Constant` excludes
-// `-1`, `+1` and `-0` for free, with no unary logic to get wrong -- and it is
-// mypy's own exclusion, structurally: `-1` is a `UnaryExpr`, never an
-// `IntExpr`, so it never reaches the test above, which is exactly why mypy
-// folds `(1)` but not `(-1)`. A type-based gate would be wrong in the
-// DANGEROUS direction. All three measured 2026-09-17: `if -1:`, `if +1:` and
-// `if -0:` guarding a return leave mypy reporting `Missing return statement`.
-//
-// TWO mypy-UNSOUND FORMS ARE EXCLUDED BY CONSTRUCTION, and a future widening
-// must not admit them. Measured 2026-09-17: mypy prunes `NotImplemented` as
-// always-true while CPython raises
-// `TypeError: NotImplemented should not be used in a boolean context` (exit 1),
-// and mypy prunes `not TYPE_CHECKING` while the pruned branch actually RUNS,
-// returning None from an `-> int` function. Following mypy on either would
-// compile a program CPython refuses to run. Both are bare `ast::Name`s, never
-// an `ast::Constant`, so neither can reach this function at all.
-//
-// THAT LAST SENTENCE IS ONLY TRUE WHILE `and`/`or` STAY OUT, and a future
-// widening must not read it as unconditional. Measured 2026-09-20: under the
-// Kleene rule below, `NotImplemented and False` folds FALSE from the DECIDING
-// SIBLING alone -- the bare Name never needs a verdict of its own, so
-// "excluded by construction" stops holding. It is harmless today only by
-// accident, because a bare `NotImplemented` draws a (NotSuppressible, and
-// itself wrong) `NameError` here, so the program still exits 1; close that
-// gap and the fold goes silent on a CPython-rejected program. Note this is
-// NOT the same as the `ZeroDivisionError` family, where cythonpp's own
-// runtime reproduces the failure faithfully -- there is no `NotImplemented`
-// in `runtime/` to reproduce anything with.
-//
-// AND THE CODEGEN HALF WOULD CLOSE AT THE SAME MOMENT, which is why this is
-// a warning and not a curiosity. Measured 2026-09-20: `--emit-cpp` on
-// `if NotImplemented and False:` refuses with no file written -- but the
-// refusal IS that same `NameError`, not a guard of the emitter's own. So the
-// reassuring-sounding claim "the emitter would refuse it anyway" is NOT
-// established; closing the `NameError` gap removes both defences together.
-// Whether anything downstream would then refuse it is UNDETERMINED and must
-// be measured, not assumed, by whoever closes that gap.
-//
-// DELIBERATE OMISSIONS, each measured-foldable under mypy and each left out:
-// `...` (ELLIPSIS), tuple displays (which fold by LENGTH -- `(0,)` folds TRUE),
-// `and`/`or`, and non-decimal int literals. For every one EXCEPT `and`/`or`,
-// omitting the form only ever RETAINS a false positive -- the safe direction
-// -- and adding it later is purely additive.
-//
-// `and`/`or` IS THE EXCEPTION, which is why it needs the paragraph below
-// rather than a line in this list: adding it is NOT purely additive, because
-// a deciding sibling can decide a condition whose other operand is a lexeme
-// BOTH ORACLES REJECT, removing a diagnostic rather than adding one. See
-// reason (2).
-//
-// `and`/`or` ARE EXCLUDED BY DECISION, NOT BY DIFFICULTY -- and the reason
-// recorded here until 2026-09-20 was WRONG, so do not restore it. It said
-// mypy's `and` is ONE-sided while its `or` is TWO-sided, so neither "is
-// expressible as a fold over operand verdicts the way `not` is". Every
-// premise is true and the conclusion is false: a fold over operand verdicts
-// expresses mypy's behaviour everywhere it was measured, and that asymmetry
-// IS the ordinary duality of three-valued logic (`and` short-circuits on
-// FALSE so one FALSE operand decides it; `or` short-circuits on TRUE so one
-// TRUE operand decides IT). Measured 2026-09-20: 52 verdict cells -- the 3x3
-// matrix for each operator, composition with every existing exclusion, n-ary
-// chains, mixed precedence, and name/call operands -- all Kleene, ZERO
-// mismatches. Every existing exclusion composes for free, `-1 and False`
-// folding FALSE because `False` decides what the signed literal cannot.
-//
-// BUT IT IS NOT AN EQUIVALENCE, and do not write that it is. Found by
-// adversarial review, re-derived here: mypy's `and`/`or` reachability is
-// TYPE-based (`can_be_false` over the narrowed type), not a fold over
-// operand verdicts, so it can be MORE decided than Kleene. Measured,
-// `if -1 and 1:` is `Missing return statement` -- UNDECIDED, both operands
-// being Unknown to mypy itself -- while `if (-1 and 1) or (-1 and 1):` is
-// `Success`, i.e. TRUE, where Kleene gives `Unknown or Unknown = Unknown`.
-// It needs int LITERAL types: the `0.0` and `""` spellings of the same shape
-// stay undecided. The divergence is always in the SAFE direction (a targeted
-// 196-case sweep found no case where Kleene decides and mypy does not), so a
-// Kleene fold would still be a strict subset -- but the subset property is
-// an EMPIRICAL result, not the equivalence it was first written as. The real reasons to decline are in
-// `.claude/specs/2026-09-20-boolop-condition-folding-design.md` and are about
-// VALUE, not expressibility:
-//   (1) the motivating idiom does not fold. A named `bool` debug flag is
-//       mypy-Unknown -- `DEBUG = True` / `if c or DEBUG:` is `Missing return
-//       statement`, and so is the `Final` spelling; only `Literal[True]`
-//       folds, and that needs an import the parser refuses. So only an inline
-//       bare literal folds, and for those the plain `if True:` / `if False:`
-//       spelling already folds today.
-//   (2) a Kleene fold would reverse the semantic half of `4c62de1` by a side
-//       route: `if 1_ or True: return 1` folds TRUE from the sibling, so the
-//       malformed lexeme never needs the verdict that commit deliberately
-//       withheld, and cythonpp's only diagnostic on a program BOTH oracles
-//       reject as a SyntaxError disappears. Five measured shapes. Guarding it
-//       needs poison-propagation through `not` and nested `BoolOp`s, which
-//       re-litigates `3d672c2`'s decision not to model Python's numeric
-//       grammar.
-//
-// EXCLUDED BECAUSE MYPY DOES NOT FOLD THEM, and including any would make
-// cythonpp accept a program mypy rejects: every signed number, float, complex,
-// str, bytes, list, dict and set. Note in particular that the falsy prune set
-// recorded elsewhere in this project as `{False, 0, None}` is INCOMPLETE rather
-// than wrong -- re-measured 2026-09-17, `()` is also pruned and `0.0` is NOT,
-// so the set is neither "numeric zero" nor "any empty container".
-GuardVerdict literal_guard_verdict(const ast::Expr& condition) {
-    // `not` INVERTS a decided operand and leaves an undecided one undecided,
-    // which is exactly mypy's behaviour and -- because it RECURSES -- gets the
-    // nesting and the exclusions for free rather than by enumeration.
-    // Measured 2026-09-17/18 in both directions: `not False`, `not 0`,
-    // `not None` and `not not True` fold TRUE; `not True`, `not 1` and
-    // `not not False` fold FALSE; and `not ""`, `not 0.0`, `not []`, `not -1`
-    // and `not 0x1` fold NEITHER -- the last five fall out with no special
-    // case at all, since their operands are Unknown and Unknown inverts to
-    // Unknown. Seven false positives closed, every one mypy-Success and
-    // CPython-clean.
-    //
-    // `and`/`or` are still excluded, but NOT because they cannot be written
-    // this way -- they can, and the claim that they cannot was refuted by
-    // measurement on 2026-09-20. A Kleene fold over operand verdicts matches
-    // mypy everywhere it was measured, so the arm would be a sibling of this
-    // one: `and` yields AlwaysFalse if ANY operand is AlwaysFalse and
-    // AlwaysTrue if ALL are AlwaysTrue; `or` is the dual. (It is a SUBSET of
-    // mypy, not an equivalence -- see the header block, which records the
-    // measured case where mypy is more decided than Kleene.) See that block
-    // for the two measured reasons it was declined anyway, both about VALUE
-    // rather than expressibility.
-    //
-    // A reader who implements it should know two shapes that are easy to get
-    // wrong. The loop must NOT early-exit on the first undecided operand --
-    // `"" and False` folds FALSE from the SECOND one. And `ast::BoolOp` is
-    // n-ary for an unparenthesised run (`a and b and c` is ONE node with
-    // three values) while a parenthesised same-operator run STAYS NESTED
-    // (`a and (b and c)` is a BoolOp inside a BoolOp), so a recursion written
-    // for only one of the two mis-folds the other.
-    if (const auto* unary = dynamic_cast<const ast::UnaryOp*>(&condition)) {
-        if (unary->op() == lexer::token_type::OP_NOT) {
-            switch (literal_guard_verdict(unary->operand())) {
-            case GuardVerdict::AlwaysTrue:
-                return GuardVerdict::AlwaysFalse;
-            case GuardVerdict::AlwaysFalse:
-                return GuardVerdict::AlwaysTrue;
-            case GuardVerdict::Unknown:
-                return GuardVerdict::Unknown;
-            }
-        }
-        // Any OTHER unary operator -- `-`, `+`, `~` -- is deliberately NOT
-        // looked through: measured, mypy folds neither `-1` nor `+1` nor `-0`,
-        // because the sign makes it a UnaryExpr and never an IntExpr. Falling
-        // through to the Constant cast below returns Unknown for them, which
-        // is the whole reason the gate is the AST SHAPE rather than the type.
-        return GuardVerdict::Unknown;
-    }
-    const auto* constant = dynamic_cast<const ast::Constant*>(&condition);
-    if (constant == nullptr) {
-        return GuardVerdict::Unknown;
-    }
-    switch (constant->type()) {
-    case lexer::token_type::BOOL_TRUE:
-        return GuardVerdict::AlwaysTrue;
-    case lexer::token_type::BOOL_FALSE:
-    case lexer::token_type::KEYWORD_NONE:
-        return GuardVerdict::AlwaysFalse;
-    case lexer::token_type::LITERAL_INT:
-        return decimal_int_guard_verdict(constant->lexeme());
-    default:
-        // A default is right here, the same judgement literal_type() makes for
-        // its own switch over the same enum: token_type has well over a
-        // hundred enumerators and all but these four are either not literals
-        // at all or measured NOT to fold. It is NOT the exhaustive-switch
-        // idiom `-Werror=switch` guards elsewhere in this codebase (TypeKind,
-        // DiagnosticKind, RuleResult::Status), where a missing case must be a
-        // compile error.
-        return GuardVerdict::Unknown;
-    }
 }
 
 // The two verdict sources are DISJOINT IN THEIR ANSWERS, which since
@@ -4266,8 +4134,12 @@ std::optional<std::string> TypeChecker::loop_narrows_truthy(const ast::While& lo
     // clause leaves its narrowing intact. Treating those as kills keeps a
     // false positive and silences nothing.
     bool rebound = false;
+    // `in_dead_arm` is deliberately IGNORED: this is already deliberately
+    // MORE conservative than mypy (see just above), and counting a
+    // dead-arm rebinding as a kill can only retain a false positive, never
+    // silence a real error.
     for_each_own_scope_binding(loop.body(),
-                               [&](const std::string& bound, int, OwnScopeBindingKind, int) {
+                               [&](const std::string& bound, int, OwnScopeBindingKind, int, bool) {
                                    if (bound == name) {
                                        rebound = true;
                                    }
