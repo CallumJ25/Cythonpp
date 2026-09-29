@@ -1623,14 +1623,21 @@ bool TypeChecker::fills_placeholder(const Binding& binding, int line) {
     // needed: a placeholder whose bound_at has been moved past a dead arm
     // must not be filled by the dead arm it was moved off.
     //
-    // !order_exempt is carried over verbatim from the single predicate this
-    // replaced, and is NOT a judgement made here. It looks redundant now that
-    // is_placeholder() answers the state question directly -- a parameter and
-    // a `for`/comprehension target are all DECLARED bindings, so none can
-    // reach this true anyway -- but "looks redundant" is not a measurement,
-    // and this project has twice kept a clause after measuring it defensive
-    // rather than deleting it on inspection (find_builtin_arity's `object`
-    // carve-out, assign_name's kind test). Neutering decides.
+    // !order_exempt is DEFENSIVE, measured, and pinned by NOTHING -- do not
+    // read it as a guard a future change would notice breaking. Neutered
+    // 2026-09-24: dropping it fails zero tests out of 1742, which confirms
+    // the reasoning it was carried over on (a parameter and a
+    // `for`/comprehension target are all DECLARED bindings, so none reaches
+    // is_placeholder() true in the first place). Kept anyway as the more
+    // precise formulation, exactly as find_builtin_arity's `object`
+    // carve-out and assign_name's kind test were kept after the same
+    // measurement.
+    //
+    // is_placeholder() itself is likewise unpinned here: dropping it also
+    // fails nothing. It STRENGTHENED this predicate when the state flag
+    // arrived (the old test was purely positional, so a non-placeholder
+    // binding sitting on the matching line used to pass), and green means
+    // nothing observable depended on that -- not that nothing could.
     return binding.is_placeholder() && binding.bound_at == OrderPosition::at_line(line) &&
            !binding.order_exempt;
 }
@@ -1646,7 +1653,17 @@ bool TypeChecker::has_prior_definition(const Binding& binding, int line) {
     // `if False: x = "s"` / `else: x: int = 1`, declared_at is the DEAD arm's
     // line, the annotation's own line differs, so there IS a prior definition
     // and mypy's own line is what gets named. Deriving that from bound_at
-    // instead is precisely the regression `3b83611` shipped.
+    // instead is precisely the regression `3b83611` shipped -- neutered
+    // 2026-09-24, and it fails exactly the test written for it.
+    //
+    // The !order_exempt and is_placeholder() clauses here are DEFENSIVE and
+    // pinned by nothing: neutered separately, each fails zero tests. Note
+    // !order_exempt is NOT redundant by inspection the way it is in
+    // fills_placeholder -- the spec proposed writing this predicate as a
+    // bare `declared_at != line`, and that form fills over a one-line
+    // `def f(x: int) -> None: x: str = "s"` parameter instead of reporting.
+    // The state flag is what actually prevents that today; the clause is
+    // belt as well as braces.
     return !(binding.is_placeholder() && binding.declared_at == line && !binding.order_exempt);
 }
 

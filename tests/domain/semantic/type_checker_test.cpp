@@ -8933,6 +8933,58 @@ TEST(TypeChecker, AReadInsideADeadArmBeforeANonBenignLiveBindingReportsBoth) {
     EXPECT_EQ(checked.diagnostics[1].line, 5);
 }
 
+// THE FILL-PRESERVE RULE. Binding::fill is called ON the placeholder and
+// carries BOTH of its positions forward rather than taking the filling
+// statement own line. That was true of the code from the day the split
+// landed and covered by NOTHING: the neutering that stamps the filling
+// line over the provenance failed ZERO tests out of 1742, which is exactly
+// the signal that a rule believed load-bearing is in fact unpinned.
+//
+// THE SHAPE NEEDS THREE STATEMENTS IN THIS ORDER, which is why no existing
+// test caught it: a DEAD arm binding (which supplies declared_at), then a
+// live PLAIN assign (which FILLS the placeholder, and whose line bound_at
+// already holds), and only THEN a redefinition that reports. Every
+// pre-existing test put the redefinition BEFORE the filling assignment, so
+// no fill had happened yet and there was no provenance to overwrite.
+//
+// Measured 2026-09-24: mypy says `already defined on line 3` -- the DEAD
+// arm own line -- for both spellings, and CPython runs both at exit 0. Only
+// mypy objects, so naming line 4 (the filling assignment) would be a line
+// neither oracle ever produces.
+TEST(TypeChecker, AFillDoesNotOverwriteTheProvenanceLine) {
+    for (const char* source :
+         {// the redefinition is an ANNOTATION
+          "def f() -> None:\n"
+          "    if False:\n"
+          "        x = \"s\"\n"
+          "    x = 1\n"
+          "    x: int = 2\n"
+          "    print(x)\n\n\nf()\n",
+          // the redefinition is a nested DEF
+          "def f() -> None:\n"
+          "    if False:\n"
+          "        x = \"s\"\n"
+          "    x = 1\n"
+          "    def x() -> None:\n"
+          "        pass\n"
+          "    x()\n\n\nf()\n"}) {
+        const Checked checked = check_module(source);
+        const auto redefinition =
+            std::find_if(checked.diagnostics.begin(), checked.diagnostics.end(),
+                         [](const diagnostics::Diagnostic& diagnostic) {
+                             return diagnostic.message.find("already defined") !=
+                                    std::string::npos;
+                         });
+        ASSERT_NE(redefinition, checked.diagnostics.end())
+            << "no redefinition reported:\n"
+            << source;
+        // Line 3, the DEAD arm. NOT line 4, the assignment that filled the
+        // placeholder -- that is what the neutering produces.
+        EXPECT_EQ(redefinition->message, "name \"x\" already defined on line 3")
+            << source;
+    }
+}
+
 // A FOLDED-FALSE LOOP HEADER means the body never executes, so a `break`
 // written in it cannot run and the `else` is guaranteed. Measured 2026-09-17:
 // `while False: break` / `else: return 1` is `mypy --strict` Success and
