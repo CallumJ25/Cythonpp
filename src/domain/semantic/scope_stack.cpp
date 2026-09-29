@@ -1,6 +1,35 @@
 #include "scope_stack.h"
 
+#include <utility>
+
 namespace cythonpp::domain::semantic {
+
+Binding Binding::placeholder(OrderPosition bound_at, int declared_at) {
+    // Type::unknown() is not a choice this factory makes on the caller's
+    // behalf -- it is what a placeholder IS. Unknown is absorbing, so a read
+    // that resolves to one is answered without a type claim, and the real
+    // type arrives from whichever statement later fills it.
+    return Binding(Type::unknown(), bound_at, declared_at, /*annotated=*/false,
+                   /*order_exempt=*/false, /*method_self=*/false, /*placeholder=*/true);
+}
+
+Binding Binding::declared(Type type, OrderPosition bound_at, int declared_at, bool annotated,
+                          bool order_exempt, bool method_self) {
+    return Binding(std::move(type), bound_at, declared_at, annotated, order_exempt, method_self,
+                   /*placeholder=*/false);
+}
+
+Binding Binding::fill(Type filled_type, bool annotated, bool order_exempt) const {
+    // BOTH positions come from `*this`, the placeholder being replaced, and
+    // neither from the filling statement -- see the declaration's comment for
+    // why that is invisible today and load-bearing the moment bound_at moves.
+    //
+    // method_self is false by construction: a method's own `self` is bound
+    // directly by visit(FunctionDef)'s parameter loop as a DECLARED binding
+    // and never goes through a placeholder, so there is nothing to preserve.
+    return Binding(std::move(filled_type), bound_at, declared_at, annotated, order_exempt,
+                   /*method_self=*/false, /*placeholder=*/false);
+}
 
 ScopeStack::ScopeStack() { scopes_.push_back(Scope{ScopeKind::Module, {}}); }
 
@@ -25,7 +54,7 @@ bool ScopeStack::bind(const std::string& name, Binding binding) {
 }
 
 void ScopeStack::rebind(const std::string& name, Binding binding) {
-    scopes_.back().bindings[name] = std::move(binding);
+    scopes_.back().bindings.insert_or_assign(name, std::move(binding));
 }
 
 Resolution ScopeStack::resolve(const std::string& name) const {

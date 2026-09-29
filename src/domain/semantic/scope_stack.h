@@ -4,20 +4,109 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "order_position.h"
 #include "type.h"
 
 namespace cythonpp::domain::semantic {
 
 enum class ScopeKind { Module, Class, Function, Comprehension };
 
-// A single name binding: the type it was inferred or declared to have, the
-// line it was bound at (for the ordering check a later task performs), and
-// whether it came from an explicit annotation.
+// A single name binding: the type it was inferred or declared to have, WHERE
+// it sits in execution order, WHERE it was first declared, and whether it
+// came from an explicit annotation.
+//
+// THE POSITION AND THE DECLARATION LINE ARE TWO FIELDS, AND WERE ONE `int`
+// (`declared_line`) UNTIL 2026-09-23. They are split because that one field
+// was answering three different questions, and they were measured pulling in
+// three directions:
+//
+//   P  position    bound_at >= statement_line_     is this name bound yet at
+//                  (ExpressionTyper::type_of_name) this read?
+//   S  state       bound_at == this statement      is this an unfilled
+//                  (is_unfilled_placeholder)       placeholder I should fill?
+//   V  provenance  "already defined on line N"     where was it FIRST bound?
+//
+// The dead-arm fix (`3b83611`) needed P to move PAST a statically-dead arm's
+// inferred binding, so the LIVE assignment is the one that fills the
+// placeholder. Moving the single field made the live binding satisfy S as
+// well -- and two of the six is_unfilled_placeholder callers read a TRUE
+// answer as "there is no prior definition, so do not report [no-redef]".
+// FOURTEEN measured shapes went from a correct `name "x" already defined on
+// line N` at exit 1 to exit 0, on programs `mypy --strict` REJECTS and
+// CPython accepts: the never-acceptable direction. Found by adversarial
+// review, not by the suite.
+//
+// The fix at the time was a `kind` whitelist (`line_may_move`) inside
+// pre_bind_function_body, arbitrating between the three jobs from outside.
+// Neutered 2026-09-23 to confirm it was load-bearing rather than assumed:
+// dropping it failed exactly one test out of 1741,
+// ALiveAnnotatedOrNestedDefBindingDoesNotTakeTheMovedLine.
 struct Binding {
+    // JOB S, and the reason construction goes through a NAMED factory rather
+    // than aggregate initialization: whether a binding is a still-unfilled
+    // PLACEHOLDER (put there by pre_bind_assignment_targets /
+    // pre_bind_function_body so a read above the real assignment resolves to
+    // something) or a REAL declaration used to be inferred from
+    // `bound_at == the statement's line`. That is how jobs S and P came to
+    // share a field, and it is what broke when P had to move (see this
+    // struct's own header comment).
+    //
+    // A DEFAULTED `bool placeholder = false` would have been the easy version
+    // and is wrong here for a reason this codebase records twice over: under
+    // aggregate initialization an omitted member is value-initialized, so a
+    // new defaulted field leaves all NINETEEN construction sites silently
+    // meaning what they meant before, and the two that create placeholders
+    // have to REMEMBER to opt in. That is exactly the "a default is the thing
+    // a caller forgets" failure DiagnosticSink::report's mandatory
+    // Suppressibility and CodegenMode's deliberately-absent default exist to
+    // prevent. An enum with no default initializer does not help either --
+    // value-initialization picks enumerator 0, so whichever state is spelled
+    // first becomes the silent one.
+    //
+    // So: no default constructor, no aggregate init, and every site says
+    // which kind it is building.
+    static Binding placeholder(OrderPosition bound_at, int declared_at);
+    static Binding declared(Type type, OrderPosition bound_at, int declared_at,
+                            bool annotated = false, bool order_exempt = false,
+                            bool method_self = false);
+
+    Binding() = delete;
+
+    bool is_placeholder() const { return placeholder_; }
+
+    // THE FILL TRANSITION. Called ON the placeholder, returns the DECLARED
+    // binding that replaces it -- and keeps BOTH of this placeholder's
+    // positions rather than taking the filling statement's.
+    //
+    // Structural rather than remembered, because remembering is what fails.
+    // Today `bound_at` and `declared_at` are equal everywhere, and the
+    // filling statement is BY CONSTRUCTION the one whose line they hold (that
+    // is what fills_placeholder tests), so stamping the filler's own line
+    // would be invisible. The moment bound_at moves past a dead arm the two
+    // diverge, and a fill that re-stamped declared_at would make every LATER
+    // `already defined on line N` name the live line where mypy names the
+    // dead arm's. Pinned by its own neutering; no pre-existing test covers it.
+    Binding fill(Type filled_type, bool annotated = false, bool order_exempt = false) const;
+
     Type type;
-    int declared_line = 0;
+
+    // JOB P. Where this binding sits in its scope's execution order. MAY be
+    // moved past a statically-dead arm's inferred binding, which is the
+    // whole reason it is no longer the same field as declared_at. See
+    // OrderPosition for why it is a distinct type and not a second `int`.
+    OrderPosition bound_at;
+
+    // JOB V. The line this name was FIRST bound at in this scope, and the
+    // line every `already defined on line N` diagnostic names. NEVER moves:
+    // it is what a reader is told to go and look at, so it must keep
+    // matching mypy's own answer. Measured -- with `if False: x = "s"` /
+    // `x: int = 1` / `x = 2`, mypy says line 3, the DEAD arm's own line, so
+    // this staying at the first binding overall is what reproduces mypy
+    // exactly and what makes a forward line reference unrepresentable.
+    int declared_at = 0;
 
     // True when the binding came from an explicit annotation. Re-annotating
     // an annotated name is a redefinition error; re-ASSIGNING it is an
@@ -27,7 +116,7 @@ struct Binding {
     // General rule: a binding is order-exempt when the name is bound BEFORE
     // the code that may read it, so a same-line read of it can never be a
     // genuine use-before-definition. The ordinary ordering check's `>=`
-    // (declared_line >= statement_line_, deliberately `>=` so `x = x + 1`
+    // (bound_at >= statement_line_, deliberately `>=` so `x = x + 1`
     // still trips) cannot tell "same line because bound first" apart from
     // "same line because read first" on its own -- this flag is how the
     // binding site, which does know which one it is, tells
@@ -48,7 +137,7 @@ struct Binding {
     //
     // The flag also lets assign_to/assign_name tell a parameter apart from
     // pre_bind_function_body's own "still-unfilled placeholder" pattern
-    // (same test, declared_line == the current statement's line) -- without
+    // (same test, bound_at == the current statement's line) -- without
     // it, `def f(x: int) -> None: x = "s"` would be mistaken for the
     // placeholder-fill case and silently REBIND over the parameter's
     // annotation instead of reporting the incompatible assignment.
@@ -136,12 +225,14 @@ struct Binding {
     // same shape with a MATCHING name is mypy-clean, so "unknown names means
     // report" would have been a false positive on the second.
     //
-    // Declared LAST on purpose: every existing brace-initialisation of a
-    // Binding passes one to five members positionally, and appending keeps
-    // all of them meaning what they say. Filled by assignment at the two
-    // sites that have names, never positionally. (`method_self` was inserted
-    // ABOVE this member for the same reason -- appending it below would have
-    // pushed `param_names` off the end of the positional prefix.)
+    // Filled by assignment at the two sites that have names, never through a
+    // factory. STALE RATIONALE CORRECTED 2026-09-24: this used to explain the
+    // field's position in terms of "every existing brace-initialisation of a
+    // Binding passes one to five members positionally", and warned that
+    // `method_self` had to be inserted ABOVE it to stay inside the positional
+    // prefix. Binding is no longer brace-initialisable anywhere (see the
+    // factories at the top of this struct), so there is no positional prefix
+    // to protect and member order is now free.
     std::vector<std::string> param_names;
 
     // The source-line where the OUTERMOST enclosing `for`/`while` loop this
@@ -183,11 +274,11 @@ struct Binding {
     // measured all three, all `Success`. This field is the line-number-only
     // approximation of that join: ExpressionTyper::type_of_name treats a read
     // as exempt from the ordering check when its own line is `>=` this one.
-    // No upper bound is stored or checked -- a binding's own `declared_line`
+    // No upper bound is stored or checked -- a binding's own `bound_at`
     // is always `<= ` the true end of whatever loop `loop_start_line` names,
-    // by construction, and this arm is only ever reached when `declared_line
-    // >= ` the read's line already, so the read's line is trapped below
-    // `declared_line` too; storing a redundant upper bound would be untestable
+    // by construction, and this arm is only ever reached when `bound_at
+    // >= ` the read's position already, so the read is trapped below
+    // `bound_at` too; storing a redundant upper bound would be untestable
     // dead data.
     //
     // GATED, in the READER (not here), on the name ALSO resolving in an
@@ -205,7 +296,7 @@ struct Binding {
     // been typed against this exact placeholder in the same single
     // top-to-bottom pass check_suite performs, so nothing downstream ever
     // needs to consult this field on the filled-in Binding.
-    int loop_start_line = 0;
+    OrderPosition loop_start_line;
 
     // True while this binding is a mypy PARTIAL NONE type: created by an
     // UNANNOTATED assignment whose value is `None`, and not yet resolved.
@@ -292,11 +383,23 @@ struct Binding {
     // value ExpressionTyper types as Unknown -- mutually exclusive at the one
     // creation site in TypeChecker::assign_name.
     //
-    // Declared LAST, after partial_none, per this struct's own convention
-    // about positional brace-initialisation (see param_names' comment):
-    // appending keeps every existing Binding{...} meaning what it says, and
-    // this member is only ever filled by assignment.
+    // Declared last, and only ever filled by assignment after construction --
+    // like param_names, and unlike everything the factories take. STALE
+    // RATIONALE CORRECTED 2026-09-24: this used to justify the position by
+    // appending keeping "every existing Binding{...} meaning what it says".
+    // There is no aggregate initialization of Binding any more (see the
+    // factories at the top of this struct), so field ORDER no longer carries
+    // meaning for callers at all; only the factory parameter lists do.
     std::optional<Type> partial_container;
+
+private:
+    Binding(Type type, OrderPosition bound_at, int declared_at, bool annotated,
+            bool order_exempt, bool method_self, bool placeholder)
+        : type(std::move(type)), bound_at(bound_at), declared_at(declared_at),
+          annotated(annotated), order_exempt(order_exempt), method_self(method_self),
+          placeholder_(placeholder) {}
+
+    bool placeholder_ = false;
 };
 
 // What a lookup found, and WHERE, because the ordering rule (3b) depends on

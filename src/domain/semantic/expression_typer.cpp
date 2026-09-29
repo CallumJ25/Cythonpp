@@ -404,7 +404,7 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
     // binding is already too late.
     //
     // order_exempt is checked
-    // FIRST, ahead of the `>=`, because a parameter's declared_line is the
+    // FIRST, ahead of the `>=`, because a parameter's bound_at is the
     // `def` line -- which for a one-line suite (`def f(x: int) -> None:
     // print(x)`) is the SAME line the body statement sits on, so `>=` alone
     // would misfire a false "used before definition" on every one-line def
@@ -421,12 +421,12 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
     // binding can still execute AFTER it, on a later iteration, which a
     // plain line-number comparison cannot see). No UPPER bound
     // (`statement_line_ <= loop_end_line`) is checked, deliberately: this arm
-    // is only ever reached when `declared_line >= statement_line_` already
+    // is only ever reached when `bound_at >= statement_line_` already
     // holds (the surrounding `if`'s own condition, checked below), and
-    // `declared_line` is itself always `<= loop_end_line` by construction --
+    // `bound_at` is itself always `<= loop_end_line` by construction --
     // pre_bind_function_body only ever tags a placeholder with a loop's
     // bounds when the placeholder's own line came from inside that exact
-    // loop's recursive walk. So `statement_line_ <= declared_line <=
+    // loop's recursive walk. So `statement_line_ <= bound_at <=
     // loop_end_line` is an invariant, not something this arm needs to assert;
     // adding it back would be dead code no neuter could ever prove
     // load-bearing. GATED on the name ALSO resolving in an ENCLOSING scope:
@@ -436,11 +436,11 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
     // Binding::loop_start_line being set is not sufficient on its own, see
     // bound_in_an_enclosing_scope's own comment.
     const bool loop_back_edge_exemption =
-        resolution.binding->loop_start_line != 0 &&
+        resolution.binding->loop_start_line.is_set() &&
         statement_line_ >= resolution.binding->loop_start_line &&
         scopes_.bound_in_an_enclosing_scope(name.identifier());
     if (resolution.in_own_scope && !resolution.binding->order_exempt &&
-        !loop_back_edge_exemption && resolution.binding->declared_line >= statement_line_) {
+        !loop_back_edge_exemption && resolution.binding->bound_at >= statement_line_) {
         return error(name, DiagnosticKind::NameError,
                      "name '" + name.identifier() + "' is used before definition");
     }
@@ -458,7 +458,9 @@ Type ExpressionTyper::type_of_name(const ast::Name& name) {
     return resolution.binding->type;
 }
 
-void ExpressionTyper::set_statement_line(int line) { statement_line_ = line; }
+void ExpressionTyper::set_statement_line(int line) {
+    statement_line_ = OrderPosition::at_line(line);
+}
 
 Type ExpressionTyper::type_of_unary_op(const ast::UnaryOp& unary) {
     const ast::Expr& operand_expr = unary.operand();
@@ -1109,9 +1111,6 @@ Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
 
         if (const auto* name_target = dynamic_cast<const ast::Name*>(clause.target.get())) {
             const ast::SourceSpan target_span = name_target->span();
-            Binding binding;
-            binding.type = element_type_value;
-            binding.declared_line = target_span.start_line;
             // order_exempt=true: the THIRD site needing this exemption (see
             // Binding::order_exempt's own comment -- function parameters were
             // the first, a `for` target the second). A comprehension target
@@ -1119,11 +1118,13 @@ Type ExpressionTyper::type_of_list_comp(const ast::ListComp& list_comp) {
             // clause's iterable/condition are ever typed, so a same-line read
             // of it (`[v * v for v in values]`, all on one line) can never be
             // a genuine use-before-definition. Without this, the ordinary
-            // `declared_line >= statement_line_` check misfires on nearly
+            // `bound_at >= statement_line_` check misfires on nearly
             // every list comprehension, since a comprehension's target,
             // element and enclosing statement are overwhelmingly written on
             // one line.
-            binding.order_exempt = true;
+            const Binding binding = Binding::declared(
+                element_type_value, OrderPosition::at_line(target_span.start_line),
+                target_span.start_line, /*annotated=*/false, /*order_exempt=*/true);
             scopes_.bind(name_target->identifier(), binding);
             // This target now means something entirely different from
             // whatever an enclosing scope's same-spelled name meant, so any

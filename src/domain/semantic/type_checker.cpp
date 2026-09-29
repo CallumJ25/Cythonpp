@@ -1228,8 +1228,9 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
                 // occupies the name.
                 const std::vector<std::string> param_names =
                     param_names_of(function_def->params());
-                Binding signature{signature_type, function_def->span().start_line,
-                                  /*annotated=*/true};
+                Binding signature = Binding::declared(
+                    signature_type, OrderPosition::at_line(function_def->span().start_line),
+                    function_def->span().start_line, /*annotated=*/true);
                 // Assigned rather than passed positionally, so the four
                 // members above keep meaning what they say -- see
                 // Binding::param_names' own comment.
@@ -1286,7 +1287,7 @@ void TypeChecker::collect_signatures(const ast::Module& module) {
                     }
                     report(*function_def, DiagnosticKind::SemanticAnalyzerTypeError,
                           "name \"" + function_def->name() + "\" already defined on line " +
-                              std::to_string(bound.binding->declared_line));
+                              std::to_string(bound.binding->declared_at));
                 } else {
                     def_bound_names.insert(function_def->name());
                 }
@@ -1306,7 +1307,7 @@ void TypeChecker::pre_bind_assignment_targets(const ast::Module& module) {
     // placeholder carries, which is a different question and was wrong: the
     // placeholder used to be stamped with the line of the first TOP-LEVEL
     // assignment, even when an EARLIER statement inside an `if`/`while`/`for`
-    // already bound the same name. is_unfilled_placeholder then refused to
+    // already bound the same name. fills_placeholder then refused to
     // let that earlier, genuinely-first assignment fill it (the lines did not
     // match), so the LATER top-level one won the declared type, which is not
     // mypy's rule and not CPython's behaviour.
@@ -1374,10 +1375,10 @@ void TypeChecker::pre_bind_target(const ast::Expr& target, int line,
             // The fallback is this statement's own line, which is what every
             // name whose first binding IS this statement resolves to anyway.
             const auto first = first_binding_line.find(name->identifier());
-            const int declared_line =
+            const int first_line =
                 first != first_binding_line.end() ? first->second : line;
             scopes_.bind(name->identifier(),
-                         Binding{Type::unknown(), declared_line, /*annotated=*/false});
+                         Binding::placeholder(OrderPosition::at_line(first_line), first_line));
         }
         return;
     }
@@ -1450,31 +1451,40 @@ void TypeChecker::pre_bind_function_body(const std::vector<ast::StmtPtr>& body) 
     // pre_bind_assignment_targets and a class body through
     // pre_collect_class_body, and mypy genuinely reports at both -- see
     // pre_bind_assignment_targets' own callback for that measurement.
-    struct ChosenBinding {
+    struct ScopeBinding {
         int line = 0;
         int loop_start_line = 0;
-        OwnScopeBindingKind kind = OwnScopeBindingKind::Assign;
     };
-    std::map<std::string, ChosenBinding> fallback;
-    std::map<std::string, ChosenBinding> chosen;
+    // TWO MAPS, ONE PER JOB. They were already both built before 2026-09-24;
+    // what changed is that a `kind` whitelist used to pick ONE of them to
+    // feed a single shared position, and now each feeds its own field:
+    //   first_live    -> Binding::bound_at    (job P, may move past a dead arm)
+    //   first_overall -> Binding::declared_at (job V, the line diagnostics name)
+    // `kind` is no longer stored on either. It was read at exactly two
+    // places, both inside the deleted whitelist; the lambda below still needs
+    // its own `kind` PARAMETER for the NestedClass skip and the dead_inferred
+    // test, which is a different thing.
+    std::map<std::string, ScopeBinding> first_overall;
+    std::map<std::string, ScopeBinding> first_live;
     for_each_own_scope_binding(
-        body, [&fallback, &chosen](const std::string& name, int line, OwnScopeBindingKind kind,
-                                   int loop_start_line, bool in_dead_arm) {
+        body, [&first_overall, &first_live](const std::string& name, int line,
+                                            OwnScopeBindingKind kind, int loop_start_line,
+                                            bool in_dead_arm) {
             if (kind == OwnScopeBindingKind::NestedClass) {
                 return;
             }
-            fallback.emplace(name, ChosenBinding{line, loop_start_line, kind});
+            first_overall.emplace(name, ScopeBinding{line, loop_start_line});
             const bool dead_inferred =
                 in_dead_arm && (kind == OwnScopeBindingKind::Assign ||
                                 kind == OwnScopeBindingKind::ForTarget);
             if (!dead_inferred) {
-                chosen.emplace(name, ChosenBinding{line, loop_start_line, kind});
+                first_live.emplace(name, ScopeBinding{line, loop_start_line});
             }
         });
 
-    for_each_own_scope_binding(body, [this, &fallback, &chosen](const std::string& name, int,
-                                                                OwnScopeBindingKind kind, int,
-                                                                bool) {
+    for_each_own_scope_binding(body, [this, &first_overall, &first_live](
+                                         const std::string& name, int, OwnScopeBindingKind kind,
+                                         int, bool) {
         if (kind == OwnScopeBindingKind::NestedClass) {
             // Deliberately UNBOUND, not merely unhandled. A nested class's
             // own name is a genuine same-scope binding form too (measured:
@@ -1506,7 +1516,7 @@ void TypeChecker::pre_bind_function_body(const std::vector<ast::StmtPtr>& body) 
             // ONLY A BENIGNLY-FILLING KIND MAY MOVE THE LINE, and this
             // clause is a UNION-RULE GUARD, not a refinement (2026-09-21,
             // found by adversarial review of the fix above). The placeholder
-            // line decides which statement `is_unfilled_placeholder` lets
+            // line decides which statement `fills_placeholder` lets
             // "fill its own placeholder" instead of reporting a
             // redefinition. For an Assign that is harmless -- rebinding a
             // name is legal Python and mypy says nothing -- but
@@ -1529,14 +1539,24 @@ void TypeChecker::pre_bind_function_body(const std::vector<ast::StmtPtr>& body) 
             // line 5` -- a FORWARD line reference -- where mypy says
             // `already defined on line 3`, the dead arm's own line. Falling
             // back reproduces mypy's line exactly.
-            const auto live = chosen.find(name);
-            const bool line_may_move =
-                live != chosen.end() && (live->second.kind == OwnScopeBindingKind::Assign ||
-                                         live->second.kind == OwnScopeBindingKind::ForTarget);
-            const ChosenBinding& picked =
-                line_may_move ? live->second : fallback.find(name)->second;
-            Binding placeholder{Type::unknown(), picked.line, /*annotated=*/false};
-            placeholder.loop_start_line = picked.loop_start_line;
+            const ScopeBinding& provenance = first_overall.find(name)->second;
+            // A name bound ONLY in dead arms has no live binding to prefer,
+            // so the position falls back to the first binding overall -- the
+            // placeholder still has to sit somewhere.
+            const auto live = first_live.find(name);
+            const ScopeBinding& position =
+                live != first_live.end() ? live->second : provenance;
+            Binding placeholder =
+                Binding::placeholder(OrderPosition::at_line(position.line), provenance.line);
+            // The loop span pairs with the POSITION, not the provenance: it
+            // is the back-edge of the loop the binding this placeholder's
+            // ordering answer represents sits inside. Pairing a live
+            // binding's line with a dead binding's loop span would break the
+            // loop-carried-accumulator exemption Binding::loop_start_line
+            // exists for.
+            placeholder.loop_start_line = position.loop_start_line != 0
+                                              ? OrderPosition::at_line(position.loop_start_line)
+                                              : OrderPosition::unset();
             scopes_.bind(name, placeholder);
         }
     });
@@ -1553,7 +1573,7 @@ TypeChecker::AnnotationBinding TypeChecker::bind_resolved_annotation(const ast::
     AnnotationBinding info{type, false};
     if (scopes_.bound_in_current_scope(target.identifier())) {
         const Resolution existing = scopes_.resolve(target.identifier());
-        if (is_unfilled_placeholder(*existing.binding, line)) {
+        if (!has_prior_definition(*existing.binding, line)) {
             // Task 18: this exact statement's own still-unfilled placeholder
             // from pre_bind_function_body (a nested AnnAssign inside a
             // function body, placeholder-bound so an earlier same-scope
@@ -1565,24 +1585,27 @@ TypeChecker::AnnotationBinding TypeChecker::bind_resolved_annotation(const ast::
             // so this branch is new surface area with no existing caller to
             // disturb.
             //
-            // Routed through is_unfilled_placeholder (rather
-            // than the raw declared_line == line this used before) so an
-            // order_exempt PARAMETER binding is never mistaken for this
+            // Routed through has_prior_definition (GROUP R -- this site
+            // decides a `[no-redef]`, not which statement commits a type) so
+            // an order_exempt PARAMETER binding is never mistaken for this
             // function's own unfilled placeholder -- a same-line annotated
             // re-assignment of a parameter (`def f(x: int) -> None:
             // x: str = "s"`) must fall through to the redefinition report
             // below, exactly like the multi-line form already does, instead
             // of silently rebinding over the parameter's real annotation.
-            scopes_.rebind(target.identifier(), Binding{type, line, /*annotated=*/true});
+            scopes_.rebind(target.identifier(),
+                           existing.binding->fill(type, /*annotated=*/true));
             return info;
         }
         report(target, DiagnosticKind::SemanticAnalyzerTypeError,
               "name \"" + target.identifier() + "\" already defined on line " +
-                  std::to_string(existing.binding->declared_line));
+                  std::to_string(existing.binding->declared_at));
         info.redefinition = true;
         return info;
     }
-    scopes_.bind(target.identifier(), Binding{type, line, /*annotated=*/true});
+    scopes_.bind(target.identifier(),
+                 Binding::declared(type, OrderPosition::at_line(line), line,
+                                   /*annotated=*/true));
     return info;
 }
 
@@ -1592,8 +1615,39 @@ void TypeChecker::visit(const ast::Assign& node) {
     assign_to(node.target(), node.value(), line);
 }
 
-bool TypeChecker::is_unfilled_placeholder(const Binding& binding, int line) {
-    return binding.declared_line == line && !binding.order_exempt;
+bool TypeChecker::fills_placeholder(const Binding& binding, int line) {
+    // GROUP F -- "should THIS statement commit the declared type?" Asked by
+    // assign_to (twice), assign_name and visit(For)'s tuple arm.
+    //
+    // is_placeholder() is the STATE; bound_at is the POSITION. Both are
+    // needed: a placeholder whose bound_at has been moved past a dead arm
+    // must not be filled by the dead arm it was moved off.
+    //
+    // !order_exempt is carried over verbatim from the single predicate this
+    // replaced, and is NOT a judgement made here. It looks redundant now that
+    // is_placeholder() answers the state question directly -- a parameter and
+    // a `for`/comprehension target are all DECLARED bindings, so none can
+    // reach this true anyway -- but "looks redundant" is not a measurement,
+    // and this project has twice kept a clause after measuring it defensive
+    // rather than deleting it on inspection (find_builtin_arity's `object`
+    // carve-out, assign_name's kind test). Neutering decides.
+    return binding.is_placeholder() && binding.bound_at == OrderPosition::at_line(line) &&
+           !binding.order_exempt;
+}
+
+bool TypeChecker::has_prior_definition(const Binding& binding, int line) {
+    // GROUP R -- "was there a prior binding mypy considers a DEFINITION?"
+    // Asked by bind_resolved_annotation and visit(FunctionDef), both of which
+    // report `[no-redef]` when the answer is yes.
+    //
+    // A DIFFERENT QUESTION from group F's, and that is the whole point of the
+    // split. It reads declared_at, which never moves, so the dead-arm shapes
+    // answer correctly with no `kind` whitelist: with
+    // `if False: x = "s"` / `else: x: int = 1`, declared_at is the DEAD arm's
+    // line, the annotation's own line differs, so there IS a prior definition
+    // and mypy's own line is what gets named. Deriving that from bound_at
+    // instead is precisely the regression `3b83611` shipped.
+    return !(binding.is_placeholder() && binding.declared_at == line && !binding.order_exempt);
 }
 
 void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int line) {
@@ -1617,10 +1671,10 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
         Type expected = Type::unknown();
         if (scopes_.bound_in_current_scope(name->identifier())) {
             const Resolution existing = scopes_.resolve(name->identifier());
-            if (!is_unfilled_placeholder(*existing.binding, line)) {
+            if (!fills_placeholder(*existing.binding, line)) {
                 // A genuine prior binding (not this exact statement's own
                 // still-unfilled placeholder, and not a same-line parameter
-                // -- see is_unfilled_placeholder) -- use its type as
+                // -- see fills_placeholder) -- use its type as
                 // bidirectional context.
                 expected = existing.binding->type;
             }
@@ -1628,7 +1682,7 @@ void TypeChecker::assign_to(const ast::Expr& target, const ast::Expr& value, int
         const Type value_type = typer_.type_of(value, expected);
 
         const bool is_new_definition = !scopes_.bound_in_current_scope(name->identifier()) ||
-                                       is_unfilled_placeholder(
+                                       fills_placeholder(
                                            *scopes_.resolve(name->identifier()).binding, line);
         // A bare empty container does NOT declare the variable's type in
         // mypy: it records a PARTIAL type and takes the declared type from
@@ -1803,14 +1857,15 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
                               bool order_exempt,
                               const std::optional<Type>& partial_container) {
     if (!scopes_.bound_in_current_scope(target.identifier())) {
-        Binding fresh{value_type, line, /*annotated=*/false, order_exempt};
+        Binding fresh = Binding::declared(value_type, OrderPosition::at_line(line), line,
+                                          /*annotated=*/false, order_exempt);
         fresh.partial_none = seeds_partial_none(value_type, order_exempt);
         fresh.partial_container = partial_container;
         scopes_.bind(target.identifier(), fresh);
         return;
     }
     const Resolution existing = scopes_.resolve(target.identifier());
-    if (is_unfilled_placeholder(*existing.binding, line)) {
+    if (fills_placeholder(*existing.binding, line)) {
         // This statement owns a still-unfilled placeholder from
         // pre_bind_assignment_targets/pre_bind_function_body (or is
         // re-visiting its own earlier tuple element within the same
@@ -1827,7 +1882,7 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
         // like the bug order_exempt exists to prevent. An ordinary Assign's
         // own placeholder-fill call never passes true, so this is a no-op for
         // every pre-existing caller.
-        Binding filled{value_type, line, /*annotated=*/false, order_exempt};
+        Binding filled = existing.binding->fill(value_type, /*annotated=*/false, order_exempt);
         filled.partial_none = seeds_partial_none(value_type, order_exempt);
         filled.partial_container = partial_container;
         scopes_.rebind(target.identifier(), filled);
@@ -1854,8 +1909,8 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
     // never freezes a wrong declared type in place.
     if (existing.binding->partial_none && value_type.kind != TypeKind::NoneType &&
         value_type.kind != TypeKind::Unknown) {
-        Binding resolved{Type::union_of({value_type, Type::none()}), line,
-                         /*annotated=*/false};
+        Binding resolved = Binding::declared(Type::union_of({value_type, Type::none()}),
+                                             OrderPosition::at_line(line), line);
         scopes_.rebind(target.identifier(), resolved);
         // Same kill-then-set the compatible path below performs: the DECLARED
         // type is the union, while this path's CURRENT type is the resolver's
@@ -1886,7 +1941,8 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
         // compatibility check below (`x = ["s"]` after `x = [1]` reports,
         // measured -- mypy calls it `List item 0 has incompatible type`, a
         // sanctioned wording divergence).
-        Binding resolved{value_type, line, /*annotated=*/false};
+        Binding resolved =
+            Binding::declared(value_type, OrderPosition::at_line(line), line);
         scopes_.rebind(target.identifier(), resolved);
         // Same kill-then-set as both neighbouring paths.
         narrowings_.kill(target.identifier());
@@ -1894,8 +1950,8 @@ void TypeChecker::assign_name(const ast::Name& target, const Type& value_type, i
         return;
     }
     // A genuine reassignment (including a one-line def's parameter, whose
-    // declared_line equals this very statement's line but which is
-    // order_exempt -- see is_unfilled_placeholder -- so it never takes the
+    // bound_at equals this very statement's line but which is
+    // order_exempt -- see fills_placeholder -- so it never takes the
     // branch above): the FIRST assignment's inferred type is sticky, so this
     // is a compatibility check only, never a rebind. This is what makes
     // `def f(x: int) -> None: x = "s"` a reported incompatible assignment
@@ -1933,7 +1989,9 @@ void TypeChecker::assign_tuple(const ast::TupleExpr& target, const ast::Expr& va
     for (const ast::ExprPtr& element : target.elements()) {
         if (const auto* name = dynamic_cast<const ast::Name*>(element.get())) {
             if (!scopes_.bound_in_current_scope(name->identifier())) {
-                scopes_.bind(name->identifier(), Binding{Type::unknown(), line, false});
+                scopes_.bind(name->identifier(),
+                             Binding::declared(Type::unknown(),
+                                               OrderPosition::at_line(line), line));
             }
         }
     }
@@ -1991,19 +2049,30 @@ bool TypeChecker::resolve_dict_partial_from_store(const ast::Subscript& target,
     // binding at Unknown, which checks strictly less.
     const Type resolved =
         Type::dict_of(typer_.type_of(target.index(), Type::unknown()), value_type);
-    // The binding keeps its ORIGINAL declared_line -- the bare `x = {}` line
-    // -- and does NOT take the resolver's, unlike assign_name's two resolver
-    // paths. Not a stylistic difference: this resolver statement READS the
+    // The binding keeps BOTH of its ORIGINAL positions -- the bare `x = {}`
+    // line -- and does NOT take the resolver's, unlike assign_name's two
+    // resolver paths.
+    //
+    // bound_at: not a stylistic difference. This resolver statement READS the
     // name it resolves (the store's receiver), and the ordering rule fires on
-    // `declared_line >= statement_line`, so stamping the store's own line
+    // `bound_at >= statement_line_`, so stamping the store's own line
     // makes the receiver read a false
     // `NameError: name 'x' is used before definition` at that very line
-    // (observed, before this was fixed). assign_name's display resolver never
+    // (observed, before this was fixed).
+    //
+    // declared_at: a resolve is not a DEFINITION, so the line every later
+    // `already defined on line N` names must stay the bare `x = {}` line.
+    // Stamping it here would make a subsequent annotation of the same name
+    // report against the STORE rather than the definition, which is a
+    // forward-looking line mypy never produces.
+    //
+    // assign_name's display resolver never
     // hits it because `x = [1]` mentions `x` only as a target. The original
     // line is also the honest answer: it is where the name was defined, and
     // it is mypy's own anchor for the diagnostic this resolve suppresses.
     scopes_.rebind(receiver->identifier(),
-                   Binding{resolved, existing.binding->declared_line, /*annotated=*/false});
+                   Binding::declared(resolved, existing.binding->bound_at,
+                                     existing.binding->declared_at));
     // Same kill-then-set as both resolver paths in assign_name.
     narrowings_.kill(receiver->identifier());
     narrowings_.set(receiver->identifier(), resolved);
@@ -2331,7 +2400,7 @@ void TypeChecker::visit(const ast::AnnAssign& node) {
             // front (own_member_type gate, see its own comment), so by the
             // time this real walk reaches the SAME node, own_existing always
             // hits. The declared LINE is the disambiguator, exactly like
-            // is_unfilled_placeholder's ScopeStack analogue: it is THIS
+            // fills_placeholder's ScopeStack analogue: it is THIS
             // statement's own install only when the line matches, and a
             // genuinely earlier same-class declaration otherwise. What that
             // second case can actually BE is narrow, and worth stating so
@@ -2934,24 +3003,28 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         const Type signature_type =
             Type::callable(param_types, return_type, defaulted_param_count(params));
         const std::vector<std::string> param_names = param_names_of(params);
-        Binding signature{signature_type, def_line, /*annotated=*/true};
+        Binding signature = Binding::declared(signature_type, OrderPosition::at_line(def_line),
+                                              def_line, /*annotated=*/true);
         // Assigned rather than passed positionally -- see
         // Binding::param_names' own comment.
         signature.param_names = param_names;
         if (scopes_.bound_in_current_scope(node.name())) {
             const Resolution existing = scopes_.resolve(node.name());
-            // Routed through is_unfilled_placeholder for
-            // consistency with every other same-line-rebind site, though the
-            // order_exempt guard is unreachable here in practice -- an
+            // Routed through has_prior_definition (GROUP R, like
+            // bind_resolved_annotation: this site decides a `[no-redef]`),
+            // though the order_exempt guard inside it is unreachable here in
+            // practice -- an
             // order_exempt binding is only ever a PARAMETER, whose
-            // declared_line is the ENCLOSING def's own header line, and a
+            // bound_at is the ENCLOSING def's own header line, and a
             // nested `def` (a compound statement) can never share that exact
             // line: Python's grammar requires it to start its own indented
             // statement line, never trail a `:` inline. Kept as the shared
             // helper anyway rather than the raw comparison, so a future
             // change to either rule only has one place to update.
-            if (is_unfilled_placeholder(*existing.binding, def_line)) {
-                scopes_.rebind(node.name(), signature);
+            if (!has_prior_definition(*existing.binding, def_line)) {
+                Binding filled = existing.binding->fill(signature_type, /*annotated=*/true);
+                filled.param_names = param_names;
+                scopes_.rebind(node.name(), filled);
             } else if (conditional_defs_.count(&node) != 0 &&
                        has_identical_signature(*existing.binding, signature_type, param_names)) {
                 // mypy's CONDITIONAL-FUNCTION-DEFINITION allowance, which is
@@ -3017,7 +3090,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
             } else {
                 report(node, DiagnosticKind::SemanticAnalyzerTypeError,
                       "name \"" + node.name() + "\" already defined on line " +
-                          std::to_string(existing.binding->declared_line));
+                          std::to_string(existing.binding->declared_at));
             }
         } else {
             scopes_.bind(node.name(), signature);
@@ -3033,7 +3106,7 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
     // used-before-definition inside that same body -- see Binding::
     // order_exempt's own comment for why the ordinary `>=` ordering check
     // would otherwise misfire on a one-line suite, and why
-    // is_unfilled_placeholder needs this same flag to avoid mistaking a
+    // fills_placeholder needs this same flag to avoid mistaking a
     // same-line parameter for its own placeholder-fill case.
     FunctionScopeGuard guard(scopes_);
     // A real `def` boundary resets the narrowing map -- see
@@ -3067,10 +3140,12 @@ void TypeChecker::visit(const ast::FunctionDef& node) {
         // an attribute from inside a closure that captured a method's self,
         // and refuse to from a nested def's own shadowing `self` parameter.
         // See Binding::method_self for both measurements.
-        if (!scopes_.bind(parameter.name, Binding{param_types[i], def_line,
-                                                  /*annotated=*/parameter.annotation != nullptr,
-                                                  /*order_exempt=*/true,
-                                                  /*method_self=*/is_method && i == 0})) {
+        if (!scopes_.bind(parameter.name,
+                          Binding::declared(param_types[i], OrderPosition::at_line(def_line),
+                                            def_line,
+                                            /*annotated=*/parameter.annotation != nullptr,
+                                            /*order_exempt=*/true,
+                                            /*method_self=*/is_method && i == 0))) {
             report(node, DiagnosticKind::SemanticAnalyzerTypeError,
                   "duplicate argument \"" + parameter.name + "\" in function definition");
         }
@@ -3229,7 +3304,7 @@ void TypeChecker::visit(const ast::ClassDef& node) {
             const Resolution existing = scopes_.resolve(node.name());
             report(node, DiagnosticKind::SemanticAnalyzerTypeError,
                   "name \"" + node.name() + "\" already defined on line " +
-                      std::to_string(existing.binding->declared_line));
+                      std::to_string(existing.binding->declared_at));
         }
         qualified_name = declare_isolated_class(
             node, "<local-class>#" + std::to_string(node.span().start_line) + "#" + node.name());
@@ -3895,7 +3970,7 @@ void TypeChecker::visit(const ast::For& node) {
         // for_each_bound_name a plain Name target uses), so the ordinary
         // fresh-bind branch below no longer fires for one inside a function
         // body -- this must fill THAT placeholder in directly, exactly as
-        // assign_name's own is_unfilled_placeholder branch does for a plain
+        // assign_name's own fills_placeholder branch does for a plain
         // Name target, or the element's order_exempt=false placeholder would
         // survive untouched and misfire the same false "used before
         // definition" order_exempt exists to prevent.
@@ -3903,15 +3978,18 @@ void TypeChecker::visit(const ast::For& node) {
             if (const auto* name = dynamic_cast<const ast::Name*>(element.get())) {
                 if (scopes_.bound_in_current_scope(name->identifier())) {
                     const Resolution existing = scopes_.resolve(name->identifier());
-                    if (is_unfilled_placeholder(*existing.binding, line)) {
+                    if (fills_placeholder(*existing.binding, line)) {
                         scopes_.rebind(name->identifier(),
-                                       Binding{Type::unknown(), line, /*annotated=*/false,
-                                              /*order_exempt=*/true});
+                                       existing.binding->fill(Type::unknown(),
+                                                              /*annotated=*/false,
+                                                              /*order_exempt=*/true));
                     }
                 } else {
                     scopes_.bind(name->identifier(),
-                                 Binding{Type::unknown(), line, /*annotated=*/false,
-                                        /*order_exempt=*/true});
+                                 Binding::declared(Type::unknown(),
+                                                   OrderPosition::at_line(line), line,
+                                                   /*annotated=*/false,
+                                                   /*order_exempt=*/true));
                 }
             }
         }
@@ -3927,8 +4005,8 @@ void TypeChecker::visit(const ast::For& node) {
         // so a one-line suite (`for i in range(3): print(i)`) reading it
         // within that same body is never a genuine use-before-definition.
         // Without this, the body's ExprStmt sets statement_line_ to this same
-        // line, and the ordinary `declared_line >= statement_line_` ordering
-        // check (declared_line == line here too) misfires exactly like it did
+        // line, and the ordinary `bound_at >= statement_line_` ordering
+        // check (bound_at == line here too) misfires exactly like it did
         // for a one-line def's own parameter before that case was fixed.
         // A read BEFORE the loop is untouched by this: the name is not bound
         // at all yet, so it still correctly reports "is not defined".

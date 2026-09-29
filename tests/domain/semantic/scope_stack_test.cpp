@@ -9,10 +9,7 @@ namespace cythonpp::domain::semantic {
 namespace {
 
 Binding at(Type type, int line) {
-    Binding binding;
-    binding.type = std::move(type);
-    binding.declared_line = line;
-    return binding;
+    return Binding::declared(std::move(type), OrderPosition::at_line(line), line);
 }
 
 TEST(ScopeStack, StartsWithAModuleScope) {
@@ -27,7 +24,8 @@ TEST(ScopeStack, ResolvesANameBoundInTheCurrentScope) {
     const Resolution resolved = scopes.resolve("x");
     ASSERT_NE(resolved.binding, nullptr);
     EXPECT_EQ(resolved.binding->type, Type::int_());
-    EXPECT_EQ(resolved.binding->declared_line, 1);
+    EXPECT_EQ(resolved.binding->declared_at, 1);
+    EXPECT_EQ(resolved.binding->bound_at, OrderPosition::at_line(1));
     EXPECT_TRUE(resolved.in_own_scope);
 }
 

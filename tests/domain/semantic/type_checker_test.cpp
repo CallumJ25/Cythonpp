@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <utility>
@@ -1419,7 +1420,7 @@ TEST(TypeChecker, AOneLineDefReadingItsOwnParameterIsClean) {
 }
 
 // The SAME root cause, in the opposite direction.
-// `assign_name` mistook a one-line def's parameter (declared_line == the
+// `assign_name` mistook a one-line def's parameter (bound_at == the
 // body statement's own line) for pre_bind_function_body's "still-unfilled
 // placeholder" and silently REBOUND over it, discarding the parameter's
 // annotation -- so a wrong-typed assignment to it went unreported. This must
@@ -3827,7 +3828,7 @@ TEST(TypeChecker, ALosingClassRedefinitionDoesNotClobberTheWinningOnesBases) {
 //
 // bind_annotation handles a function-local AnnAssign target (visit(AnnAssign)
 // routes any non-module-level Name target here) and used to compare
-// `existing.binding->declared_line == line` directly, with no order_exempt
+// `existing.binding->bound_at == line` directly, with no order_exempt
 // involvement -- so a same-line, order_exempt PARAMETER re-annotated with
 // `:` was mistaken for bind_annotation's own "still-unfilled placeholder"
 // case and silently REBOUND, discarding the parameter's real annotation with
@@ -3846,7 +3847,7 @@ TEST(TypeChecker, AOneLineDefReannotatingItsOwnParameterIsARedefinition) {
 }
 
 // The two-line form takes bind_annotation's OTHER branch from the start
-// (existing.binding->declared_line == 1, the def's own line, is already !=
+// (existing.binding->bound_at == line 1, the def's own line, is already !=
 // 2, the AnnAssign's own line, with no order_exempt involvement needed) --
 // this pins that it reports the SAME redefinition wording as the one-line
 // form above, so the two forms do not silently diverge.
@@ -3890,7 +3891,7 @@ TEST(TypeChecker, TheForTargetSurvivesTheLoop) {
 // target was a false NameError before this fix -- the body's ExprStmt sets
 // statement_line_ to the SAME line the for-loop bound `i` at (there is no
 // separate body line to be strictly greater, exactly the one-line-def shape
-// Task 18 already fixed for parameters), so the ordinary `declared_line >=
+// Task 18 already fixed for parameters), so the ordinary `bound_at >=
 // statement_line_` ordering check misfired as "name 'i' is used before
 // definition" on mypy-clean code. Verified against mypy 1.18.1: --strict
 // clean. Also verified directly against the compiled binary (see the fix
@@ -8156,7 +8157,7 @@ TEST(TypeChecker, AnUnboundedModelKindConstructorStillDefersRatherThanGoingSilen
 // name whose first binding sits inside an `if`/`while`/`for` body and which is
 // assigned again at top level used to take its DECLARED type from the LATER
 // top-level assignment: the Phase-2.5 placeholder was stamped with that
-// statement's line, so is_unfilled_placeholder refused to let the earlier,
+// statement's line, so fills_placeholder refused to let the earlier,
 // genuinely-first assignment fill it. mypy takes the declared type from the
 // FIRST assignment in source order, wherever it sits, so the later
 // incompatible one is an error -- measured, all three shapes
@@ -8784,7 +8785,7 @@ TEST(TypeChecker, ALaterLiveAssignmentIsStillCheckedAgainstTheLiveDeclaredType) 
 // a UNION-RULE GUARD rather than a refinement -- found by adversarial review
 // of the fix above, which had introduced the defect it closes.
 //
-// The placeholder line decides which statement `is_unfilled_placeholder` lets
+// The placeholder line decides which statement `fills_placeholder` lets
 // fill its own placeholder instead of reporting a redefinition. For an
 // `Assign` that is harmless: rebinding a name is legal Python and mypy says
 // nothing. But bind_resolved_annotation (an AnnAssign) and visit(FunctionDef)
@@ -8866,9 +8867,70 @@ TEST(TypeChecker, ALiveAnnotatedOrNestedDefBindingDoesNotTakeTheMovedLine) {
         ASSERT_FALSE(checked.diagnostics.empty())
             << "SILENT on a program mypy rejects:\n"
             << source;
-        EXPECT_EQ(checked.diagnostics.front().code, "TypeError") << source;
-        EXPECT_EQ(checked.diagnostics.front().message, expected) << source;
+        // PRESENT, not necessarily FIRST. Loosened 2026-09-24 with the
+        // bound_at/declared_at split: one shape below puts the read INSIDE
+        // the dead arm, which now draws its own use-before-definition ahead
+        // of the redefinition -- pinned on its own in
+        // AReadInsideADeadArmBeforeANonBenignLiveBindingReportsBoth. What
+        // this test exists for is unchanged and still exact: the
+        // `[no-redef]` must be reported, and must name mypy own line.
+        const auto redefinition =
+            std::find_if(checked.diagnostics.begin(), checked.diagnostics.end(),
+                         [](const diagnostics::Diagnostic& diagnostic) {
+                             return diagnostic.code == "TypeError";
+                         });
+        ASSERT_NE(redefinition, checked.diagnostics.end())
+            << "no redefinition reported:\n"
+            << source;
+        EXPECT_EQ(redefinition->message, expected) << source;
     }
+}
+
+// A READ POSITIONED INSIDE A DEAD ARM, ahead of a live binding that is NOT
+// an Assign/ForTarget, now draws its own `used before definition` as well as
+// the redefinition. This is the ONE place the bound_at/declared_at split
+// (2026-09-24) changes behaviour rather than preserving it, so it is pinned
+// here rather than left to the test above to notice through front().
+//
+// MECHANISM. Before the split, a live ANNOTATED or nested-`def` binding
+// refused to let the placeholder line move at all -- that was the
+// `line_may_move` kind whitelist -- so the placeholder sat on the DEAD arm
+// own line and a read below it was ordered against nothing. Now the
+// POSITION follows the first live binding while the DECLARATION LINE stays
+// on the dead arm, so the read is ordered correctly and reports.
+//
+// WHY THIS IS NOT A NEW FALSE POSITIVE, measured rather than argued. Every
+// program in this family is one mypy REJECTS, and for a structural reason:
+// the live binding is a redefinition of the dead arm own symbol, which is
+// exactly the property that makes it non-benign. Swept 2026-09-24 over 216
+// shapes -- 3 dead-arm spellings x 4 dead-binding kinds (plain assign, a
+// `for` target with the read inside the loop, a `for` target with the read
+// after it, a tuple unpack) x 6 live-binding kinds x 3 scopes. 72 are
+// accepted by BOTH oracles and every single one of those has a BENIGN live
+// binding, whose position already moved before this change. ZERO shapes
+// with a non-benign live binding are accepted by both. An earlier 252-shape
+// sweep missed this family entirely because it always bound the dead arm
+// with a plain assign; this test is what found that hole.
+//
+// Note CPython ACCEPTS this exact program -- the dead arm never runs, so
+// the read never executes -- and prints `1`. The union rule therefore rests
+// on mypy alone here, and mypy reports TWO errors on it: `[no-redef]` at
+// the annotation and `[has-type]` at the trailing read.
+TEST(TypeChecker, AReadInsideADeadArmBeforeANonBenignLiveBindingReportsBoth) {
+    const Checked checked = check_module("def f() -> None:\n"
+                                         "    if False:\n"
+                                         "        for x in [\"s\"]:\n"
+                                         "            print(x)\n"
+                                         "    x: int = 1\n"
+                                         "    print(x)\n\n\nf()\n");
+    ASSERT_EQ(checked.diagnostics.size(), 2u);
+    EXPECT_EQ(checked.diagnostics[0].code, "NameError");
+    EXPECT_EQ(checked.diagnostics[0].message, "name 'x' is used before definition");
+    EXPECT_EQ(checked.diagnostics[0].line, 4);
+    EXPECT_EQ(checked.diagnostics[1].code, "TypeError");
+    EXPECT_EQ(checked.diagnostics[1].message,
+              "name \"x\" already defined on line 3");
+    EXPECT_EQ(checked.diagnostics[1].line, 5);
 }
 
 // A FOLDED-FALSE LOOP HEADER means the body never executes, so a `break`

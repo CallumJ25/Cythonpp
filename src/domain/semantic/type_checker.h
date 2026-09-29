@@ -780,7 +780,7 @@ private:
     // placeholder-declared at ITS OWN line. This is what
     // lets assign_attribute's real, later pass over that EXACT statement
     // recognise "this is my own placeholder, fill in the real type" (line
-    // equality, exactly like is_unfilled_placeholder's ScopeStack analogue)
+    // equality, exactly like fills_placeholder's ScopeStack analogue)
     // rather than mistaking it for either a genuinely new declaration (there
     // is no "genuinely new" left once every attribute is placeholder-declared
     // up front) or a second, real conflicting assignment.
@@ -908,11 +908,11 @@ private:
     // bound (i.e. not a FunctionDef/AnnAssign name from Phase 2) get a
     // PLACEHOLDER binding -- Type::unknown(), at the statement's own line --
     // so a module-level "used before definition" read (`y = x` before
-    // `x = 5`) resolves to a real Binding whose declared_line lets
+    // `x = 5`) resolves to a real Binding whose bound_at lets
     // ExpressionTyper's ordering check fire with the right wording, rather
     // than falling through to "not defined". Phase 3's own Assign handling
     // recognises "my own placeholder, still unfilled" by comparing this
-    // Binding's declared_line to the statement it is currently checking, and
+    // Binding's bound_at to the statement it is currently checking, and
     // replaces it (via ScopeStack::rebind) with the real inferred type
     // exactly once -- see assign_name.
     //
@@ -937,7 +937,7 @@ private:
     // first bound inside an `if`/`while`/`for` and assigned again at top
     // level got its placeholder stamped with the LATER top-level line, so
     // (a) the earlier, genuinely-first assignment could not fill its own
-    // placeholder (is_unfilled_placeholder compares lines) and the later
+    // placeholder (fills_placeholder compares lines) and the later
     // assignment won the declared type, losing mypy's `Incompatible types in
     // assignment` entirely, and (b) a read sitting BETWEEN the two reported a
     // false `used before definition` against that later line. See
@@ -1221,7 +1221,7 @@ private:
     // for practically every attribute and a bare "does a member/method exist
     // already" test can no longer tell "brand new" from "this IS my own
     // placeholder, fill it in". The declared LINE is the disambiguator,
-    // exactly like is_unfilled_placeholder's ScopeStack analogue.
+    // exactly like fills_placeholder's ScopeStack analogue.
     //
     // ExistingDeclaration covers BOTH a member declared at a DIFFERENT line
     // (a genuine earlier, real assignment or annotation) and a same-name
@@ -1233,14 +1233,14 @@ private:
     // The one place a Name target is bound or checked, for both a plain
     // Assign and each element of a tuple-unpacking Assign. See
     // pre_bind_assignment_targets for what "my own still-unfilled
-    // placeholder" means and why declared_line == line is the signal for it.
+    // placeholder" means and why fills_placeholder is the signal for it.
     //
     // `order_exempt` defaults to false for
     // every ordinary assignment, but a `for` target's own first bind passes
     // true: like a parameter, it is bound before its body ever runs, so a
     // one-line suite (`for i in range(3): print(i)`) reading it within that
     // same body can never be a genuine use-before-definition, only a false
-    // positive from the ordinary `declared_line >= read_line` check. The
+    // positive from the ordinary `bound_at >= read_line` check. The
     // FRESH-bind branch honours this flag directly; the placeholder-fill
     // branch threads it through too (since 2026-09-13, when
     // pre_bind_function_body started pre-binding a `for` target the same way
@@ -1262,19 +1262,32 @@ private:
                      bool order_exempt = false,
                      const std::optional<Type>& partial_container = std::nullopt);
 
-    // True when `binding` is THIS exact
-    // statement's own still-unfilled placeholder (from
-    // pre_bind_assignment_targets / pre_bind_function_body) rather than a
-    // genuine prior binding -- the signal being declared_line == line, AS
-    // LONG AS the binding is not order_exempt. A parameter's declared_line
-    // is the `def` line, which for a one-line suite equals the body
-    // statement's own line too, but a parameter is never a placeholder to
-    // fill in -- it already carries its real (possibly annotated) type --
-    // so order_exempt vetoes the match. Shared by assign_to (for both the
-    // bidirectional `expected` type and the bare-empty-container check) and
-    // assign_name, so the parameter exemption cannot be added to one call
-    // site and missed on another.
-    static bool is_unfilled_placeholder(const Binding& binding, int line);
+    // TWO PREDICATES, ONE PER QUESTION -- and they were ONE
+    // (`is_unfilled_placeholder`) until 2026-09-24. Its six call sites were
+    // measured to be asking two DIFFERENT things, which is why splitting the
+    // field they both read (see Binding's own header comment) meant splitting
+    // this too:
+    //
+    //   fills_placeholder     GROUP F, four sites: assign_to (twice),
+    //                         assign_name, visit(For)'s tuple arm.
+    //                         "Should THIS statement commit the declared
+    //                         type?" Reads bound_at, which MAY have moved.
+    //
+    //   has_prior_definition  GROUP R, two sites: bind_resolved_annotation,
+    //                         visit(FunctionDef). "Was there a prior binding
+    //                         mypy considers a DEFINITION?", i.e. is this a
+    //                         `[no-redef]`. Reads declared_at, which never
+    //                         moves.
+    //
+    // They coincided only while a placeholder's position and its declaration
+    // line were the same number. The dead-arm fix broke that, and answering
+    // group R from the moved position deleted fourteen real diagnostics.
+    //
+    // Each stays SHARED across its own call sites, for the reason the single
+    // predicate was shared before: an exemption added at one site and missed
+    // at another is how this family produces regressions.
+    static bool fills_placeholder(const Binding& binding, int line);
+    static bool has_prior_definition(const Binding& binding, int line);
 
     // True for `[]`, `{}`, or a zero-argument call to
     // list/dict/set/frozenset/tuple -- the five constructs mypy leaves

@@ -55,10 +55,8 @@ Typed type_expression(const std::string& expression,
 
     ScopeStack scopes;
     for (const auto& entry : bindings) {
-        Binding binding;
-        binding.type = entry.second;
-        binding.declared_line = 1;
-        scopes.bind(entry.first, binding);
+        scopes.bind(entry.first,
+                    Binding::declared(entry.second, OrderPosition::at_line(1), 1));
     }
 
     ClassTable owned;
@@ -1735,9 +1733,9 @@ TEST(ExpressionTyper, TypesAListComprehension) {
 // with the bug present, and exactly why no existing unit test caught this
 // before the corpus did. This test builds the pipeline by hand instead, so
 // it can call set_statement_line(1) itself, mirroring what TypeChecker does
-// for every real statement. `values` is bound at declared_line=0 -- an
+// for every real statement. `values` is bound at an UNSET bound_at -- an
 // earlier, real line -- rather than through the bindings map (which pins
-// declared_line=1, indistinguishable from a same-line binding for this
+// bound_at line 1, indistinguishable from a same-line binding for this
 // check), so the test isolates the comprehension target's own exemption
 // rather than accidentally tripping the ordering check on `values` too.
 TEST(ExpressionTyper, AListComprehensionMayReadItsOwnTarget) {
@@ -1756,9 +1754,8 @@ TEST(ExpressionTyper, AListComprehensionMayReadItsOwnTarget) {
     ASSERT_NE(statement, nullptr) << "fixture must be an expression statement";
 
     ScopeStack scopes;
-    Binding values_binding;
-    values_binding.type = Type::list_of(Type::int_());
-    values_binding.declared_line = 0;
+    const Binding values_binding =
+        Binding::declared(Type::list_of(Type::int_()), OrderPosition::unset(), 0);
     scopes.bind("values", values_binding);
 
     ClassTable classes;

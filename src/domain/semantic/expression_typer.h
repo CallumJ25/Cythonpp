@@ -1,7 +1,6 @@
 #ifndef CYTHONPP_DOMAIN_SEMANTIC_EXPRESSION_TYPER_H
 #define CYTHONPP_DOMAIN_SEMANTIC_EXPRESSION_TYPER_H
 
-#include <limits>
 #include <string>
 
 #include "class_table.h"
@@ -22,6 +21,7 @@
 #include "domain/ast/unary_op.h"
 #include "domain/diagnostics/diagnostic_sink.h"
 #include "narrowing_map.h"
+#include "order_position.h"
 #include "rule_result.h"
 #include "scope_stack.h"
 #include "type.h"
@@ -57,8 +57,10 @@ public:
     Type type_of(const ast::Expr& expr, const Type& expected);
 
     // The ordering rule (Task 11, "the rule with teeth") needs the READING
-    // statement's own line, which only the statement-level checker (Task 17)
-    // knows -- so it calls this before typing each statement's subtree.
+    // statement's own position, which only the statement-level checker
+    // (Task 17) knows -- so it calls this before typing each statement's
+    // subtree. Still takes a LINE: every caller has one to hand, and
+    // OrderPosition is where the line-vs-ordinal question is confined.
     // Left at its default (see statement_line_'s comment) for every existing
     // caller that never calls this, so the check is inert unless a caller
     // opts in.
@@ -410,15 +412,16 @@ private:
     NarrowingMap& narrowings_;
     diagnostics::DiagnosticSink& sink_;
 
-    // The line of the statement currently being checked, for the ordering
-    // rule in type_of_name. Defaults to INT_MAX -- not 0 -- so a caller that
-    // never calls set_statement_line (every existing expression_typer_test.cpp
+    // Where the statement currently being checked sits in execution order,
+    // for the ordering rule in type_of_name. Defaults to
+    // OrderPosition::after_all() -- not unset() -- so a caller that never
+    // calls set_statement_line (every existing expression_typer_test.cpp
     // fixture, which types one bare expression with no enclosing statement)
-    // gets a comparison that can never fire: a real declared_line is always
-    // far smaller than INT_MAX. Defaulting to 0 would have made the ordering
-    // check fire on EVERY own-scope binding for every caller that does not
-    // opt in, since declared_line >= 0 is always true.
-    int statement_line_ = std::numeric_limits<int>::max();
+    // gets a comparison that can never fire: a real bound_at is always
+    // before it. Defaulting to unset() would have made the ordering check
+    // fire on EVERY own-scope binding for every caller that does not opt in,
+    // since `bound_at >= unset()` is always true.
+    OrderPosition statement_line_ = OrderPosition::after_all();
 };
 
 } // namespace cythonpp::domain::semantic
